@@ -62,26 +62,14 @@ pub struct FrontmatterConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChunkingConfig {
-    #[serde(default = "default_strategy")]
-    pub strategy: String,
     #[serde(default = "default_max_chunk_size")]
     pub max_chunk_size: usize,
-    #[serde(default = "default_chunk_overlap")]
-    pub chunk_overlap: usize,
     #[serde(default)]
     pub prepend_description: bool,
 }
 
-fn default_strategy() -> String {
-    "markdown".into()
-}
-
 fn default_max_chunk_size() -> usize {
     1500
-}
-
-fn default_chunk_overlap() -> usize {
-    200
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,8 +126,6 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebhookConfig {
-    #[serde(default = "default_webhook_port")]
-    pub port: u16,
     #[serde(default = "default_webhook_secret_env")]
     pub secret_env: String,
     #[serde(default = "default_provider")]
@@ -149,15 +135,10 @@ pub struct WebhookConfig {
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
-            port: 9000,
             secret_env: "WEBHOOK_SECRET".into(),
             provider: "gitea".into(),
         }
     }
-}
-
-fn default_webhook_port() -> u16 {
-    9000
 }
 
 fn default_webhook_secret_env() -> String {
@@ -204,16 +185,17 @@ impl Config {
     pub fn data_path(&self) -> &str {
         self.source.data_path.as_deref().unwrap_or("/data")
     }
-
-    /// Parse config from a YAML string (for testing)
-    pub fn from_str(yaml: &str) -> anyhow::Result<Self> {
-        Ok(serde_yaml_ng::from_str(yaml)?)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Config {
+        fn from_str(yaml: &str) -> anyhow::Result<Self> {
+            Ok(serde_yaml_ng::from_str(yaml)?)
+        }
+    }
 
     const MINIMAL_CONFIG: &str = r#"
 source:
@@ -239,11 +221,9 @@ qdrant:
         assert_eq!(cfg.embedding.batch_size, 32);
         assert_eq!(cfg.qdrant.collection, "knowledge-base");
         assert_eq!(cfg.chunking.max_chunk_size, 1000);
-        assert_eq!(cfg.chunking.chunk_overlap, 200);
         assert!(cfg.validation.enabled);
         assert!(!cfg.validation.strict);
         assert_eq!(cfg.mcp.port, 8001);
-        assert_eq!(cfg.webhook.port, 9000);
     }
 
     #[test]
@@ -263,9 +243,7 @@ frontmatter:
   defaults:
     status: "draft"
 chunking:
-  strategy: "markdown"
   max_chunk_size: 2000
-  chunk_overlap: 100
   prepend_description: true
 embedding:
   base_url: "http://embed:8080/v1"
@@ -279,7 +257,6 @@ validation:
   enabled: false
   strict: true
 webhook:
-  port: 9001
   secret_env: "MY_SECRET"
   provider: "github"
 mcp:

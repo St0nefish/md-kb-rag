@@ -18,7 +18,6 @@ pub struct ValidationResult {
 
 #[derive(Debug, Clone)]
 pub struct ValidatedFile {
-    pub file_path: String,
     pub frontmatter: HashMap<String, Value>,
     pub body: String,
 }
@@ -119,7 +118,6 @@ pub fn validate_file(
 
     let validated_file = if valid {
         Some(ValidatedFile {
-            file_path,
             frontmatter,
             body: parsed.content,
         })

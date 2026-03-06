@@ -35,9 +35,7 @@ mod tests {
 
     fn test_config(max_chunk_size: usize, prepend: bool) -> ChunkingConfig {
         ChunkingConfig {
-            strategy: "markdown".into(),
             max_chunk_size,
-            chunk_overlap: 0,
             prepend_description: prepend,
         }
     }
