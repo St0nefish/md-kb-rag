@@ -170,6 +170,24 @@ mod tests {
     }
 
     #[test]
+    fn realistic_large_doc_no_heading_only_chunks() {
+        // Simulate a large doc where sections exceed max_chunk_size,
+        // forcing the splitter to put headings in their own chunks.
+        let big_section = "x ".repeat(800); // ~1600 chars
+        let body = format!(
+            "## First Section\n\n{big_section}\n\n## Testing\n\n```bash\ncargo test\n```\n\n## Another\n\n{big_section}"
+        );
+        let chunks = chunk_markdown(&body, None, &test_config(1500, false));
+        for chunk in &chunks {
+            assert!(
+                !is_heading_only(&chunk.text),
+                "Chunk should not be heading-only: {:?}",
+                &chunk.text[..chunk.text.len().min(200)]
+            );
+        }
+    }
+
+    #[test]
     fn is_heading_only_detection() {
         assert!(is_heading_only("# Hello"));
         assert!(is_heading_only("## Sub\n\n### Deeper"));

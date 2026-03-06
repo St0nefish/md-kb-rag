@@ -116,6 +116,23 @@ impl QdrantStore {
         Ok(Self { client })
     }
 
+    pub async fn drop_collection(&self, collection: &str) -> Result<()> {
+        let exists = self
+            .client
+            .collection_exists(collection)
+            .await
+            .context("Failed to check if collection exists")?;
+
+        if exists {
+            info!("Dropping Qdrant collection '{}'", collection);
+            self.client
+                .delete_collection(collection)
+                .await
+                .context("Failed to delete collection")?;
+        }
+        Ok(())
+    }
+
     pub async fn ensure_collection(
         &self,
         collection: &str,

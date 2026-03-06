@@ -201,10 +201,14 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
 
     info!("Discovered {} files", discovered.len());
 
-    // ── Full-mode: wipe state so everything is re-indexed ────────────────────
+    // ── Full-mode: wipe state and Qdrant collection so everything is clean ───
     if full {
-        info!("Full reindex: clearing state DB");
+        info!("Full reindex: clearing state DB and Qdrant collection");
         state.clear().await.context("Failed to clear state DB")?;
+        store
+            .drop_collection(collection)
+            .await
+            .context("Failed to drop Qdrant collection for full reindex")?;
     }
 
     // ── Determine which previously-indexed files no longer exist ─────────────
