@@ -19,7 +19,7 @@ use crate::{
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentParams {
     /// The file path of the document (as returned by search results).
-    pub file_path: String,
+    pub path: String,
 }
 
 /// Parameters for the `search` tool.
@@ -216,7 +216,7 @@ impl KbSearchServer {
         &self,
         Parameters(params): Parameters<GetDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
-        let requested = PathBuf::from(&params.file_path);
+        let requested = PathBuf::from(&params.path);
 
         // Canonicalize the data path for safe prefix checking
         let canonical_data = self.data_path.canonicalize().map_err(|e| {
@@ -231,13 +231,13 @@ impl KbSearchServer {
         };
 
         let canonical_resolved = resolved.canonicalize().map_err(|_| {
-            McpError::invalid_params(format!("File not found: {}", params.file_path), None)
+            McpError::invalid_params(format!("File not found: {}", params.path), None)
         })?;
 
         // Prevent path traversal outside data directory
         if !canonical_resolved.starts_with(&canonical_data) {
             return Err(McpError::invalid_params(
-                format!("File path is outside the data directory: {}", params.file_path),
+                format!("File path is outside the data directory: {}", params.path),
                 None,
             ));
         }
@@ -246,7 +246,7 @@ impl KbSearchServer {
             .await
             .map_err(|e| {
                 McpError::invalid_params(
-                    format!("Failed to read file '{}': {}", params.file_path, e),
+                    format!("Failed to read file '{}': {}", params.path, e),
                     None,
                 )
             })?;
