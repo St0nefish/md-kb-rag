@@ -1,0 +1,46 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  embeddings:
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    volumes:
+      - ${MODEL_PATH}:/models:ro
+    command: >
+      --model /models/${MODEL_FILE}
+      --host 0.0.0.0 --port 8080
+      --embeddings --flash-attn on -ngl 999
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  md-kb-rag:
+    build: .
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${KB_PATH:-./data/repo}:/data:rw
+      - ./data/state:/app/data:rw
+    environment:
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN}
+      - RUST_LOG=${RUST_LOG:-info}
+    ports:
+      - "${MCP_PORT:-8001}:8001"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+    command: ["serve", "--config", "/app/config.yaml"]

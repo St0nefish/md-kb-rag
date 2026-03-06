@@ -1,0 +1,138 @@
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use axum::{
+    Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+};
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService,
+    session::local::LocalSessionManager,
+};
+use tokio_util::sync::CancellationToken;
+use tracing::info;
+
+use crate::config::Config;
+use crate::embed::EmbedClient;
+use crate::mcp::KbSearchServer;
+use crate::qdrant::QdrantStore;
+use crate::webhook::{self, WebhookState};
+
+#[derive(Clone)]
+struct AuthState {
+    bearer_token: Option<String>,
+}
+
+async fn bearer_auth(
+    State(auth): State<AuthState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let Some(ref expected_token) = auth.bearer_token else {
+        return Ok(next.run(request).await);
+    };
+
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .unwrap_or("");
+
+    if token == expected_token {
+        Ok(next.run(request).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+pub async fn run_server(config: Config) -> Result<()> {
+    let config = Arc::new(config);
+
+    // Set up shared services
+    let embed_client = Arc::new(EmbedClient::new(&config.embedding));
+    let qdrant = Arc::new(
+        QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?,
+    );
+
+    // Ensure collection exists
+    qdrant
+        .ensure_collection(
+            &config.qdrant.collection,
+            config.embedding.vector_size,
+            &config.frontmatter.indexed_fields,
+        )
+        .await
+        .context("Failed to ensure Qdrant collection")?;
+
+    // MCP service
+    let collection = config.qdrant.collection.clone();
+    let embed_for_mcp = Arc::clone(&embed_client);
+    let qdrant_for_mcp = Arc::clone(&qdrant);
+
+    let ct = CancellationToken::new();
+
+    let mcp_service = StreamableHttpService::new(
+        move || {
+            Ok(KbSearchServer::new(
+                Arc::clone(&embed_for_mcp),
+                Arc::clone(&qdrant_for_mcp),
+                collection.clone(),
+            ))
+        },
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig {
+            cancellation_token: ct.child_token(),
+            ..Default::default()
+        },
+    );
+
+    // Bearer token for MCP auth
+    let bearer_token = std::env::var(&config.mcp.bearer_token_env).ok();
+    let auth_state = AuthState { bearer_token };
+
+    // Webhook state
+    let webhook_secret = std::env::var(&config.webhook.secret_env).unwrap_or_default();
+    let webhook_state = WebhookState {
+        config: Arc::clone(&config),
+        secret: webhook_secret,
+    };
+
+    // Build router
+    let mcp_router = Router::new()
+        .nest_service("/mcp", mcp_service)
+        .route_layer(middleware::from_fn_with_state(auth_state.clone(), bearer_auth));
+
+    let webhook_router = Router::new()
+        .route("/hooks/reindex", axum::routing::post(webhook::handle_webhook))
+        .with_state(webhook_state);
+
+    let app = Router::new().merge(mcp_router).merge(webhook_router);
+
+    let mcp_port = config.mcp.port;
+    let bind_addr = format!("0.0.0.0:{}", mcp_port);
+    info!("Starting server on {}", bind_addr);
+    info!("  MCP endpoint: /mcp");
+    info!("  Webhook endpoint: /hooks/reindex");
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .context("Failed to bind server address")?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Shutting down server");
+            ct.cancel();
+        })
+        .await
+        .context("Server error")?;
+
+    Ok(())
+}

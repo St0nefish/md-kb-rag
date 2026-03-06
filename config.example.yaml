@@ -1,0 +1,71 @@
+# Knowledge base source
+source:
+  git_url: "https://git.example.com/user/knowledge-base.git"
+  branch: "master"
+  # Or bind-mount to /data and omit git_url
+
+# What to index
+indexing:
+  include:
+    - "**/*.md"
+  exclude:
+    - "archive/**"
+    - ".git/**"
+    - ".claude/**"
+    - ".tools/**"
+    - "node_modules/**"
+  exclude_files:
+    - "CLAUDE.md"
+    - "README.md"
+    - "index.md"
+
+# Frontmatter schema
+frontmatter:
+  required:
+    - title
+    - description
+    - type
+    - tags
+  indexed_fields:
+    - type
+    - domain
+    - tags
+    - status
+  defaults:
+    status: "active"
+
+# Chunking
+chunking:
+  strategy: "markdown"
+  max_chunk_size: 1500
+  chunk_overlap: 200
+  prepend_description: true
+
+# Embedding
+embedding:
+  base_url: "http://embeddings:8080/v1"
+  model: "nomic-embed-text-v2-moe"
+  vector_size: 768
+  batch_size: 32
+
+# Qdrant
+qdrant:
+  url: "http://qdrant:6334"
+  collection: "knowledge-base"
+
+# Validation
+validation:
+  enabled: true
+  strict: false
+  lint_command: null
+
+# Webhook
+webhook:
+  port: 9000
+  secret_env: "WEBHOOK_SECRET"
+  provider: "gitea"
+
+# MCP server
+mcp:
+  port: 8001
+  bearer_token_env: "MCP_BEARER_TOKEN"

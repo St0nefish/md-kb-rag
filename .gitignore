@@ -1,0 +1,8 @@
+/target
+/data
+.env
+config.yaml
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
