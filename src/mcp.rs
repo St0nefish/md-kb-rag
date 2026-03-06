@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::{
@@ -13,6 +14,13 @@ use crate::{
     embed::EmbedClient,
     qdrant::{QdrantStore, SearchResult},
 };
+
+/// Parameters for the `get_document` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetDocumentParams {
+    /// The file path of the document (as returned by search results).
+    pub file_path: String,
+}
 
 /// Parameters for the `search` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -42,6 +50,7 @@ pub struct KbSearchServer {
     embed_client: Arc<EmbedClient>,
     qdrant: Arc<QdrantStore>,
     collection: String,
+    data_path: PathBuf,
     tool_router: ToolRouter<KbSearchServer>,
 }
 
@@ -51,11 +60,13 @@ impl KbSearchServer {
         embed_client: Arc<EmbedClient>,
         qdrant: Arc<QdrantStore>,
         collection: String,
+        data_path: PathBuf,
     ) -> Self {
         Self {
             embed_client,
             qdrant,
             collection,
+            data_path,
             tool_router: Self::tool_router(),
         }
     }
@@ -196,6 +207,51 @@ impl KbSearchServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(output.trim())]))
+    }
+
+    #[tool(description = "Retrieve the full raw content of a document by file path. \
+        Use file paths returned by the `search` tool. Returns the complete markdown \
+        including frontmatter.")]
+    async fn get_document(
+        &self,
+        Parameters(params): Parameters<GetDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let requested = PathBuf::from(&params.file_path);
+
+        // Canonicalize the data path for safe prefix checking
+        let canonical_data = self.data_path.canonicalize().map_err(|e| {
+            McpError::internal_error(format!("Data path not accessible: {}", e), None)
+        })?;
+
+        // Resolve the requested path — it may be absolute or relative to data_path
+        let resolved = if requested.is_absolute() {
+            requested.clone()
+        } else {
+            self.data_path.join(&requested)
+        };
+
+        let canonical_resolved = resolved.canonicalize().map_err(|_| {
+            McpError::invalid_params(format!("File not found: {}", params.file_path), None)
+        })?;
+
+        // Prevent path traversal outside data directory
+        if !canonical_resolved.starts_with(&canonical_data) {
+            return Err(McpError::invalid_params(
+                format!("File path is outside the data directory: {}", params.file_path),
+                None,
+            ));
+        }
+
+        let content = tokio::fs::read_to_string(&canonical_resolved)
+            .await
+            .map_err(|e| {
+                McpError::invalid_params(
+                    format!("Failed to read file '{}': {}", params.file_path, e),
+                    None,
+                )
+            })?;
+
+        Ok(CallToolResult::success(vec![Content::text(content)]))
     }
 }
 
