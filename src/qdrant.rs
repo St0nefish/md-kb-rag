@@ -319,3 +319,117 @@ impl QdrantStore {
         Ok(count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qdrant_value_roundtrip() {
+        let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
+        payload.insert("title".into(), serde_json::Value::String("Test Doc".into()));
+        payload.insert("file_path".into(), serde_json::Value::String("/data/test.md".into()));
+        payload.insert("text".into(), serde_json::Value::String("Some chunk content".into()));
+        payload.insert("chunk_index".into(), serde_json::json!(0));
+        payload.insert(
+            "tags".into(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("rust".into()),
+                serde_json::Value::String("rag".into()),
+            ]),
+        );
+
+        let qdrant_payload = json_payload_to_qdrant(&payload);
+        let roundtripped = qdrant_payload_to_json(&qdrant_payload);
+
+        assert_eq!(
+            roundtripped.get("title").and_then(|v| v.as_str()),
+            Some("Test Doc")
+        );
+        assert_eq!(
+            roundtripped.get("file_path").and_then(|v| v.as_str()),
+            Some("/data/test.md")
+        );
+        assert_eq!(
+            roundtripped.get("text").and_then(|v| v.as_str()),
+            Some("Some chunk content")
+        );
+        assert_eq!(
+            roundtripped.get("chunk_index").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        let tags = roundtripped.get("tags").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].as_str(), Some("rust"));
+        assert_eq!(tags[1].as_str(), Some("rag"));
+    }
+
+    /// Integration test: upsert a point, search, and verify payload is returned.
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test qdrant_search_returns_payload -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn qdrant_search_returns_payload() {
+        let config = QdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test-search-payload".into(),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        // Clean up from any prior run
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        let vector_size = 4;
+        store
+            .ensure_collection(&config.collection, vector_size, &[])
+            .await
+            .unwrap();
+
+        let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
+        payload.insert("title".into(), serde_json::json!("Test Document"));
+        payload.insert("file_path".into(), serde_json::json!("/data/test.md"));
+        payload.insert("text".into(), serde_json::json!("Hello world chunk"));
+
+        let point = QdrantPoint {
+            id: "00000000-0000-0000-0000-000000000001".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            payload,
+        };
+        store
+            .upsert_points(&config.collection, vec![point])
+            .await
+            .unwrap();
+
+        // Small delay for indexing
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let results = store
+            .search(
+                &config.collection,
+                vec![1.0, 0.0, 0.0, 0.0],
+                HashMap::new(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(
+            result.payload.get("title").and_then(|v| v.as_str()),
+            Some("Test Document"),
+            "search results must include payload fields"
+        );
+        assert_eq!(
+            result.payload.get("file_path").and_then(|v| v.as_str()),
+            Some("/data/test.md"),
+        );
+        assert_eq!(
+            result.payload.get("text").and_then(|v| v.as_str()),
+            Some("Hello world chunk"),
+        );
+
+        // Clean up
+        store.client.delete_collection(&config.collection).await.unwrap();
+    }
+}
