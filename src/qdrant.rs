@@ -272,7 +272,7 @@ impl QdrantStore {
             })
             .collect();
 
-        let mut builder = SearchPointsBuilder::new(collection, vector, limit);
+        let mut builder = SearchPointsBuilder::new(collection, vector, limit).with_payload(true);
         if !conditions.is_empty() {
             builder = builder.filter(Filter::must(conditions));
         }
