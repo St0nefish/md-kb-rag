@@ -80,10 +80,12 @@ pub async fn validate_file(
 
     // Run lint command if configured
     if let Some(lint_cmd) = &validation.lint_command {
-        let cmd_str = lint_cmd.replace("{file}", &file_path);
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if let Some((program, args)) = parts.split_first() {
-            let output = Command::new(program).args(args).output().await;
+        if let Some((program, args)) = lint_cmd.split_first() {
+            let output = Command::new(program)
+                .args(args)
+                .arg(path)
+                .output()
+                .await;
             match output {
                 Ok(out) if !out.status.success() => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -244,5 +246,75 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].0.valid);
         assert!(!results[1].0.valid);
+    }
+
+    #[tokio::test]
+    async fn lint_command_passing_exits_zero() {
+        let content = "---\ntitle: Test\ntype: guide\n---\nBody";
+        let f = write_temp(content);
+        let val_config = ValidationConfig {
+            enabled: true,
+            strict: false,
+            lint_command: Some(vec!["true".into()]),
+        };
+        let (result, _) = validate_file(f.path(), &default_fm_config(), &val_config)
+            .await
+            .unwrap();
+        assert!(result.valid);
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lint_command_failing_adds_error() {
+        let content = "---\ntitle: Test\ntype: guide\n---\nBody";
+        let f = write_temp(content);
+        let val_config = ValidationConfig {
+            enabled: true,
+            strict: false,
+            lint_command: Some(vec!["false".into()]),
+        };
+        let (result, validated) = validate_file(f.path(), &default_fm_config(), &val_config)
+            .await
+            .unwrap();
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| e.contains("Lint command failed")));
+        assert!(validated.is_none());
+    }
+
+    #[tokio::test]
+    async fn lint_command_receives_path_as_argument() {
+        // Use `sh -c 'test -f "$1"' -- ` to verify the path was passed as a
+        // distinct argument and actually points to an existing file.
+        let content = "---\ntitle: Test\ntype: guide\n---\nBody";
+        let f = write_temp(content);
+        let val_config = ValidationConfig {
+            enabled: true,
+            strict: false,
+            lint_command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "test -f \"$1\"".into(),
+                "--".into(),
+            ]),
+        };
+        let (result, _) = validate_file(f.path(), &default_fm_config(), &val_config)
+            .await
+            .unwrap();
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[tokio::test]
+    async fn lint_command_empty_vec_is_noop() {
+        let content = "---\ntitle: Test\ntype: guide\n---\nBody";
+        let f = write_temp(content);
+        let val_config = ValidationConfig {
+            enabled: true,
+            strict: false,
+            lint_command: Some(vec![]),
+        };
+        let (result, _) = validate_file(f.path(), &default_fm_config(), &val_config)
+            .await
+            .unwrap();
+        assert!(result.valid);
     }
 }

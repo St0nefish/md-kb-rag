@@ -200,7 +200,7 @@ pub struct ValidationConfig {
     pub enabled: bool,
     #[serde(default)]
     pub strict: bool,
-    pub lint_command: Option<String>,
+    pub lint_command: Option<Vec<String>>,
 }
 
 impl Default for ValidationConfig {
