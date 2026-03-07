@@ -13,13 +13,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 2
 
-      - name: Compute sha tag
+      - name: Compute sha tag from PR branch parent
         id: version
         run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          # The merge commit's second parent is the PR branch HEAD that CI built
+          # Fall back to HEAD if not a merge commit (e.g. direct push to master)
+          if git rev-parse HEAD^2 >/dev/null 2>&1; then
+            SHORT_SHA=$(git rev-parse HEAD^2 | cut -c1-7)
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          fi
           echo "short_sha=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Using image tag: sha-${SHORT_SHA}"
 
       - name: Login to container registry
         run: |
