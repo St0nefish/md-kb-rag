@@ -165,3 +165,71 @@ pub async fn run_server(config: Config) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::get};
+    use tower::ServiceExt;
+
+    fn test_app(token: Option<String>) -> Router {
+        let auth_state = AuthState {
+            bearer_token: token,
+        };
+        Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(auth_state, bearer_auth))
+    }
+
+    #[tokio::test]
+    async fn no_auth_configured_allows_all() {
+        let app = test_app(None);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn valid_bearer_token_allowed() {
+        let app = test_app(Some("secret-token".to_string()));
+        let req = Request::builder()
+            .uri("/test")
+            .header("authorization", "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_token_rejected() {
+        let app = test_app(Some("secret-token".to_string()));
+        let req = Request::builder()
+            .uri("/test")
+            .header("authorization", "Bearer wrong-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_auth_header_rejected() {
+        let app = test_app(Some("secret-token".to_string()));
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn malformed_auth_header_rejected() {
+        let app = test_app(Some("secret-token".to_string()));
+        let req = Request::builder()
+            .uri("/test")
+            .header("authorization", "Basic c2VjcmV0LXRva2Vu")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
