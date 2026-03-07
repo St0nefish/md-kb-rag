@@ -35,6 +35,15 @@ volumes:
 
 See [config.example.yaml](config.example.yaml) for all available options and their defaults.
 
+## Usage Guide
+
+See [docs/USAGE.md](docs/USAGE.md) for detailed setup instructions, including:
+
+- Sample markdown document with frontmatter
+- How the chunking algorithm works
+- Frontmatter validation configuration
+- Step-by-step project setup walkthrough
+
 ## Architecture
 
 Three Docker services:
