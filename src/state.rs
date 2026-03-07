@@ -1,6 +1,7 @@
 use anyhow::Result;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use std::str::FromStr;
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct IndexedFile {
@@ -16,11 +17,13 @@ pub struct StateDb {
 
 impl StateDb {
     pub async fn new(db_path: &str) -> Result<Self> {
-        let connection_string = format!("sqlite:{}?mode=rwc", db_path);
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db_path))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&connection_string)
+            .connect_with(options)
             .await?;
 
         sqlx::query(

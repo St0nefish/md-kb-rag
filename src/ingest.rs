@@ -421,10 +421,22 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
                     })?;
             }
 
-            store
-                .upsert_points(collection, points)
-                .await
-                .with_context(|| format!("Failed to upsert points for '{}'", pf.file_path))?;
+            if let Err(e) = store.upsert_points(collection, points).await {
+                // Upsert failed after old points were already deleted.
+                // Remove the state entry so this file is re-processed on the next run
+                // instead of being silently skipped due to a stale hash match.
+                if pf.was_indexed {
+                    if let Err(del_err) = state.delete(&pf.file_path).await {
+                        error!(
+                            "Failed to clean up state DB entry for '{}' after upsert failure: {:#}",
+                            pf.file_path, del_err
+                        );
+                    }
+                }
+                return Err(e).with_context(|| {
+                    format!("Failed to upsert points for '{}'", pf.file_path)
+                });
+            }
 
             state
                 .upsert(&pf.file_path, &pf.hash, *count as i64)

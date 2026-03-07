@@ -1,5 +1,7 @@
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use tokio::sync::Mutex;
 
 use axum::{
     body::Bytes,
@@ -16,6 +18,9 @@ use crate::config::Config;
 use crate::ingest;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Prevents concurrent reindex tasks from interleaving Qdrant/SQLite operations.
+static REINDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone)]
 pub struct WebhookState {
@@ -133,9 +138,10 @@ pub async fn handle_webhook(
         }
     }
 
-    // Trigger incremental reindex
+    // Trigger incremental reindex (serialized via mutex)
     let config = Arc::clone(&state.config);
     tokio::spawn(async move {
+        let _guard = REINDEX_LOCK.lock().await;
         info!("Webhook triggered incremental reindex");
         if let Err(e) = ingest::run_index(&config, false).await {
             error!("Reindex failed: {:#}", e);
