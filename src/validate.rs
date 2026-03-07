@@ -50,7 +50,7 @@ pub async fn validate_file(
     let file_path = path.to_string_lossy().to_string();
     let mut errors: Vec<String> = Vec::new();
 
-    let content = std::fs::read_to_string(path)?;
+    let content = tokio::fs::read_to_string(path).await?;
 
     let matter = Matter::<YAML>::new();
     let parsed = matter.parse(&content);
