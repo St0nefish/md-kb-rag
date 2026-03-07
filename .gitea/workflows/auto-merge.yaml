@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+concurrency:
+  group: ci-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
