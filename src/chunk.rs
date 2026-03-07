@@ -104,11 +104,36 @@ pub fn chunk_markdown(
             let mut pending: Option<RawChunk> = None;
             for part in splitter.chunks(&section.text) {
                 if let Some(mut prev) = pending.take() {
-                    prev.append(part, section.line_end);
-                    if prev.text.trim().len() < MIN_MERGE_SIZE {
-                        pending = Some(prev);
+                    let prev_len = prev.text.trim().len();
+                    let combined = prev_len + 2 + part.trim().len();
+                    // Always merge a tiny pending fragment (e.g. a lone heading)
+                    // forward regardless of size — a heading-only chunk is useless.
+                    // Only reject the merge when prev is already a substantial chunk
+                    // and combining would exceed max.
+                    if combined <= max || prev_len < MIN_MERGE_SIZE {
+                        prev.append(part, section.line_end);
+                        if prev.text.trim().len() < MIN_MERGE_SIZE {
+                            pending = Some(prev);
+                        } else {
+                            chunks.push(prev);
+                        }
                     } else {
+                        // Would overflow and prev is already substantial — push
+                        // prev as-is, then handle part independently.
                         chunks.push(prev);
+                        if part.trim().len() < MIN_MERGE_SIZE {
+                            pending = Some(RawChunk {
+                                text: part.to_string(),
+                                line_start: section.line_start,
+                                line_end: section.line_end,
+                            });
+                        } else {
+                            chunks.push(RawChunk {
+                                text: part.to_string(),
+                                line_start: section.line_start,
+                                line_end: section.line_end,
+                            });
+                        }
                     }
                 } else if part.trim().len() < MIN_MERGE_SIZE {
                     pending = Some(RawChunk {
@@ -124,10 +149,15 @@ pub fn chunk_markdown(
                     });
                 }
             }
-            // Trailing small fragment — append to last chunk
+            // Trailing small fragment — append to last chunk if it fits
             if let Some(tail) = pending.take() {
                 if let Some(last) = chunks.last_mut() {
-                    last.append(&tail.text, tail.line_end);
+                    let combined = last.text.trim().len() + 2 + tail.text.trim().len();
+                    if combined <= max {
+                        last.append(&tail.text, tail.line_end);
+                    } else {
+                        chunks.push(tail);
+                    }
                 } else {
                     chunks.push(tail);
                 }
@@ -235,10 +265,16 @@ mod tests {
         let body = format!("## Big Section\n\n{big}");
         let chunks = chunk_markdown(&body, None, &cfg(1000, Some(800), false));
         assert!(chunks.len() >= 2, "Oversized section should be split");
+        // Allow up to max + MIN_MERGE_SIZE to accommodate a tiny pending heading
+        // (< MIN_MERGE_SIZE chars) that is always merged forward into the first
+        // content chunk to keep it attached to its section.
+        let limit = 1000 + MIN_MERGE_SIZE;
         for chunk in &chunks {
             assert!(
-                chunk.text.len() <= 1100,
-                "No chunk should wildly exceed max"
+                chunk.text.trim().len() <= limit,
+                "No chunk should wildly exceed max (got {} chars trimmed, limit {})",
+                chunk.text.trim().len(),
+                limit,
             );
         }
     }
@@ -330,5 +366,72 @@ mod tests {
         assert!(chunks[0].line_end > 1);
         assert!(chunks[1].line_start > chunks[0].line_end);
         assert!(chunks[1].line_end >= chunks[1].line_start);
+    }
+
+    #[test]
+    fn oversized_section_never_exceeds_max_chunk_size() {
+        // Generate a very large section with many paragraphs
+        let paragraphs: Vec<String> = (0..20)
+            .map(|i| {
+                format!(
+                    "Paragraph {}. {}",
+                    i,
+                    "Lorem ipsum dolor sit amet. ".repeat(10)
+                )
+            })
+            .collect();
+        let body = format!("## Big\n\n{}", paragraphs.join("\n\n"));
+        let max = 1000;
+        let chunks = chunk_markdown(&body, None, &cfg(max, Some(800), false));
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.text.trim().len() <= max,
+                "Chunk {} has {} chars (max {})",
+                i,
+                chunk.text.trim().len(),
+                max,
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_fragment_overflow_creates_own_chunk() {
+        // Build a section where the last splitter fragment is small but the
+        // previous chunk is already near max — merging would overflow.
+        let near_max = "X ".repeat(490); // ~980 chars
+        let tail = "Tail content here."; // small
+        let body = format!("## Title\n\n{}\n\n{}", near_max, tail);
+        let max = 1000;
+        let chunks = chunk_markdown(&body, None, &cfg(max, Some(800), false));
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.text.trim().len() <= max,
+                "Chunk {} has {} chars (max {})",
+                i,
+                chunk.text.trim().len(),
+                max,
+            );
+        }
+    }
+
+    #[test]
+    fn two_consecutive_small_fragments_stay_within_max() {
+        // Two small parts that individually are below MIN_MERGE_SIZE but
+        // together with a near-max preceding chunk would overflow.
+        let big_part = "Y ".repeat(480); // ~960 chars
+        let small_a = "Alpha. ".repeat(5); // ~35 chars
+        let small_b = "Beta. ".repeat(5); // ~30 chars
+        let body = format!("## S\n\n{}\n\n{}\n\n{}", big_part, small_a, small_b);
+        let max = 1000;
+        let chunks = chunk_markdown(&body, None, &cfg(max, Some(800), false));
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.text.trim().len() <= max,
+                "Chunk {} has {} chars (max {})",
+                i,
+                chunk.text.trim().len(),
+                max,
+            );
+        }
     }
 }
