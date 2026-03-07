@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container:
+      image: catthehacker/ubuntu:act-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Compute sha tag
+        id: version
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "short_sha=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to container registry
+        run: |
+          echo "${{ secrets.PACKAGE_REGISTRY_TOKEN }}" | docker login git.stonefish.tech -u ${{ github.actor }} --password-stdin
+
+      - name: Tag as latest
+        run: |
+          docker buildx imagetools create \
+            --tag git.stonefish.tech/${{ github.repository }}:latest \
+            git.stonefish.tech/${{ github.repository }}:${{ steps.version.outputs.short_sha }}

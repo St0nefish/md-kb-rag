@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    container:
+      image: catthehacker/ubuntu:act-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebase onto master
+        run: |
+          git config user.email "ci@stonefish.tech"
+          git config user.name "CI"
+          git fetch origin master
+          git rebase origin/master
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Compute version
+        id: version
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "short_sha=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to container registry
+        run: |
+          echo "${{ secrets.PACKAGE_REGISTRY_TOKEN }}" | docker login git.stonefish.tech -u ${{ github.actor }} --password-stdin
+
+      - name: Set up builder
+        run: |
+          docker buildx create --name ci-builder --driver docker-container --use 2>/dev/null || docker buildx use ci-builder
+
+      - name: Build and push (sha tag)
+        run: |
+          docker buildx build \
+            --builder ci-builder \
+            --push \
+            --cache-from type=registry,ref=git.stonefish.tech/${{ github.repository }}:buildcache \
+            --cache-to type=registry,ref=git.stonefish.tech/${{ github.repository }}:buildcache,mode=max \
+            --tag git.stonefish.tech/${{ github.repository }}:${{ steps.version.outputs.short_sha }} \
+            --file ./Dockerfile \
+            .
+
+      - name: Merge PR
+        env:
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"Do\":\"merge\",\"MergeTitleField\":\"${PR_TITLE}\",\"delete_branch_after_merge\":true}" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/pulls/${PR_NUM}/merge"
