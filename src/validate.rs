@@ -81,11 +81,7 @@ pub async fn validate_file(
     // Run lint command if configured
     if let Some(lint_cmd) = &validation.lint_command {
         if let Some((program, args)) = lint_cmd.split_first() {
-            let output = Command::new(program)
-                .args(args)
-                .arg(path)
-                .output()
-                .await;
+            let output = Command::new(program).args(args).arg(path).output().await;
             match output {
                 Ok(out) if !out.status.success() => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -277,7 +273,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.contains("Lint command failed")));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("Lint command failed"))
+        );
         assert!(validated.is_none());
     }
 
