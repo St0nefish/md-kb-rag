@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -261,7 +262,8 @@ fn default_bearer_token_env() -> String {
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let config = if path.exists() {
-            let content = std::fs::read_to_string(path)?;
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
             serde_yaml_ng::from_str(&content)?
         } else {
             warn!("Config file '{}' not found, using defaults", path.display());

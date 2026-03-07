@@ -11,6 +11,7 @@ mod webhook;
 
 use std::path::Path;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
@@ -65,7 +66,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Index { full } => {
             // Ensure data directory exists for state DB
-            std::fs::create_dir_all("data")?;
+            std::fs::create_dir_all("data")
+                .context("Failed to create 'data' directory for state DB")?;
             ingest::run_index(&cfg, full).await?;
         }
         Commands::Validate => {
