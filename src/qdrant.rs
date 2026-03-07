@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
-    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
-    Distance, FieldCondition, FieldType, Filter, Match, PointStruct, SearchPointsBuilder,
-    UpsertPointsBuilder, VectorParamsBuilder,
+    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
+    DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter, Match, PointStruct,
+    Range, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
     value::Kind,
     Value as QdrantValue,
 };
@@ -103,6 +103,63 @@ fn qdrant_payload_to_json(
         .iter()
         .map(|(k, v)| (k.clone(), qdrant_value_to_json(v)))
         .collect()
+}
+
+/// Build Qdrant filter conditions from a JSON filter map.
+///
+/// Supports: String (keyword match), Number (integer match or float range),
+/// Bool (boolean match), Array of strings (match_any).
+/// Returns an error for null, object, or other unsupported types.
+fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<Condition>> {
+    let mut conditions = Vec::new();
+    for (key, value) in filters {
+        let condition = match value {
+            serde_json::Value::Array(arr) => {
+                let string_values: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                Condition::matches(key, string_values)
+            }
+            serde_json::Value::String(s) => Condition::matches(key, s.clone()),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Condition::matches(key, i)
+                } else if let Some(f) = n.as_f64() {
+                    Condition::from(FieldCondition {
+                        key: key.clone(),
+                        range: Some(Range {
+                            gte: Some(f),
+                            lte: Some(f),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                } else {
+                    anyhow::bail!("Unsupported numeric filter value for key '{}'", key);
+                }
+            }
+            serde_json::Value::Bool(b) => {
+                Condition::from(FieldCondition {
+                    key: key.clone(),
+                    r#match: Some(Match {
+                        match_value: Some(
+                            qdrant_client::qdrant::r#match::MatchValue::Boolean(*b),
+                        ),
+                    }),
+                    ..Default::default()
+                })
+            }
+            serde_json::Value::Null => {
+                anyhow::bail!("Unsupported filter value type: null for key '{}'", key);
+            }
+            serde_json::Value::Object(_) => {
+                anyhow::bail!("Unsupported filter value type: object for key '{}'", key);
+            }
+        };
+        conditions.push(condition);
+    }
+    Ok(conditions)
 }
 
 impl QdrantStore {
@@ -235,57 +292,7 @@ impl QdrantStore {
         filters: HashMap<String, serde_json::Value>,
         limit: u64,
     ) -> Result<Vec<SearchResult>> {
-        let conditions: Vec<Condition> = filters
-            .iter()
-            .map(|(key, value)| match value {
-                serde_json::Value::Array(arr) => {
-                    // match_any for array values
-                    let string_values: Vec<String> = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                    Condition::matches(key, string_values)
-                }
-                serde_json::Value::String(s) => {
-                    // keyword match for string values
-                    Condition::matches(key, s.clone())
-                }
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        Condition::matches(key, i)
-                    } else {
-                        // Fall back to field condition with double range for floats;
-                        // for simplicity encode as string match (best effort)
-                        let fc = FieldCondition {
-                            key: key.clone(),
-                            ..Default::default()
-                        };
-                        Condition::from(fc)
-                    }
-                }
-                serde_json::Value::Bool(b) => {
-                    let fc = FieldCondition {
-                        key: key.clone(),
-                        r#match: Some(Match {
-                            match_value: Some(
-                                qdrant_client::qdrant::r#match::MatchValue::Boolean(*b),
-                            ),
-                        }),
-                        ..Default::default()
-                    };
-                    Condition::from(fc)
-                }
-                _ => {
-                    // unsupported filter type — produce a condition that is always satisfied
-                    // by using the field's existence check (best effort)
-                    let fc = FieldCondition {
-                        key: key.clone(),
-                        ..Default::default()
-                    };
-                    Condition::from(fc)
-                }
-            })
-            .collect();
+        let conditions = build_conditions(&filters)?;
 
         let mut builder = SearchPointsBuilder::new(collection, vector, limit).with_payload(true);
         if !conditions.is_empty() {
@@ -446,5 +453,66 @@ mod tests {
 
         // Clean up
         store.client.delete_collection(&config.collection).await.unwrap();
+    }
+
+    #[test]
+    fn filter_string_creates_match() {
+        let mut filters = HashMap::new();
+        filters.insert("domain".to_string(), serde_json::json!("engineering"));
+        let conditions = build_conditions(&filters).unwrap();
+        assert_eq!(conditions.len(), 1);
+    }
+
+    #[test]
+    fn filter_integer_creates_match() {
+        let mut filters = HashMap::new();
+        filters.insert("priority".to_string(), serde_json::json!(42i64));
+        let conditions = build_conditions(&filters).unwrap();
+        assert_eq!(conditions.len(), 1);
+    }
+
+    #[test]
+    fn filter_float_creates_range() {
+        let mut filters = HashMap::new();
+        filters.insert("score".to_string(), serde_json::json!(3.14f64));
+        let conditions = build_conditions(&filters).unwrap();
+        assert_eq!(conditions.len(), 1);
+    }
+
+    #[test]
+    fn filter_bool_creates_match() {
+        let mut filters = HashMap::new();
+        filters.insert("active".to_string(), serde_json::json!(true));
+        let conditions = build_conditions(&filters).unwrap();
+        assert_eq!(conditions.len(), 1);
+    }
+
+    #[test]
+    fn filter_array_creates_any_match() {
+        let mut filters = HashMap::new();
+        filters.insert("tags".to_string(), serde_json::json!(["rust", "rag"]));
+        let conditions = build_conditions(&filters).unwrap();
+        assert_eq!(conditions.len(), 1);
+    }
+
+    #[test]
+    fn filter_null_returns_error() {
+        let mut filters = HashMap::new();
+        filters.insert("bad".to_string(), serde_json::Value::Null);
+        assert!(build_conditions(&filters).is_err());
+    }
+
+    #[test]
+    fn filter_nested_object_returns_error() {
+        let mut filters = HashMap::new();
+        filters.insert("nested".to_string(), serde_json::json!({"a": 1}));
+        assert!(build_conditions(&filters).is_err());
+    }
+
+    #[test]
+    fn empty_filters_returns_empty() {
+        let filters = HashMap::new();
+        let conditions = build_conditions(&filters).unwrap();
+        assert!(conditions.is_empty());
     }
 }
