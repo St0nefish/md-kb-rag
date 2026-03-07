@@ -25,7 +25,7 @@ COPY --from=builder /build/target/release/md-kb-rag /usr/local/bin/md-kb-rag
 WORKDIR /app
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
-  CMD ["md-kb-rag", "--config", "/app/config.yaml", "health"]
+  CMD ["md-kb-rag", "health"]
 
 ENTRYPOINT ["md-kb-rag"]
-CMD ["--config", "/app/config.yaml", "serve"]
+CMD ["serve"]

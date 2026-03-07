@@ -17,7 +17,7 @@ cp .env.example .env
 docker compose up -d
 
 # Initial full index
-docker compose exec kb-rag md-kb-rag index --full --config /app/config.yaml
+docker compose exec kb-rag md-kb-rag index --full
 
 # Add MCP to Claude Code
 claude mcp add --transport http kb-search \
@@ -145,8 +145,8 @@ Point IDs are deterministic UUIDs (v5) derived from `file_path::chunk_index`.
 
 ```bash
 cargo build
-cargo run -- serve --config config.yaml
-cargo run -- index --full --config config.yaml
+cargo run -- serve
+cargo run -- index --full
 ```
 
 ## License
