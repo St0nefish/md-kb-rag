@@ -16,6 +16,16 @@ jobs:
       image: catthehacker/ubuntu:act-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebase onto master
+        if: github.event_name == 'pull_request'
+        run: |
+          git config user.email "ci@stonefish.tech"
+          git config user.name "CI"
+          git fetch origin master
+          git rebase origin/master
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
