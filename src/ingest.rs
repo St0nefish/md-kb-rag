@@ -188,12 +188,7 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
     let collection = &config.qdrant.collection;
     let vector_size = config.embedding.vector_size;
 
-    // Build the list of fields we want keyword-indexed in Qdrant: all
-    // configured frontmatter indexed_fields plus the built-in "file_path".
-    let mut indexed_fields = config.frontmatter.indexed_fields.clone();
-    if !indexed_fields.contains(&"file_path".to_string()) {
-        indexed_fields.push("file_path".to_string());
-    }
+    let indexed_fields = config.effective_indexed_fields();
 
     // ── Full-mode: wipe state and Qdrant collection so everything is clean ───
     if full {
