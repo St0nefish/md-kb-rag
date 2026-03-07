@@ -250,6 +250,8 @@ pub struct McpConfig {
     pub port: u16,
     #[serde(default = "default_bearer_token_env")]
     pub bearer_token_env: String,
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 impl Default for McpConfig {
@@ -257,6 +259,7 @@ impl Default for McpConfig {
         Self {
             port: 8001,
             bearer_token_env: "MCP_BEARER_TOKEN".into(),
+            allow_unauthenticated: false,
         }
     }
 }

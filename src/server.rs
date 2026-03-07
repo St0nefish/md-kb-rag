@@ -159,8 +159,17 @@ pub async fn run_server(config: Config) -> Result<()> {
     let bearer_token = match std::env::var(&config.mcp.bearer_token_env) {
         Ok(val) if !val.is_empty() => Some(val),
         _ => {
+            if !config.mcp.allow_unauthenticated {
+                anyhow::bail!(
+                    "Environment variable '{}' is not set or empty. \
+                     Set it to a bearer token, or set mcp.allow_unauthenticated: true \
+                     in config.yaml to explicitly opt out of authentication.",
+                    config.mcp.bearer_token_env
+                );
+            }
             warn!(
-                "Environment variable '{}' is not set or empty — MCP endpoints will have no auth",
+                "Environment variable '{}' is not set or empty — MCP endpoints will have no auth \
+                 (allow_unauthenticated is enabled)",
                 config.mcp.bearer_token_env
             );
             None

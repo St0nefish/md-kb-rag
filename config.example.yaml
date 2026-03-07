@@ -207,6 +207,10 @@ mcp:
   port: 8001
 
   # Name of the environment variable containing the Bearer token for MCP
-  # authentication. If the env var is unset or empty, MCP endpoints are
-  # served WITHOUT authentication (a warning is logged).
+  # authentication.
   bearer_token_env: "MCP_BEARER_TOKEN"
+
+  # When false (the default), the server refuses to start if the bearer token
+  # env var is unset or empty. Set to true only in trusted environments where
+  # authentication is handled by an upstream proxy or is genuinely not needed.
+  allow_unauthenticated: false
