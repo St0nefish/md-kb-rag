@@ -17,6 +17,12 @@ use crate::{
     qdrant::{QdrantStore, SearchResult},
 };
 
+const MAX_SEARCH_LIMIT: u64 = 50;
+
+fn resolve_limit(requested: Option<u64>) -> u64 {
+    requested.unwrap_or(10).min(MAX_SEARCH_LIMIT)
+}
+
 /// Parameters for the `get_document` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentParams {
@@ -42,7 +48,7 @@ pub struct SearchParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 
-    /// Maximum number of results to return (default: 10).
+    /// Maximum number of results to return (default: 10, max: 50).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 }
@@ -109,7 +115,7 @@ impl KbSearchServer {
             filters.insert("tags".to_string(), serde_json::Value::Array(tag_values));
         }
 
-        let limit = params.limit.unwrap_or(10);
+        let limit = resolve_limit(params.limit);
 
         // Search Qdrant
         let results: Vec<SearchResult> = self
@@ -286,5 +292,30 @@ impl ServerHandler for KbSearchServer {
              with optional filters for domain, type, and tags."
                 .to_string(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_limit_is_ten() {
+        assert_eq!(resolve_limit(None), 10);
+    }
+
+    #[test]
+    fn requested_limit_within_max_is_preserved() {
+        assert_eq!(resolve_limit(Some(25)), 25);
+    }
+
+    #[test]
+    fn requested_limit_above_max_is_clamped() {
+        assert_eq!(resolve_limit(Some(1_000_000)), MAX_SEARCH_LIMIT);
+    }
+
+    #[test]
+    fn zero_limit_is_passed_through() {
+        assert_eq!(resolve_limit(Some(0)), 0);
     }
 }
