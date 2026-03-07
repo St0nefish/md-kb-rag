@@ -5,6 +5,10 @@ use crate::config::ChunkingConfig;
 pub struct Chunk {
     pub text: String,
     pub index: usize,
+    /// 1-based line number where this chunk starts in the original body.
+    pub line_start: usize,
+    /// 1-based line number where this chunk ends (inclusive).
+    pub line_end: usize,
 }
 
 /// When the MarkdownSplitter breaks up an oversized section, merge any
@@ -12,16 +16,33 @@ pub struct Chunk {
 /// or code fence openers.
 const MIN_MERGE_SIZE: usize = 200;
 
+/// A section of markdown with its line range in the original body.
+struct Section {
+    text: String,
+    /// 1-based start line.
+    line_start: usize,
+    /// 1-based end line (inclusive).
+    line_end: usize,
+}
+
 /// Split markdown into sections at heading boundaries.
 /// Each section includes its heading line plus all content until the next heading.
-fn split_sections(body: &str) -> Vec<String> {
-    let mut sections: Vec<String> = Vec::new();
+fn split_sections(body: &str) -> Vec<Section> {
+    let mut sections: Vec<Section> = Vec::new();
     let mut current = String::new();
+    let mut section_start: usize = 1;
 
-    for line in body.lines() {
+    for (i, line) in body.lines().enumerate() {
+        let line_num = i + 1; // 1-based
         if line.starts_with('#') && !current.trim().is_empty() {
-            sections.push(current);
+            let line_end = line_num - 1;
+            sections.push(Section {
+                text: current,
+                line_start: section_start,
+                line_end,
+            });
             current = String::new();
+            section_start = line_num;
         }
         if !current.is_empty() {
             current.push('\n');
@@ -29,9 +50,29 @@ fn split_sections(body: &str) -> Vec<String> {
         current.push_str(line);
     }
     if !current.trim().is_empty() {
-        sections.push(current);
+        let total_lines = body.lines().count();
+        sections.push(Section {
+            text: current,
+            line_start: section_start,
+            line_end: total_lines,
+        });
     }
     sections
+}
+
+/// Intermediate chunk with line tracking before final indexing.
+struct RawChunk {
+    text: String,
+    line_start: usize,
+    line_end: usize,
+}
+
+impl RawChunk {
+    fn append(&mut self, text: &str, line_end: usize) {
+        self.text.push_str("\n\n");
+        self.text.push_str(text);
+        self.line_end = line_end;
+    }
 }
 
 pub fn chunk_markdown(
@@ -45,40 +86,48 @@ pub fn chunk_markdown(
 
     // Greedily accumulate sections into chunks up to target size.
     // If a single section exceeds max, use MarkdownSplitter to break it down.
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
+    let mut chunks: Vec<RawChunk> = Vec::new();
+    let mut current: Option<RawChunk> = None;
 
     for section in sections {
-        if section.trim().len() > max {
+        if section.text.trim().len() > max {
             // Flush current accumulator first
-            if !current.trim().is_empty() {
-                chunks.push(current);
-                current = String::new();
+            if let Some(cur) = current.take() {
+                chunks.push(cur);
             }
             // Split oversized section with MarkdownSplitter, but merge
             // small leading fragments (headings, code fence openers) forward
             // so they stay attached to the content they introduce.
+            // All sub-chunks share the section's line range since we can't
+            // reliably map splitter output back to exact line offsets.
             let splitter = MarkdownSplitter::new(max);
-            let mut pending: Option<String> = None;
-            for part in splitter.chunks(&section) {
-                if let Some(prev) = pending.take() {
-                    let combined = format!("{}\n\n{}", prev, part);
-                    if combined.trim().len() < MIN_MERGE_SIZE {
-                        pending = Some(combined);
+            let mut pending: Option<RawChunk> = None;
+            for part in splitter.chunks(&section.text) {
+                if let Some(mut prev) = pending.take() {
+                    prev.append(part, section.line_end);
+                    if prev.text.trim().len() < MIN_MERGE_SIZE {
+                        pending = Some(prev);
                     } else {
-                        chunks.push(combined);
+                        chunks.push(prev);
                     }
                 } else if part.trim().len() < MIN_MERGE_SIZE {
-                    pending = Some(part.to_string());
+                    pending = Some(RawChunk {
+                        text: part.to_string(),
+                        line_start: section.line_start,
+                        line_end: section.line_end,
+                    });
                 } else {
-                    chunks.push(part.to_string());
+                    chunks.push(RawChunk {
+                        text: part.to_string(),
+                        line_start: section.line_start,
+                        line_end: section.line_end,
+                    });
                 }
             }
             // Trailing small fragment — append to last chunk
             if let Some(tail) = pending.take() {
                 if let Some(last) = chunks.last_mut() {
-                    last.push_str("\n\n");
-                    last.push_str(&tail);
+                    last.append(&tail.text, tail.line_end);
                 } else {
                     chunks.push(tail);
                 }
@@ -86,41 +135,55 @@ pub fn chunk_markdown(
             continue;
         }
 
-        let combined_len = if current.is_empty() {
-            section.trim().len()
+        let combined_len = if let Some(ref cur) = current {
+            cur.text.trim().len() + 2 + section.text.trim().len()
         } else {
-            current.trim().len() + 2 + section.trim().len()
+            section.text.trim().len()
         };
 
         if combined_len <= target {
             // Fits within target — accumulate
-            if !current.is_empty() {
-                current.push_str("\n\n");
+            if let Some(ref mut cur) = current {
+                cur.append(&section.text, section.line_end);
+            } else {
+                current = Some(RawChunk {
+                    text: section.text,
+                    line_start: section.line_start,
+                    line_end: section.line_end,
+                });
             }
-            current.push_str(&section);
         } else {
             // Would exceed target — flush and start new chunk
-            if !current.trim().is_empty() {
-                chunks.push(current);
+            if let Some(cur) = current.take() {
+                chunks.push(cur);
             }
-            current = section;
+            current = Some(RawChunk {
+                text: section.text,
+                line_start: section.line_start,
+                line_end: section.line_end,
+            });
         }
     }
 
-    if !current.trim().is_empty() {
-        chunks.push(current);
+    if let Some(cur) = current.take() {
+        chunks.push(cur);
     }
 
     chunks
         .into_iter()
         .enumerate()
-        .map(|(index, part)| {
+        .map(|(index, raw)| {
             let text = if index == 0 && config.prepend_description && description.is_some() {
-                format!("{}\n\n{}", description.unwrap(), part)
+                format!("{}\n\n{}", description.unwrap(), raw.text)
             } else {
-                part
+                raw.text
             };
-            Chunk { text, index }
+            Chunk {
+                text,
+                index,
+                line_start: raw.line_start,
+                line_end: raw.line_end,
+            }
         })
         .collect()
 }
@@ -242,7 +305,30 @@ mod tests {
         let body = "# A\n\nContent A\n\n## B\n\nContent B";
         let sections = split_sections(body);
         assert_eq!(sections.len(), 2);
-        assert!(sections[0].starts_with("# A"));
-        assert!(sections[1].starts_with("## B"));
+        // # A        = line 1
+        // (blank)    = line 2
+        // Content A  = line 3
+        // (blank)    = line 4  ← still part of section A
+        // ## B       = line 5
+        // (blank)    = line 6
+        // Content B  = line 7
+        assert!(sections[0].text.starts_with("# A"));
+        assert_eq!(sections[0].line_start, 1);
+        assert_eq!(sections[0].line_end, 4);
+        assert!(sections[1].text.starts_with("## B"));
+        assert_eq!(sections[1].line_start, 5);
+        assert_eq!(sections[1].line_end, 7);
+    }
+
+    #[test]
+    fn chunks_have_line_ranges() {
+        let filler = "Word ".repeat(50); // ~250 chars
+        let body = format!("# A\n\n{filler}\n\n## B\n\n{filler}");
+        let chunks = chunk_markdown(&body, None, &cfg(1500, Some(300), false));
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].line_start, 1);
+        assert!(chunks[0].line_end > 1);
+        assert!(chunks[1].line_start > chunks[0].line_end);
+        assert!(chunks[1].line_end >= chunks[1].line_start);
     }
 }

@@ -395,6 +395,14 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
                     "text".to_string(),
                     serde_json::Value::String(chunk.text.clone()),
                 );
+                payload.insert(
+                    "line_start".to_string(),
+                    serde_json::Value::Number(chunk.line_start.into()),
+                );
+                payload.insert(
+                    "line_end".to_string(),
+                    serde_json::Value::Number(chunk.line_end.into()),
+                );
 
                 points.push(QdrantPoint {
                     id: make_point_id(&pf.file_path, chunk.index),

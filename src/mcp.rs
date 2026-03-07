@@ -175,15 +175,24 @@ impl KbSearchServer {
                 })
                 .unwrap_or_default();
 
+            let lines = match (
+                result.payload.get("line_start").and_then(|v| v.as_i64()),
+                result.payload.get("line_end").and_then(|v| v.as_i64()),
+            ) {
+                (Some(s), Some(e)) => format!(" (lines {s}–{e})"),
+                _ => String::new(),
+            };
+
             output.push_str(&format!(
                 "## Result {rank}\n\
                 **Title**: {title}\n\
                 **Score**: {score:.4}\n\
-                **File**: {file_path}\n",
+                **File**: {file_path}{lines}\n",
                 rank = i + 1,
                 title = title,
                 score = result.score,
                 file_path = file_path,
+                lines = lines,
             ));
 
             if !domain.is_empty() {
