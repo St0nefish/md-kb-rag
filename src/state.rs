@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use std::path::Path;
 use std::str::FromStr;
 
 #[derive(Debug, sqlx::FromRow)]
@@ -16,8 +17,10 @@ pub struct StateDb {
 }
 
 impl StateDb {
-    pub async fn new(db_path: &str) -> Result<Self> {
-        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db_path))?
+    pub async fn new(db_path: &Path) -> Result<Self> {
+        let db_str = db_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("State DB path is not valid UTF-8: {}", db_path.display()))?;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db_str))?
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(5));
 
@@ -109,7 +112,7 @@ mod tests {
     async fn test_db() -> (StateDb, TempDir) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.db");
-        let db = StateDb::new(path.to_str().unwrap()).await.unwrap();
+        let db = StateDb::new(&path).await.unwrap();
         (db, dir)
     }
 
