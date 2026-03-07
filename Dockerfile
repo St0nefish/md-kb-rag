@@ -1,26 +1,29 @@
-FROM rust:1.88-alpine AS builder
-
+FROM rust:1.88-alpine AS chef
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static perl
-
+RUN cargo install cargo-chef
 WORKDIR /build
 
-# Cache dependencies
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
-    cargo build --release && \
-    rm -rf src
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Build real binary
-COPY src/ src/
-COPY migrations/ migrations/
-RUN touch src/main.rs && cargo build --release
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo chef cook --release --recipe-path recipe.json
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release && \
+    cp target/release/md-kb-rag /usr/local/bin/md-kb-rag
 
 # Runtime image
 FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates git
 
-COPY --from=builder /build/target/release/md-kb-rag /usr/local/bin/md-kb-rag
+COPY --from=builder /usr/local/bin/md-kb-rag /usr/local/bin/md-kb-rag
 
 RUN addgroup -g 65532 -S nonroot && adduser -u 65532 -S nonroot -G nonroot
 
