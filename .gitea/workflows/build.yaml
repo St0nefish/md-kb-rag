@@ -58,6 +58,10 @@ jobs:
         run: |
           echo "${{ secrets.PACKAGE_REGISTRY_TOKEN }}" | docker login git.stonefish.tech -u ${{ github.actor }} --password-stdin
 
+      - name: Set up builder
+        run: |
+          docker buildx create --name ci-builder --driver docker-container --use 2>/dev/null || docker buildx use ci-builder
+
       - name: Build and push (sha tag)
         run: |
           docker buildx build \
