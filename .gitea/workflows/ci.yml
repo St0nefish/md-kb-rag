@@ -1,4 +1,4 @@
-name: CI
+name: Build Container Image
 
 on:
   pull_request:
@@ -10,7 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
+  test:
+    if: ${{ !github.event.pull_request.merged }}
     runs-on: ubuntu-latest
     container:
       image: catthehacker/ubuntu:act-latest
@@ -76,13 +77,17 @@ jobs:
             --file ./Dockerfile \
             .
 
+  merge:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
       - name: Merge PR
         env:
           PR_NUM: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          curl -sf -X POST \
-            -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
+          curl --fail-with-body -X POST \
+            -H "Authorization: token ${{ secrets.GIT_PUSH_TOKEN }}" \
             -H "Content-Type: application/json" \
             -d "{\"Do\":\"merge\",\"MergeTitleField\":\"${PR_TITLE}\",\"delete_branch_after_merge\":true}" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/pulls/${PR_NUM}/merge"
