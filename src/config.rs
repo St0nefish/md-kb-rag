@@ -311,6 +311,17 @@ impl Config {
             );
         }
 
+        // Validate lower bounds
+        if self.embedding.vector_size == 0 {
+            anyhow::bail!("embedding.vector_size must be >= 1");
+        }
+        if self.embedding.batch_size == 0 {
+            anyhow::bail!("embedding.batch_size must be >= 1");
+        }
+        if self.chunking.max_chunk_size == 0 {
+            anyhow::bail!("chunking.max_chunk_size must be >= 1");
+        }
+
         // Validate required fields
         let mut missing = Vec::new();
         if self.embedding.base_url.is_none() {
@@ -796,6 +807,93 @@ chunking:
         assert!(
             err.contains("max_chunk_size"),
             "error should mention max_chunk_size: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+    }
+
+    #[test]
+    fn zero_batch_size_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
+        let yaml = r#"
+embedding:
+  batch_size: 0
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("batch_size"),
+            "error should mention batch_size: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+    }
+
+    #[test]
+    fn zero_max_chunk_size_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
+        let yaml = r#"
+chunking:
+  max_chunk_size: 0
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("max_chunk_size"),
+            "error should mention max_chunk_size: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+    }
+
+    #[test]
+    fn zero_vector_size_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
+        let yaml = r#"
+embedding:
+  vector_size: 0
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("vector_size"),
+            "error should mention vector_size: {err}"
         );
 
         unsafe {
