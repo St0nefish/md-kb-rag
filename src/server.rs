@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -128,6 +128,7 @@ pub async fn run_server(config: Config) -> Result<()> {
                 "/hooks/reindex",
                 axum::routing::post(webhook::handle_webhook),
             )
+            .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
             .with_state(webhook_state);
         app = app.merge(webhook_router);
         info!("  Webhook endpoint: /hooks/reindex");
