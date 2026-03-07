@@ -300,6 +300,17 @@ impl Config {
             self.qdrant.url = Some(val);
         }
 
+        // Validate chunk size config
+        if let Some(target) = self.chunking.target_chunk_size
+            && target > self.chunking.max_chunk_size
+        {
+            anyhow::bail!(
+                "chunking.target_chunk_size ({}) must be <= chunking.max_chunk_size ({})",
+                target,
+                self.chunking.max_chunk_size
+            );
+        }
+
         // Validate required fields
         let mut missing = Vec::new();
         if self.embedding.base_url.is_none() {
@@ -758,5 +769,39 @@ source:
         assert_eq!(cfg.embedding.model(), "test-model");
         assert_eq!(cfg.qdrant.url(), "http://localhost:6334");
         assert_eq!(cfg.embedding.vector_size, 768);
+    }
+
+    #[test]
+    fn target_exceeds_max_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
+        let yaml = r#"
+chunking:
+  target_chunk_size: 1500
+  max_chunk_size: 1000
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("target_chunk_size"),
+            "error should mention target_chunk_size: {err}"
+        );
+        assert!(
+            err.contains("max_chunk_size"),
+            "error should mention max_chunk_size: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
     }
 }
