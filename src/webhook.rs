@@ -1,4 +1,4 @@
-use std::process::Command;
+use tokio::process::Command;
 use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Mutex;
@@ -121,7 +121,8 @@ pub async fn handle_webhook(
         let output = Command::new("git")
             .args(["pull", "--ff-only"])
             .current_dir(data_path)
-            .output();
+            .output()
+            .await;
 
         match output {
             Ok(o) if o.status.success() => {

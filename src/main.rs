@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
             info!("Validating {} files", files.len());
 
             let results =
-                validate::validate_all(data_path, &files, &cfg.frontmatter, &cfg.validation);
+                validate::validate_all(&files, &cfg.frontmatter, &cfg.validation).await;
 
             let mut valid_count = 0;
             let mut invalid_count = 0;
@@ -93,9 +93,6 @@ async fn main() -> anyhow::Result<()> {
                     for err in &result.errors {
                         eprintln!("  - {}", err);
                     }
-                }
-                for warn in &result.warnings {
-                    eprintln!("  WARN: {}", warn);
                 }
             }
 

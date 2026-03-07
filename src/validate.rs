@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 
 use gray_matter::engine::YAML;
 use gray_matter::{Matter, Pod};
@@ -13,7 +13,6 @@ pub struct ValidationResult {
     pub file_path: String,
     pub valid: bool,
     pub errors: Vec<String>,
-    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,14 +42,13 @@ fn pod_to_value(pod: Pod) -> Value {
     }
 }
 
-pub fn validate_file(
+pub async fn validate_file(
     path: &Path,
     config: &FrontmatterConfig,
     validation: &ValidationConfig,
 ) -> anyhow::Result<(ValidationResult, Option<ValidatedFile>)> {
     let file_path = path.to_string_lossy().to_string();
     let mut errors: Vec<String> = Vec::new();
-    let warnings: Vec<String> = Vec::new();
 
     let content = std::fs::read_to_string(path)?;
 
@@ -85,7 +83,7 @@ pub fn validate_file(
         let cmd_str = lint_cmd.replace("{file}", &file_path);
         let parts: Vec<&str> = cmd_str.split_whitespace().collect();
         if let Some((program, args)) = parts.split_first() {
-            let output = Command::new(program).args(args).output();
+            let output = Command::new(program).args(args).output().await;
             match output {
                 Ok(out) if !out.status.success() => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -111,7 +109,6 @@ pub fn validate_file(
         file_path: file_path.clone(),
         valid,
         errors,
-        warnings,
     };
 
     let validated_file = if valid {
@@ -126,27 +123,27 @@ pub fn validate_file(
     Ok((result, validated_file))
 }
 
-pub fn validate_all(
-    _data_path: &Path,
+pub async fn validate_all(
     files: &[PathBuf],
     config: &FrontmatterConfig,
     validation: &ValidationConfig,
 ) -> Vec<(ValidationResult, Option<ValidatedFile>)> {
-    files
-        .iter()
-        .map(|file| match validate_file(file, config, validation) {
+    let mut results = Vec::new();
+    for file in files {
+        let pair = match validate_file(file, config, validation).await {
             Ok(pair) => pair,
             Err(e) => {
                 let result = ValidationResult {
                     file_path: file.to_string_lossy().to_string(),
                     valid: false,
                     errors: vec![format!("Failed to read or parse file: {}", e)],
-                    warnings: Vec::new(),
                 };
                 (result, None)
             }
-        })
-        .collect()
+        };
+        results.push(pair);
+    }
+    results
 }
 
 #[cfg(test)]
@@ -178,12 +175,12 @@ mod tests {
         f
     }
 
-    #[test]
-    fn valid_frontmatter() {
+    #[tokio::test]
+    async fn valid_frontmatter() {
         let content = "---\ntitle: Test\ntype: guide\n---\n# Hello\nBody text";
         let f = write_temp(content);
         let (result, validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config()).unwrap();
+            validate_file(f.path(), &default_fm_config(), &default_val_config()).await.unwrap();
         assert!(result.valid);
         assert!(result.errors.is_empty());
         let vf = validated.unwrap();
@@ -198,33 +195,33 @@ mod tests {
         assert!(vf.body.contains("Hello"));
     }
 
-    #[test]
-    fn missing_required_field() {
+    #[tokio::test]
+    async fn missing_required_field() {
         let content = "---\ntitle: Test\n---\nBody";
         let f = write_temp(content);
         let (result, validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config()).unwrap();
+            validate_file(f.path(), &default_fm_config(), &default_val_config()).await.unwrap();
         assert!(!result.valid);
         assert!(result.errors.iter().any(|e| e.contains("type")));
         assert!(validated.is_none());
     }
 
-    #[test]
-    fn no_frontmatter() {
+    #[tokio::test]
+    async fn no_frontmatter() {
         let content = "# Just markdown\nNo frontmatter here";
         let f = write_temp(content);
         let (result, _) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config()).unwrap();
+            validate_file(f.path(), &default_fm_config(), &default_val_config()).await.unwrap();
         assert!(!result.valid);
         assert_eq!(result.errors.len(), 2); // missing title and type
     }
 
-    #[test]
-    fn defaults_applied() {
+    #[tokio::test]
+    async fn defaults_applied() {
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
         let (_, validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config()).unwrap();
+            validate_file(f.path(), &default_fm_config(), &default_val_config()).await.unwrap();
         let vf = validated.unwrap();
         assert_eq!(
             vf.frontmatter.get("status").unwrap().as_str().unwrap(),
@@ -232,17 +229,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_all_mixed() {
+    #[tokio::test]
+    async fn validate_all_mixed() {
         let good = write_temp("---\ntitle: Good\ntype: guide\n---\nBody");
         let bad = write_temp("---\ntitle: Bad\n---\nMissing type");
         let files = vec![good.path().to_path_buf(), bad.path().to_path_buf()];
         let results = validate_all(
-            Path::new("/tmp"),
             &files,
             &default_fm_config(),
             &default_val_config(),
-        );
+        ).await;
         assert_eq!(results.len(), 2);
         assert!(results[0].0.valid);
         assert!(!results[1].0.valid);
