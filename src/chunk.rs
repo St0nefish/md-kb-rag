@@ -7,6 +7,11 @@ pub struct Chunk {
     pub index: usize,
 }
 
+/// When the MarkdownSplitter breaks up an oversized section, merge any
+/// fragment smaller than this into its neighbor to avoid orphaned headings
+/// or code fence openers.
+const MIN_MERGE_SIZE: usize = 200;
+
 /// Split markdown into sections at heading boundaries.
 /// Each section includes its heading line plus all content until the next heading.
 fn split_sections(body: &str) -> Vec<String> {
@@ -50,10 +55,33 @@ pub fn chunk_markdown(
                 chunks.push(current);
                 current = String::new();
             }
-            // Split oversized section with MarkdownSplitter
+            // Split oversized section with MarkdownSplitter, but merge
+            // small leading fragments (headings, code fence openers) forward
+            // so they stay attached to the content they introduce.
             let splitter = MarkdownSplitter::new(max);
+            let mut pending: Option<String> = None;
             for part in splitter.chunks(&section) {
-                chunks.push(part.to_string());
+                if let Some(prev) = pending.take() {
+                    let combined = format!("{}\n\n{}", prev, part);
+                    if combined.trim().len() < MIN_MERGE_SIZE {
+                        pending = Some(combined);
+                    } else {
+                        chunks.push(combined);
+                    }
+                } else if part.trim().len() < MIN_MERGE_SIZE {
+                    pending = Some(part.to_string());
+                } else {
+                    chunks.push(part.to_string());
+                }
+            }
+            // Trailing small fragment — append to last chunk
+            if let Some(tail) = pending.take() {
+                if let Some(last) = chunks.last_mut() {
+                    last.push_str("\n\n");
+                    last.push_str(&tail);
+                } else {
+                    chunks.push(tail);
+                }
             }
             continue;
         }
@@ -190,6 +218,23 @@ mod tests {
     fn target_defaults_to_max() {
         let c = cfg(1500, None, false);
         assert_eq!(c.target(), 1500);
+    }
+
+    #[test]
+    fn oversized_section_heading_stays_with_code_block() {
+        // Heading + large code block in one section — when split by
+        // MarkdownSplitter, the heading must stay attached to content.
+        let big_yaml = "  key: value\n".repeat(150); // ~1950 chars
+        let body = format!("## Docker Compose\n\n```yaml\n{big_yaml}```");
+        let chunks = chunk_markdown(&body, None, &cfg(1500, Some(1000), false));
+        assert!(
+            chunks[0].text.contains("## Docker Compose"),
+            "First chunk must contain the heading"
+        );
+        assert!(
+            chunks[0].text.contains("key: value"),
+            "First chunk must contain code block content, not just the heading"
+        );
     }
 
     #[test]
