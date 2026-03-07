@@ -173,8 +173,12 @@ pub fn chunk_markdown(
         .into_iter()
         .enumerate()
         .map(|(index, raw)| {
-            let text = if index == 0 && config.prepend_description && description.is_some() {
-                format!("{}\n\n{}", description.unwrap(), raw.text)
+            let text = if index == 0 && config.prepend_description {
+                if let Some(desc) = description {
+                    format!("{}\n\n{}", desc, raw.text)
+                } else {
+                    raw.text
+                }
             } else {
                 raw.text
             };

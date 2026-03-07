@@ -38,10 +38,8 @@ fn json_to_qdrant_value(v: &serde_json::Value) -> QdrantValue {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Some(Kind::IntegerValue(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(Kind::DoubleValue(f))
             } else {
-                None
+                n.as_f64().map(Kind::DoubleValue)
             }
         }
         serde_json::Value::String(s) => Some(Kind::StringValue(s.clone())),

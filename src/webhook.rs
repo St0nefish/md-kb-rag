@@ -97,15 +97,14 @@ pub async fn handle_webhook(
     }
 
     // Check branch
-    if let Some(branch) = extract_branch(&body) {
-        if branch != state.config.source.branch {
+    if let Some(branch) = extract_branch(&body)
+        && branch != state.config.source.branch {
             info!(
                 "Ignoring webhook for branch '{}' (expected '{}')",
                 branch, state.config.source.branch
             );
             return (StatusCode::OK, "Branch ignored".to_string());
         }
-    }
 
     // Git pull if git_url is configured
     if state.config.source.git_url.is_some() {

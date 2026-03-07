@@ -78,26 +78,30 @@ fn walk_dir(
     for entry in entries {
         let entry = entry.with_context(|| format!("Failed to read entry in {}", dir.display()))?;
         let path = entry.path();
-        let metadata = entry
-            .metadata()
+        let file_type = entry
+            .file_type()
             .with_context(|| format!("Failed to stat: {}", path.display()))?;
 
-        if metadata.is_dir() {
+        if file_type.is_symlink() {
+            warn!("Skipping symlink: {}", path.display());
+            continue;
+        }
+
+        if file_type.is_dir() {
             walk_dir(root, &path, include_set, exclude_set, exclude_filenames, matched)?;
             continue;
         }
 
-        if !metadata.is_file() {
+        if !file_type.is_file() {
             continue;
         }
 
         // Check exclude_files by filename
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if exclude_filenames.contains(file_name) {
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+            && exclude_filenames.contains(file_name) {
                 debug!("Skipping excluded filename: {}", path.display());
                 continue;
             }
-        }
 
         // Build relative path for glob matching
         let rel = path
@@ -112,12 +116,11 @@ fn walk_dir(
         }
 
         // Must not match any exclude pattern
-        if let Some(excl) = exclude_set {
-            if excl.is_match(rel) || excl.is_match(rel_str.as_ref()) {
+        if let Some(excl) = exclude_set
+            && (excl.is_match(rel) || excl.is_match(rel_str.as_ref())) {
                 debug!("Excluding file: {}", path.display());
                 continue;
             }
-        }
 
         matched.push(path);
     }
@@ -248,15 +251,13 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
 
         let was_indexed = state_entry.is_some();
 
-        if !full {
-            if let Some(ref entry) = state_entry {
-                if entry.content_hash == hash {
-                    debug!("Unchanged, skipping: {}", file_path);
-                    skipped += 1;
-                    continue;
-                }
+        if !full
+            && let Some(ref entry) = state_entry
+            && entry.content_hash == hash {
+                debug!("Unchanged, skipping: {}", file_path);
+                skipped += 1;
+                continue;
             }
-        }
 
         // Validate
         if config.validation.enabled {
@@ -425,14 +426,13 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
                 // Upsert failed after old points were already deleted.
                 // Remove the state entry so this file is re-processed on the next run
                 // instead of being silently skipped due to a stale hash match.
-                if pf.was_indexed {
-                    if let Err(del_err) = state.delete(&pf.file_path).await {
+                if pf.was_indexed
+                    && let Err(del_err) = state.delete(&pf.file_path).await {
                         error!(
                             "Failed to clean up state DB entry for '{}' after upsert failure: {:#}",
                             pf.file_path, del_err
                         );
                     }
-                }
                 return Err(e).with_context(|| {
                     format!("Failed to upsert points for '{}'", pf.file_path)
                 });
@@ -551,5 +551,53 @@ mod tests {
         let files = discover_files(dir.path(), &indexing).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("keep.md"));
+    }
+
+    #[test]
+    fn discover_files_skips_symlinks_to_files() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real.md");
+        std::fs::write(&real, "# Real").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, dir.path().join("link.md")).unwrap();
+        }
+
+        let indexing = IndexingConfig {
+            include: vec!["**/*.md".into()],
+            exclude: vec![],
+            exclude_files: vec![],
+        };
+        let files = discover_files(dir.path(), &indexing).unwrap();
+
+        #[cfg(unix)]
+        {
+            assert_eq!(files.len(), 1, "Symlinked file should be skipped");
+            assert!(files[0].ends_with("real.md"));
+        }
+    }
+
+    #[test]
+    fn discover_files_symlink_loop_does_not_hang() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("doc.md"), "# Doc").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+
+        #[cfg(unix)]
+        {
+            // Create a symlink loop: sub/loop -> parent dir
+            std::os::unix::fs::symlink(dir.path(), dir.path().join("sub/loop")).unwrap();
+        }
+
+        let indexing = IndexingConfig {
+            include: vec!["**/*.md".into()],
+            exclude: vec![],
+            exclude_files: vec![],
+        };
+
+        // This should complete without hanging or panicking
+        let files = discover_files(dir.path(), &indexing).unwrap();
+        assert!(files.iter().any(|p| p.ends_with("doc.md")));
     }
 }

@@ -60,11 +60,9 @@ pub fn validate_file(
     // Parse frontmatter fields
     let mut frontmatter: HashMap<String, Value> = HashMap::new();
 
-    if let Some(data) = parsed.data {
-        if let Pod::Hash(map) = data {
-            for (k, v) in map {
-                frontmatter.insert(k, pod_to_value(v));
-            }
+    if let Some(Pod::Hash(map)) = parsed.data {
+        for (k, v) in map {
+            frontmatter.insert(k, pod_to_value(v));
         }
     }
 
@@ -136,8 +134,8 @@ pub fn validate_all(
 ) -> Vec<(ValidationResult, Option<ValidatedFile>)> {
     files
         .iter()
-        .filter_map(|file| match validate_file(file, config, validation) {
-            Ok(pair) => Some(pair),
+        .map(|file| match validate_file(file, config, validation) {
+            Ok(pair) => pair,
             Err(e) => {
                 let result = ValidationResult {
                     file_path: file.to_string_lossy().to_string(),
@@ -145,7 +143,7 @@ pub fn validate_all(
                     errors: vec![format!("Failed to read or parse file: {}", e)],
                     warnings: Vec::new(),
                 };
-                Some((result, None))
+                (result, None)
             }
         })
         .collect()
