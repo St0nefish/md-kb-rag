@@ -35,7 +35,7 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 ## Workflow
 
 - **Branch protection** on `master`: direct push disabled, status checks required (`test` job must pass)
-- Work on feature branches, open PRs, merge after CI passes
+- Work on feature branches, open PRs — auto-merge on CI pass (via `auto-merge.yaml` workflow)
 - `fix #N` in merge commit auto-closes Gitea issues
 - Branches auto-delete after merge
 - Pre-commit hook enforces `cargo fmt` (activate with `git config core.hooksPath .githooks`)
