@@ -203,7 +203,7 @@ pub fn chunk_markdown(
         .into_iter()
         .enumerate()
         .map(|(index, raw)| {
-            let text = if index == 0 && config.prepend_description {
+            let text = if config.prepend_description {
                 if let Some(desc) = description {
                     format!("{}\n\n{}", desc, raw.text)
                 } else {
@@ -309,6 +309,21 @@ mod tests {
     fn no_prepend_when_disabled() {
         let chunks = chunk_markdown("Body text", Some("A description"), &cfg(1000, None, false));
         assert_eq!(chunks[0].text, "Body text");
+    }
+
+    #[test]
+    fn prepend_description_all_chunks() {
+        // Create two sections large enough to land in separate chunks (target=400)
+        let filler = "Word ".repeat(60); // ~300 chars per section
+        let body = format!("# Section 1\n\n{filler}\n\n# Section 2\n\n{filler}");
+        let chunks = chunk_markdown(&body, Some("My description"), &cfg(1500, Some(400), true));
+        assert!(chunks.len() >= 2, "Expected multiple chunks for this test");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.text.starts_with("My description\n\n"),
+                "Chunk {i} does not start with the description"
+            );
+        }
     }
 
     #[test]
