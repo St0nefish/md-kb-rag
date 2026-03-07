@@ -299,4 +299,98 @@ mod tests {
         let err = check_branch(body, "main").unwrap_err();
         assert!(err.1.contains("No ref"));
     }
+
+    fn minimal_config() -> Arc<Config> {
+        let yaml = r#"
+source:
+  branch: "master"
+  data_path: "/tmp"
+embedding:
+  base_url: "http://localhost:8080/v1"
+  model: "test"
+qdrant:
+  url: "http://localhost:6334"
+"#;
+        Arc::new(serde_yaml_ng::from_str(yaml).unwrap())
+    }
+
+    #[tokio::test]
+    async fn handle_webhook_valid_request_returns_ok() {
+        use axum::response::IntoResponse;
+
+        let secret = "test-secret";
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+        let sig = compute_hmac(secret, body);
+
+        let config = minimal_config();
+        let state = WebhookState {
+            config,
+            secret: secret.to_string(),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-gitea-signature",
+            axum::http::HeaderValue::from_str(&sig).unwrap(),
+        );
+
+        let resp = handle_webhook(State(state), headers, Bytes::copy_from_slice(body))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_webhook_bad_signature_returns_unauthorized() {
+        use axum::response::IntoResponse;
+
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+
+        let config = minimal_config();
+        let state = WebhookState {
+            config,
+            secret: "correct-secret".to_string(),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-gitea-signature",
+            axum::http::HeaderValue::from_static("badsignature"),
+        );
+
+        let resp = handle_webhook(State(state), headers, Bytes::copy_from_slice(body))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_webhook_wrong_branch_returns_ok_with_ignored() {
+        use axum::response::IntoResponse;
+
+        let secret = "test-secret";
+        // Payload targets "develop", but config expects "master"
+        let body: &[u8] = br#"{"ref":"refs/heads/develop"}"#;
+        let sig = compute_hmac(secret, body);
+
+        let config = minimal_config();
+        let state = WebhookState {
+            config,
+            secret: secret.to_string(),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-gitea-signature",
+            axum::http::HeaderValue::from_str(&sig).unwrap(),
+        );
+
+        let resp = handle_webhook(State(state), headers, Bytes::copy_from_slice(body))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }

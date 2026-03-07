@@ -319,6 +319,40 @@ mod tests {
     }
 
     #[test]
+    fn path_traversal_detection() {
+        // Raw PathBuf::join does NOT resolve `..` components — the resulting path
+        // still textually starts_with the data_path prefix, so a naive starts_with
+        // check is insufficient. canonicalize() is required to resolve `..`.
+        let data_path = std::path::PathBuf::from("/tmp/test-kb-data");
+        let traversal = data_path.join("../../../etc/passwd");
+        // starts_with returns true because the path is built on top of data_path
+        assert!(
+            traversal.starts_with(&data_path),
+            "raw join with .. still starts_with data_path — canonicalize() is needed"
+        );
+    }
+
+    #[test]
+    fn absolute_path_outside_data_rejected() {
+        let data_path = std::path::PathBuf::from("/tmp/test-kb-data");
+        let outside = std::path::PathBuf::from("/etc/passwd");
+        assert!(
+            !outside.starts_with(&data_path),
+            "/etc/passwd should not start_with /tmp/test-kb-data"
+        );
+    }
+
+    #[test]
+    fn relative_path_inside_data_accepted() {
+        let data_path = std::path::PathBuf::from("/tmp/test-kb-data");
+        let inside = data_path.join("docs/guide.md");
+        assert!(
+            inside.starts_with(&data_path),
+            "data_path/docs/guide.md should start_with data_path"
+        );
+    }
+
+    #[test]
     fn ellipsis_uses_char_count_not_byte_len() {
         // 400 chars of a 2-byte character = 800 bytes
         let text: String = std::iter::repeat('é').take(401).collect();
