@@ -28,6 +28,7 @@ services:
 
   kb-rag:
     build: .
+    # user: "1000:1000"  # recommended: run as non-root
     volumes:
       - ${KB_PATH:-./data/repo}:/data:rw
       - ./data/state:/app/data:rw

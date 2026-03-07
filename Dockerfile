@@ -22,7 +22,13 @@ RUN apk add --no-cache ca-certificates git
 
 COPY --from=builder /build/target/release/md-kb-rag /usr/local/bin/md-kb-rag
 
+RUN addgroup -g 65532 -S nonroot && adduser -u 65532 -S nonroot -G nonroot
+
 WORKDIR /app
+
+RUN mkdir -p /app/data && chown nonroot:nonroot /app/data
+
+USER nonroot
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
   CMD ["md-kb-rag", "health"]
