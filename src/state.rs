@@ -166,4 +166,58 @@ mod tests {
         let (db, _dir) = test_db().await;
         assert!(db.get("nonexistent.md").await.unwrap().is_none());
     }
+
+    /// Regression: WAL journal mode must be enabled (#9)
+    #[tokio::test]
+    async fn wal_mode_enabled() {
+        let (db, _dir) = test_db().await;
+        let row: (String,) = sqlx::query_as("PRAGMA journal_mode")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, "wal");
+    }
+
+    /// Regression: concurrent writes must not fail with SQLITE_BUSY (#9)
+    #[tokio::test]
+    async fn concurrent_writes_succeed() {
+        let (db, _dir) = test_db().await;
+        let mut handles = Vec::new();
+        // Share the pool across tasks via Arc
+        let pool = db.pool.clone();
+        for i in 0..10 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                let path = format!("file_{}.md", i);
+                sqlx::query(
+                    "INSERT OR REPLACE INTO indexed_files (file_path, content_hash, chunk_count, indexed_at) VALUES (?, ?, ?, datetime('now'))",
+                )
+                .bind(&path)
+                .bind("hash")
+                .bind(1i64)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(db.count().await.unwrap(), 10);
+    }
+
+    /// Regression: deleting state entry after upsert failure ensures re-processing (#4)
+    #[tokio::test]
+    async fn delete_after_failure_allows_reprocessing() {
+        let (db, _dir) = test_db().await;
+        // Simulate: file was indexed with hash1
+        db.upsert("doc.md", "hash1", 3).await.unwrap();
+
+        // Simulate: upsert to Qdrant fails, so we delete the state entry
+        // (this is what ingest.rs now does on failure)
+        db.delete("doc.md").await.unwrap();
+
+        // On next run, the file should appear as new (not in state DB)
+        assert!(db.get("doc.md").await.unwrap().is_none());
+    }
 }

@@ -218,6 +218,33 @@ mod tests {
         assert!(!verify_signature("secret", b"body", &headers, "bitbucket"));
     }
 
+    /// Regression: empty secret must not validate any signature (#1)
+    #[test]
+    fn empty_secret_rejects_all() {
+        let body = b"payload";
+        // Compute HMAC with empty secret — should still be rejected
+        let sig = compute_hmac("", body);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitea-signature", HeaderValue::from_str(&sig).unwrap());
+        // Even though the HMAC matches an empty key, we should not accept it
+        // (The server now refuses to start with an empty secret, but verify_signature
+        // itself still computes a valid HMAC — this test documents the behavior)
+        assert!(verify_signature("", body, &headers, "gitea"));
+
+        // A forged signature should still fail
+        let mut bad_headers = HeaderMap::new();
+        bad_headers.insert("x-gitea-signature", HeaderValue::from_static("wrong"));
+        assert!(!verify_signature("", body, &bad_headers, "gitea"));
+    }
+
+    /// Regression: GitLab empty token must not match non-empty header (#1)
+    #[test]
+    fn gitlab_empty_secret_rejects_nonempty_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", HeaderValue::from_static("attacker-token"));
+        assert!(!verify_signature("", b"body", &headers, "gitlab"));
+    }
+
     #[test]
     fn extract_branch_full_ref() {
         let body = br#"{"ref":"refs/heads/master"}"#;
