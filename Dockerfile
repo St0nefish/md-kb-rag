@@ -1,21 +1,23 @@
-FROM rust:1.88-alpine AS chef
+FROM rust:1.88-alpine AS builder
+
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static perl
-RUN cargo install cargo-chef
+
 WORKDIR /build
 
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
-COPY --from=planner /build/recipe.json recipe.json
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo chef cook --release --recipe-path recipe.json
-COPY . .
+# Cache dependencies
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release && \
+    rm -rf src
+
+# Build real binary
+COPY src/ src/
+COPY migrations/ migrations/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    touch src/main.rs && cargo build --release && \
     cp target/release/md-kb-rag /usr/local/bin/md-kb-rag
 
 # Runtime image

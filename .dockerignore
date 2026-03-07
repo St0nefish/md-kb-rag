@@ -1,0 +1,10 @@
+target/
+data/
+.git/
+.gitea/
+.claude/
+.env*
+*.md
+config.yaml
+config.example.yaml
+LICENSE
