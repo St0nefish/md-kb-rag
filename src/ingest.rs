@@ -172,8 +172,8 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
     );
 
     // ── Infrastructure ──────────────────────────────────────────────────────
-    let db_path = "data/state.db";
-    let state = StateDb::new(db_path)
+    let db_path = config.state_db_path();
+    let state = StateDb::new(Path::new(&db_path))
         .await
         .context("Failed to open state DB")?;
 

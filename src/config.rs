@@ -5,6 +5,7 @@ use std::path::Path;
 use tracing::warn;
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub source: SourceConfig,
@@ -27,6 +28,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     pub git_url: Option<String>,
     #[serde(default = "default_branch")]
@@ -55,6 +57,7 @@ fn default_data_path() -> Option<String> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexingConfig {
     #[serde(default = "default_include")]
     pub include: Vec<String>,
@@ -92,6 +95,7 @@ fn default_exclude_files() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FrontmatterConfig {
     #[serde(default)]
     pub required: Vec<String>,
@@ -102,6 +106,7 @@ pub struct FrontmatterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChunkingConfig {
     #[serde(default = "default_max_chunk_size")]
     pub max_chunk_size: usize,
@@ -138,6 +143,7 @@ fn default_target_chunk_size() -> Option<usize> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -167,6 +173,7 @@ fn default_batch_size() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QdrantConfig {
     pub url: Option<String>,
     #[serde(default = "default_collection")]
@@ -187,6 +194,7 @@ fn default_collection() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -210,6 +218,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     #[serde(default = "default_webhook_secret_env")]
     pub secret_env: String,
@@ -235,6 +244,7 @@ fn default_provider() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpConfig {
     #[serde(default = "default_mcp_port")]
     pub port: u16,
@@ -315,6 +325,11 @@ impl Config {
     /// Resolve the data path (source.data_path, or /data as default)
     pub fn data_path(&self) -> &str {
         self.source.data_path.as_deref().unwrap_or("/data")
+    }
+
+    /// Derive the state DB path from data_path: `{data_path}/state.db`
+    pub fn state_db_path(&self) -> String {
+        format!("{}/state.db", self.data_path())
     }
 }
 
@@ -661,6 +676,52 @@ chunking:
     fn accessor_panics_without_resolve() {
         let cfg = Config::from_str_raw("{}").unwrap();
         let _ = cfg.embedding.base_url();
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let yaml = r#"
+source:
+  branch: "main"
+unknown_top_level: true
+embedding:
+  base_url: "http://localhost:8080/v1"
+  model: "test"
+qdrant:
+  url: "http://localhost:6334"
+"#;
+        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "top-level unknown field should be rejected"
+        );
+    }
+
+    #[test]
+    fn unknown_fields_in_nested_struct_are_rejected() {
+        let yaml = r#"
+source:
+  branch: "main"
+  unknown_nested: "oops"
+"#;
+        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        assert!(result.is_err(), "nested unknown field should be rejected");
+    }
+
+    #[test]
+    fn state_db_path_derived_from_data_path() {
+        let yaml = r#"
+source:
+  data_path: "/custom/path"
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.state_db_path(), "/custom/path/state.db");
+    }
+
+    #[test]
+    fn state_db_path_uses_default_data_path() {
+        let cfg = Config::from_str_raw("{}").unwrap();
+        assert_eq!(cfg.state_db_path(), "/data/state.db");
     }
 
     #[test]

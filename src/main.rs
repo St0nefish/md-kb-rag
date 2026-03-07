@@ -65,9 +65,12 @@ async fn main() -> anyhow::Result<()> {
             server::run_server(cfg).await?;
         }
         Commands::Index { full } => {
-            // Ensure data directory exists for state DB
-            std::fs::create_dir_all("data")
-                .context("Failed to create 'data' directory for state DB")?;
+            // Ensure parent directory exists for state DB
+            let db_path = cfg.state_db_path();
+            if let Some(parent) = std::path::Path::new(&db_path).parent() {
+                std::fs::create_dir_all(parent)
+                    .context("Failed to create directory for state DB")?;
+            }
             ingest::run_index(&cfg, full).await?;
         }
         Commands::Validate => {
@@ -104,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status => {
             // State DB stats
-            let state = state::StateDb::new("data/state.db").await?;
+            let state = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
             let count = state.count().await?;
             let files = state.list_all().await?;
             println!("State DB: {} indexed files", count);
