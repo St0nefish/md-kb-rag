@@ -32,6 +32,14 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 | `webhook.rs` | Webhook handler |
 | `server.rs` | Axum server (MCP + webhook routes) |
 
+## Workflow
+
+- **Branch protection** on `master`: direct push disabled, status checks required (`test` job must pass)
+- Work on feature branches, open PRs, merge after CI passes
+- `fix #N` in merge commit auto-closes Gitea issues
+- Branches auto-delete after merge
+- Pre-commit hook enforces `cargo fmt` (activate with `git config core.hooksPath .githooks`)
+
 ## Issue tracking
 
 Bugs, features, and enhancements are tracked as Gitea issues (not in-repo TODO files).
