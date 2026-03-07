@@ -61,6 +61,7 @@ jobs:
       - name: Build and push (sha tag)
         run: |
           docker buildx build \
+            --builder ci-builder \
             --push \
             --cache-from type=registry,ref=git.stonefish.tech/${{ github.repository }}:buildcache \
             --cache-to type=registry,ref=git.stonefish.tech/${{ github.repository }}:buildcache,mode=max \

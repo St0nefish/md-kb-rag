@@ -8,7 +8,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,id=md-rag-target,target=/build/target \
     cargo build --release && \
     rm -rf src
 
@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY src/ src/
 COPY migrations/ migrations/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,id=md-rag-target,target=/build/target \
     touch src/main.rs && cargo build --release && \
     cp target/release/md-kb-rag /usr/local/bin/md-kb-rag
 
