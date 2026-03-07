@@ -1664,6 +1664,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "sqlx",
+ "subtle",
  "tempfile",
  "text-splitter",
  "thiserror 2.0.18",

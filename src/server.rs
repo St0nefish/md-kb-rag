@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use subtle::ConstantTimeEq;
 use axum::{
     Router,
     extract::State,
@@ -13,7 +14,7 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::embed::EmbedClient;
@@ -45,7 +46,7 @@ async fn bearer_auth(
         .strip_prefix("Bearer ")
         .unwrap_or("");
 
-    if token == expected_token {
+    if token.as_bytes().ct_eq(expected_token.as_bytes()).into() {
         Ok(next.run(request).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -96,11 +97,28 @@ pub async fn run_server(config: Config) -> Result<()> {
     );
 
     // Bearer token for MCP auth
-    let bearer_token = std::env::var(&config.mcp.bearer_token_env).ok();
+    let bearer_token = match std::env::var(&config.mcp.bearer_token_env) {
+        Ok(val) if !val.is_empty() => Some(val),
+        _ => {
+            warn!(
+                "Environment variable '{}' is not set or empty — MCP endpoints will have no auth",
+                config.mcp.bearer_token_env
+            );
+            None
+        }
+    };
     let auth_state = AuthState { bearer_token };
 
-    // Webhook state
-    let webhook_secret = std::env::var(&config.webhook.secret_env).unwrap_or_default();
+    // Webhook state — require non-empty secret
+    let webhook_secret = std::env::var(&config.webhook.secret_env)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Environment variable '{}' must be set to a non-empty value for webhook signature verification",
+                config.webhook.secret_env
+            )
+        })?;
     let webhook_state = WebhookState {
         config: Arc::clone(&config),
         secret: webhook_secret,

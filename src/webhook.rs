@@ -9,6 +9,7 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
@@ -47,7 +48,7 @@ fn verify_signature(secret: &str, body: &[u8], headers: &HeaderMap, provider: &s
 
     // GitLab uses a shared token (not HMAC)
     if provider == "gitlab" {
-        return header_value == secret;
+        return header_value.as_bytes().ct_eq(secret.as_bytes()).into();
     }
 
     // GitHub prefixes with "sha256=", Gitea sends raw hex
@@ -62,7 +63,7 @@ fn verify_signature(secret: &str, body: &[u8], headers: &HeaderMap, provider: &s
     mac.update(body);
     let expected = hex::encode(mac.finalize().into_bytes());
 
-    expected == received_hex
+    expected.as_bytes().ct_eq(received_hex.as_bytes()).into()
 }
 
 /// Extract the ref/branch from the webhook JSON payload.
@@ -119,14 +120,14 @@ pub async fn handle_webhook(
                 error!("Git pull failed: {}", stderr);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Git pull failed: {}", stderr),
+                    "Git pull failed".to_string(),
                 );
             }
             Err(e) => {
                 error!("Failed to run git: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to run git: {}", e),
+                    "Failed to run git".to_string(),
                 );
             }
         }

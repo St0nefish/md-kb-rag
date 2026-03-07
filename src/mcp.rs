@@ -10,6 +10,8 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 
+use tracing::error;
+
 use crate::{
     embed::EmbedClient,
     qdrant::{QdrantStore, SearchResult},
@@ -83,7 +85,10 @@ impl KbSearchServer {
             .embed_client
             .embed_query(&params.query)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| {
+                error!("Embedding query failed: {:#}", e);
+                McpError::internal_error("Failed to generate query embedding".to_string(), None)
+            })?;
 
         // Build filter map from optional params
         let mut filters: HashMap<String, serde_json::Value> = HashMap::new();
@@ -111,7 +116,10 @@ impl KbSearchServer {
             .qdrant
             .search(&self.collection, vector, filters, limit)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| {
+                error!("Qdrant search failed: {:#}", e);
+                McpError::internal_error("Search query failed".to_string(), None)
+            })?;
 
         if results.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -220,7 +228,8 @@ impl KbSearchServer {
 
         // Canonicalize the data path for safe prefix checking
         let canonical_data = self.data_path.canonicalize().map_err(|e| {
-            McpError::internal_error(format!("Data path not accessible: {}", e), None)
+            error!("Data path not accessible: {}", e);
+            McpError::internal_error("Data path not accessible".to_string(), None)
         })?;
 
         // Resolve the requested path — it may be absolute or relative to data_path
@@ -231,13 +240,13 @@ impl KbSearchServer {
         };
 
         let canonical_resolved = resolved.canonicalize().map_err(|_| {
-            McpError::invalid_params(format!("File not found: {}", params.path), None)
+            McpError::invalid_params("File not found".to_string(), None)
         })?;
 
         // Prevent path traversal outside data directory
         if !canonical_resolved.starts_with(&canonical_data) {
             return Err(McpError::invalid_params(
-                format!("File path is outside the data directory: {}", params.path),
+                "File path is outside the data directory".to_string(),
                 None,
             ));
         }
@@ -245,10 +254,8 @@ impl KbSearchServer {
         let content = tokio::fs::read_to_string(&canonical_resolved)
             .await
             .map_err(|e| {
-                McpError::invalid_params(
-                    format!("Failed to read file '{}': {}", params.path, e),
-                    None,
-                )
+                error!("Failed to read file '{}': {}", canonical_resolved.display(), e);
+                McpError::invalid_params("Failed to read file".to_string(), None)
             })?;
 
         Ok(CallToolResult::success(vec![Content::text(content)]))
