@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
-    Router,
+    Json, Router,
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
@@ -20,6 +20,70 @@ use crate::embed::EmbedClient;
 use crate::mcp::KbSearchServer;
 use crate::qdrant::QdrantStore;
 use crate::webhook::{self, WebhookState};
+
+#[derive(Clone)]
+struct HealthState {
+    qdrant: Arc<QdrantStore>,
+    embed: Arc<EmbedClient>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub qdrant: ComponentHealth,
+    pub embeddings: ComponentHealth,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ComponentHealth {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<HealthResponse>) {
+    let (qdrant_result, embed_result) =
+        tokio::join!(state.qdrant.health_check(), state.embed.health_check());
+
+    let qdrant = match &qdrant_result {
+        Ok(()) => ComponentHealth {
+            status: "ok".into(),
+            error: None,
+        },
+        Err(e) => ComponentHealth {
+            status: "error".into(),
+            error: Some(e.to_string()),
+        },
+    };
+
+    let embeddings = match &embed_result {
+        Ok(()) => ComponentHealth {
+            status: "ok".into(),
+            error: None,
+        },
+        Err(e) => ComponentHealth {
+            status: "error".into(),
+            error: Some(e.to_string()),
+        },
+    };
+
+    let all_ok = qdrant_result.is_ok() && embed_result.is_ok();
+    let status = if all_ok { "healthy" } else { "degraded" };
+    let code = if all_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        code,
+        Json(HealthResponse {
+            status: status.into(),
+            qdrant,
+            embeddings,
+        }),
+    )
+}
 
 #[derive(Clone)]
 struct AuthState {
@@ -114,8 +178,16 @@ pub async fn run_server(config: Config) -> Result<()> {
         middleware::from_fn_with_state(auth_state.clone(), bearer_auth),
     );
 
+    let health_state = HealthState {
+        qdrant: Arc::clone(&qdrant),
+        embed: Arc::clone(&embed_client),
+    };
+
     let mut app = Router::new()
-        .route("/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/health",
+            axum::routing::get(health_handler).with_state(health_state),
+        )
         .merge(mcp_router);
 
     if let Some(secret) = webhook_secret {

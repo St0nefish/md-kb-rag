@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_openai::{
     Client,
-    config::OpenAIConfig,
+    config::{Config as OpenAIConfigTrait, OpenAIConfig},
     types::{CreateEmbeddingRequestArgs, EmbeddingInput},
 };
 use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
@@ -62,6 +62,15 @@ impl EmbedClient {
         }
 
         Ok(all_embeddings)
+    }
+
+    pub async fn health_check(&self) -> Result<()> {
+        let url = format!("{}/models", self.client.config().api_base());
+        reqwest::get(&url)
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| anyhow::anyhow!("Embeddings service health check failed: {e}"))?;
+        Ok(())
     }
 
     pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {

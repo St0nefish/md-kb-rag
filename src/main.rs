@@ -15,6 +15,14 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
+fn print_component(name: &str, c: &server::ComponentHealth) {
+    if let Some(ref err) = c.error {
+        println!("  {}: {} ({})", name, c.status, err);
+    } else {
+        println!("  {}: {}", name, c.status);
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "md-kb-rag", about = "Markdown knowledge base RAG server")]
 struct Cli {
@@ -142,12 +150,22 @@ async fn main() -> anyhow::Result<()> {
             let url = format!("http://localhost:{}/health", port);
             let resp = reqwest::get(&url).await;
             match resp {
-                Ok(r) if r.status().is_success() => {
-                    println!("healthy");
-                }
                 Ok(r) => {
-                    eprintln!("unhealthy: status {}", r.status());
-                    std::process::exit(1);
+                    let status = r.status();
+                    match r.json::<server::HealthResponse>().await {
+                        Ok(health) => {
+                            println!("status: {}", health.status);
+                            print_component("qdrant", &health.qdrant);
+                            print_component("embeddings", &health.embeddings);
+                            if !status.is_success() {
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("unhealthy: failed to parse response: {e}");
+                            std::process::exit(1);
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("unhealthy: {}", e);
