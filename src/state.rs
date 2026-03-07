@@ -1,6 +1,6 @@
 use anyhow::Result;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -18,8 +18,9 @@ pub struct StateDb {
 
 impl StateDb {
     pub async fn new(db_path: &Path) -> Result<Self> {
-        let db_str = db_path.to_str()
-            .ok_or_else(|| anyhow::anyhow!("State DB path is not valid UTF-8: {}", db_path.display()))?;
+        let db_str = db_path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("State DB path is not valid UTF-8: {}", db_path.display())
+        })?;
         let options = SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db_str))?
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(5));
@@ -54,7 +55,12 @@ impl StateDb {
         Ok(row)
     }
 
-    pub async fn upsert(&self, file_path: &str, content_hash: &str, chunk_count: i64) -> Result<()> {
+    pub async fn upsert(
+        &self,
+        file_path: &str,
+        content_hash: &str,
+        chunk_count: i64,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO indexed_files (file_path, content_hash, chunk_count, indexed_at)
              VALUES (?, ?, ?, datetime('now'))",

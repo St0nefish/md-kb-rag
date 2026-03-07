@@ -55,6 +55,9 @@ uuid = { version = "1", features = ["v5"] }
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }
 
+# Retry with exponential backoff
+backoff = { version = "0.4", features = ["tokio"] }
+
 # Misc
 anyhow = "1"
 thiserror = "2"

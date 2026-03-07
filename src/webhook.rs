@@ -1,5 +1,5 @@
-use tokio::process::Command;
 use std::sync::{Arc, LazyLock};
+use tokio::process::Command;
 
 use tokio::sync::Mutex;
 
@@ -193,10 +193,7 @@ mod tests {
         let body = b"payload";
         let sig = format!("sha256={}", compute_hmac(secret, body));
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-hub-signature-256",
-            HeaderValue::from_str(&sig).unwrap(),
-        );
+        headers.insert("x-hub-signature-256", HeaderValue::from_str(&sig).unwrap());
         assert!(verify_signature(secret, body, &headers, "github"));
     }
 
@@ -211,7 +208,12 @@ mod tests {
     fn gitlab_token_mismatch() {
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-token", HeaderValue::from_static("wrong"));
-        assert!(!verify_signature("mytoken", b"anything", &headers, "gitlab"));
+        assert!(!verify_signature(
+            "mytoken",
+            b"anything",
+            &headers,
+            "gitlab"
+        ));
     }
 
     #[test]

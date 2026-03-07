@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use subtle::ConstantTimeEq;
 use axum::{
     Router,
     extract::State,
@@ -10,9 +9,9 @@ use axum::{
     response::Response,
 };
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -42,9 +41,7 @@ async fn bearer_auth(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .unwrap_or("");
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
 
     if token.as_bytes().ct_eq(expected_token.as_bytes()).into() {
         Ok(next.run(request).await)
@@ -58,9 +55,7 @@ pub async fn run_server(config: Config) -> Result<()> {
 
     // Set up shared services
     let embed_client = Arc::new(EmbedClient::new(&config.embedding));
-    let qdrant = Arc::new(
-        QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?,
-    );
+    let qdrant = Arc::new(QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?);
 
     // Ensure collection exists
     qdrant
@@ -115,9 +110,9 @@ pub async fn run_server(config: Config) -> Result<()> {
         .filter(|s| !s.is_empty());
 
     // Build router
-    let mcp_router = Router::new()
-        .nest_service("/mcp", mcp_service)
-        .route_layer(middleware::from_fn_with_state(auth_state.clone(), bearer_auth));
+    let mcp_router = Router::new().nest_service("/mcp", mcp_service).route_layer(
+        middleware::from_fn_with_state(auth_state.clone(), bearer_auth),
+    );
 
     let mut app = Router::new()
         .route("/health", axum::routing::get(|| async { "ok" }))
@@ -129,7 +124,10 @@ pub async fn run_server(config: Config) -> Result<()> {
             secret,
         };
         let webhook_router = Router::new()
-            .route("/hooks/reindex", axum::routing::post(webhook::handle_webhook))
+            .route(
+                "/hooks/reindex",
+                axum::routing::post(webhook::handle_webhook),
+            )
             .with_state(webhook_state);
         app = app.merge(webhook_router);
         info!("  Webhook endpoint: /hooks/reindex");

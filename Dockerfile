@@ -35,7 +35,7 @@ RUN mkdir -p /app/data && chown nonroot:nonroot /app/data
 
 USER nonroot
 
-HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=10s \
   CMD ["md-kb-rag", "health"]
 
 ENTRYPOINT ["md-kb-rag"]

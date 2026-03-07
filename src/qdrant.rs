@@ -3,11 +3,9 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
-    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
-    DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter, Match, PointStruct,
-    Range, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
-    value::Kind,
-    Value as QdrantValue,
+    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
+    Distance, FieldCondition, FieldType, Filter, Match, PointStruct, Range, SearchPointsBuilder,
+    UpsertPointsBuilder, Value as QdrantValue, VectorParamsBuilder, value::Kind,
 };
 use tracing::{debug, info};
 
@@ -65,11 +63,9 @@ fn qdrant_value_to_json(v: &QdrantValue) -> serde_json::Value {
         Some(Kind::NullValue(_)) => serde_json::Value::Null,
         Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
         Some(Kind::IntegerValue(i)) => serde_json::Value::Number((*i).into()),
-        Some(Kind::DoubleValue(f)) => {
-            serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        Some(Kind::DoubleValue(f)) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
         Some(Kind::ListValue(list)) => {
             serde_json::Value::Array(list.values.iter().map(qdrant_value_to_json).collect())
@@ -139,17 +135,13 @@ fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<
                     anyhow::bail!("Unsupported numeric filter value for key '{}'", key);
                 }
             }
-            serde_json::Value::Bool(b) => {
-                Condition::from(FieldCondition {
-                    key: key.clone(),
-                    r#match: Some(Match {
-                        match_value: Some(
-                            qdrant_client::qdrant::r#match::MatchValue::Boolean(*b),
-                        ),
-                    }),
-                    ..Default::default()
-                })
-            }
+            serde_json::Value::Bool(b) => Condition::from(FieldCondition {
+                key: key.clone(),
+                r#match: Some(Match {
+                    match_value: Some(qdrant_client::qdrant::r#match::MatchValue::Boolean(*b)),
+                }),
+                ..Default::default()
+            }),
             serde_json::Value::Null => {
                 anyhow::bail!("Unsupported filter value type: null for key '{}'", key);
             }
@@ -220,9 +212,11 @@ impl QdrantStore {
                 field, collection
             );
             self.client
-                .create_field_index(
-                    CreateFieldIndexCollectionBuilder::new(collection, field, FieldType::Keyword),
-                )
+                .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                    collection,
+                    field,
+                    FieldType::Keyword,
+                ))
                 .await
                 .with_context(|| {
                     format!(
@@ -235,11 +229,7 @@ impl QdrantStore {
         Ok(())
     }
 
-    pub async fn upsert_points(
-        &self,
-        collection: &str,
-        points: Vec<QdrantPoint>,
-    ) -> Result<()> {
+    pub async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()> {
         if points.is_empty() {
             return Ok(());
         }
@@ -263,10 +253,7 @@ impl QdrantStore {
     }
 
     pub async fn delete_by_file(&self, collection: &str, file_path: &str) -> Result<()> {
-        let filter = Filter::must([Condition::matches(
-            "file_path",
-            file_path.to_string(),
-        )]);
+        let filter = Filter::must([Condition::matches("file_path", file_path.to_string())]);
 
         self.client
             .delete_points(DeletePointsBuilder::new(collection).points(filter))
@@ -334,9 +321,7 @@ impl QdrantStore {
             .await
             .context("Failed to get collection info")?;
 
-        let count = info
-            .result
-            .and_then(|r| r.points_count);
+        let count = info.result.and_then(|r| r.points_count);
 
         Ok(count)
     }
@@ -350,8 +335,14 @@ mod tests {
     fn qdrant_value_roundtrip() {
         let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
         payload.insert("title".into(), serde_json::Value::String("Test Doc".into()));
-        payload.insert("file_path".into(), serde_json::Value::String("/data/test.md".into()));
-        payload.insert("text".into(), serde_json::Value::String("Some chunk content".into()));
+        payload.insert(
+            "file_path".into(),
+            serde_json::Value::String("/data/test.md".into()),
+        );
+        payload.insert(
+            "text".into(),
+            serde_json::Value::String("Some chunk content".into()),
+        );
         payload.insert("chunk_index".into(), serde_json::json!(0));
         payload.insert(
             "tags".into(),
@@ -452,7 +443,11 @@ mod tests {
         );
 
         // Clean up
-        store.client.delete_collection(&config.collection).await.unwrap();
+        store
+            .client
+            .delete_collection(&config.collection)
+            .await
+            .unwrap();
     }
 
     #[test]

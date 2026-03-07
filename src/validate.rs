@@ -180,7 +180,9 @@ mod tests {
         let content = "---\ntitle: Test\ntype: guide\n---\n# Hello\nBody text";
         let f = write_temp(content);
         let (result, validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config()).await.unwrap();
+            validate_file(f.path(), &default_fm_config(), &default_val_config())
+                .await
+                .unwrap();
         assert!(result.valid);
         assert!(result.errors.is_empty());
         let vf = validated.unwrap();
@@ -200,7 +202,9 @@ mod tests {
         let content = "---\ntitle: Test\n---\nBody";
         let f = write_temp(content);
         let (result, validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config()).await.unwrap();
+            validate_file(f.path(), &default_fm_config(), &default_val_config())
+                .await
+                .unwrap();
         assert!(!result.valid);
         assert!(result.errors.iter().any(|e| e.contains("type")));
         assert!(validated.is_none());
@@ -210,8 +214,9 @@ mod tests {
     async fn no_frontmatter() {
         let content = "# Just markdown\nNo frontmatter here";
         let f = write_temp(content);
-        let (result, _) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config()).await.unwrap();
+        let (result, _) = validate_file(f.path(), &default_fm_config(), &default_val_config())
+            .await
+            .unwrap();
         assert!(!result.valid);
         assert_eq!(result.errors.len(), 2); // missing title and type
     }
@@ -220,8 +225,9 @@ mod tests {
     async fn defaults_applied() {
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
-        let (_, validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config()).await.unwrap();
+        let (_, validated) = validate_file(f.path(), &default_fm_config(), &default_val_config())
+            .await
+            .unwrap();
         let vf = validated.unwrap();
         assert_eq!(
             vf.frontmatter.get("status").unwrap().as_str().unwrap(),
@@ -234,11 +240,7 @@ mod tests {
         let good = write_temp("---\ntitle: Good\ntype: guide\n---\nBody");
         let bad = write_temp("---\ntitle: Bad\n---\nMissing type");
         let files = vec![good.path().to_path_buf(), bad.path().to_path_buf()];
-        let results = validate_all(
-            &files,
-            &default_fm_config(),
-            &default_val_config(),
-        ).await;
+        let results = validate_all(&files, &default_fm_config(), &default_val_config()).await;
         assert_eq!(results.len(), 2);
         assert!(results[0].0.valid);
         assert!(!results[1].0.valid);

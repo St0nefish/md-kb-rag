@@ -1,6 +1,7 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.17.0
+    restart: unless-stopped
     volumes:
       - ./data/qdrant:/qdrant/storage
     ports:
@@ -11,23 +12,29 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
   embeddings:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b8233
+    restart: unless-stopped
     volumes:
       - ${MODEL_PATH}:/models:ro
     command: >
       --model /models/${MODEL_FILE}
       --host 0.0.0.0 --port 8080
       --embeddings --flash-attn on -ngl 999
+    devices:
+      - /dev/dri:/dev/dri
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 30s
 
   kb-rag:
     build: .
+    restart: unless-stopped
     # user: "1000:1000"  # recommended: run as non-root
     volumes:
       - ${KB_PATH:-./data/repo}:/data:rw
@@ -44,6 +51,12 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
     ports:
       - "${MCP_PORT:-8001}:8001"
+    healthcheck:
+      test: ["CMD", "md-kb-rag", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       qdrant:
         condition: service_healthy

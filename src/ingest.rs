@@ -23,31 +23,25 @@ use crate::{
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob = Glob::new(pattern)
-            .with_context(|| format!("Invalid glob pattern: '{}'", pattern))?;
+        let glob =
+            Glob::new(pattern).with_context(|| format!("Invalid glob pattern: '{}'", pattern))?;
         builder.add(glob);
     }
     Ok(builder.build()?)
 }
 
 pub fn discover_files(data_path: &Path, indexing: &IndexingConfig) -> Result<Vec<PathBuf>> {
-    let include_set = build_globset(&indexing.include)
-        .context("Failed to build include glob set")?;
+    let include_set =
+        build_globset(&indexing.include).context("Failed to build include glob set")?;
 
     let exclude_set = if indexing.exclude.is_empty() {
         None
     } else {
-        Some(
-            build_globset(&indexing.exclude)
-                .context("Failed to build exclude glob set")?,
-        )
+        Some(build_globset(&indexing.exclude).context("Failed to build exclude glob set")?)
     };
 
-    let exclude_filenames: HashSet<&str> = indexing
-        .exclude_files
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let exclude_filenames: HashSet<&str> =
+        indexing.exclude_files.iter().map(|s| s.as_str()).collect();
 
     let mut matched: Vec<PathBuf> = Vec::new();
 
@@ -88,7 +82,14 @@ fn walk_dir(
         }
 
         if file_type.is_dir() {
-            walk_dir(root, &path, include_set, exclude_set, exclude_filenames, matched)?;
+            walk_dir(
+                root,
+                &path,
+                include_set,
+                exclude_set,
+                exclude_filenames,
+                matched,
+            )?;
             continue;
         }
 
@@ -98,15 +99,14 @@ fn walk_dir(
 
         // Check exclude_files by filename
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-            && exclude_filenames.contains(file_name) {
-                debug!("Skipping excluded filename: {}", path.display());
-                continue;
-            }
+            && exclude_filenames.contains(file_name)
+        {
+            debug!("Skipping excluded filename: {}", path.display());
+            continue;
+        }
 
         // Build relative path for glob matching
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path);
+        let rel = path.strip_prefix(root).unwrap_or(&path);
 
         let rel_str = rel.to_string_lossy();
 
@@ -117,10 +117,11 @@ fn walk_dir(
 
         // Must not match any exclude pattern
         if let Some(excl) = exclude_set
-            && (excl.is_match(rel) || excl.is_match(rel_str.as_ref())) {
-                debug!("Excluding file: {}", path.display());
-                continue;
-            }
+            && (excl.is_match(rel) || excl.is_match(rel_str.as_ref()))
+        {
+            debug!("Excluding file: {}", path.display());
+            continue;
+        }
 
         matched.push(path);
     }
@@ -147,8 +148,7 @@ pub fn compute_hash(path: &Path) -> Result<String> {
 
 /// Project-specific UUID v5 namespace (generated once, never change after first index).
 const NAMESPACE_MDKBRAG: Uuid = Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1,
-    0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
 pub fn make_point_id(file_path: &str, chunk_index: usize) -> String {
@@ -183,8 +183,7 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
         .await
         .context("Failed to open state DB")?;
 
-    let store = QdrantStore::new(&config.qdrant)
-        .context("Failed to connect to Qdrant")?;
+    let store = QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?;
 
     let collection = &config.qdrant.collection;
     let vector_size = config.embedding.vector_size;
@@ -215,8 +214,8 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
 
     // ── File discovery ───────────────────────────────────────────────────────
     let data_path = Path::new(config.data_path());
-    let discovered = discover_files(data_path, &config.indexing)
-        .context("Failed to discover files")?;
+    let discovered =
+        discover_files(data_path, &config.indexing).context("Failed to discover files")?;
 
     info!("Discovered {} files", discovered.len());
 
@@ -251,19 +250,21 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
         };
 
         // Skip unchanged files in incremental mode
-        let state_entry = state.get(&file_path).await.with_context(|| {
-            format!("Failed to query state DB for '{}'", file_path)
-        })?;
+        let state_entry = state
+            .get(&file_path)
+            .await
+            .with_context(|| format!("Failed to query state DB for '{}'", file_path))?;
 
         let was_indexed = state_entry.is_some();
 
         if !full
             && let Some(ref entry) = state_entry
-            && entry.content_hash == hash {
-                debug!("Unchanged, skipping: {}", file_path);
-                skipped += 1;
-                continue;
-            }
+            && entry.content_hash == hash
+        {
+            debug!("Unchanged, skipping: {}", file_path);
+            skipped += 1;
+            continue;
+        }
 
         // Validate
         if config.validation.enabled {
@@ -427,15 +428,15 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
                 // Remove the state entry so this file is re-processed on the next run
                 // instead of being silently skipped due to a stale hash match.
                 if pf.was_indexed
-                    && let Err(del_err) = state.delete(&pf.file_path).await {
-                        error!(
-                            "Failed to clean up state DB entry for '{}' after upsert failure: {:#}",
-                            pf.file_path, del_err
-                        );
-                    }
-                return Err(e).with_context(|| {
-                    format!("Failed to upsert points for '{}'", pf.file_path)
-                });
+                    && let Err(del_err) = state.delete(&pf.file_path).await
+                {
+                    error!(
+                        "Failed to clean up state DB entry for '{}' after upsert failure: {:#}",
+                        pf.file_path, del_err
+                    );
+                }
+                return Err(e)
+                    .with_context(|| format!("Failed to upsert points for '{}'", pf.file_path));
             }
 
             state
@@ -454,9 +455,7 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
             store
                 .delete_by_file(collection, file_path)
                 .await
-                .with_context(|| {
-                    format!("Failed to delete orphaned points for '{}'", file_path)
-                })?;
+                .with_context(|| format!("Failed to delete orphaned points for '{}'", file_path))?;
 
             state
                 .delete(file_path)

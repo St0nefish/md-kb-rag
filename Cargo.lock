@@ -1651,6 +1651,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "axum 0.8.8",
+ "backoff",
  "clap",
  "globset",
  "gray_matter",

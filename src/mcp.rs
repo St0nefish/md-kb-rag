@@ -3,11 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
-    handler::server::router::tool::ToolRouter,
-    handler::server::wrapper::Parameters,
-    model::*,
-    schemars, tool, tool_handler, tool_router,
+    ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
+    handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
 };
 
 use tracing::error;
@@ -79,9 +76,11 @@ impl KbSearchServer {
         }
     }
 
-    #[tool(description = "Search the knowledge base using a natural-language query. \
+    #[tool(
+        description = "Search the knowledge base using a natural-language query. \
         Returns ranked document chunks with title, relevance score, text snippet, and metadata. \
-        Optionally filter by domain, type, or tags.")]
+        Optionally filter by domain, type, or tags."
+    )]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -108,10 +107,8 @@ impl KbSearchServer {
         }
 
         if let Some(tags) = params.tags {
-            let tag_values: Vec<serde_json::Value> = tags
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect();
+            let tag_values: Vec<serde_json::Value> =
+                tags.into_iter().map(serde_json::Value::String).collect();
             filters.insert("tags".to_string(), serde_json::Value::Array(tag_values));
         }
 
@@ -232,9 +229,11 @@ impl KbSearchServer {
         Ok(CallToolResult::success(vec![Content::text(output.trim())]))
     }
 
-    #[tool(description = "Retrieve the full raw content of a document by file path. \
+    #[tool(
+        description = "Retrieve the full raw content of a document by file path. \
         Use file paths returned by the `search` tool. Returns the complete markdown \
-        including frontmatter.")]
+        including frontmatter."
+    )]
     async fn get_document(
         &self,
         Parameters(params): Parameters<GetDocumentParams>,
@@ -254,9 +253,9 @@ impl KbSearchServer {
             self.data_path.join(&requested)
         };
 
-        let canonical_resolved = resolved.canonicalize().map_err(|_| {
-            McpError::invalid_params("File not found".to_string(), None)
-        })?;
+        let canonical_resolved = resolved
+            .canonicalize()
+            .map_err(|_| McpError::invalid_params("File not found".to_string(), None))?;
 
         // Prevent path traversal outside data directory
         if !canonical_resolved.starts_with(&canonical_data) {
@@ -269,7 +268,11 @@ impl KbSearchServer {
         let content = tokio::fs::read_to_string(&canonical_resolved)
             .await
             .map_err(|e| {
-                error!("Failed to read file '{}': {}", canonical_resolved.display(), e);
+                error!(
+                    "Failed to read file '{}': {}",
+                    canonical_resolved.display(),
+                    e
+                );
                 McpError::invalid_params("Failed to read file".to_string(), None)
             })?;
 
@@ -280,18 +283,14 @@ impl KbSearchServer {
 #[tool_handler]
 impl ServerHandler for KbSearchServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-        )
-        .with_server_info(Implementation::from_build_env())
-        .with_instructions(
-            "Knowledge base semantic search server. \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+            .with_instructions(
+                "Knowledge base semantic search server. \
              Use the `search` tool to find relevant documents by natural-language query, \
              with optional filters for domain, type, and tags."
-                .to_string(),
-        )
+                    .to_string(),
+            )
     }
 }
 
@@ -327,7 +326,10 @@ mod tests {
         assert!(text.chars().count() > 400, "char count should exceed 400");
         // If we used .len() on a 400-char string it would wrongly trigger ellipsis
         let short: String = std::iter::repeat('é').take(400).collect();
-        assert!(short.len() > 400, "byte len of 400 2-byte chars exceeds 400");
+        assert!(
+            short.len() > 400,
+            "byte len of 400 2-byte chars exceeds 400"
+        );
         assert_eq!(short.chars().count(), 400, "char count is exactly 400");
     }
 }

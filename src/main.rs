@@ -52,8 +52,7 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -78,8 +77,7 @@ async fn main() -> anyhow::Result<()> {
             let files = ingest::discover_files(data_path, &cfg.indexing)?;
             info!("Validating {} files", files.len());
 
-            let results =
-                validate::validate_all(&files, &cfg.frontmatter, &cfg.validation).await;
+            let results = validate::validate_all(&files, &cfg.frontmatter, &cfg.validation).await;
 
             let mut valid_count = 0;
             let mut invalid_count = 0;
@@ -96,7 +94,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            info!(valid = valid_count, invalid = invalid_count, "Validation complete");
+            info!(
+                valid = valid_count,
+                invalid = invalid_count,
+                "Validation complete"
+            );
 
             if invalid_count > 0 && cfg.validation.strict {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
