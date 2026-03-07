@@ -98,8 +98,7 @@ jobs:
             --tag git.stonefish.tech/${{ github.repository }}:latest \
             git.stonefish.tech/${{ github.repository }}:${{ steps.version.outputs.short_sha }}
 
-  cleanup-branch-image:
-    if: github.ref != 'refs/heads/master'
+  cleanup:
     needs: build
     runs-on: ubuntu-latest
     container:
@@ -112,6 +111,7 @@ jobs:
           echo "short_sha=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Delete branch image from registry
+        if: github.ref != 'refs/heads/master'
         run: |
           REPO_OWNER=$(echo "${{ github.repository }}" | cut -d'/' -f1)
           REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
