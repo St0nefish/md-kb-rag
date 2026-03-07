@@ -109,40 +109,41 @@ pub async fn run_server(config: Config) -> Result<()> {
     };
     let auth_state = AuthState { bearer_token };
 
-    // Webhook state — require non-empty secret
+    // Webhook state — optional, skip if secret is unset/empty
     let webhook_secret = std::env::var(&config.webhook.secret_env)
         .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Environment variable '{}' must be set to a non-empty value for webhook signature verification",
-                config.webhook.secret_env
-            )
-        })?;
-    let webhook_state = WebhookState {
-        config: Arc::clone(&config),
-        secret: webhook_secret,
-    };
+        .filter(|s| !s.is_empty());
 
     // Build router
     let mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
         .route_layer(middleware::from_fn_with_state(auth_state.clone(), bearer_auth));
 
-    let webhook_router = Router::new()
-        .route("/hooks/reindex", axum::routing::post(webhook::handle_webhook))
-        .with_state(webhook_state);
-
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", axum::routing::get(|| async { "ok" }))
-        .merge(mcp_router)
-        .merge(webhook_router);
+        .merge(mcp_router);
+
+    if let Some(secret) = webhook_secret {
+        let webhook_state = WebhookState {
+            config: Arc::clone(&config),
+            secret,
+        };
+        let webhook_router = Router::new()
+            .route("/hooks/reindex", axum::routing::post(webhook::handle_webhook))
+            .with_state(webhook_state);
+        app = app.merge(webhook_router);
+        info!("  Webhook endpoint: /hooks/reindex");
+    } else {
+        warn!(
+            "Environment variable '{}' is not set or empty — webhook endpoint disabled",
+            config.webhook.secret_env
+        );
+    }
 
     let mcp_port = config.mcp.port;
     let bind_addr = format!("0.0.0.0:{}", mcp_port);
     info!("Starting server on {}", bind_addr);
     info!("  MCP endpoint: /mcp");
-    info!("  Webhook endpoint: /hooks/reindex");
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

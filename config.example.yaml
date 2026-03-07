@@ -1,70 +1,67 @@
+# md-kb-rag configuration reference
+#
+# All fields have sensible defaults for Docker Compose usage.
+# Connection settings (embedding URL, qdrant URL, model) come from
+# environment variables by default — see docker-compose.yml.
+#
+# Mount this file at /app/config.yaml only if you need to override defaults.
+# Env vars take priority over config file values for connection settings.
+
 # Knowledge base source
-source:
-  git_url: "https://git.example.com/user/knowledge-base.git"
-  branch: "master"
-  # Or bind-mount to /data and omit git_url
+# source:
+#   git_url: "https://git.example.com/user/knowledge-base.git"
+#   branch: "master"              # default: master
+#   data_path: "/data"            # default: /data (bind-mount in Docker)
 
 # What to index
-indexing:
-  include:
-    - "**/*.md"
-  exclude:
-    - "archive/**"
-    - ".git/**"
-    - ".claude/**"
-    - ".tools/**"
-    - "node_modules/**"
-  exclude_files:
-    - "CLAUDE.md"
-    - "README.md"
-    - "index.md"
+# indexing:
+#   include:                      # default: ["**/*.md"]
+#     - "**/*.md"
+#   exclude:                      # default: [".git/**", ".claude/**", ".tools/**", "node_modules/**"]
+#     - ".git/**"
+#     - ".claude/**"
+#     - ".tools/**"
+#     - "node_modules/**"
+#   exclude_files:                # default: ["CLAUDE.md", "README.md"]
+#     - "CLAUDE.md"
+#     - "README.md"
 
-# Frontmatter schema
-frontmatter:
-  required:
-    - title
-    - description
-    - type
-    - tags
-  indexed_fields:
-    - type
-    - domain
-    - tags
-    - status
-  defaults:
-    status: "active"
+# Frontmatter schema (no enforcement by default)
+# frontmatter:
+#   required: []                  # e.g. [title, description, type, tags]
+#   indexed_fields: []            # e.g. [type, domain, tags, status]
+#   defaults: {}                  # e.g. { status: "active" }
 
 # Chunking
-chunking:
-  max_chunk_size: 1500
-  target_chunk_size: 1000
-  prepend_description: true
+# chunking:
+#   target_chunk_size: 1000       # default: 1000
+#   max_chunk_size: 1500          # default: 1500
+#   prepend_description: true     # default: true
 
-# Embedding
-embedding:
-  base_url: "http://embeddings:8080/v1"
-  model: "nomic-embed-text-v2-moe"
-  vector_size: 768
-  batch_size: 32
+# Embedding (connection settings come from env vars by default)
+# embedding:
+#   base_url: "http://embeddings:8080/v1"   # env: EMBEDDING_BASE_URL
+#   model: "nomic-embed-text-v2-moe"        # env: EMBEDDING_MODEL
+#   vector_size: 768                         # env: EMBEDDING_VECTOR_SIZE, default: 768
+#   batch_size: 32                           # default: 32
 
-# Qdrant
-qdrant:
-  url: "http://qdrant:6334"
-  collection: "knowledge-base"
+# Qdrant (connection URL comes from env var by default)
+# qdrant:
+#   url: "http://qdrant:6334"    # env: QDRANT_URL
+#   collection: "knowledge-base" # default: knowledge-base
 
 # Validation
-validation:
-  enabled: true
-  strict: false
-  lint_command: null
+# validation:
+#   enabled: true                 # default: true
+#   strict: false                 # default: false
+#   lint_command: null
 
-# Webhook
-webhook:
-  port: 9000
-  secret_env: "WEBHOOK_SECRET"
-  provider: "gitea"
+# Webhook (disabled if WEBHOOK_SECRET env var is unset/empty)
+# webhook:
+#   secret_env: "WEBHOOK_SECRET"  # default: WEBHOOK_SECRET
+#   provider: "gitea"             # default: gitea
 
 # MCP server
-mcp:
-  port: 8001
-  bearer_token_env: "MCP_BEARER_TOKEN"
+# mcp:
+#   port: 8001                    # default: 8001
+#   bearer_token_env: "MCP_BEARER_TOKEN"  # default: MCP_BEARER_TOKEN

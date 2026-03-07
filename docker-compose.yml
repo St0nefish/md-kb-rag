@@ -26,14 +26,19 @@ services:
       timeout: 5s
       retries: 10
 
-  md-kb-rag:
+  kb-rag:
     build: .
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
       - ${KB_PATH:-./data/repo}:/data:rw
       - ./data/state:/app/data:rw
+      # Optional: mount config.yaml for overrides beyond env vars
+      # - ./config.yaml:/app/config.yaml:ro
     environment:
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - EMBEDDING_BASE_URL=http://embeddings:8080/v1
+      - EMBEDDING_MODEL=nomic-embed-text-v2-moe
+      - EMBEDDING_VECTOR_SIZE=768
+      - QDRANT_URL=http://qdrant:6334
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
       - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN}
       - RUST_LOG=${RUST_LOG:-info}
     ports:
@@ -43,8 +48,3 @@ services:
         condition: service_healthy
       embeddings:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "md-kb-rag", "health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5

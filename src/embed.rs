@@ -16,14 +16,14 @@ pub struct EmbedClient {
 impl EmbedClient {
     pub fn new(config: &EmbeddingConfig) -> Self {
         let openai_config = OpenAIConfig::new()
-            .with_api_base(&config.base_url)
+            .with_api_base(config.base_url())
             .with_api_key("not-needed");
 
         let client = Client::with_config(openai_config);
 
         Self {
             client,
-            model: config.model.clone(),
+            model: config.model().to_string(),
             batch_size: config.batch_size,
         }
     }

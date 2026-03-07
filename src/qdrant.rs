@@ -109,10 +109,10 @@ fn qdrant_payload_to_json(
 
 impl QdrantStore {
     pub fn new(config: &QdrantConfig) -> Result<Self> {
-        let client = Qdrant::from_url(&config.url)
+        let client = Qdrant::from_url(config.url())
             .build()
             .context("Failed to connect to Qdrant")?;
-        info!("Connected to Qdrant at {}", config.url);
+        info!("Connected to Qdrant at {}", config.url());
         Ok(Self { client })
     }
 
@@ -388,7 +388,7 @@ mod tests {
     #[ignore]
     async fn qdrant_search_returns_payload() {
         let config = QdrantConfig {
-            url: "http://localhost:6334".into(),
+            url: Some("http://localhost:6334".into()),
             collection: "test-search-payload".into(),
         };
         let store = QdrantStore::new(&config).unwrap();
