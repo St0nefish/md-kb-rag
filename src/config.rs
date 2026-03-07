@@ -356,6 +356,19 @@ impl Config {
     pub fn state_db_path(&self) -> String {
         format!("{}/state.db", self.data_path())
     }
+
+    /// Returns the full set of fields to keyword-index in Qdrant.
+    ///
+    /// Always includes `"file_path"` (required for `delete_by_file` and
+    /// filtered searches), in addition to any user-configured
+    /// `frontmatter.indexed_fields`.
+    pub fn effective_indexed_fields(&self) -> Vec<String> {
+        let mut fields = self.frontmatter.indexed_fields.clone();
+        if !fields.contains(&"file_path".to_string()) {
+            fields.push("file_path".to_string());
+        }
+        fields
+    }
 }
 
 impl EmbeddingConfig {
@@ -904,5 +917,43 @@ embedding:
             std::env::remove_var("EMBEDDING_MODEL");
             std::env::remove_var("QDRANT_URL");
         }
+    }
+
+    #[test]
+    fn effective_indexed_fields_always_includes_file_path() {
+        // When indexed_fields is empty, file_path is injected.
+        let cfg = Config::from_str_raw(MINIMAL_CONFIG).unwrap();
+        assert!(cfg.frontmatter.indexed_fields.is_empty());
+        let fields = cfg.effective_indexed_fields();
+        assert!(
+            fields.contains(&"file_path".to_string()),
+            "effective_indexed_fields must include file_path"
+        );
+    }
+
+    #[test]
+    fn effective_indexed_fields_no_duplicate_file_path() {
+        // When indexed_fields already contains file_path, it should not be duplicated.
+        let yaml = r#"
+source:
+  git_url: "https://example.com/repo.git"
+indexing:
+  include: ["**/*.md"]
+frontmatter:
+  required: [title]
+  indexed_fields: [file_path, domain]
+chunking:
+  max_chunk_size: 1000
+embedding:
+  base_url: "http://localhost:8080/v1"
+  model: "test-model"
+qdrant:
+  url: "http://localhost:6334"
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        let fields = cfg.effective_indexed_fields();
+        let count = fields.iter().filter(|f| f.as_str() == "file_path").count();
+        assert_eq!(count, 1, "file_path should appear exactly once");
+        assert!(fields.contains(&"domain".to_string()));
     }
 }

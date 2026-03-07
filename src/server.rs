@@ -126,7 +126,7 @@ pub async fn run_server(config: Config) -> Result<()> {
         .ensure_collection(
             &config.qdrant.collection,
             config.embedding.vector_size,
-            &config.frontmatter.indexed_fields,
+            &config.effective_indexed_fields(),
         )
         .await
         .context("Failed to ensure Qdrant collection")?;
