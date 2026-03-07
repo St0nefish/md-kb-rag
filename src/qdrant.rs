@@ -304,6 +304,14 @@ impl QdrantStore {
         Ok(results)
     }
 
+    pub async fn health_check(&self) -> Result<()> {
+        self.client
+            .health_check()
+            .await
+            .context("Qdrant health check failed")?;
+        Ok(())
+    }
+
     pub async fn collection_info(&self, collection: &str) -> Result<Option<u64>> {
         let exists = self
             .client
