@@ -84,6 +84,18 @@ fn extract_branch(body: &[u8]) -> Option<String> {
     )
 }
 
+/// Validate that the webhook payload targets the expected branch.
+fn check_branch(body: &[u8], expected: &str) -> Result<(), (StatusCode, String)> {
+    match extract_branch(body) {
+        Some(branch) if branch == expected => Ok(()),
+        Some(branch) => Err((
+            StatusCode::OK,
+            format!("Branch ignored: '{}' (expected '{}')", branch, expected),
+        )),
+        None => Err((StatusCode::OK, "No ref in payload, ignored".to_string())),
+    }
+}
+
 pub async fn handle_webhook(
     State(state): State<WebhookState>,
     headers: HeaderMap,
@@ -97,14 +109,10 @@ pub async fn handle_webhook(
     }
 
     // Check branch
-    if let Some(branch) = extract_branch(&body)
-        && branch != state.config.source.branch {
-            info!(
-                "Ignoring webhook for branch '{}' (expected '{}')",
-                branch, state.config.source.branch
-            );
-            return (StatusCode::OK, "Branch ignored".to_string());
-        }
+    if let Err(resp) = check_branch(&body, &state.config.source.branch) {
+        info!("{}", resp.1);
+        return resp;
+    }
 
     // Git pull if git_url is configured
     if state.config.source.git_url.is_some() {
@@ -260,5 +268,32 @@ mod tests {
     fn extract_branch_missing() {
         let body = br#"{"action":"push"}"#;
         assert_eq!(extract_branch(body), None);
+    }
+
+    #[test]
+    fn branch_check_correct_branch_passes() {
+        let body = br#"{"ref":"refs/heads/main"}"#;
+        assert!(check_branch(body, "main").is_ok());
+    }
+
+    #[test]
+    fn branch_check_wrong_branch_returns_ignored() {
+        let body = br#"{"ref":"refs/heads/develop"}"#;
+        let err = check_branch(body, "main").unwrap_err();
+        assert!(err.1.contains("Branch ignored"));
+    }
+
+    #[test]
+    fn branch_check_missing_ref_returns_no_ref() {
+        let body = br#"{"action":"push"}"#;
+        let err = check_branch(body, "main").unwrap_err();
+        assert!(err.1.contains("No ref"));
+    }
+
+    #[test]
+    fn branch_check_invalid_json_returns_no_ref() {
+        let body = b"not json at all";
+        let err = check_branch(body, "main").unwrap_err();
+        assert!(err.1.contains("No ref"));
     }
 }
