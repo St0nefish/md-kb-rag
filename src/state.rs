@@ -4,7 +4,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::path::Path;
 use std::str::FromStr;
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct IndexedFile {
     pub file_path: String,
     pub content_hash: String,
@@ -44,6 +44,7 @@ impl StateDb {
         Ok(Self { pool })
     }
 
+    #[cfg(test)]
     pub async fn get(&self, file_path: &str) -> Result<Option<IndexedFile>> {
         let row = sqlx::query_as::<_, IndexedFile>(
             "SELECT file_path, content_hash, chunk_count, indexed_at FROM indexed_files WHERE file_path = ?",

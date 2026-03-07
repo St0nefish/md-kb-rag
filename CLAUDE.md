@@ -38,7 +38,7 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 - Work on feature branches, open PRs — auto-merge on CI pass (via `auto-merge.yaml` workflow)
 - `fix #N` in merge commit auto-closes Gitea issues
 - Branches auto-delete after merge
-- Pre-commit hook enforces `cargo fmt` (activate with `git config core.hooksPath .githooks`)
+- Pre-commit hook enforces `cargo fmt` + `cargo clippy` (activate with `./scripts/setup-dev.sh` after cloning)
 
 ## Issue tracking
 

@@ -12,7 +12,7 @@ use crate::{
     config::{Config, IndexingConfig},
     embed::EmbedClient,
     qdrant::{QdrantPoint, QdrantStore},
-    state::StateDb,
+    state::{IndexedFile, StateDb},
     validate,
 };
 
@@ -233,6 +233,12 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
         .filter(|fp| !discovered_set.contains(fp))
         .collect();
 
+    // Build a lookup map to avoid N+1 per-file DB queries in the loop below.
+    let indexed_map: HashMap<String, IndexedFile> = all_indexed
+        .into_iter()
+        .map(|f| (f.file_path.clone(), f))
+        .collect();
+
     // ── Per-file processing ──────────────────────────────────────────────────
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut skipped = 0usize;
@@ -250,10 +256,7 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
         };
 
         // Skip unchanged files in incremental mode
-        let state_entry = state
-            .get(&file_path)
-            .await
-            .with_context(|| format!("Failed to query state DB for '{}'", file_path))?;
+        let state_entry = indexed_map.get(&file_path).cloned();
 
         let was_indexed = state_entry.is_some();
 
