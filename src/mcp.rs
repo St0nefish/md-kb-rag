@@ -216,7 +216,7 @@ impl KbSearchServer {
                     .payload
                     .get("text")
                     .and_then(|v| v.as_str())
-                    .map(|t| t.len() > 400)
+                    .map(|t| t.chars().count() > 400)
                     .unwrap_or(false)
                 {
                     "..."
@@ -317,5 +317,17 @@ mod tests {
     #[test]
     fn zero_limit_is_passed_through() {
         assert_eq!(resolve_limit(Some(0)), 0);
+    }
+
+    #[test]
+    fn ellipsis_uses_char_count_not_byte_len() {
+        // 400 chars of a 2-byte character = 800 bytes
+        let text: String = std::iter::repeat('é').take(401).collect();
+        assert!(text.len() > 400, "byte len should exceed 400");
+        assert!(text.chars().count() > 400, "char count should exceed 400");
+        // If we used .len() on a 400-char string it would wrongly trigger ellipsis
+        let short: String = std::iter::repeat('é').take(400).collect();
+        assert!(short.len() > 400, "byte len of 400 2-byte chars exceeds 400");
+        assert_eq!(short.chars().count(), 400, "char count is exactly 400");
     }
 }

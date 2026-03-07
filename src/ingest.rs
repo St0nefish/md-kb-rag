@@ -145,9 +145,15 @@ pub fn compute_hash(path: &Path) -> Result<String> {
 // Point ID generation
 // ---------------------------------------------------------------------------
 
+/// Project-specific UUID v5 namespace (generated once, never change after first index).
+const NAMESPACE_MDKBRAG: Uuid = Uuid::from_bytes([
+    0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1,
+    0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+]);
+
 pub fn make_point_id(file_path: &str, chunk_index: usize) -> String {
     let name = format!("{}::{}", file_path, chunk_index);
-    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes()).to_string()
+    Uuid::new_v5(&NAMESPACE_MDKBRAG, name.as_bytes()).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -261,14 +267,8 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
 
         // Validate
         if config.validation.enabled {
-            match validate::validate_file(path, &config.frontmatter, &config.validation) {
-                Ok((result, Some(validated))) => {
-                    if !result.warnings.is_empty() {
-                        for w in &result.warnings {
-                            warn!("  [{}] {}", file_path, w);
-                        }
-                    }
-
+            match validate::validate_file(path, &config.frontmatter, &config.validation).await {
+                Ok((_result, Some(validated))) => {
                     let description = validated
                         .frontmatter
                         .get("description")
