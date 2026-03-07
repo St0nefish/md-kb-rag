@@ -62,6 +62,8 @@ jobs:
         run: |
           docker buildx build \
             --push \
+            --cache-from type=registry,ref=git.stonefish.tech/${{ github.repository }}:buildcache \
+            --cache-to type=registry,ref=git.stonefish.tech/${{ github.repository }}:buildcache,mode=max \
             --tag git.stonefish.tech/${{ github.repository }}:${{ steps.version.outputs.short_sha }} \
             --file ./Dockerfile \
             .
