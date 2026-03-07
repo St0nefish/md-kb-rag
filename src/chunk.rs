@@ -7,14 +7,10 @@ pub struct Chunk {
     pub index: usize,
 }
 
-/// Returns true if the text is only markdown headings (no body content).
-fn is_heading_only(text: &str) -> bool {
-    let trimmed = text.trim();
-    !trimmed.is_empty()
-        && trimmed
-            .lines()
-            .all(|line| line.trim().is_empty() || line.trim().starts_with('#'))
-}
+/// Minimum chunk size in characters. Chunks smaller than this get merged
+/// with their neighbor so we never index tiny fragments (headings, code
+/// fence openers, etc.) that are useless as search results.
+const MIN_CHUNK_SIZE: usize = 200;
 
 pub fn chunk_markdown(
     body: &str,
@@ -24,34 +20,33 @@ pub fn chunk_markdown(
     let splitter = MarkdownSplitter::new(config.max_chunk_size);
     let raw_parts: Vec<&str> = splitter.chunks(body).collect();
 
-    // Merge heading-only chunks forward into the next chunk so headings
-    // always appear with the content they introduce.
+    // Merge undersized chunks forward into the next chunk. If the last
+    // chunk is undersized, merge it backward into the previous one.
     let mut merged: Vec<String> = Vec::with_capacity(raw_parts.len());
-    let mut pending_heading: Option<String> = None;
+    let mut pending: Option<String> = None;
 
     for part in raw_parts {
-        if is_heading_only(part) {
-            // Accumulate headings to prepend to the next content chunk
-            let heading = pending_heading.take().unwrap_or_default();
-            pending_heading = Some(if heading.is_empty() {
-                part.to_string()
+        if let Some(prev) = pending.take() {
+            let combined = format!("{}\n\n{}", prev, part);
+            if combined.trim().len() < MIN_CHUNK_SIZE {
+                pending = Some(combined);
             } else {
-                format!("{}\n\n{}", heading, part)
-            });
-        } else if let Some(heading) = pending_heading.take() {
-            merged.push(format!("{}\n\n{}", heading, part));
+                merged.push(combined);
+            }
+        } else if part.trim().len() < MIN_CHUNK_SIZE {
+            pending = Some(part.to_string());
         } else {
             merged.push(part.to_string());
         }
     }
 
-    // If trailing heading(s) remain, append to the last chunk or keep as-is
-    if let Some(heading) = pending_heading.take() {
+    // Trailing undersized fragment — append to last chunk or keep as-is
+    if let Some(tail) = pending.take() {
         if let Some(last) = merged.last_mut() {
             last.push_str("\n\n");
-            last.push_str(&heading);
+            last.push_str(&tail);
         } else {
-            merged.push(heading);
+            merged.push(tail);
         }
     }
 
@@ -90,8 +85,9 @@ mod tests {
 
     #[test]
     fn multiple_chunks() {
-        let body = "# Section 1\n\nSome content here.\n\n# Section 2\n\nMore content here.";
-        let chunks = chunk_markdown(body, None, &test_config(30, false));
+        let filler = "Word ".repeat(60); // ~300 chars per section
+        let body = format!("# Section 1\n\n{filler}\n\n# Section 2\n\n{filler}");
+        let chunks = chunk_markdown(&body, None, &test_config(400, false));
         assert!(chunks.len() >= 2);
         for (i, chunk) in chunks.iter().enumerate() {
             assert_eq!(chunk.index, i);
@@ -124,55 +120,31 @@ mod tests {
     }
 
     #[test]
-    fn heading_only_chunk_merged_forward() {
-        // With a small chunk size, the splitter may put the heading in its own chunk.
-        // Our merge logic should combine it with the following content chunk.
+    fn small_chunks_merged_forward() {
+        // Small fragments should be merged into the next chunk
         let body = "# Section\n\nSome content here that belongs under the heading.";
         let chunks = chunk_markdown(body, None, &test_config(20, false));
-        // Regardless of how the splitter splits, no chunk should be heading-only
         for chunk in &chunks {
             assert!(
-                !is_heading_only(&chunk.text),
-                "Chunk should not be heading-only: {:?}",
-                chunk.text
+                chunk.text.trim().len() >= MIN_CHUNK_SIZE || chunks.len() == 1,
+                "Chunk too small ({} chars): {:?}",
+                chunk.text.trim().len(),
+                &chunk.text[..chunk.text.len().min(100)]
             );
         }
     }
 
     #[test]
-    fn multiple_heading_only_chunks_merged() {
-        let body = "# Top\n\n## Sub\n\nActual content goes here.";
-        let chunks = chunk_markdown(body, None, &test_config(15, false));
-        for chunk in &chunks {
-            assert!(
-                !is_heading_only(&chunk.text),
-                "Chunk should not be heading-only: {:?}",
-                chunk.text
-            );
-        }
-    }
-
-    #[test]
-    fn trailing_heading_appended_to_last() {
+    fn trailing_small_chunk_merged_backward() {
         let body = "Some content.\n\n# Trailing Heading";
-        let chunks = chunk_markdown(body, None, &test_config(20, false));
-        // The trailing heading should be merged into the last chunk
-        assert!(!chunks.is_empty());
-        let last = &chunks[chunks.len() - 1];
-        assert!(
-            last.text.contains("Trailing Heading"),
-            "Last chunk should contain the trailing heading"
-        );
-        assert!(
-            last.text.contains("Some content"),
-            "Last chunk should also contain content"
-        );
+        let chunks = chunk_markdown(body, None, &test_config(1000, false));
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("Trailing Heading"));
+        assert!(chunks[0].text.contains("Some content"));
     }
 
     #[test]
-    fn realistic_large_doc_no_heading_only_chunks() {
-        // Simulate a large doc where sections exceed max_chunk_size,
-        // forcing the splitter to put headings in their own chunks.
+    fn realistic_large_doc_no_tiny_chunks() {
         let big_section = "x ".repeat(800); // ~1600 chars
         let body = format!(
             "## First Section\n\n{big_section}\n\n## Testing\n\n```bash\ncargo test\n```\n\n## Another\n\n{big_section}"
@@ -180,20 +152,11 @@ mod tests {
         let chunks = chunk_markdown(&body, None, &test_config(1500, false));
         for chunk in &chunks {
             assert!(
-                !is_heading_only(&chunk.text),
-                "Chunk should not be heading-only: {:?}",
+                chunk.text.trim().len() >= MIN_CHUNK_SIZE,
+                "Chunk too small ({} chars): {:?}",
+                chunk.text.trim().len(),
                 &chunk.text[..chunk.text.len().min(200)]
             );
         }
-    }
-
-    #[test]
-    fn is_heading_only_detection() {
-        assert!(is_heading_only("# Hello"));
-        assert!(is_heading_only("## Sub\n\n### Deeper"));
-        assert!(is_heading_only("# Title\n\n"));
-        assert!(!is_heading_only("# Title\n\nSome text"));
-        assert!(!is_heading_only("Just text"));
-        assert!(!is_heading_only(""));
     }
 }
