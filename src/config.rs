@@ -64,8 +64,17 @@ pub struct FrontmatterConfig {
 pub struct ChunkingConfig {
     #[serde(default = "default_max_chunk_size")]
     pub max_chunk_size: usize,
+    /// Target chunk size — accumulate markdown sections up to this size.
+    /// Defaults to max_chunk_size (i.e. fill chunks as much as possible).
+    pub target_chunk_size: Option<usize>,
     #[serde(default)]
     pub prepend_description: bool,
+}
+
+impl ChunkingConfig {
+    pub fn target(&self) -> usize {
+        self.target_chunk_size.unwrap_or(self.max_chunk_size)
+    }
 }
 
 fn default_max_chunk_size() -> usize {
