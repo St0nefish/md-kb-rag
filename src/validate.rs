@@ -79,25 +79,25 @@ pub async fn validate_file(
     }
 
     // Run lint command if configured
-    if let Some(lint_cmd) = &validation.lint_command {
-        if let Some((program, args)) = lint_cmd.split_first() {
-            let output = Command::new(program).args(args).arg(path).output().await;
-            match output {
-                Ok(out) if !out.status.success() => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let msg = if !stderr.is_empty() {
-                        stderr.trim().to_string()
-                    } else {
-                        stdout.trim().to_string()
-                    };
-                    errors.push(format!("Lint command failed: {}", msg));
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to run lint command: {}", e));
-                }
-                _ => {}
+    if let Some(lint_cmd) = &validation.lint_command
+        && let Some((program, args)) = lint_cmd.split_first()
+    {
+        let output = Command::new(program).args(args).arg(path).output().await;
+        match output {
+            Ok(out) if !out.status.success() => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let msg = if !stderr.is_empty() {
+                    stderr.trim().to_string()
+                } else {
+                    stdout.trim().to_string()
+                };
+                errors.push(format!("Lint command failed: {}", msg));
             }
+            Err(e) => {
+                errors.push(format!("Failed to run lint command: {}", e));
+            }
+            _ => {}
         }
     }
 
