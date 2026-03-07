@@ -6,6 +6,9 @@ on:
       - '**.md'
       - 'docs/**'
       - '.claude/**'
+      - '.env.example'
+      - 'config.example.yaml'
+      - 'LICENSE'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

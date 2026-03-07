@@ -1,67 +1,212 @@
-# md-kb-rag configuration reference
+# ============================================================================
+# md-kb-rag — full configuration reference
+# ============================================================================
 #
-# All fields have sensible defaults for Docker Compose usage.
-# Connection settings (embedding URL, qdrant URL, model) come from
-# environment variables by default — see docker-compose.yml.
+# Every field shown below is optional and displays its default value.
+# The config file itself is optional — if missing, all defaults apply.
 #
-# Mount this file at /app/config.yaml only if you need to override defaults.
-# Env vars take priority over config file values for connection settings.
+# RESOLUTION ORDER (highest wins):
+#   1. Environment variable    (connection settings only — see [env] tags)
+#   2. Config file value
+#   3. Built-in default
+#
+# QUICK START (Docker Compose):
+#   Only .env is required. Set MCP_BEARER_TOKEN + MODEL_PATH/MODEL_FILE,
+#   then `docker compose up -d`. Connection env vars are wired in compose.
+#   Mount this file at /app/config.yaml only to override non-connection
+#   settings like frontmatter rules, chunking, or extra exclude patterns.
+#
+# ============================================================================
 
-# Knowledge base source
-# source:
-#   git_url: "https://git.example.com/user/knowledge-base.git"
-#   branch: "master"              # default: master
-#   data_path: "/data"            # default: /data (bind-mount in Docker)
 
-# What to index
-# indexing:
-#   include:                      # default: ["**/*.md"]
-#     - "**/*.md"
-#   exclude:                      # default: [".git/**", ".claude/**", ".tools/**", "node_modules/**"]
-#     - ".git/**"
-#     - ".claude/**"
-#     - ".tools/**"
-#     - "node_modules/**"
-#   exclude_files:                # default: ["CLAUDE.md", "README.md"]
-#     - "CLAUDE.md"
-#     - "README.md"
+# ----------------------------------------------------------------------------
+# source — where the knowledge base lives
+# ----------------------------------------------------------------------------
+source:
 
-# Frontmatter schema (no enforcement by default)
-# frontmatter:
-#   required: []                  # e.g. [title, description, type, tags]
-#   indexed_fields: []            # e.g. [type, domain, tags, status]
-#   defaults: {}                  # e.g. { status: "active" }
+  # Git remote to clone/pull from. If omitted, the knowledge base must be
+  # provided via a bind-mount at data_path (the typical Docker workflow).
+  git_url: null
 
-# Chunking
-# chunking:
-#   target_chunk_size: 1000       # default: 1000
-#   max_chunk_size: 1500          # default: 1500
-#   prepend_description: true     # default: true
+  # Branch to track when using git_url.
+  branch: "master"
 
-# Embedding (connection settings come from env vars by default)
-# embedding:
-#   base_url: "http://embeddings:8080/v1"   # env: EMBEDDING_BASE_URL
-#   model: "nomic-embed-text-v2-moe"        # env: EMBEDDING_MODEL
-#   vector_size: 768                         # env: EMBEDDING_VECTOR_SIZE, default: 768
-#   batch_size: 32                           # default: 32
+  # Filesystem path to the knowledge base root. In Docker, bind-mount your
+  # repo to this path. The indexer walks this directory for markdown files.
+  data_path: "/data"
 
-# Qdrant (connection URL comes from env var by default)
-# qdrant:
-#   url: "http://qdrant:6334"    # env: QDRANT_URL
-#   collection: "knowledge-base" # default: knowledge-base
 
-# Validation
-# validation:
-#   enabled: true                 # default: true
-#   strict: false                 # default: false
-#   lint_command: null
+# ----------------------------------------------------------------------------
+# indexing — which files to include/exclude
+# ----------------------------------------------------------------------------
+# Glob patterns are matched relative to data_path. Setting any list here
+# REPLACES the default (not merges), so include the defaults if you want
+# to extend them.
+indexing:
 
-# Webhook (disabled if WEBHOOK_SECRET env var is unset/empty)
-# webhook:
-#   secret_env: "WEBHOOK_SECRET"  # default: WEBHOOK_SECRET
-#   provider: "gitea"             # default: gitea
+  # Glob patterns for files to index.
+  include:
+    - "**/*.md"
 
-# MCP server
-# mcp:
-#   port: 8001                    # default: 8001
-#   bearer_token_env: "MCP_BEARER_TOKEN"  # default: MCP_BEARER_TOKEN
+  # Glob patterns for directories/files to skip entirely.
+  exclude:
+    - ".git/**"
+    - ".claude/**"
+    - ".tools/**"
+    - "node_modules/**"
+
+  # Exact filenames to skip (matched against the filename, not the path).
+  exclude_files:
+    - "CLAUDE.md"
+    - "README.md"
+
+
+# ----------------------------------------------------------------------------
+# frontmatter — YAML frontmatter schema and enforcement
+# ----------------------------------------------------------------------------
+# By default, no frontmatter rules are enforced. Files without frontmatter
+# are indexed normally. Configure this section to require specific fields
+# or expose metadata as filterable Qdrant payload fields.
+frontmatter:
+
+  # Fields that MUST be present in every file's frontmatter. Files missing
+  # required fields are skipped during indexing (with a warning).
+  # Example: [title, description, type, tags]
+  required: []
+
+  # Frontmatter fields to store as Qdrant payload fields, enabling filtered
+  # search. These become keyword-indexed payload fields on each point.
+  # Example: [type, domain, tags, status]
+  indexed_fields: []
+
+  # Default values applied to frontmatter before validation. If a file is
+  # missing a key listed here, the default is injected automatically.
+  # Example: { status: "active" }
+  defaults: {}
+
+
+# ----------------------------------------------------------------------------
+# chunking — how markdown files are split into vector chunks
+# ----------------------------------------------------------------------------
+# The chunker is section-aware: it splits at heading boundaries first, then
+# combines small consecutive sections up to target_chunk_size. Sections that
+# exceed max_chunk_size are split further by a secondary text splitter.
+chunking:
+
+  # Ideal chunk size in characters. The chunker accumulates sections until
+  # adding the next one would exceed this limit, then starts a new chunk.
+  target_chunk_size: 1000
+
+  # Hard upper limit. Sections larger than this are force-split by a
+  # secondary markdown-aware splitter. Must be >= target_chunk_size.
+  max_chunk_size: 1500
+
+  # Prepend the document's `description` frontmatter field (if present) to
+  # every chunk from that document. Gives the embedding model more context
+  # about what the chunk relates to.
+  prepend_description: true
+
+
+# ----------------------------------------------------------------------------
+# embedding — connection to an OpenAI-compatible embedding API
+# ----------------------------------------------------------------------------
+# The default Docker Compose stack runs llama.cpp as the embedding server.
+# These settings also work with vLLM, TEI, OpenAI, or any server that
+# implements the /v1/embeddings endpoint.
+#
+# Connection fields (base_url, model) are REQUIRED — set them here or via
+# env vars. In Docker Compose, the env vars are pre-wired to the bundled
+# llama.cpp service, so no config is needed.
+embedding:
+
+  # Base URL of the embedding API (without /embeddings).
+  # [env] EMBEDDING_BASE_URL — overrides this value if set.
+  base_url: "http://embeddings:8080/v1"   # REQUIRED (or set env var)
+
+  # Model name passed in the API request body. For llama.cpp this can be
+  # any string (it serves whatever model was loaded), but it's used for
+  # logging and identification.
+  # [env] EMBEDDING_MODEL — overrides this value if set.
+  model: "nomic-embed-text-v2-moe"        # REQUIRED (or set env var)
+
+  # Dimensionality of the embedding vectors. Must match the model's output.
+  # IMPORTANT: changing this requires a full reindex (drops + recreates the
+  # Qdrant collection).
+  # [env] EMBEDDING_VECTOR_SIZE — overrides this value if set.
+  vector_size: 768
+
+  # Number of texts to send per API request. Higher values are faster but
+  # use more memory on the embedding server. Tune based on your model's
+  # context window and available VRAM.
+  batch_size: 32
+
+
+# ----------------------------------------------------------------------------
+# qdrant — vector database connection
+# ----------------------------------------------------------------------------
+qdrant:
+
+  # Qdrant gRPC endpoint URL (port 6334, not the REST port 6333).
+  # [env] QDRANT_URL — overrides this value if set.
+  url: "http://qdrant:6334"               # REQUIRED (or set env var)
+
+  # Collection name. One collection per knowledge base. Changing this creates
+  # a new empty collection on next startup; the old one is not deleted.
+  collection: "knowledge-base"
+
+
+# ----------------------------------------------------------------------------
+# validation — frontmatter validation behavior during indexing
+# ----------------------------------------------------------------------------
+validation:
+
+  # Master switch. When false, frontmatter validation is skipped entirely
+  # and all files are indexed regardless of their frontmatter.
+  enabled: true
+
+  # Strict mode. When true, files that fail validation are treated as hard
+  # errors (indexing aborts). When false, invalid files are skipped with a
+  # warning and indexing continues.
+  strict: false
+
+  # External lint command run on each markdown file before indexing. The file
+  # path is appended as the last argument. Non-zero exit = validation failure.
+  # Example: "markdownlint --fix"
+  lint_command: null
+
+
+# ----------------------------------------------------------------------------
+# webhook — push-to-reindex endpoint
+# ----------------------------------------------------------------------------
+# Listens on POST /hooks/reindex. Verifies request authenticity, then
+# triggers an incremental reindex. The endpoint is DISABLED entirely if the
+# secret env var is unset or empty — no route is mounted.
+webhook:
+
+  # Name of the environment variable containing the HMAC shared secret
+  # (or GitLab token). The actual secret value goes in .env, not here.
+  secret_env: "WEBHOOK_SECRET"
+
+  # Webhook provider determines which header is checked for the signature
+  # and how verification works:
+  #   "gitea"  — X-Gitea-Signature header, HMAC-SHA256 hex
+  #   "github" — X-Hub-Signature-256 header, HMAC-SHA256 with sha256= prefix
+  #   "gitlab" — X-Gitlab-Token header, constant-time string comparison
+  provider: "gitea"
+
+
+# ----------------------------------------------------------------------------
+# mcp — Model Context Protocol server (Streamable HTTP)
+# ----------------------------------------------------------------------------
+# Exposes a `search` tool over MCP at /mcp. Clients authenticate with a
+# Bearer token. The search tool accepts: query (required), domain, type,
+# tags, and limit parameters.
+mcp:
+
+  # Port the HTTP server listens on (serves both MCP and webhook routes).
+  port: 8001
+
+  # Name of the environment variable containing the Bearer token for MCP
+  # authentication. If the env var is unset or empty, MCP endpoints are
+  # served WITHOUT authentication (a warning is logged).
+  bearer_token_env: "MCP_BEARER_TOKEN"

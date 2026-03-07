@@ -380,7 +380,7 @@ qdrant:
 
     #[test]
     fn parse_minimal_config() {
-        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        let cfg = Config::from_str_raw(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.source.branch, "master");
         assert_eq!(cfg.embedding.vector_size, 768);
         assert_eq!(cfg.embedding.batch_size, 32);
@@ -428,7 +428,7 @@ mcp:
   port: 9002
   bearer_token_env: "MY_TOKEN"
 "#;
-        let cfg = Config::from_str(yaml).unwrap();
+        let cfg = Config::from_str_raw(yaml).unwrap();
         assert_eq!(cfg.source.branch, "main");
         assert_eq!(cfg.data_path(), "/custom/path");
         assert_eq!(cfg.embedding.vector_size, 512);
@@ -441,7 +441,7 @@ mcp:
 
     #[test]
     fn default_data_path() {
-        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        let cfg = Config::from_str_raw(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.data_path(), "/data");
     }
 
@@ -640,6 +640,14 @@ chunking:
 
     #[test]
     fn accessor_methods_work_after_resolve() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.embedding.base_url(), "http://localhost:8080/v1");
         assert_eq!(cfg.embedding.model(), "test-model");
@@ -651,6 +659,24 @@ chunking:
     fn accessor_panics_without_resolve() {
         let cfg = Config::from_str_raw("{}").unwrap();
         let _ = cfg.embedding.base_url();
+    }
+
+    #[test]
+    fn example_config_deserializes() {
+        let yaml = include_str!("../config.example.yaml");
+        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("config.example.yaml should parse");
+        // Spot-check a few values to catch drift between example and struct
+        assert_eq!(cfg.source.branch, "master");
+        assert_eq!(cfg.chunking.max_chunk_size, 1500);
+        assert_eq!(cfg.chunking.target_chunk_size, Some(1000));
+        assert!(cfg.chunking.prepend_description);
+        assert_eq!(cfg.embedding.vector_size, 768);
+        assert_eq!(cfg.embedding.batch_size, 32);
+        assert_eq!(cfg.qdrant.collection, "knowledge-base");
+        assert!(cfg.validation.enabled);
+        assert!(!cfg.validation.strict);
+        assert_eq!(cfg.webhook.provider, "gitea");
+        assert_eq!(cfg.mcp.port, 8001);
     }
 
     #[test]
