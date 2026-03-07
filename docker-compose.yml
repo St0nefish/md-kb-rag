@@ -43,4 +43,8 @@ services:
         condition: service_healthy
       embeddings:
         condition: service_healthy
-    command: ["serve", "--config", "/app/config.yaml"]
+    healthcheck:
+      test: ["CMD", "md-kb-rag", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

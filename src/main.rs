@@ -22,12 +22,12 @@ struct Cli {
     config: String,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the server (MCP + webhook endpoints)
+    /// Start the server (MCP + webhook endpoints) [default]
     Serve,
     /// Run indexing pipeline
     Index {
@@ -39,6 +39,12 @@ enum Commands {
     Validate,
     /// Print collection stats and state DB info
     Status,
+    /// Check if the server is healthy
+    Health {
+        /// Port to check (defaults to config mcp.port)
+        #[arg(short, long)]
+        port: Option<u16>,
+    },
 }
 
 #[tokio::main]
@@ -53,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = config::Config::load(Path::new(&cli.config))?;
 
-    match cli.command {
+    match cli.command.unwrap_or(Commands::Serve) {
         Commands::Serve => {
             server::run_server(cfg).await?;
         }
@@ -124,6 +130,24 @@ async fn main() -> anyhow::Result<()> {
                         "Qdrant collection '{}': does not exist",
                         cfg.qdrant.collection
                     );
+                }
+            }
+        }
+        Commands::Health { port } => {
+            let port = port.unwrap_or(cfg.mcp.port);
+            let url = format!("http://localhost:{}/health", port);
+            let resp = reqwest::get(&url).await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("healthy");
+                }
+                Ok(r) => {
+                    eprintln!("unhealthy: status {}", r.status());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("unhealthy: {}", e);
+                    std::process::exit(1);
                 }
             }
         }

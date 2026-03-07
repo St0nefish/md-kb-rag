@@ -1,4 +1,6 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.88-alpine AS builder
+
+RUN apk add --no-cache musl-dev
 
 WORKDIR /build
 
@@ -14,14 +16,11 @@ COPY migrations/ migrations/
 RUN touch src/main.rs && cargo build --release
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM alpine:3.21
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates git && \
-    rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates git
 
 COPY --from=builder /build/target/release/md-kb-rag /usr/local/bin/md-kb-rag
 
 WORKDIR /app
 ENTRYPOINT ["md-kb-rag"]
-CMD ["serve"]

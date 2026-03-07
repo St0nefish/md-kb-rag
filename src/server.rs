@@ -115,7 +115,10 @@ pub async fn run_server(config: Config) -> Result<()> {
         .route("/hooks/reindex", axum::routing::post(webhook::handle_webhook))
         .with_state(webhook_state);
 
-    let app = Router::new().merge(mcp_router).merge(webhook_router);
+    let app = Router::new()
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .merge(mcp_router)
+        .merge(webhook_router);
 
     let mcp_port = config.mcp.port;
     let bind_addr = format!("0.0.0.0:{}", mcp_port);
