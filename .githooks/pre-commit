@@ -1,12 +1,12 @@
 #!/bin/sh
-# Pre-commit hook: ensure Rust code is formatted
+# Pre-commit hook: auto-format Rust code and re-stage any changes
 
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "cargo not found, skipping fmt check"
+    echo "cargo not found, skipping fmt"
     exit 0
 fi
 
-if ! cargo fmt -- --check >/dev/null 2>&1; then
-    echo "error: cargo fmt check failed. Run 'cargo fmt' and re-commit."
-    exit 1
-fi
+cargo fmt
+
+# Re-stage any files that were reformatted
+git diff --name-only | grep '\.rs$' | xargs -r git add
