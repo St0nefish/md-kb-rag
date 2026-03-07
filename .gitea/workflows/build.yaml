@@ -2,13 +2,7 @@ name: Build Container Image
 
 on:
   push:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.claude/**'
-      - '.env.example'
-      - 'config.example.yaml'
-      - 'LICENSE'
+  pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
