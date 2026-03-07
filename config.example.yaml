@@ -169,9 +169,11 @@ validation:
   # warning and indexing continues.
   strict: false
 
-  # External lint command run on each markdown file before indexing. The file
-  # path is appended as the last argument. Non-zero exit = validation failure.
-  # Example: "markdownlint --fix"
+  # External lint command run on each markdown file before indexing. Specified
+  # as a list: the first element is the program, the rest are arguments. The
+  # file path is always appended as the final argument automatically.
+  # Non-zero exit = validation failure.
+  # Example: ["markdownlint", "--config", ".markdownlint.json"]
   lint_command: null
 
 

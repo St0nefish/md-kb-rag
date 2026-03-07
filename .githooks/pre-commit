@@ -1,12 +1,14 @@
 #!/bin/sh
-# Pre-commit hook: ensure Rust code is formatted
+# Pre-commit hook: auto-format and lint Rust code
 
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "cargo not found, skipping fmt check"
+    echo "cargo not found, skipping fmt/clippy"
     exit 0
 fi
 
-if ! cargo fmt -- --check >/dev/null 2>&1; then
-    echo "error: cargo fmt check failed. Run 'cargo fmt' and re-commit."
-    exit 1
-fi
+cargo fmt
+
+# Re-stage any files that were reformatted
+git diff --name-only | grep '\.rs$' | xargs -r git add
+
+cargo clippy -- -D warnings
