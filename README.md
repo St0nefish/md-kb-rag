@@ -117,7 +117,7 @@ The `search` tool accepts:
 | `domain` | string | no | Filter by domain field |
 | `type` | string | no | Filter by document type |
 | `tags` | string[] | no | Filter by tags (match any) |
-| `limit` | integer | no | Max results (default: 10) |
+| `limit` | integer | no | Max results (default: 10, max: 50) |
 
 ## Webhook
 

@@ -32,6 +32,10 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 | `webhook.rs` | Webhook handler |
 | `server.rs` | Axum server (MCP + webhook routes) |
 
+## Issue tracking
+
+Bugs, features, and enhancements are tracked as Gitea issues (not in-repo TODO files).
+
 ## Build & run
 
 ```bash

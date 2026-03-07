@@ -200,7 +200,7 @@ webhook:
 # ----------------------------------------------------------------------------
 # Exposes a `search` tool over MCP at /mcp. Clients authenticate with a
 # Bearer token. The search tool accepts: query (required), domain, type,
-# tags, and limit parameters.
+# tags, and limit (default 10, max 50) parameters.
 mcp:
 
   # Port the HTTP server listens on (serves both MCP and webhook routes).
