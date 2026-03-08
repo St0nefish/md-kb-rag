@@ -247,22 +247,23 @@ impl QdrantStore {
         Ok(())
     }
 
-    pub async fn delete_by_file(&self, collection: &str, file_path: &str) -> Result<()> {
-        let filter = Filter::must([Condition::matches("file_path", file_path.to_string())]);
+    pub async fn delete_by_files(&self, collection: &str, file_paths: &[&str]) -> Result<()> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+
+        let values: Vec<String> = file_paths.iter().map(|s| s.to_string()).collect();
+        let filter = Filter::must([Condition::matches("file_path", values)]);
 
         self.client
             .delete_points(DeletePointsBuilder::new(collection).points(filter))
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to delete points for file '{}' in collection '{}'",
-                    file_path, collection
-                )
-            })?;
+            .context("Failed to batch-delete points by file paths")?;
 
         debug!(
-            "Deleted points for file '{}' from collection '{}'",
-            file_path, collection
+            "Batch-deleted points for {} file(s) from collection '{}'",
+            file_paths.len(),
+            collection
         );
         Ok(())
     }
@@ -446,6 +447,169 @@ mod tests {
         );
 
         // Clean up
+        store
+            .client
+            .delete_collection(&config.collection)
+            .await
+            .unwrap();
+    }
+
+    /// Integration test: upsert points for multiple files, batch-delete by file paths,
+    /// and verify the targeted points are removed while others remain.
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test delete_by_files_removes_matching -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn delete_by_files_removes_matching() {
+        let config = QdrantConfig {
+            url: Some("http://localhost:6334".into()),
+            collection: "test-delete-by-files".into(),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        let vector_size = 4;
+        store
+            .ensure_collection(&config.collection, vector_size, &["file_path".to_string()])
+            .await
+            .unwrap();
+
+        // Insert points for 3 different files
+        let make_point = |id: &str, file: &str, vec: Vec<f32>| {
+            let mut payload = HashMap::new();
+            payload.insert("file_path".into(), serde_json::json!(file));
+            QdrantPoint {
+                id: id.into(),
+                vector: vec,
+                payload,
+            }
+        };
+
+        let points = vec![
+            make_point(
+                "00000000-0000-0000-0000-000000000001",
+                "/data/a.md",
+                vec![1.0, 0.0, 0.0, 0.0],
+            ),
+            make_point(
+                "00000000-0000-0000-0000-000000000002",
+                "/data/b.md",
+                vec![0.0, 1.0, 0.0, 0.0],
+            ),
+            make_point(
+                "00000000-0000-0000-0000-000000000003",
+                "/data/c.md",
+                vec![0.0, 0.0, 1.0, 0.0],
+            ),
+        ];
+        store
+            .upsert_points(&config.collection, points)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Delete points for files a.md and b.md in one call
+        store
+            .delete_by_files(&config.collection, &["/data/a.md", "/data/b.md"])
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // c.md point should still be searchable
+        let results = store
+            .search(
+                &config.collection,
+                vec![0.0, 0.0, 1.0, 0.0],
+                HashMap::new(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].payload.get("file_path").and_then(|v| v.as_str()),
+            Some("/data/c.md"),
+        );
+
+        // a.md and b.md should return no results
+        let results_a = store
+            .search(
+                &config.collection,
+                vec![1.0, 0.0, 0.0, 0.0],
+                {
+                    let mut f = HashMap::new();
+                    f.insert("file_path".into(), serde_json::json!("/data/a.md"));
+                    f
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(results_a.is_empty(), "a.md points should be deleted");
+
+        store
+            .client
+            .delete_collection(&config.collection)
+            .await
+            .unwrap();
+    }
+
+    /// Integration test: delete_by_files with empty slice is a no-op.
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test delete_by_files_empty_is_noop -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn delete_by_files_empty_is_noop() {
+        let config = QdrantConfig {
+            url: Some("http://localhost:6334".into()),
+            collection: "test-delete-by-files-empty".into(),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        store
+            .ensure_collection(&config.collection, 4, &[])
+            .await
+            .unwrap();
+
+        let mut payload = HashMap::new();
+        payload.insert("file_path".into(), serde_json::json!("/data/a.md"));
+        let point = QdrantPoint {
+            id: "00000000-0000-0000-0000-000000000001".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            payload,
+        };
+        store
+            .upsert_points(&config.collection, vec![point])
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Empty delete should be fine
+        store
+            .delete_by_files(&config.collection, &[])
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Point should still exist
+        let results = store
+            .search(
+                &config.collection,
+                vec![1.0, 0.0, 0.0, 0.0],
+                HashMap::new(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
         store
             .client
             .delete_collection(&config.collection)
