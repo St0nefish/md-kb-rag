@@ -47,13 +47,21 @@ pub async fn validate_file(
     config: &FrontmatterConfig,
     validation: &ValidationConfig,
 ) -> anyhow::Result<(ValidationResult, Option<ValidatedFile>)> {
+    let content = tokio::fs::read_to_string(path).await?;
+    validate_content(path, &content, config, validation).await
+}
+
+pub async fn validate_content(
+    path: &Path,
+    content: &str,
+    config: &FrontmatterConfig,
+    validation: &ValidationConfig,
+) -> anyhow::Result<(ValidationResult, Option<ValidatedFile>)> {
     let file_path = path.to_string_lossy().to_string();
     let mut errors: Vec<String> = Vec::new();
 
-    let content = tokio::fs::read_to_string(path).await?;
-
     let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(&content);
+    let parsed = matter.parse(content);
 
     // Parse frontmatter fields
     let mut frontmatter: HashMap<String, Value> = HashMap::new();
@@ -226,6 +234,66 @@ mod tests {
         let (_, validated) = validate_file(f.path(), &default_fm_config(), &default_val_config())
             .await
             .unwrap();
+        let vf = validated.unwrap();
+        assert_eq!(
+            vf.frontmatter.get("status").unwrap().as_str().unwrap(),
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_content_matches_validate_file() {
+        let content = "---\ntitle: Test\ntype: guide\n---\n# Hello\nBody text";
+        let f = write_temp(content);
+        let (file_result, file_validated) =
+            validate_file(f.path(), &default_fm_config(), &default_val_config())
+                .await
+                .unwrap();
+        let (content_result, content_validated) = validate_content(
+            f.path(),
+            content,
+            &default_fm_config(),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(file_result.valid, content_result.valid);
+        assert_eq!(file_result.errors, content_result.errors);
+        let fv = file_validated.unwrap();
+        let cv = content_validated.unwrap();
+        assert_eq!(fv.frontmatter, cv.frontmatter);
+        assert_eq!(fv.body, cv.body);
+    }
+
+    #[tokio::test]
+    async fn validate_content_invalid_frontmatter() {
+        let content = "---\ntitle: Test\n---\nBody";
+        let f = write_temp(content);
+        let (result, validated) = validate_content(
+            f.path(),
+            content,
+            &default_fm_config(),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| e.contains("type")));
+        assert!(validated.is_none());
+    }
+
+    #[tokio::test]
+    async fn validate_content_applies_defaults() {
+        let content = "---\ntitle: Test\ntype: guide\n---\nBody";
+        let f = write_temp(content);
+        let (_, validated) = validate_content(
+            f.path(),
+            content,
+            &default_fm_config(),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         let vf = validated.unwrap();
         assert_eq!(
             vf.frontmatter.get("status").unwrap().as_str().unwrap(),
