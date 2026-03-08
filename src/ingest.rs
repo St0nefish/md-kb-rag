@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     chunk,
     config::{IndexingConfig, ResolvedConfig},
-    embed::EmbedClient,
-    qdrant::{QdrantPoint, QdrantStore},
+    embed::{EmbedClient, EmbedStore},
+    qdrant::{QdrantPoint, QdrantStore, VectorStore},
     state::{IndexedFile, StateDb},
     validate,
 };
@@ -285,10 +285,10 @@ async fn process_file(
 }
 
 /// Embed all pending files and upsert their points into Qdrant.
-async fn upsert_pending(
+async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     pending: &[PendingFile],
-    embedder: &EmbedClient,
-    store: &QdrantStore,
+    embedder: &E,
+    store: &Q,
     state: &StateDb,
     collection: &str,
 ) -> Result<()> {
@@ -400,9 +400,9 @@ async fn upsert_pending(
 }
 
 /// Remove orphaned files (deleted from disk but still in the index).
-async fn remove_orphans(
+async fn remove_orphans<Q: VectorStore>(
     orphaned: &[String],
-    store: &QdrantStore,
+    store: &Q,
     state: &StateDb,
     collection: &str,
 ) -> Result<()> {
@@ -856,6 +856,181 @@ mod tests {
         let files = discover_files(dir.path(), &indexing).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("keep.md"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock structs for upsert_pending / remove_orphans tests
+    // -----------------------------------------------------------------------
+
+    use crate::embed::EmbedStore;
+    use crate::qdrant::VectorStore;
+    use std::sync::Mutex;
+
+    struct MockEmbedClient {
+        result: Result<Vec<Vec<f32>>>,
+    }
+
+    impl MockEmbedClient {
+        fn ok(vecs: Vec<Vec<f32>>) -> Self {
+            Self { result: Ok(vecs) }
+        }
+    }
+
+    impl EmbedStore for MockEmbedClient {
+        async fn embed_texts(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            match &self.result {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => anyhow::bail!("{}", e),
+            }
+        }
+    }
+
+    struct MockVectorStore {
+        delete_result: Mutex<Result<()>>,
+        upsert_result: Mutex<Result<()>>,
+        upsert_called: Mutex<bool>,
+    }
+
+    impl MockVectorStore {
+        fn all_ok() -> Self {
+            Self {
+                delete_result: Mutex::new(Ok(())),
+                upsert_result: Mutex::new(Ok(())),
+                upsert_called: Mutex::new(false),
+            }
+        }
+
+        fn with_delete_err(msg: &str) -> Self {
+            Self {
+                delete_result: Mutex::new(Err(anyhow::anyhow!("{}", msg))),
+                upsert_result: Mutex::new(Ok(())),
+                upsert_called: Mutex::new(false),
+            }
+        }
+
+        fn with_upsert_err(msg: &str) -> Self {
+            Self {
+                delete_result: Mutex::new(Ok(())),
+                upsert_result: Mutex::new(Err(anyhow::anyhow!("{}", msg))),
+                upsert_called: Mutex::new(false),
+            }
+        }
+    }
+
+    impl VectorStore for MockVectorStore {
+        async fn upsert_points(
+            &self,
+            _collection: &str,
+            _points: Vec<crate::qdrant::QdrantPoint>,
+        ) -> Result<()> {
+            *self.upsert_called.lock().unwrap() = true;
+            let guard = self.upsert_result.lock().unwrap();
+            match &*guard {
+                Ok(()) => Ok(()),
+                Err(e) => anyhow::bail!("{}", e),
+            }
+        }
+
+        async fn delete_by_files(&self, _collection: &str, _file_paths: &[&str]) -> Result<()> {
+            let guard = self.delete_result.lock().unwrap();
+            match &*guard {
+                Ok(()) => Ok(()),
+                Err(e) => anyhow::bail!("{}", e),
+            }
+        }
+    }
+
+    async fn test_state_db(dir: &TempDir) -> StateDb {
+        let db_path = dir.path().join("state.db");
+        StateDb::new(&db_path).await.unwrap()
+    }
+
+    fn make_pending(file_path: &str, chunk_count: usize, was_indexed: bool) -> PendingFile {
+        let chunks: Vec<chunk::Chunk> = (0..chunk_count)
+            .map(|i| chunk::Chunk {
+                text: format!("chunk {}", i),
+                index: i,
+                line_start: i * 10 + 1,
+                line_end: (i + 1) * 10,
+            })
+            .collect();
+        PendingFile {
+            file_path: file_path.to_string(),
+            frontmatter: HashMap::new(),
+            chunks,
+            hash: "abc123".to_string(),
+            was_indexed,
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_count_mismatch_bails() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        // 2-chunk file but embedder returns only 1 vector
+        let pending = vec![make_pending("/data/test.md", 2, false)];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]]);
+        let store = MockVectorStore::all_ok();
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Embedding count mismatch"),
+            "Expected mismatch error, got: {}",
+            msg
+        );
+        assert!(
+            !*store.upsert_called.lock().unwrap(),
+            "upsert_points should not be called after mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_delete_failure_preserves_state() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        // Seed state DB with an entry
+        state.upsert("/data/orphan.md", "hash1", 3).await.unwrap();
+
+        let store = MockVectorStore::with_delete_err("qdrant unavailable");
+
+        let result =
+            remove_orphans(&["/data/orphan.md".to_string()], &store, &state, "test-col").await;
+
+        assert!(result.is_err());
+        // State DB entry should still exist
+        let entry = state.get("/data/orphan.md").await.unwrap();
+        assert!(
+            entry.is_some(),
+            "State DB entry should be preserved on delete failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_failure_cleans_up_state() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        // Seed state with a previously-indexed file
+        state.upsert("/data/test.md", "old-hash", 2).await.unwrap();
+
+        let pending = vec![make_pending("/data/test.md", 2, true)];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
+        let store = MockVectorStore::with_upsert_err("upsert failed");
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+
+        assert!(result.is_err());
+        // State DB entry should be cleaned up (deleted) so file gets reprocessed
+        let entry = state.get("/data/test.md").await.unwrap();
+        assert!(
+            entry.is_none(),
+            "State DB entry should be deleted after upsert failure for was_indexed file"
+        );
     }
 
     #[test]

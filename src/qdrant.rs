@@ -11,6 +11,11 @@ use tracing::{debug, info};
 
 use crate::config::ResolvedQdrantConfig;
 
+pub trait VectorStore: Send + Sync {
+    async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()>;
+    async fn delete_by_files(&self, collection: &str, file_paths: &[&str]) -> Result<()>;
+}
+
 pub struct QdrantStore {
     client: Qdrant,
 }
@@ -267,7 +272,19 @@ impl QdrantStore {
         );
         Ok(())
     }
+}
 
+impl VectorStore for QdrantStore {
+    async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()> {
+        QdrantStore::upsert_points(self, collection, points).await
+    }
+
+    async fn delete_by_files(&self, collection: &str, file_paths: &[&str]) -> Result<()> {
+        QdrantStore::delete_by_files(self, collection, file_paths).await
+    }
+}
+
+impl QdrantStore {
     pub async fn search(
         &self,
         collection: &str,
