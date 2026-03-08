@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
     ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
@@ -56,7 +57,27 @@ pub struct KbSearchServer {
     qdrant: Arc<QdrantStore>,
     collection: String,
     data_path: PathBuf,
+    /// Glob patterns (from `indexing.include`) used to restrict `get_document` to permitted file types.
+    include_patterns: Arc<GlobSet>,
     tool_router: ToolRouter<KbSearchServer>,
+}
+
+fn build_include_globset(patterns: &[String]) -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        match Glob::new(p) {
+            Ok(g) => {
+                builder.add(g);
+            }
+            Err(e) => {
+                error!("Invalid include glob pattern '{}': {}", p, e);
+            }
+        }
+    }
+    // Fall back to **/*.md if no valid patterns were added
+    builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
 }
 
 #[tool_router]
@@ -66,12 +87,14 @@ impl KbSearchServer {
         qdrant: Arc<QdrantStore>,
         collection: String,
         data_path: PathBuf,
+        include_patterns: &[String],
     ) -> Self {
         Self {
             embed_client,
             qdrant,
             collection,
             data_path,
+            include_patterns: Arc::new(build_include_globset(include_patterns)),
             tool_router: Self::tool_router(),
         }
     }
@@ -265,6 +288,17 @@ impl KbSearchServer {
             ));
         }
 
+        // Restrict to permitted file types (indexing.include patterns)
+        let relative = canonical_resolved
+            .strip_prefix(&canonical_data)
+            .unwrap_or(&canonical_resolved);
+        if !self.include_patterns.is_match(relative) {
+            return Err(McpError::invalid_params(
+                "File type not permitted".to_string(),
+                None,
+            ));
+        }
+
         let content = tokio::fs::read_to_string(&canonical_resolved)
             .await
             .map_err(|e| {
@@ -365,5 +399,45 @@ mod tests {
             "byte len of 400 2-byte chars exceeds 400"
         );
         assert_eq!(short.chars().count(), 400, "char count is exactly 400");
+    }
+
+    #[test]
+    fn include_globset_matches_markdown() {
+        let patterns = vec!["**/*.md".to_string()];
+        let gs = build_include_globset(&patterns);
+        assert!(
+            gs.is_match("docs/guide.md"),
+            "**/*.md should match docs/guide.md"
+        );
+        assert!(
+            gs.is_match("README.md"),
+            "**/*.md should match top-level README.md"
+        );
+    }
+
+    #[test]
+    fn include_globset_rejects_non_markdown() {
+        let patterns = vec!["**/*.md".to_string()];
+        let gs = build_include_globset(&patterns);
+        assert!(
+            !gs.is_match("state.db"),
+            "**/*.md should not match state.db"
+        );
+        assert!(
+            !gs.is_match("scripts/run.sh"),
+            "**/*.md should not match shell scripts"
+        );
+        assert!(
+            !gs.is_match(".env"),
+            "**/*.md should not match credential files"
+        );
+    }
+
+    #[test]
+    fn include_globset_respects_custom_patterns() {
+        let patterns = vec!["**/*.md".to_string(), "**/*.txt".to_string()];
+        let gs = build_include_globset(&patterns);
+        assert!(gs.is_match("notes/todo.txt"), "should match *.txt");
+        assert!(!gs.is_match("data.json"), "should not match *.json");
     }
 }
