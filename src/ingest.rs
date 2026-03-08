@@ -177,6 +177,238 @@ struct PendingFile {
     was_indexed: bool,
 }
 
+/// Result of processing a single discovered file.
+enum FileOutcome {
+    Skipped,
+    Invalid,
+    Empty,
+    Ready(PendingFile),
+}
+
+/// Process a single file: hash, skip-if-unchanged, validate, chunk.
+async fn process_file(
+    path: &Path,
+    content: &str,
+    full: bool,
+    state_entry: Option<IndexedFile>,
+    config: &Config,
+) -> Result<FileOutcome> {
+    let file_path = path.to_string_lossy().to_string();
+    let hash = compute_hash_from_bytes(content.as_bytes());
+
+    let was_indexed = state_entry.is_some();
+
+    // Skip unchanged files in incremental mode
+    if !full
+        && let Some(ref entry) = state_entry
+        && entry.content_hash == hash
+    {
+        debug!("Unchanged, skipping: {}", file_path);
+        return Ok(FileOutcome::Skipped);
+    }
+
+    if config.validation.enabled {
+        match validate::validate_content(path, content, &config.frontmatter, &config.validation)
+            .await
+        {
+            Ok((_result, Some(validated))) => {
+                let description = validated
+                    .frontmatter
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+
+                let chunks = chunk::chunk_markdown(
+                    &validated.body,
+                    description.as_deref(),
+                    &config.chunking,
+                );
+
+                if chunks.is_empty() {
+                    warn!("No chunks produced for: {}", file_path);
+                    return Ok(FileOutcome::Empty);
+                }
+
+                debug!("  {} chunks from: {}", chunks.len(), file_path);
+
+                Ok(FileOutcome::Ready(PendingFile {
+                    file_path,
+                    frontmatter: validated.frontmatter,
+                    chunks,
+                    hash,
+                    was_indexed,
+                }))
+            }
+            Ok((result, None)) => {
+                for err in &result.errors {
+                    warn!("Validation error [{}]: {}", file_path, err);
+                }
+
+                if config.validation.strict {
+                    anyhow::bail!(
+                        "Validation failed for '{}' (strict mode): {:?}",
+                        file_path,
+                        result.errors
+                    );
+                }
+
+                Ok(FileOutcome::Invalid)
+            }
+            Err(e) => {
+                error!("Failed to validate {}: {:#}", file_path, e);
+
+                if config.validation.strict {
+                    return Err(e).with_context(|| {
+                        format!("Validation error in strict mode for '{}'", file_path)
+                    });
+                }
+
+                Ok(FileOutcome::Invalid)
+            }
+        }
+    } else {
+        // Validation disabled — chunk the already-read content
+        let chunks = chunk::chunk_markdown(content, None, &config.chunking);
+        if chunks.is_empty() {
+            warn!("No chunks produced for: {}", file_path);
+            return Ok(FileOutcome::Empty);
+        }
+
+        Ok(FileOutcome::Ready(PendingFile {
+            file_path,
+            frontmatter: HashMap::new(),
+            chunks,
+            hash,
+            was_indexed,
+        }))
+    }
+}
+
+/// Embed all pending files and upsert their points into Qdrant.
+async fn upsert_pending(
+    pending: &[PendingFile],
+    embedder: &EmbedClient,
+    store: &QdrantStore,
+    state: &StateDb,
+    collection: &str,
+) -> Result<()> {
+    // Flatten all chunk texts in order, recording boundaries
+    let mut all_texts: Vec<String> = Vec::new();
+    let mut file_boundaries: Vec<(usize, usize)> = Vec::new(); // (start_idx, count)
+
+    for pf in pending {
+        let start = all_texts.len();
+        for c in &pf.chunks {
+            all_texts.push(c.text.clone());
+        }
+        file_boundaries.push((start, pf.chunks.len()));
+    }
+
+    let all_embeddings = embedder
+        .embed_texts(&all_texts)
+        .await
+        .context("Failed to embed chunk texts")?;
+
+    if all_embeddings.len() != all_texts.len() {
+        anyhow::bail!(
+            "Embedding count mismatch: expected {}, got {}",
+            all_texts.len(),
+            all_embeddings.len()
+        );
+    }
+
+    for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
+        let embeddings = &all_embeddings[*start..*start + *count];
+
+        let mut points: Vec<QdrantPoint> = Vec::with_capacity(*count);
+        for (chunk, vector) in pf.chunks.iter().zip(embeddings.iter()) {
+            let mut payload: HashMap<String, serde_json::Value> = pf.frontmatter.clone();
+            payload.insert(
+                "file_path".to_string(),
+                serde_json::Value::String(pf.file_path.clone()),
+            );
+            payload.insert(
+                "chunk_index".to_string(),
+                serde_json::Value::Number(chunk.index.into()),
+            );
+            payload.insert(
+                "text".to_string(),
+                serde_json::Value::String(chunk.text.clone()),
+            );
+            payload.insert(
+                "line_start".to_string(),
+                serde_json::Value::Number(chunk.line_start.into()),
+            );
+            payload.insert(
+                "line_end".to_string(),
+                serde_json::Value::Number(chunk.line_end.into()),
+            );
+
+            points.push(QdrantPoint {
+                id: make_point_id(&pf.file_path, chunk.index),
+                vector: vector.clone(),
+                payload,
+            });
+        }
+
+        // Delete old points first (for changed files that were already indexed)
+        if pf.was_indexed {
+            store
+                .delete_by_file(collection, &pf.file_path)
+                .await
+                .with_context(|| format!("Failed to delete old points for '{}'", pf.file_path))?;
+        }
+
+        if let Err(e) = store.upsert_points(collection, points).await {
+            // Upsert failed after old points were already deleted.
+            // Remove the state entry so this file is re-processed on the next run
+            // instead of being silently skipped due to a stale hash match.
+            if pf.was_indexed
+                && let Err(del_err) = state.delete(&pf.file_path).await
+            {
+                error!(
+                    "Failed to clean up state DB entry for '{}' after upsert failure: {:#}",
+                    pf.file_path, del_err
+                );
+            }
+            return Err(e)
+                .with_context(|| format!("Failed to upsert points for '{}'", pf.file_path));
+        }
+
+        state
+            .upsert(&pf.file_path, &pf.hash, *count as i64)
+            .await
+            .with_context(|| format!("Failed to update state DB for '{}'", pf.file_path))?;
+
+        info!("Indexed {} chunk(s) from: {}", count, pf.file_path);
+    }
+
+    Ok(())
+}
+
+/// Remove orphaned files (deleted from disk but still in the index).
+async fn remove_orphans(
+    orphaned: &[String],
+    store: &QdrantStore,
+    state: &StateDb,
+    collection: &str,
+) -> Result<()> {
+    for file_path in orphaned {
+        store
+            .delete_by_file(collection, file_path)
+            .await
+            .with_context(|| format!("Failed to delete orphaned points for '{}'", file_path))?;
+
+        state
+            .delete(file_path)
+            .await
+            .with_context(|| format!("Failed to delete state DB entry for '{}'", file_path))?;
+
+        info!("Removed orphaned file: {}", file_path);
+    }
+    Ok(())
+}
+
 pub async fn run_index(config: &Config, full: bool) -> Result<()> {
     info!(
         mode = if full { "full" } else { "incremental" },
@@ -221,7 +453,6 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
     info!("Discovered {} files", discovered.len());
 
     // ── Determine which previously-indexed files no longer exist ─────────────
-    // (do this before the per-file loop so we have the complete picture)
     let all_indexed = state.list_all().await.context("Failed to list state DB")?;
     let discovered_set: HashSet<String> = discovered
         .iter()
@@ -234,7 +465,6 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
         .filter(|fp| !discovered_set.contains(fp))
         .collect();
 
-    // Build a lookup map to avoid N+1 per-file DB queries in the loop below.
     let indexed_map: HashMap<String, IndexedFile> = all_indexed
         .into_iter()
         .map(|f| (f.file_path.clone(), f))
@@ -257,225 +487,33 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
             }
         };
 
-        let hash = compute_hash_from_bytes(content.as_bytes());
-
-        // Skip unchanged files in incremental mode
         let state_entry = indexed_map.get(&file_path).cloned();
 
-        let was_indexed = state_entry.is_some();
-
-        if !full
-            && let Some(ref entry) = state_entry
-            && entry.content_hash == hash
-        {
-            debug!("Unchanged, skipping: {}", file_path);
-            skipped += 1;
-            continue;
-        }
-
-        // Validate
-        if config.validation.enabled {
-            match validate::validate_content(
-                path,
-                &content,
-                &config.frontmatter,
-                &config.validation,
-            )
-            .await
-            {
-                Ok((_result, Some(validated))) => {
-                    let description = validated
-                        .frontmatter
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned);
-
-                    let chunks = chunk::chunk_markdown(
-                        &validated.body,
-                        description.as_deref(),
-                        &config.chunking,
-                    );
-
-                    if chunks.is_empty() {
-                        warn!("No chunks produced for: {}", file_path);
-                        continue;
-                    }
-
-                    debug!("  {} chunks from: {}", chunks.len(), file_path);
-
-                    pending.push(PendingFile {
-                        file_path,
-                        frontmatter: validated.frontmatter,
-                        chunks,
-                        hash,
-                        was_indexed,
-                    });
-                }
-                Ok((result, None)) => {
-                    // Validation failed
-                    for err in &result.errors {
-                        warn!("Validation error [{}]: {}", file_path, err);
-                    }
-                    invalid += 1;
-
-                    if config.validation.strict {
-                        anyhow::bail!(
-                            "Validation failed for '{}' (strict mode): {:?}",
-                            file_path,
-                            result.errors
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to validate {}: {:#}", file_path, e);
-                    invalid += 1;
-
-                    if config.validation.strict {
-                        return Err(e).with_context(|| {
-                            format!("Validation error in strict mode for '{}'", file_path)
-                        });
-                    }
-                }
-            }
-        } else {
-            // Validation disabled — chunk the already-read content
-            let chunks = chunk::chunk_markdown(&content, None, &config.chunking);
-            if chunks.is_empty() {
-                warn!("No chunks produced for: {}", file_path);
-                continue;
-            }
-
-            pending.push(PendingFile {
-                file_path,
-                frontmatter: HashMap::new(),
-                chunks,
-                hash,
-                was_indexed,
-            });
+        match process_file(path, &content, full, state_entry, config).await? {
+            FileOutcome::Skipped => skipped += 1,
+            FileOutcome::Invalid => invalid += 1,
+            FileOutcome::Empty => {}
+            FileOutcome::Ready(pf) => pending.push(pf),
         }
     }
 
-    // ── Batch embedding ──────────────────────────────────────────────────────
+    // ── Batch embedding & upsert ────────────────────────────────────────────
+    let pending_count = pending.len();
     if !pending.is_empty() {
-        info!("Embedding chunks for {} changed file(s)…", pending.len());
-
-        // Flatten all chunk texts in order, recording boundaries
-        let mut all_texts: Vec<String> = Vec::new();
-        let mut file_boundaries: Vec<(usize, usize)> = Vec::new(); // (start_idx, count)
-
-        for pf in &pending {
-            let start = all_texts.len();
-            for c in &pf.chunks {
-                all_texts.push(c.text.clone());
-            }
-            file_boundaries.push((start, pf.chunks.len()));
-        }
-
-        let all_embeddings = embedder
-            .embed_texts(&all_texts)
-            .await
-            .context("Failed to embed chunk texts")?;
-
-        if all_embeddings.len() != all_texts.len() {
-            anyhow::bail!(
-                "Embedding count mismatch: expected {}, got {}",
-                all_texts.len(),
-                all_embeddings.len()
-            );
-        }
-
-        // ── Build Qdrant points, delete stale data, upsert, update state ──────
-        for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
-            let embeddings = &all_embeddings[*start..*start + *count];
-
-            let mut points: Vec<QdrantPoint> = Vec::with_capacity(*count);
-            for (chunk, vector) in pf.chunks.iter().zip(embeddings.iter()) {
-                let mut payload: HashMap<String, serde_json::Value> = pf.frontmatter.clone();
-                payload.insert(
-                    "file_path".to_string(),
-                    serde_json::Value::String(pf.file_path.clone()),
-                );
-                payload.insert(
-                    "chunk_index".to_string(),
-                    serde_json::Value::Number(chunk.index.into()),
-                );
-                payload.insert(
-                    "text".to_string(),
-                    serde_json::Value::String(chunk.text.clone()),
-                );
-                payload.insert(
-                    "line_start".to_string(),
-                    serde_json::Value::Number(chunk.line_start.into()),
-                );
-                payload.insert(
-                    "line_end".to_string(),
-                    serde_json::Value::Number(chunk.line_end.into()),
-                );
-
-                points.push(QdrantPoint {
-                    id: make_point_id(&pf.file_path, chunk.index),
-                    vector: vector.clone(),
-                    payload,
-                });
-            }
-
-            // Delete old points first (for changed files that were already indexed)
-            if pf.was_indexed {
-                store
-                    .delete_by_file(collection, &pf.file_path)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to delete old points for '{}'", pf.file_path)
-                    })?;
-            }
-
-            if let Err(e) = store.upsert_points(collection, points).await {
-                // Upsert failed after old points were already deleted.
-                // Remove the state entry so this file is re-processed on the next run
-                // instead of being silently skipped due to a stale hash match.
-                if pf.was_indexed
-                    && let Err(del_err) = state.delete(&pf.file_path).await
-                {
-                    error!(
-                        "Failed to clean up state DB entry for '{}' after upsert failure: {:#}",
-                        pf.file_path, del_err
-                    );
-                }
-                return Err(e)
-                    .with_context(|| format!("Failed to upsert points for '{}'", pf.file_path));
-            }
-
-            state
-                .upsert(&pf.file_path, &pf.hash, *count as i64)
-                .await
-                .with_context(|| format!("Failed to update state DB for '{}'", pf.file_path))?;
-
-            info!("Indexed {} chunk(s) from: {}", count, pf.file_path);
-        }
+        info!("Embedding chunks for {} changed file(s)…", pending_count);
+        upsert_pending(&pending, &embedder, &store, &state, collection).await?;
     }
 
     // ── Handle orphaned (deleted) files ──────────────────────────────────────
     if !orphaned.is_empty() {
         info!("Removing {} orphaned file(s) from index", orphaned.len());
-        for file_path in &orphaned {
-            store
-                .delete_by_file(collection, file_path)
-                .await
-                .with_context(|| format!("Failed to delete orphaned points for '{}'", file_path))?;
-
-            state
-                .delete(file_path)
-                .await
-                .with_context(|| format!("Failed to delete state DB entry for '{}'", file_path))?;
-
-            info!("Removed orphaned file: {}", file_path);
-        }
+        remove_orphans(&orphaned, &store, &state, collection).await?;
     }
 
     // ── Summary ──────────────────────────────────────────────────────────────
     info!(
         discovered = discovered.len(),
-        indexed = pending.len(),
+        indexed = pending_count,
         skipped,
         invalid,
         orphans_removed = orphaned.len(),
@@ -549,6 +587,203 @@ mod tests {
             compute_hash(&p1).await.unwrap(),
             compute_hash(&p2).await.unwrap()
         );
+    }
+
+    /// Helper: build a Config with validation disabled for simpler test setup.
+    fn config_no_validation() -> Config {
+        Config {
+            validation: crate::config::ValidationConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn process_file_skips_unchanged_incremental() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "# Hello\nSome body text here.";
+        std::fs::write(&path, content).unwrap();
+
+        let hash = compute_hash_from_bytes(content.as_bytes());
+        let state_entry = Some(IndexedFile {
+            file_path: path.to_string_lossy().to_string(),
+            content_hash: hash,
+            chunk_count: 1,
+            indexed_at: String::new(),
+        });
+
+        let config = config_no_validation();
+        let outcome = process_file(&path, content, false, state_entry, &config)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Skipped));
+    }
+
+    #[tokio::test]
+    async fn process_file_indexes_changed_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "# Hello\nSome body text here.";
+        std::fs::write(&path, content).unwrap();
+
+        let state_entry = Some(IndexedFile {
+            file_path: path.to_string_lossy().to_string(),
+            content_hash: "old-hash".to_string(),
+            chunk_count: 1,
+            indexed_at: String::new(),
+        });
+
+        let config = config_no_validation();
+        let outcome = process_file(&path, content, false, state_entry, &config)
+            .await
+            .unwrap();
+        match outcome {
+            FileOutcome::Ready(pf) => {
+                assert!(!pf.chunks.is_empty());
+                assert!(pf.was_indexed);
+            }
+            other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_file_full_mode_ignores_matching_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "# Hello\nSome body text here.";
+        std::fs::write(&path, content).unwrap();
+
+        let hash = compute_hash_from_bytes(content.as_bytes());
+        let state_entry = Some(IndexedFile {
+            file_path: path.to_string_lossy().to_string(),
+            content_hash: hash,
+            chunk_count: 1,
+            indexed_at: String::new(),
+        });
+
+        let config = config_no_validation();
+        let outcome = process_file(&path, content, true, state_entry, &config)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, FileOutcome::Ready(_)),
+            "Full mode should process even when hash matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_file_new_file_not_was_indexed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "# Hello\nBody text.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = config_no_validation();
+        let outcome = process_file(&path, content, false, None, &config)
+            .await
+            .unwrap();
+        match outcome {
+            FileOutcome::Ready(pf) => assert!(!pf.was_indexed),
+            other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_file_empty_content_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "";
+        std::fs::write(&path, content).unwrap();
+
+        let config = config_no_validation();
+        let outcome = process_file(&path, content, false, None, &config)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Empty));
+    }
+
+    #[tokio::test]
+    async fn process_file_with_validation_valid_frontmatter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\n# Hello\nBody text here.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = Config {
+            frontmatter: crate::config::FrontmatterConfig {
+                required: vec!["title".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let outcome = process_file(&path, content, false, None, &config)
+            .await
+            .unwrap();
+        match outcome {
+            FileOutcome::Ready(pf) => {
+                assert!(pf.frontmatter.contains_key("title"));
+            }
+            other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_file_with_validation_missing_required_field() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\n# Hello\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = Config {
+            frontmatter: crate::config::FrontmatterConfig {
+                required: vec!["description".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let outcome = process_file(&path, content, false, None, &config)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Invalid));
+    }
+
+    #[tokio::test]
+    async fn process_file_strict_validation_failure_is_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\n# Hello\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = Config {
+            validation: crate::config::ValidationConfig {
+                enabled: true,
+                strict: true,
+                ..Default::default()
+            },
+            frontmatter: crate::config::FrontmatterConfig {
+                required: vec!["description".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = process_file(&path, content, false, None, &config).await;
+        assert!(result.is_err(), "Strict mode should propagate as Err");
+    }
+
+    /// Helper for debug output in test assertions.
+    fn outcome_name(outcome: &FileOutcome) -> &'static str {
+        match outcome {
+            FileOutcome::Skipped => "Skipped",
+            FileOutcome::Invalid => "Invalid",
+            FileOutcome::Empty => "Empty",
+            FileOutcome::Ready(_) => "Ready",
+        }
     }
 
     #[test]
