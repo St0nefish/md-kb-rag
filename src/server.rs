@@ -50,10 +50,13 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
             status: "ok".into(),
             error: None,
         },
-        Err(e) => ComponentHealth {
-            status: "error".into(),
-            error: Some(e.to_string()),
-        },
+        Err(e) => {
+            warn!("qdrant health check failed: {e:#}");
+            ComponentHealth {
+                status: "unavailable".into(),
+                error: None,
+            }
+        }
     };
 
     let embeddings = match &embed_result {
@@ -61,10 +64,13 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
             status: "ok".into(),
             error: None,
         },
-        Err(e) => ComponentHealth {
-            status: "error".into(),
-            error: Some(e.to_string()),
-        },
+        Err(e) => {
+            warn!("embeddings health check failed: {e:#}");
+            ComponentHealth {
+                status: "unavailable".into(),
+                error: None,
+            }
+        }
     };
 
     let all_ok = qdrant_result.is_ok() && embed_result.is_ok();
