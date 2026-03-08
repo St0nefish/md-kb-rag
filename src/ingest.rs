@@ -317,10 +317,24 @@ async fn upsert_pending(
         );
     }
 
+    // Phase A: batch-delete old points for changed files
+    let paths_to_delete: Vec<&str> = pending
+        .iter()
+        .filter(|pf| pf.was_indexed)
+        .map(|pf| pf.file_path.as_str())
+        .collect();
+
+    store
+        .delete_by_files(collection, &paths_to_delete)
+        .await
+        .context("Failed to batch-delete old points for changed files")?;
+
+    // Phase B: build all points, then batch-upsert
+    let mut all_points: Vec<QdrantPoint> = Vec::new();
+
     for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
         let embeddings = &all_embeddings[*start..*start + *count];
 
-        let mut points: Vec<QdrantPoint> = Vec::with_capacity(*count);
         for (chunk, vector) in pf.chunks.iter().zip(embeddings.iter()) {
             let mut payload: HashMap<String, serde_json::Value> = pf.frontmatter.clone();
             payload.insert(
@@ -344,37 +358,30 @@ async fn upsert_pending(
                 serde_json::Value::Number(chunk.line_end.into()),
             );
 
-            points.push(QdrantPoint {
+            all_points.push(QdrantPoint {
                 id: make_point_id(&pf.file_path, chunk.index),
                 vector: vector.clone(),
                 payload,
             });
         }
+    }
 
-        // Delete old points first (for changed files that were already indexed)
-        if pf.was_indexed {
-            store
-                .delete_by_file(collection, &pf.file_path)
-                .await
-                .with_context(|| format!("Failed to delete old points for '{}'", pf.file_path))?;
-        }
-
-        if let Err(e) = store.upsert_points(collection, points).await {
-            // Upsert failed after old points were already deleted.
-            // Remove the state entry so this file is re-processed on the next run
-            // instead of being silently skipped due to a stale hash match.
-            if pf.was_indexed
-                && let Err(del_err) = state.delete(&pf.file_path).await
-            {
+    if let Err(e) = store.upsert_points(collection, all_points).await {
+        // Upsert failed after old points were already deleted.
+        // Clean up state for all previously-indexed files so they are reprocessed.
+        for pf in pending.iter().filter(|pf| pf.was_indexed) {
+            if let Err(del_err) = state.delete(&pf.file_path).await {
                 error!(
                     "Failed to clean up state DB entry for '{}' after upsert failure: {:#}",
                     pf.file_path, del_err
                 );
             }
-            return Err(e)
-                .with_context(|| format!("Failed to upsert points for '{}'", pf.file_path));
         }
+        return Err(e).context("Failed to batch-upsert points");
+    }
 
+    // Phase C: update state DB per file
+    for (pf, (_start, count)) in pending.iter().zip(file_boundaries.iter()) {
         state
             .upsert(&pf.file_path, &pf.hash, *count as i64)
             .await
@@ -382,6 +389,12 @@ async fn upsert_pending(
 
         info!("Indexed {} chunk(s) from: {}", count, pf.file_path);
     }
+
+    info!(
+        "Upserted {} total points across {} files",
+        all_texts.len(),
+        pending.len()
+    );
 
     Ok(())
 }
@@ -393,12 +406,13 @@ async fn remove_orphans(
     state: &StateDb,
     collection: &str,
 ) -> Result<()> {
-    for file_path in orphaned {
-        store
-            .delete_by_file(collection, file_path)
-            .await
-            .with_context(|| format!("Failed to delete orphaned points for '{}'", file_path))?;
+    let orphan_refs: Vec<&str> = orphaned.iter().map(|s| s.as_str()).collect();
+    store
+        .delete_by_files(collection, &orphan_refs)
+        .await
+        .context("Failed to batch-delete orphaned points")?;
 
+    for file_path in orphaned {
         state
             .delete(file_path)
             .await
