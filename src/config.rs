@@ -219,30 +219,35 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookProvider {
+    #[default]
+    Gitea,
+    Github,
+    Gitlab,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     #[serde(default = "default_webhook_secret_env")]
     pub secret_env: String,
-    #[serde(default = "default_provider")]
-    pub provider: String,
+    #[serde(default)]
+    pub provider: WebhookProvider,
 }
 
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
             secret_env: "WEBHOOK_SECRET".into(),
-            provider: "gitea".into(),
+            provider: WebhookProvider::default(),
         }
     }
 }
 
 fn default_webhook_secret_env() -> String {
     "WEBHOOK_SECRET".into()
-}
-
-fn default_provider() -> String {
-    "gitea".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -518,7 +523,7 @@ mcp:
         assert_eq!(cfg.qdrant.collection, "my-kb");
         assert!(!cfg.validation.enabled);
         assert!(cfg.validation.strict);
-        assert_eq!(cfg.webhook.provider, "github");
+        assert_eq!(cfg.webhook.provider, WebhookProvider::Github);
         assert_eq!(cfg.frontmatter.defaults.get("status").unwrap(), "draft");
     }
 
@@ -806,8 +811,21 @@ source:
         assert_eq!(cfg.qdrant.collection, "knowledge-base");
         assert!(cfg.validation.enabled);
         assert!(!cfg.validation.strict);
-        assert_eq!(cfg.webhook.provider, "gitea");
+        assert_eq!(cfg.webhook.provider, WebhookProvider::Gitea);
         assert_eq!(cfg.mcp.port, 8001);
+    }
+
+    #[test]
+    fn invalid_provider_rejected_at_parse_time() {
+        let yaml = r#"
+webhook:
+  provider: "bitbucket"
+"#;
+        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown provider should be rejected at parse time"
+        );
     }
 
     #[test]
