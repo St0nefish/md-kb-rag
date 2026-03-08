@@ -133,8 +133,9 @@ fn walk_dir(
 // Hashing
 // ---------------------------------------------------------------------------
 
-pub fn compute_hash(path: &Path) -> Result<String> {
-    let content = std::fs::read(path)
+pub async fn compute_hash(path: &Path) -> Result<String> {
+    let content = tokio::fs::read(path)
+        .await
         .with_context(|| format!("Failed to read file for hashing: {}", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(&content);
@@ -242,7 +243,7 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
     for path in &discovered {
         let file_path = path.to_string_lossy().to_string();
 
-        let hash = match compute_hash(path) {
+        let hash = match compute_hash(path).await {
             Ok(h) => h,
             Err(e) => {
                 error!("Failed to hash {}: {:#}", file_path, e);
@@ -323,7 +324,7 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
             }
         } else {
             // Validation disabled — just chunk raw content
-            let raw = match std::fs::read_to_string(path) {
+            let raw = match tokio::fs::read_to_string(path).await {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to read {}: {}", file_path, e);
@@ -492,25 +493,28 @@ mod tests {
         uuid::Uuid::parse_str(&id1).unwrap();
     }
 
-    #[test]
-    fn compute_hash_consistent() {
+    #[tokio::test]
+    async fn compute_hash_consistent() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "hello world").unwrap();
-        let h1 = compute_hash(&path).unwrap();
-        let h2 = compute_hash(&path).unwrap();
+        let h1 = compute_hash(&path).await.unwrap();
+        let h2 = compute_hash(&path).await.unwrap();
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64); // SHA256 hex
     }
 
-    #[test]
-    fn compute_hash_differs_on_content() {
+    #[tokio::test]
+    async fn compute_hash_differs_on_content() {
         let dir = TempDir::new().unwrap();
         let p1 = dir.path().join("a.txt");
         let p2 = dir.path().join("b.txt");
         std::fs::write(&p1, "hello").unwrap();
         std::fs::write(&p2, "world").unwrap();
-        assert_ne!(compute_hash(&p1).unwrap(), compute_hash(&p2).unwrap());
+        assert_ne!(
+            compute_hash(&p1).await.unwrap(),
+            compute_hash(&p2).await.unwrap()
+        );
     }
 
     #[test]
