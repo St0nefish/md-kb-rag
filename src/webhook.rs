@@ -14,7 +14,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, WebhookProvider};
 use crate::ingest;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -29,15 +29,16 @@ pub struct WebhookState {
 }
 
 /// Verify HMAC signature from webhook headers.
-fn verify_signature(secret: &str, body: &[u8], headers: &HeaderMap, provider: &str) -> bool {
+fn verify_signature(
+    secret: &str,
+    body: &[u8],
+    headers: &HeaderMap,
+    provider: &WebhookProvider,
+) -> bool {
     let header_name = match provider {
-        "github" => "x-hub-signature-256",
-        "gitea" => "x-gitea-signature",
-        "gitlab" => "x-gitlab-token",
-        _ => {
-            warn!("Unknown webhook provider: {}", provider);
-            return false;
-        }
+        WebhookProvider::Github => "x-hub-signature-256",
+        WebhookProvider::Gitea => "x-gitea-signature",
+        WebhookProvider::Gitlab => "x-gitlab-token",
     };
 
     let header_value = match headers.get(header_name) {
@@ -52,7 +53,7 @@ fn verify_signature(secret: &str, body: &[u8], headers: &HeaderMap, provider: &s
     };
 
     // GitLab uses a shared token (not HMAC)
-    if provider == "gitlab" {
+    if matches!(provider, WebhookProvider::Gitlab) {
         return header_value.as_bytes().ct_eq(secret.as_bytes()).into();
     }
 
@@ -177,14 +178,24 @@ mod tests {
         let sig = compute_hmac(secret, body);
         let mut headers = HeaderMap::new();
         headers.insert("x-gitea-signature", HeaderValue::from_str(&sig).unwrap());
-        assert!(verify_signature(secret, body, &headers, "gitea"));
+        assert!(verify_signature(
+            secret,
+            body,
+            &headers,
+            &WebhookProvider::Gitea
+        ));
     }
 
     #[test]
     fn gitea_signature_invalid() {
         let mut headers = HeaderMap::new();
         headers.insert("x-gitea-signature", HeaderValue::from_static("bad"));
-        assert!(!verify_signature("secret", b"body", &headers, "gitea"));
+        assert!(!verify_signature(
+            "secret",
+            b"body",
+            &headers,
+            &WebhookProvider::Gitea
+        ));
     }
 
     #[test]
@@ -194,14 +205,24 @@ mod tests {
         let sig = format!("sha256={}", compute_hmac(secret, body));
         let mut headers = HeaderMap::new();
         headers.insert("x-hub-signature-256", HeaderValue::from_str(&sig).unwrap());
-        assert!(verify_signature(secret, body, &headers, "github"));
+        assert!(verify_signature(
+            secret,
+            body,
+            &headers,
+            &WebhookProvider::Github
+        ));
     }
 
     #[test]
     fn gitlab_token_match() {
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-token", HeaderValue::from_static("mytoken"));
-        assert!(verify_signature("mytoken", b"anything", &headers, "gitlab"));
+        assert!(verify_signature(
+            "mytoken",
+            b"anything",
+            &headers,
+            &WebhookProvider::Gitlab
+        ));
     }
 
     #[test]
@@ -212,20 +233,19 @@ mod tests {
             "mytoken",
             b"anything",
             &headers,
-            "gitlab"
+            &WebhookProvider::Gitlab,
         ));
     }
 
     #[test]
     fn missing_header() {
         let headers = HeaderMap::new();
-        assert!(!verify_signature("secret", b"body", &headers, "gitea"));
-    }
-
-    #[test]
-    fn unknown_provider() {
-        let headers = HeaderMap::new();
-        assert!(!verify_signature("secret", b"body", &headers, "bitbucket"));
+        assert!(!verify_signature(
+            "secret",
+            b"body",
+            &headers,
+            &WebhookProvider::Gitea
+        ));
     }
 
     /// Regression: empty secret must not validate any signature (#1)
@@ -239,12 +259,22 @@ mod tests {
         // Even though the HMAC matches an empty key, we should not accept it
         // (The server now refuses to start with an empty secret, but verify_signature
         // itself still computes a valid HMAC — this test documents the behavior)
-        assert!(verify_signature("", body, &headers, "gitea"));
+        assert!(verify_signature(
+            "",
+            body,
+            &headers,
+            &WebhookProvider::Gitea
+        ));
 
         // A forged signature should still fail
         let mut bad_headers = HeaderMap::new();
         bad_headers.insert("x-gitea-signature", HeaderValue::from_static("wrong"));
-        assert!(!verify_signature("", body, &bad_headers, "gitea"));
+        assert!(!verify_signature(
+            "",
+            body,
+            &bad_headers,
+            &WebhookProvider::Gitea
+        ));
     }
 
     /// Regression: GitLab empty token must not match non-empty header (#1)
@@ -252,7 +282,12 @@ mod tests {
     fn gitlab_empty_secret_rejects_nonempty_token() {
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-token", HeaderValue::from_static("attacker-token"));
-        assert!(!verify_signature("", b"body", &headers, "gitlab"));
+        assert!(!verify_signature(
+            "",
+            b"body",
+            &headers,
+            &WebhookProvider::Gitlab
+        ));
     }
 
     #[test]
