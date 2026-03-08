@@ -134,6 +134,7 @@ pub async fn run_server(config: Config) -> Result<()> {
     // MCP service
     let collection = config.qdrant.collection.clone();
     let data_path = std::path::PathBuf::from(config.data_path());
+    let include_patterns = config.indexing.include.clone();
     let embed_for_mcp = Arc::clone(&embed_client);
     let qdrant_for_mcp = Arc::clone(&qdrant);
 
@@ -146,6 +147,7 @@ pub async fn run_server(config: Config) -> Result<()> {
                 Arc::clone(&qdrant_for_mcp),
                 collection.clone(),
                 data_path.clone(),
+                &include_patterns,
             ))
         },
         LocalSessionManager::default().into(),
