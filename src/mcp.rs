@@ -16,9 +16,55 @@ use crate::{
 };
 
 const MAX_SEARCH_LIMIT: u64 = 50;
+const MAX_QUERY_LEN: usize = 4096;
+const MAX_FILTER_STR_LEN: usize = 256;
+const MAX_TAG_COUNT: usize = 20;
+const MAX_TAG_LEN: usize = 256;
 
 fn resolve_limit(requested: Option<u64>) -> u64 {
     requested.unwrap_or(10).min(MAX_SEARCH_LIMIT)
+}
+
+fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
+    if params.query.len() > MAX_QUERY_LEN {
+        return Err(McpError::invalid_params(
+            format!("query exceeds maximum length of {MAX_QUERY_LEN} characters"),
+            None,
+        ));
+    }
+    if let Some(domain) = &params.domain
+        && domain.len() > MAX_FILTER_STR_LEN
+    {
+        return Err(McpError::invalid_params(
+            format!("domain exceeds maximum length of {MAX_FILTER_STR_LEN} characters"),
+            None,
+        ));
+    }
+    if let Some(doc_type) = &params.r#type
+        && doc_type.len() > MAX_FILTER_STR_LEN
+    {
+        return Err(McpError::invalid_params(
+            format!("type exceeds maximum length of {MAX_FILTER_STR_LEN} characters"),
+            None,
+        ));
+    }
+    if let Some(tags) = &params.tags {
+        if tags.len() > MAX_TAG_COUNT {
+            return Err(McpError::invalid_params(
+                format!("tags list exceeds maximum of {MAX_TAG_COUNT} entries"),
+                None,
+            ));
+        }
+        for tag in tags {
+            if tag.len() > MAX_TAG_LEN {
+                return Err(McpError::invalid_params(
+                    format!("tag exceeds maximum length of {MAX_TAG_LEN} characters"),
+                    None,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parameters for the `get_document` tool.
@@ -108,6 +154,8 @@ impl KbSearchServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_search_params(&params)?;
+
         // Embed the query
         let vector = self
             .embed_client
@@ -439,5 +487,78 @@ mod tests {
         let gs = build_include_globset(&patterns);
         assert!(gs.is_match("notes/todo.txt"), "should match *.txt");
         assert!(!gs.is_match("data.json"), "should not match *.json");
+    }
+
+    fn make_params(query: &str) -> SearchParams {
+        SearchParams {
+            query: query.to_string(),
+            domain: None,
+            r#type: None,
+            tags: None,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn valid_params_accepted() {
+        let params = make_params("find documents about authentication");
+        assert!(validate_search_params(&params).is_ok());
+    }
+
+    #[test]
+    fn query_at_limit_is_accepted() {
+        let params = make_params(&"a".repeat(MAX_QUERY_LEN));
+        assert!(validate_search_params(&params).is_ok());
+    }
+
+    #[test]
+    fn query_too_long_is_rejected() {
+        let params = make_params(&"a".repeat(MAX_QUERY_LEN + 1));
+        assert!(validate_search_params(&params).is_err());
+    }
+
+    #[test]
+    fn domain_too_long_is_rejected() {
+        let params = SearchParams {
+            domain: Some("x".repeat(MAX_FILTER_STR_LEN + 1)),
+            ..make_params("query")
+        };
+        assert!(validate_search_params(&params).is_err());
+    }
+
+    #[test]
+    fn type_too_long_is_rejected() {
+        let params = SearchParams {
+            r#type: Some("x".repeat(MAX_FILTER_STR_LEN + 1)),
+            ..make_params("query")
+        };
+        assert!(validate_search_params(&params).is_err());
+    }
+
+    #[test]
+    fn too_many_tags_rejected() {
+        let params = SearchParams {
+            tags: Some(vec!["tag".to_string(); MAX_TAG_COUNT + 1]),
+            ..make_params("query")
+        };
+        assert!(validate_search_params(&params).is_err());
+    }
+
+    #[test]
+    fn tag_too_long_is_rejected() {
+        let params = SearchParams {
+            tags: Some(vec!["x".repeat(MAX_TAG_LEN + 1)]),
+            ..make_params("query")
+        };
+        assert!(validate_search_params(&params).is_err());
+    }
+
+    #[test]
+    fn max_tags_at_limit_accepted() {
+        let params = SearchParams {
+            tags: Some(vec!["tag".to_string(); MAX_TAG_COUNT]),
+            ..make_params("query")
+        };
+        assert!(validate_search_params(&params).is_ok());
     }
 }
