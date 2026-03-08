@@ -9,6 +9,10 @@ use std::time::Duration;
 
 use crate::config::ResolvedEmbeddingConfig;
 
+pub trait EmbedStore: Send + Sync {
+    async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+}
+
 pub struct EmbedClient {
     client: Client<OpenAIConfig>,
     model: String,
@@ -63,7 +67,15 @@ impl EmbedClient {
 
         Ok(all_embeddings)
     }
+}
 
+impl EmbedStore for EmbedClient {
+    async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        EmbedClient::embed_texts(self, texts).await
+    }
+}
+
+impl EmbedClient {
     pub async fn health_check(&self) -> Result<()> {
         let url = format!("{}/models", self.client.config().api_base());
         reqwest::get(&url)
