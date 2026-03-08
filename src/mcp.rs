@@ -324,9 +324,16 @@ impl KbSearchServer {
             self.data_path.join(&requested)
         };
 
-        let canonical_resolved = resolved
-            .canonicalize()
-            .map_err(|_| McpError::invalid_params("File not found".to_string(), None))?;
+        let canonical_resolved = resolved.canonicalize().map_err(|e| {
+            let msg = match e.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", resolved.display()),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", resolved.display())
+                }
+                _ => format!("Cannot access file '{}': {}", resolved.display(), e),
+            };
+            McpError::invalid_params(msg, None)
+        })?;
 
         // Prevent path traversal outside data directory
         if !canonical_resolved.starts_with(&canonical_data) {
@@ -560,5 +567,43 @@ mod tests {
             ..make_params("query")
         };
         assert!(validate_search_params(&params).is_ok());
+    }
+
+    #[test]
+    fn canonicalize_nonexistent_file_produces_not_found_message() {
+        let bad_path = std::path::PathBuf::from("/tmp/nonexistent-kb-test-dir/missing.md");
+        let err = bad_path
+            .canonicalize()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", bad_path.display()),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", bad_path.display())
+                }
+                _ => format!("Cannot access file '{}': {}", bad_path.display(), e),
+            })
+            .unwrap_err();
+        assert!(
+            err.contains("File not found"),
+            "expected 'File not found', got: {err}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_error_message_includes_path() {
+        let bad_path = std::path::PathBuf::from("/tmp/nonexistent-kb-test-dir/missing.md");
+        let err = bad_path
+            .canonicalize()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", bad_path.display()),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", bad_path.display())
+                }
+                _ => format!("Cannot access file '{}': {}", bad_path.display(), e),
+            })
+            .unwrap_err();
+        assert!(
+            err.contains(&bad_path.display().to_string()),
+            "error message should include the file path, got: {err}"
+        );
     }
 }
