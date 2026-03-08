@@ -874,6 +874,12 @@ mod tests {
         fn ok(vecs: Vec<Vec<f32>>) -> Self {
             Self { result: Ok(vecs) }
         }
+
+        fn err(msg: &str) -> Self {
+            Self {
+                result: Err(anyhow::anyhow!("{}", msg)),
+            }
+        }
     }
 
     impl EmbedStore for MockEmbedClient {
@@ -1031,6 +1037,51 @@ mod tests {
             entry.is_none(),
             "State DB entry should be deleted after upsert failure for was_indexed file"
         );
+    }
+
+    #[tokio::test]
+    async fn embed_error_propagates_without_upsert() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        let pending = vec![make_pending("/data/test.md", 2, false)];
+        let embedder = MockEmbedClient::err("embedding service unavailable");
+        let store = MockVectorStore::all_ok();
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+
+        assert!(result.is_err());
+        assert!(
+            !*store.upsert_called.lock().unwrap(),
+            "upsert_points should not be called when embedding fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_pending_happy_path() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        let pending = vec![make_pending("/data/test.md", 2, false)];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
+        let store = MockVectorStore::all_ok();
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+
+        assert!(result.is_ok());
+        assert!(
+            *store.upsert_called.lock().unwrap(),
+            "upsert_points should be called"
+        );
+        // State DB should have the entry
+        let entry = state.get("/data/test.md").await.unwrap();
+        assert!(
+            entry.is_some(),
+            "State DB should have entry after successful upsert"
+        );
+        let entry = entry.unwrap();
+        assert_eq!(entry.chunk_count, 2);
+        assert_eq!(entry.content_hash, "abc123");
     }
 
     #[test]
