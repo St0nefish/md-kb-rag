@@ -1,4 +1,6 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -13,6 +15,9 @@ use rmcp::transport::streamable_http_server::{
 };
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -190,6 +195,26 @@ pub async fn run_server(config: Config) -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty());
 
+    // Rate limiting (per-IP via SmartIpKeyExtractor for proxy-aware extraction)
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(config.rate_limit.per_second)
+            .burst_size(config.rate_limit.burst_size)
+            .key_extractor(SmartIpKeyExtractor)
+            .use_headers()
+            .finish()
+            .unwrap(),
+    );
+
+    let governor_limiter = governor_conf.limiter().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            governor_limiter.retain_recent();
+        }
+    });
+
     // Build router
     let mcp_router = Router::new().nest_service("/mcp", mcp_service).route_layer(
         middleware::from_fn_with_state(auth_state.clone(), bearer_auth),
@@ -205,7 +230,8 @@ pub async fn run_server(config: Config) -> Result<()> {
             "/health",
             axum::routing::get(health_handler).with_state(health_state),
         )
-        .merge(mcp_router);
+        .merge(mcp_router)
+        .layer(GovernorLayer::new(Arc::clone(&governor_conf)));
 
     if let Some(secret) = webhook_secret {
         let webhook_state = WebhookState {
@@ -237,20 +263,22 @@ pub async fn run_server(config: Config) -> Result<()> {
         .await
         .context("Failed to bind server address")?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to register SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = sigterm.recv() => {},
-            }
-            info!("Shutting down server");
-            ct.cancel();
-        })
-        .await
-        .context("Server error")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+        info!("Shutting down server");
+        ct.cancel();
+    })
+    .await
+    .context("Server error")?;
 
     Ok(())
 }
@@ -320,5 +348,87 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn rate_limited_app(burst_size: u32) -> Router {
+        let governor_conf = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_second(1)
+                .burst_size(burst_size)
+                .key_extractor(SmartIpKeyExtractor)
+                .finish()
+                .unwrap(),
+        );
+        Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .layer(GovernorLayer::new(governor_conf))
+    }
+
+    #[tokio::test]
+    async fn rate_limit_allows_burst() {
+        let app = rate_limited_app(3);
+        for _ in 0..3 {
+            let req = Request::builder()
+                .uri("/test")
+                .header("x-forwarded-for", "1.2.3.4")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rejects_over_burst() {
+        let app = rate_limited_app(2);
+        // Exhaust the burst
+        for _ in 0..2 {
+            let req = Request::builder()
+                .uri("/test")
+                .header("x-forwarded-for", "5.6.7.8")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // Next request should be rate limited (429)
+        let req = Request::builder()
+            .uri("/test")
+            .header("x-forwarded-for", "5.6.7.8")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_is_per_ip() {
+        let app = rate_limited_app(1);
+        // First IP uses its burst
+        let req = Request::builder()
+            .uri("/test")
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // First IP is now limited
+        let req = Request::builder()
+            .uri("/test")
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Second IP still has its own burst
+        let req = Request::builder()
+            .uri("/test")
+            .header("x-forwarded-for", "10.0.0.2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

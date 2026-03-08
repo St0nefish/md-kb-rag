@@ -58,6 +58,9 @@ reqwest = { version = "0.12", features = ["json"] }
 # Retry with exponential backoff
 backoff = { version = "0.4", features = ["tokio"] }
 
+# Rate limiting
+tower_governor = "0.8"
+
 # Misc
 anyhow = "1"
 thiserror = "2"

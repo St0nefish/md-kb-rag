@@ -216,3 +216,23 @@ mcp:
   # env var is unset or empty. Set to true only in trusted environments where
   # authentication is handled by an upstream proxy or is genuinely not needed.
   allow_unauthenticated: false
+
+
+# ----------------------------------------------------------------------------
+# rate_limit — per-IP rate limiting for all HTTP endpoints
+# ----------------------------------------------------------------------------
+# Uses the Governor algorithm (token bucket) with per-IP tracking. Behind a
+# reverse proxy, the real client IP is extracted from X-Forwarded-For,
+# X-Real-IP, or Forwarded headers (falling back to peer IP).
+#
+# Responses include standard rate limit headers:
+#   x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-after, retry-after
+rate_limit:
+
+  # Token replenishment rate: one token is added every 1/per_second seconds.
+  per_second: 2
+
+  # Maximum burst size: how many requests can be made before rate limiting
+  # kicks in. After the burst is exhausted, requests are limited to the
+  # per_second rate.
+  burst_size: 10
