@@ -25,6 +25,8 @@ pub struct Config {
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -262,6 +264,32 @@ impl Default for McpConfig {
             allow_unauthenticated: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_rate_limit_per_second")]
+    pub per_second: u64,
+    #[serde(default = "default_rate_limit_burst_size")]
+    pub burst_size: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            per_second: default_rate_limit_per_second(),
+            burst_size: default_rate_limit_burst_size(),
+        }
+    }
+}
+
+fn default_rate_limit_per_second() -> u64 {
+    2
+}
+
+fn default_rate_limit_burst_size() -> u32 {
+    10
 }
 
 fn default_mcp_port() -> u16 {
@@ -524,6 +552,8 @@ mcp:
         assert_eq!(cfg.qdrant.collection, "knowledge-base");
         assert!(cfg.validation.enabled);
         assert_eq!(cfg.mcp.port, 8001);
+        assert_eq!(cfg.rate_limit.per_second, 2);
+        assert_eq!(cfg.rate_limit.burst_size, 10);
     }
 
     #[test]
