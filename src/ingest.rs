@@ -133,14 +133,19 @@ fn walk_dir(
 // Hashing
 // ---------------------------------------------------------------------------
 
+pub fn compute_hash_from_bytes(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    let digest = hasher.finalize();
+    hex::encode(digest)
+}
+
+#[cfg(test)]
 pub async fn compute_hash(path: &Path) -> Result<String> {
     let content = tokio::fs::read(path)
         .await
         .with_context(|| format!("Failed to read file for hashing: {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let digest = hasher.finalize();
-    Ok(hex::encode(digest))
+    Ok(compute_hash_from_bytes(&content))
 }
 
 // ---------------------------------------------------------------------------
@@ -243,13 +248,16 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
     for path in &discovered {
         let file_path = path.to_string_lossy().to_string();
 
-        let hash = match compute_hash(path).await {
-            Ok(h) => h,
+        // Read file once — used for hashing, validation, and chunking (fix TOCTOU #51)
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(s) => s,
             Err(e) => {
-                error!("Failed to hash {}: {:#}", file_path, e);
+                error!("Failed to read {}: {:#}", file_path, e);
                 continue;
             }
         };
+
+        let hash = compute_hash_from_bytes(content.as_bytes());
 
         // Skip unchanged files in incremental mode
         let state_entry = indexed_map.get(&file_path).cloned();
@@ -267,7 +275,14 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
 
         // Validate
         if config.validation.enabled {
-            match validate::validate_file(path, &config.frontmatter, &config.validation).await {
+            match validate::validate_content(
+                path,
+                &content,
+                &config.frontmatter,
+                &config.validation,
+            )
+            .await
+            {
                 Ok((_result, Some(validated))) => {
                     let description = validated
                         .frontmatter
@@ -323,16 +338,8 @@ pub async fn run_index(config: &Config, full: bool) -> Result<()> {
                 }
             }
         } else {
-            // Validation disabled — just chunk raw content
-            let raw = match tokio::fs::read_to_string(path).await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to read {}: {}", file_path, e);
-                    continue;
-                }
-            };
-
-            let chunks = chunk::chunk_markdown(&raw, None, &config.chunking);
+            // Validation disabled — chunk the already-read content
+            let chunks = chunk::chunk_markdown(&content, None, &config.chunking);
             if chunks.is_empty() {
                 warn!("No chunks produced for: {}", file_path);
                 continue;
@@ -491,6 +498,33 @@ mod tests {
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
         uuid::Uuid::parse_str(&id1).unwrap();
+    }
+
+    #[test]
+    fn compute_hash_from_bytes_consistent() {
+        let h1 = compute_hash_from_bytes(b"hello world");
+        let h2 = compute_hash_from_bytes(b"hello world");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // SHA256 hex
+    }
+
+    #[test]
+    fn compute_hash_from_bytes_differs_on_content() {
+        assert_ne!(
+            compute_hash_from_bytes(b"hello"),
+            compute_hash_from_bytes(b"world")
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_hash_from_bytes_matches_file_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        let content = b"hello world";
+        std::fs::write(&path, content).unwrap();
+        let file_hash = compute_hash(&path).await.unwrap();
+        let bytes_hash = compute_hash_from_bytes(content);
+        assert_eq!(file_hash, bytes_hash);
     }
 
     #[tokio::test]
