@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
-    Distance, FieldCondition, FieldType, Filter, Match, PointStruct, Range, SearchPointsBuilder,
+    Distance, FieldCondition, FieldType, Filter, Match, PointStruct, SearchPointsBuilder,
     UpsertPointsBuilder, Value as QdrantValue, VectorParamsBuilder, value::Kind,
 };
 use tracing::{debug, info};
@@ -103,9 +103,9 @@ fn qdrant_payload_to_json(
 
 /// Build Qdrant filter conditions from a JSON filter map.
 ///
-/// Supports: String (keyword match), Number (integer match or float range),
+/// Supports: String (keyword match), Integer (exact match),
 /// Bool (boolean match), Array of strings (match_any).
-/// Returns an error for null, object, or other unsupported types.
+/// Returns an error for float values, null, object, or other unsupported types.
 fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<Condition>> {
     let mut conditions = Vec::new();
     for (key, value) in filters {
@@ -121,18 +121,13 @@ fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     Condition::matches(key, i)
-                } else if let Some(f) = n.as_f64() {
-                    Condition::from(FieldCondition {
-                        key: key.clone(),
-                        range: Some(Range {
-                            gte: Some(f),
-                            lte: Some(f),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    })
                 } else {
-                    anyhow::bail!("Unsupported numeric filter value for key '{}'", key);
+                    anyhow::bail!(
+                        "Float filter values are not supported for key '{}': \
+                         exact float equality is unreliable due to floating-point precision. \
+                         Use an integer filter instead.",
+                        key
+                    );
                 }
             }
             serde_json::Value::Bool(b) => Condition::from(FieldCondition {
@@ -475,11 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn filter_float_creates_range() {
+    fn filter_float_returns_error() {
         let mut filters = HashMap::new();
         filters.insert("score".to_string(), serde_json::json!(3.14f64));
-        let conditions = build_conditions(&filters).unwrap();
-        assert_eq!(conditions.len(), 1);
+        let err = build_conditions(&filters).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Float filter values are not supported")
+        );
     }
 
     #[test]
