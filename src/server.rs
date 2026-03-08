@@ -20,7 +20,7 @@ use tower_governor::{
 };
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::ResolvedConfig;
 use crate::embed::EmbedClient;
 use crate::mcp::KbSearchServer;
 use crate::qdrant::QdrantStore;
@@ -125,7 +125,7 @@ async fn bearer_auth(
     }
 }
 
-pub async fn run_server(config: Config) -> Result<()> {
+pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let config = Arc::new(config);
 
     // Set up shared services

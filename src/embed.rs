@@ -7,7 +7,7 @@ use async_openai::{
 use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
 use std::time::Duration;
 
-use crate::config::EmbeddingConfig;
+use crate::config::ResolvedEmbeddingConfig;
 
 pub struct EmbedClient {
     client: Client<OpenAIConfig>,
@@ -16,16 +16,16 @@ pub struct EmbedClient {
 }
 
 impl EmbedClient {
-    pub fn new(config: &EmbeddingConfig) -> Self {
+    pub fn new(config: &ResolvedEmbeddingConfig) -> Self {
         let openai_config = OpenAIConfig::new()
-            .with_api_base(config.base_url())
+            .with_api_base(&config.base_url)
             .with_api_key("not-needed");
 
         let client = Client::with_config(openai_config);
 
         Self {
             client,
-            model: config.model().to_string(),
+            model: config.model.clone(),
             batch_size: config.batch_size,
         }
     }

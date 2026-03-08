@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     chunk,
-    config::{Config, IndexingConfig},
+    config::{IndexingConfig, ResolvedConfig},
     embed::EmbedClient,
     qdrant::{QdrantPoint, QdrantStore},
     state::{IndexedFile, StateDb},
@@ -191,7 +191,7 @@ async fn process_file(
     content: &str,
     full: bool,
     state_entry: Option<IndexedFile>,
-    config: &Config,
+    config: &ResolvedConfig,
 ) -> Result<FileOutcome> {
     let file_path = path.to_string_lossy().to_string();
     let hash = compute_hash_from_bytes(content.as_bytes());
@@ -423,7 +423,7 @@ async fn remove_orphans(
     Ok(())
 }
 
-pub async fn run_index(config: &Config, full: bool) -> Result<()> {
+pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
     info!(
         mode = if full { "full" } else { "incremental" },
         "Starting indexing run"
@@ -603,14 +603,30 @@ mod tests {
         );
     }
 
-    /// Helper: build a Config with validation disabled for simpler test setup.
-    fn config_no_validation() -> Config {
-        Config {
+    /// Helper: build a ResolvedConfig with validation disabled for simpler test setup.
+    fn config_no_validation() -> ResolvedConfig {
+        ResolvedConfig {
+            source: Default::default(),
+            indexing: Default::default(),
+            frontmatter: Default::default(),
+            chunking: Default::default(),
+            embedding: crate::config::ResolvedEmbeddingConfig {
+                base_url: "http://test:8080/v1".into(),
+                model: "test-model".into(),
+                vector_size: 768,
+                batch_size: 32,
+            },
+            qdrant: crate::config::ResolvedQdrantConfig {
+                url: "http://test:6334".into(),
+                collection: "knowledge-base".into(),
+            },
             validation: crate::config::ValidationConfig {
                 enabled: false,
                 ..Default::default()
             },
-            ..Default::default()
+            webhook: Default::default(),
+            mcp: Default::default(),
+            rate_limit: Default::default(),
         }
     }
 
@@ -726,12 +742,14 @@ mod tests {
         let content = "---\ntitle: Test\n---\n# Hello\nBody text here.";
         std::fs::write(&path, content).unwrap();
 
-        let config = Config {
-            frontmatter: crate::config::FrontmatterConfig {
+        let config = {
+            let mut c = config_no_validation();
+            c.validation.enabled = true;
+            c.frontmatter = crate::config::FrontmatterConfig {
                 required: vec!["title".into()],
                 ..Default::default()
-            },
-            ..Default::default()
+            };
+            c
         };
 
         let outcome = process_file(&path, content, false, None, &config)
@@ -752,12 +770,14 @@ mod tests {
         let content = "---\ntitle: Test\n---\n# Hello\nBody.";
         std::fs::write(&path, content).unwrap();
 
-        let config = Config {
-            frontmatter: crate::config::FrontmatterConfig {
+        let config = {
+            let mut c = config_no_validation();
+            c.validation.enabled = true;
+            c.frontmatter = crate::config::FrontmatterConfig {
                 required: vec!["description".into()],
                 ..Default::default()
-            },
-            ..Default::default()
+            };
+            c
         };
 
         let outcome = process_file(&path, content, false, None, &config)
@@ -773,17 +793,18 @@ mod tests {
         let content = "---\ntitle: Test\n---\n# Hello\nBody.";
         std::fs::write(&path, content).unwrap();
 
-        let config = Config {
-            validation: crate::config::ValidationConfig {
+        let config = {
+            let mut c = config_no_validation();
+            c.validation = crate::config::ValidationConfig {
                 enabled: true,
                 strict: true,
                 ..Default::default()
-            },
-            frontmatter: crate::config::FrontmatterConfig {
+            };
+            c.frontmatter = crate::config::FrontmatterConfig {
                 required: vec!["description".into()],
                 ..Default::default()
-            },
-            ..Default::default()
+            };
+            c
         };
 
         let result = process_file(&path, content, false, None, &config).await;

@@ -9,7 +9,7 @@ use qdrant_client::qdrant::{
 };
 use tracing::{debug, info};
 
-use crate::config::QdrantConfig;
+use crate::config::ResolvedQdrantConfig;
 
 pub struct QdrantStore {
     client: Qdrant,
@@ -150,11 +150,11 @@ fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<
 }
 
 impl QdrantStore {
-    pub fn new(config: &QdrantConfig) -> Result<Self> {
-        let client = Qdrant::from_url(config.url())
+    pub fn new(config: &ResolvedQdrantConfig) -> Result<Self> {
+        let client = Qdrant::from_url(&config.url)
             .build()
             .context("Failed to connect to Qdrant")?;
-        info!("Connected to Qdrant at {}", config.url());
+        info!("Connected to Qdrant at {}", config.url);
         Ok(Self { client })
     }
 
@@ -387,8 +387,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn qdrant_search_returns_payload() {
-        let config = QdrantConfig {
-            url: Some("http://localhost:6334".into()),
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
             collection: "test-search-payload".into(),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -461,8 +461,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn delete_by_files_removes_matching() {
-        let config = QdrantConfig {
-            url: Some("http://localhost:6334".into()),
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
             collection: "test-delete-by-files".into(),
         };
         let store = QdrantStore::new(&config).unwrap();
@@ -563,8 +563,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn delete_by_files_empty_is_noop() {
-        let config = QdrantConfig {
-            url: Some("http://localhost:6334".into()),
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
             collection: "test-delete-by-files-empty".into(),
         };
         let store = QdrantStore::new(&config).unwrap();

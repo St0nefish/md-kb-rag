@@ -305,8 +305,39 @@ fn default_bearer_token_env() -> String {
     "MCP_BEARER_TOKEN".into()
 }
 
+/// Resolved embedding config — all required fields are guaranteed present.
+#[derive(Debug, Clone)]
+pub struct ResolvedEmbeddingConfig {
+    pub base_url: String,
+    pub model: String,
+    pub vector_size: u64,
+    pub batch_size: usize,
+}
+
+/// Resolved Qdrant config — `url` is guaranteed present.
+#[derive(Debug, Clone)]
+pub struct ResolvedQdrantConfig {
+    pub url: String,
+    pub collection: String,
+}
+
+/// Fully resolved configuration — all required fields validated and present.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    pub source: SourceConfig,
+    pub indexing: IndexingConfig,
+    pub frontmatter: FrontmatterConfig,
+    pub chunking: ChunkingConfig,
+    pub embedding: ResolvedEmbeddingConfig,
+    pub qdrant: ResolvedQdrantConfig,
+    pub validation: ValidationConfig,
+    pub webhook: WebhookConfig,
+    pub mcp: McpConfig,
+    pub rate_limit: RateLimitConfig,
+}
+
 impl Config {
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
+    pub fn load(path: &Path) -> anyhow::Result<ResolvedConfig> {
         let config = if path.exists() {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
@@ -319,7 +350,7 @@ impl Config {
     }
 
     /// Apply env var overrides and validate required fields.
-    fn resolve(mut self) -> anyhow::Result<Self> {
+    fn resolve(mut self) -> anyhow::Result<ResolvedConfig> {
         // Env var overrides
         if let Ok(val) = std::env::var("EMBEDDING_BASE_URL") {
             self.embedding.base_url = Some(val);
@@ -377,9 +408,30 @@ impl Config {
             );
         }
 
-        Ok(self)
+        Ok(ResolvedConfig {
+            source: self.source,
+            indexing: self.indexing,
+            frontmatter: self.frontmatter,
+            chunking: self.chunking,
+            embedding: ResolvedEmbeddingConfig {
+                base_url: self.embedding.base_url.unwrap(),
+                model: self.embedding.model.unwrap(),
+                vector_size: self.embedding.vector_size,
+                batch_size: self.embedding.batch_size,
+            },
+            qdrant: ResolvedQdrantConfig {
+                url: self.qdrant.url.unwrap(),
+                collection: self.qdrant.collection,
+            },
+            validation: self.validation,
+            webhook: self.webhook,
+            mcp: self.mcp,
+            rate_limit: self.rate_limit,
+        })
     }
+}
 
+impl ResolvedConfig {
     /// Resolve the data path (source.data_path, or /data as default)
     pub fn data_path(&self) -> &str {
         self.source.data_path.as_deref().unwrap_or("/data")
@@ -404,31 +456,6 @@ impl Config {
     }
 }
 
-impl EmbeddingConfig {
-    /// Returns the base_url, panics if not resolved.
-    pub fn base_url(&self) -> &str {
-        self.base_url
-            .as_deref()
-            .expect("embedding.base_url must be set (call Config::resolve first)")
-    }
-
-    /// Returns the model, panics if not resolved.
-    pub fn model(&self) -> &str {
-        self.model
-            .as_deref()
-            .expect("embedding.model must be set (call Config::resolve first)")
-    }
-}
-
-impl QdrantConfig {
-    /// Returns the url, panics if not resolved.
-    pub fn url(&self) -> &str {
-        self.url
-            .as_deref()
-            .expect("qdrant.url must be set (call Config::resolve first)")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,7 +466,7 @@ mod tests {
 
     impl Config {
         /// Deserialize + resolve (requires env vars or config values for required fields)
-        fn from_str(yaml: &str) -> anyhow::Result<Self> {
+        fn from_str(yaml: &str) -> anyhow::Result<ResolvedConfig> {
             let config: Config = serde_yaml_ng::from_str(yaml)?;
             config.resolve()
         }
@@ -518,7 +545,7 @@ mcp:
 "#;
         let cfg = Config::from_str_raw(yaml).unwrap();
         assert_eq!(cfg.source.branch, "main");
-        assert_eq!(cfg.data_path(), "/custom/path");
+        assert_eq!(cfg.source.data_path.as_deref(), Some("/custom/path"));
         assert_eq!(cfg.embedding.vector_size, 512);
         assert_eq!(cfg.qdrant.collection, "my-kb");
         assert!(!cfg.validation.enabled);
@@ -529,7 +556,7 @@ mcp:
 
     #[test]
     fn default_data_path() {
-        let cfg = Config::from_str_raw(MINIMAL_CONFIG).unwrap();
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.data_path(), "/data");
     }
 
@@ -577,12 +604,9 @@ mcp:
             .resolve()
             .unwrap();
 
-        assert_eq!(
-            cfg.embedding.base_url.as_deref(),
-            Some("http://env-embed:9090/v1")
-        );
-        assert_eq!(cfg.embedding.model.as_deref(), Some("env-model"));
-        assert_eq!(cfg.qdrant.url.as_deref(), Some("http://env-qdrant:6334"));
+        assert_eq!(cfg.embedding.base_url, "http://env-embed:9090/v1");
+        assert_eq!(cfg.embedding.model, "env-model");
+        assert_eq!(cfg.qdrant.url, "http://env-qdrant:6334");
 
         unsafe {
             std::env::remove_var("EMBEDDING_BASE_URL");
@@ -711,12 +735,9 @@ chunking:
   max_chunk_size: 2000
 "#;
         let cfg = Config::from_str_raw(yaml).unwrap().resolve().unwrap();
-        assert_eq!(
-            cfg.embedding.base_url.as_deref(),
-            Some("http://env:8080/v1")
-        );
-        assert_eq!(cfg.embedding.model.as_deref(), Some("env-model"));
-        assert_eq!(cfg.qdrant.url.as_deref(), Some("http://config-qdrant:6334"));
+        assert_eq!(cfg.embedding.base_url, "http://env:8080/v1");
+        assert_eq!(cfg.embedding.model, "env-model");
+        assert_eq!(cfg.qdrant.url, "http://config-qdrant:6334");
         assert_eq!(cfg.chunking.max_chunk_size, 2000);
         // Other fields should still be defaults
         assert_eq!(cfg.source.branch, "master");
@@ -729,7 +750,7 @@ chunking:
     }
 
     #[test]
-    fn accessor_methods_work_after_resolve() {
+    fn resolved_fields_accessible_after_resolve() {
         let _lock = ENV_MUTEX.lock().unwrap();
 
         unsafe {
@@ -739,16 +760,94 @@ chunking:
         }
 
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
-        assert_eq!(cfg.embedding.base_url(), "http://localhost:8080/v1");
-        assert_eq!(cfg.embedding.model(), "test-model");
-        assert_eq!(cfg.qdrant.url(), "http://localhost:6334");
+        assert_eq!(cfg.embedding.base_url, "http://localhost:8080/v1");
+        assert_eq!(cfg.embedding.model, "test-model");
+        assert_eq!(cfg.qdrant.url, "http://localhost:6334");
     }
 
     #[test]
-    #[should_panic(expected = "embedding.base_url must be set")]
-    fn accessor_panics_without_resolve() {
-        let cfg = Config::from_str_raw("{}").unwrap();
-        let _ = cfg.embedding.base_url();
+    fn resolve_converts_option_fields_to_plain_strings() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+
+        // These are plain String fields on ResolvedConfig, not Option<String>.
+        // If they were still Option<String>, this code would fail to compile.
+        let _base_url: &String = &cfg.embedding.base_url;
+        let _model: &String = &cfg.embedding.model;
+        let _url: &String = &cfg.qdrant.url;
+
+        assert_eq!(_base_url, "http://localhost:8080/v1");
+        assert_eq!(_model, "test-model");
+        assert_eq!(_url, "http://localhost:6334");
+
+        // Non-optional fields are carried through unchanged
+        assert_eq!(cfg.embedding.vector_size, 768);
+        assert_eq!(cfg.embedding.batch_size, 32);
+        assert_eq!(cfg.qdrant.collection, "knowledge-base");
+    }
+
+    #[test]
+    fn resolved_config_usable_without_raw_config() {
+        // Construct ResolvedConfig directly — proves no Option unwrapping needed at use sites.
+        let cfg = ResolvedConfig {
+            source: SourceConfig::default(),
+            indexing: IndexingConfig::default(),
+            frontmatter: FrontmatterConfig::default(),
+            chunking: ChunkingConfig::default(),
+            embedding: ResolvedEmbeddingConfig {
+                base_url: "http://embed:8080/v1".into(),
+                model: "test-model".into(),
+                vector_size: 768,
+                batch_size: 32,
+            },
+            qdrant: ResolvedQdrantConfig {
+                url: "http://qdrant:6334".into(),
+                collection: "test-collection".into(),
+            },
+            validation: ValidationConfig::default(),
+            webhook: WebhookConfig::default(),
+            mcp: McpConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+        };
+
+        // All fields are directly accessible — no unwrap, no panic path.
+        assert_eq!(cfg.embedding.base_url, "http://embed:8080/v1");
+        assert_eq!(cfg.embedding.model, "test-model");
+        assert_eq!(cfg.qdrant.url, "http://qdrant:6334");
+        assert_eq!(cfg.qdrant.collection, "test-collection");
+        assert_eq!(cfg.data_path(), "/data");
+        assert_eq!(cfg.state_db_path(), "/data/state.db");
+    }
+
+    #[test]
+    fn load_returns_resolved_config() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://load-test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "load-model");
+            std::env::set_var("QDRANT_URL", "http://load-qdrant:6334");
+        }
+
+        let cfg = Config::load(Path::new("/nonexistent/config.yaml")).unwrap();
+
+        // Config::load returns ResolvedConfig — fields are plain Strings.
+        assert_eq!(cfg.embedding.base_url, "http://load-test:8080/v1");
+        assert_eq!(cfg.embedding.model, "load-model");
+        assert_eq!(cfg.qdrant.url, "http://load-qdrant:6334");
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
     }
 
     #[test]
@@ -783,17 +882,31 @@ source:
 
     #[test]
     fn state_db_path_derived_from_data_path() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
         let yaml = r#"
 source:
   data_path: "/custom/path"
 "#;
-        let cfg = Config::from_str_raw(yaml).unwrap();
+        let cfg = Config::from_str_raw(yaml).unwrap().resolve().unwrap();
         assert_eq!(cfg.state_db_path(), "/custom/path/state.db");
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
     }
 
     #[test]
     fn state_db_path_uses_default_data_path() {
-        let cfg = Config::from_str_raw("{}").unwrap();
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.state_db_path(), "/data/state.db");
     }
 
@@ -840,9 +953,9 @@ webhook:
         }
 
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
-        assert_eq!(cfg.embedding.base_url(), "http://localhost:8080/v1");
-        assert_eq!(cfg.embedding.model(), "test-model");
-        assert_eq!(cfg.qdrant.url(), "http://localhost:6334");
+        assert_eq!(cfg.embedding.base_url, "http://localhost:8080/v1");
+        assert_eq!(cfg.embedding.model, "test-model");
+        assert_eq!(cfg.qdrant.url, "http://localhost:6334");
         assert_eq!(cfg.embedding.vector_size, 768);
     }
 
@@ -969,8 +1082,16 @@ embedding:
 
     #[test]
     fn effective_indexed_fields_always_includes_file_path() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+
         // When indexed_fields is empty, file_path is injected.
-        let cfg = Config::from_str_raw(MINIMAL_CONFIG).unwrap();
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert!(cfg.frontmatter.indexed_fields.is_empty());
         let fields = cfg.effective_indexed_fields();
         assert!(
@@ -981,6 +1102,14 @@ embedding:
 
     #[test]
     fn effective_indexed_fields_no_duplicate_file_path() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+
         // When indexed_fields already contains file_path, it should not be duplicated.
         let yaml = r#"
 source:
@@ -998,7 +1127,7 @@ embedding:
 qdrant:
   url: "http://localhost:6334"
 "#;
-        let cfg = Config::from_str_raw(yaml).unwrap();
+        let cfg = Config::from_str(yaml).unwrap();
         let fields = cfg.effective_indexed_fields();
         let count = fields.iter().filter(|f| f.as_str() == "file_path").count();
         assert_eq!(count, 1, "file_path should appear exactly once");

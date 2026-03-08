@@ -14,7 +14,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, WebhookProvider};
+use crate::config::{ResolvedConfig, WebhookProvider};
 use crate::ingest;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -24,7 +24,7 @@ static REINDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone)]
 pub struct WebhookState {
-    pub config: Arc<Config>,
+    pub config: Arc<ResolvedConfig>,
     pub secret: String,
 }
 
@@ -335,18 +335,31 @@ mod tests {
         assert!(err.1.contains("No ref"));
     }
 
-    fn minimal_config() -> Arc<Config> {
-        let yaml = r#"
-source:
-  branch: "master"
-  data_path: "/tmp"
-embedding:
-  base_url: "http://localhost:8080/v1"
-  model: "test"
-qdrant:
-  url: "http://localhost:6334"
-"#;
-        Arc::new(serde_yaml_ng::from_str(yaml).unwrap())
+    fn minimal_config() -> Arc<ResolvedConfig> {
+        Arc::new(ResolvedConfig {
+            source: crate::config::SourceConfig {
+                git_url: None,
+                branch: "master".into(),
+                data_path: Some("/tmp".into()),
+            },
+            indexing: Default::default(),
+            frontmatter: Default::default(),
+            chunking: Default::default(),
+            embedding: crate::config::ResolvedEmbeddingConfig {
+                base_url: "http://localhost:8080/v1".into(),
+                model: "test".into(),
+                vector_size: 768,
+                batch_size: 32,
+            },
+            qdrant: crate::config::ResolvedQdrantConfig {
+                url: "http://localhost:6334".into(),
+                collection: "knowledge-base".into(),
+            },
+            validation: Default::default(),
+            webhook: Default::default(),
+            mcp: Default::default(),
+            rate_limit: Default::default(),
+        })
     }
 
     #[tokio::test]
