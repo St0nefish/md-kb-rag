@@ -1,0 +1,83 @@
+name: ARM64 Nightly
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # 3am ET
+  workflow_dispatch: # manual trigger
+
+jobs:
+  arm64:
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if build needed
+        id: check
+        run: |
+          # Get the sha of the current latest amd64 image
+          LATEST_DIGEST=$(docker manifest inspect ${{ steps.image.outputs.name }}:latest-arm64 2>/dev/null | \
+            grep -o '"org.opencontainers.image.revision":"[^"]*"' | cut -d'"' -f4 || echo "none")
+          CURRENT_SHA=$(git rev-parse --short HEAD)
+          if [ "$LATEST_DIGEST" = "$CURRENT_SHA" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No changes since last arm64 build ($CURRENT_SHA)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "New commits detected, building arm64 ($CURRENT_SHA)"
+          fi
+
+      - name: Set up QEMU
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Login to container registry
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Set up builder
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          docker buildx create --name ci-builder --driver docker-container --use 2>/dev/null || docker buildx use ci-builder
+
+      - name: Build and push arm64
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          docker buildx build \
+            --builder ci-builder \
+            --platform linux/arm64 \
+            --push \
+            --cache-from type=registry,ref=${{ steps.image.outputs.name }}:buildcache-arm64 \
+            --cache-to type=registry,ref=${{ steps.image.outputs.name }}:buildcache-arm64,mode=max \
+            --label "org.opencontainers.image.revision=${SHORT_SHA}" \
+            --tag ${{ steps.image.outputs.name }}:latest-arm64 \
+            --file ./Dockerfile \
+            .
+
+      - name: Create multi-arch manifest
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          # Get the amd64 digest from the current :latest manifest
+          AMD64_DIGEST=$(docker buildx imagetools inspect ${{ steps.image.outputs.name }}:latest --raw | \
+            python3 -c "import sys,json; m=json.load(sys.stdin); [print(x['digest']) for x in m.get('manifests', []) if x.get('platform',{}).get('architecture')=='amd64']" 2>/dev/null)
+
+          if [ -n "$AMD64_DIGEST" ]; then
+            # Latest is already a manifest list — extract the amd64 digest
+            AMD64_REF="${{ steps.image.outputs.name }}@${AMD64_DIGEST}"
+          else
+            # Latest is a single-arch image — use it directly
+            AMD64_REF="${{ steps.image.outputs.name }}:latest"
+          fi
+
+          docker buildx imagetools create \
+            --tag ${{ steps.image.outputs.name }}:latest \
+            "$AMD64_REF" \
+            ${{ steps.image.outputs.name }}:latest-arm64
