@@ -670,7 +670,11 @@ mod tests {
     #[test]
     fn default_instructions_constant_is_reasonable() {
         assert!(DEFAULT_INSTRUCTIONS.contains("search"));
-        assert!(DEFAULT_INSTRUCTIONS.to_lowercase().contains("knowledge base"));
+        assert!(
+            DEFAULT_INSTRUCTIONS
+                .to_lowercase()
+                .contains("knowledge base")
+        );
     }
 
     #[test]

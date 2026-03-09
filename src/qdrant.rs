@@ -359,7 +359,10 @@ impl QdrantStore {
         let response = match self.client.facet(builder).await {
             Ok(resp) => resp,
             Err(e) => {
-                debug!("Facet query for field '{}' failed (may be empty collection): {e}", field);
+                debug!(
+                    "Facet query for field '{}' failed (may be empty collection): {e}",
+                    field
+                );
                 return Ok(vec![]);
             }
         };
@@ -767,11 +770,7 @@ mod tests {
         let _ = store.client.delete_collection(&config.collection).await;
 
         store
-            .ensure_collection(
-                &config.collection,
-                4,
-                &["domain".to_string()],
-            )
+            .ensure_collection(&config.collection, 4, &["domain".to_string()])
             .await
             .unwrap();
 

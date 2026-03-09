@@ -936,7 +936,10 @@ mcp:
   metadata_refresh_secs: 60
 "#;
         let cfg = Config::from_str_raw(yaml).unwrap();
-        assert_eq!(cfg.mcp.instructions.as_deref(), Some("My custom KB description."));
+        assert_eq!(
+            cfg.mcp.instructions.as_deref(),
+            Some("My custom KB description.")
+        );
         assert_eq!(cfg.mcp.metadata_refresh_secs, 60);
     }
 
