@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
+
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
     ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
@@ -107,6 +109,8 @@ pub struct KbSearchServer {
     canonical_data_path: PathBuf,
     /// Glob patterns (from `indexing.include`) used to restrict `get_document` to permitted file types.
     include_patterns: Arc<GlobSet>,
+    /// Dynamic MCP server instructions, refreshed periodically with discovered metadata.
+    instructions: Arc<RwLock<String>>,
     tool_router: ToolRouter<KbSearchServer>,
 }
 
@@ -136,6 +140,7 @@ impl KbSearchServer {
         collection: String,
         data_path: PathBuf,
         include_patterns: &[String],
+        instructions: Arc<RwLock<String>>,
     ) -> anyhow::Result<Self> {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
             format!("Failed to canonicalize data path: {}", data_path.display())
@@ -147,6 +152,7 @@ impl KbSearchServer {
             data_path,
             canonical_data_path,
             include_patterns: Arc::new(build_include_globset(include_patterns)),
+            instructions,
             tool_router: Self::tool_router(),
         })
     }
@@ -367,17 +373,18 @@ impl KbSearchServer {
     }
 }
 
+/// Default instructions used when no custom instructions are configured.
+pub const DEFAULT_INSTRUCTIONS: &str = "Knowledge base semantic search server. \
+Use the `search` tool to find relevant documents by natural-language query, \
+with optional filters for domain, type, and tags.";
+
 #[tool_handler]
 impl ServerHandler for KbSearchServer {
     fn get_info(&self) -> ServerInfo {
+        let instructions = self.instructions.blocking_read().clone();
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
-            .with_instructions(
-                "Knowledge base semantic search server. \
-             Use the `search` tool to find relevant documents by natural-language query, \
-             with optional filters for domain, type, and tags."
-                    .to_string(),
-            )
+            .with_instructions(instructions)
     }
 }
 
@@ -583,6 +590,90 @@ mod tests {
         assert!(
             err.contains("File not found"),
             "expected 'File not found', got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_info_returns_dynamic_instructions() {
+        use rmcp::ServerHandler;
+
+        // Create a temp directory to serve as data_path (must exist for canonicalize)
+        let tmp = tempfile::tempdir().unwrap();
+        let custom_text = "Custom KB instructions.\nAvailable domain: infra, networking";
+        let instructions = Arc::new(RwLock::new(custom_text.to_string()));
+
+        let config = crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        };
+        let qdrant = Arc::new(QdrantStore::new(&config).unwrap());
+        let embed_config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            vector_size: 768,
+            batch_size: 32,
+        };
+        let embed = Arc::new(EmbedClient::new(&embed_config));
+
+        let server = KbSearchServer::new(
+            embed,
+            qdrant,
+            "test".into(),
+            tmp.path().to_path_buf(),
+            &["**/*.md".to_string()],
+            instructions,
+        )
+        .unwrap();
+
+        let info = server.get_info();
+        let returned = info.instructions.unwrap();
+        assert_eq!(returned, custom_text);
+    }
+
+    #[test]
+    fn get_info_reflects_updated_instructions() {
+        use rmcp::ServerHandler;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let instructions = Arc::new(RwLock::new("Initial instructions".to_string()));
+
+        let config = crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        };
+        let qdrant = Arc::new(QdrantStore::new(&config).unwrap());
+        let embed_config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            vector_size: 768,
+            batch_size: 32,
+        };
+        let embed = Arc::new(EmbedClient::new(&embed_config));
+
+        let server = KbSearchServer::new(
+            embed,
+            qdrant,
+            "test".into(),
+            tmp.path().to_path_buf(),
+            &["**/*.md".to_string()],
+            Arc::clone(&instructions),
+        )
+        .unwrap();
+
+        // Simulate a refresh
+        *instructions.blocking_write() = "Updated with metadata".to_string();
+
+        let info = server.get_info();
+        assert_eq!(info.instructions.unwrap(), "Updated with metadata");
+    }
+
+    #[test]
+    fn default_instructions_constant_is_reasonable() {
+        assert!(DEFAULT_INSTRUCTIONS.contains("search"));
+        assert!(
+            DEFAULT_INSTRUCTIONS
+                .to_lowercase()
+                .contains("knowledge base")
         );
     }
 

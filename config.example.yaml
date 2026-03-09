@@ -217,6 +217,17 @@ mcp:
   # authentication is handled by an upstream proxy or is genuinely not needed.
   allow_unauthenticated: false
 
+  # Custom narrative for MCP server instructions. Tells agents what this
+  # knowledge base covers. If omitted, a generic description is used.
+  # The server automatically appends discovered filter values (domains, types,
+  # tags, etc.) from the indexed data.
+  # instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring."
+
+  # How often (in seconds) to refresh discovered metadata (filter values)
+  # from Qdrant. Appended to the instructions so agents know what filters
+  # are available. Default: 300 (5 minutes).
+  # metadata_refresh_secs: 300
+
 
 # ----------------------------------------------------------------------------
 # rate_limit — per-IP rate limiting for all HTTP endpoints
