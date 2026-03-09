@@ -116,10 +116,17 @@ fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<
     for (key, value) in filters {
         let condition = match value {
             serde_json::Value::Array(arr) => {
-                let string_values: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
+                let mut string_values: Vec<String> = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v.as_str() {
+                        Some(s) => string_values.push(s.to_string()),
+                        None => anyhow::bail!(
+                            "Array filter for key '{}' contains a non-string element: {}",
+                            key,
+                            v
+                        ),
+                    }
+                }
                 Condition::matches(key, string_values)
             }
             serde_json::Value::String(s) => Condition::matches(key, s.clone()),
@@ -696,5 +703,20 @@ mod tests {
         let filters = HashMap::new();
         let conditions = build_conditions(&filters).unwrap();
         assert!(conditions.is_empty());
+    }
+
+    #[test]
+    fn filter_array_with_non_string_element_returns_error() {
+        let mut filters = HashMap::new();
+        filters.insert(
+            "tags".to_string(),
+            serde_json::json!(["valid", 42, "also-valid"]),
+        );
+        let err = build_conditions(&filters).unwrap_err();
+        assert!(
+            err.to_string().contains("non-string element"),
+            "expected non-string error, got: {}",
+            err
+        );
     }
 }

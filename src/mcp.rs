@@ -8,6 +8,7 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
 };
 
+use anyhow::Context as _;
 use tracing::error;
 
 use crate::{
@@ -103,6 +104,7 @@ pub struct KbSearchServer {
     qdrant: Arc<QdrantStore>,
     collection: String,
     data_path: PathBuf,
+    canonical_data_path: PathBuf,
     /// Glob patterns (from `indexing.include`) used to restrict `get_document` to permitted file types.
     include_patterns: Arc<GlobSet>,
     tool_router: ToolRouter<KbSearchServer>,
@@ -134,15 +136,19 @@ impl KbSearchServer {
         collection: String,
         data_path: PathBuf,
         include_patterns: &[String],
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let canonical_data_path = data_path.canonicalize().with_context(|| {
+            format!("Failed to canonicalize data path: {}", data_path.display())
+        })?;
+        Ok(Self {
             embed_client,
             qdrant,
             collection,
             data_path,
+            canonical_data_path,
             include_patterns: Arc::new(build_include_globset(include_patterns)),
             tool_router: Self::tool_router(),
-        }
+        })
     }
 
     #[tool(
@@ -210,14 +216,19 @@ impl KbSearchServer {
                 .and_then(|v| v.as_str())
                 .unwrap_or("(untitled)");
 
-            let text_snippet = result
-                .payload
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .chars()
-                .take(400)
-                .collect::<String>();
+            let (text_snippet, needs_ellipsis) = {
+                let full_text = result
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let chars: Vec<char> = full_text.chars().take(401).collect();
+                if chars.len() > 400 {
+                    (chars[..400].iter().collect::<String>(), true)
+                } else {
+                    (chars.into_iter().collect::<String>(), false)
+                }
+            };
 
             let file_path = result
                 .payload
@@ -280,17 +291,7 @@ impl KbSearchServer {
             }
 
             if !text_snippet.is_empty() {
-                let ellipsis = if result
-                    .payload
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(|t| t.chars().count() > 400)
-                    .unwrap_or(false)
-                {
-                    "..."
-                } else {
-                    ""
-                };
+                let ellipsis = if needs_ellipsis { "..." } else { "" };
                 output.push_str(&format!("\n{text_snippet}{ellipsis}\n"));
             }
 
@@ -311,11 +312,8 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         let requested = PathBuf::from(&params.path);
 
-        // Canonicalize the data path for safe prefix checking
-        let canonical_data = self.data_path.canonicalize().map_err(|e| {
-            error!("Data path not accessible: {}", e);
-            McpError::internal_error("Data path not accessible".to_string(), None)
-        })?;
+        // Use the pre-canonicalized data path for safe prefix checking
+        let canonical_data = &self.canonical_data_path;
 
         // Resolve the requested path — it may be absolute or relative to data_path
         let resolved = if requested.is_absolute() {
@@ -336,7 +334,7 @@ impl KbSearchServer {
         })?;
 
         // Prevent path traversal outside data directory
-        if !canonical_resolved.starts_with(&canonical_data) {
+        if !canonical_resolved.starts_with(canonical_data) {
             return Err(McpError::invalid_params(
                 "File path is outside the data directory".to_string(),
                 None,
@@ -345,7 +343,7 @@ impl KbSearchServer {
 
         // Restrict to permitted file types (indexing.include patterns)
         let relative = canonical_resolved
-            .strip_prefix(&canonical_data)
+            .strip_prefix(canonical_data)
             .unwrap_or(&canonical_resolved);
         if !self.include_patterns.is_match(relative) {
             return Err(McpError::invalid_params(

@@ -15,6 +15,7 @@ pub trait EmbedStore: Send + Sync {
 
 pub struct EmbedClient {
     client: Client<OpenAIConfig>,
+    http_client: reqwest::Client,
     model: String,
     batch_size: usize,
 }
@@ -29,6 +30,7 @@ impl EmbedClient {
 
         Self {
             client,
+            http_client: reqwest::Client::new(),
             model: config.model.clone(),
             batch_size: config.batch_size,
         }
@@ -38,11 +40,10 @@ impl EmbedClient {
         let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
         for batch in texts.chunks(self.batch_size) {
-            let batch = batch.to_vec();
             let response = backoff::future::retry(embed_backoff(), || async {
                 let request = CreateEmbeddingRequestArgs::default()
                     .model(&self.model)
-                    .input(EmbeddingInput::StringArray(batch.clone()))
+                    .input(EmbeddingInput::StringArray(batch.to_vec()))
                     .build()
                     .map_err(backoff::Error::permanent)?;
 
@@ -77,8 +78,13 @@ impl EmbedStore for EmbedClient {
 
 impl EmbedClient {
     pub async fn health_check(&self) -> Result<()> {
-        let url = format!("{}/models", self.client.config().api_base());
-        reqwest::get(&url)
+        let url = format!(
+            "{}/models",
+            self.client.config().api_base().trim_end_matches('/')
+        );
+        self.http_client
+            .get(&url)
+            .send()
             .await
             .and_then(|r| r.error_for_status())
             .map_err(|e| anyhow::anyhow!("Embeddings service health check failed: {e}"))?;
@@ -195,5 +201,23 @@ mod tests {
 
         assert_eq!(result.unwrap(), "success");
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn api_base_trailing_slash_trimmed() {
+        let config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1/".into(),
+            model: "test-model".into(),
+            vector_size: 768,
+            batch_size: 32,
+        };
+        let client = EmbedClient::new(&config);
+        // The health_check URL should not have a double slash
+        let api_base = client.client.config().api_base().trim_end_matches('/');
+        let url = format!("{}/models", api_base);
+        assert!(
+            !url.contains("//models"),
+            "URL should not have double slash: {url}"
+        );
     }
 }

@@ -149,11 +149,16 @@ pub async fn handle_webhook(
 
     // Trigger incremental reindex (serialized via mutex)
     let config = Arc::clone(&state.config);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let _guard = REINDEX_LOCK.lock().await;
         info!("Webhook triggered incremental reindex");
         if let Err(e) = ingest::run_index(&config, false).await {
             error!("Reindex failed: {:#}", e);
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = task.await {
+            error!("Reindex task panicked: {e}");
         }
     });
 
