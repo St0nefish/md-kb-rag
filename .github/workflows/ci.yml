@@ -61,7 +61,7 @@ jobs:
       - name: Compute version
         id: version
         run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          SHORT_SHA=$(git rev-parse --short HEAD)
           echo "short_sha=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Login to container registry
