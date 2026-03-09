@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  release:
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Compute sha tag from squash merge
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Squash merge commit message contains "(#123)" — extract PR number
+          PR_NUM=$(git log -1 --pretty=%s | grep -oP '\(#\K[0-9]+(?=\))')
+          if [ -n "$PR_NUM" ]; then
+            HEAD_SHA=$(gh pr view "$PR_NUM" --json headRefOid --jq '.headRefOid')
+            TAG="sha-${HEAD_SHA:0:7}"
+          else
+            # Direct push fallback
+            TAG="sha-$(git rev-parse --short HEAD)"
+          fi
+          echo "short_sha=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Using image tag: ${TAG}"
+
+      - name: Login to container registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Tag as latest
+        run: |
+          docker buildx imagetools create \
+            --tag ghcr.io/${{ github.repository }}:latest \
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.short_sha }}
