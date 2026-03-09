@@ -31,12 +31,6 @@ jobs:
             echo "New commits detected, building arm64 ($CURRENT_SHA)"
           fi
 
-      - name: Set up QEMU
-        if: steps.check.outputs.skip != 'true'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - name: Login to container registry
         if: steps.check.outputs.skip != 'true'
         run: |
