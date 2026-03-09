@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+use tokio::task::JoinSet;
 
 use gray_matter::engine::YAML;
 use gray_matter::{Matter, Pod};
@@ -134,22 +135,38 @@ pub async fn validate_all(
     config: &FrontmatterConfig,
     validation: &ValidationConfig,
 ) -> Vec<(ValidationResult, Option<ValidatedFile>)> {
-    let mut results = Vec::new();
-    for file in files {
-        let pair = match validate_file(file, config, validation).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                let result = ValidationResult {
-                    file_path: file.to_string_lossy().to_string(),
-                    valid: false,
-                    errors: vec![format!("Failed to read or parse file: {}", e)],
-                };
-                (result, None)
-            }
-        };
-        results.push(pair);
+    let mut set = JoinSet::new();
+
+    for (i, file) in files.iter().enumerate() {
+        let file = file.clone();
+        let config = config.clone();
+        let validation = validation.clone();
+        set.spawn(async move {
+            let pair = match validate_file(&file, &config, &validation).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let result = ValidationResult {
+                        file_path: file.to_string_lossy().to_string(),
+                        valid: false,
+                        errors: vec![format!("Failed to read or parse file: {}", e)],
+                    };
+                    (result, None)
+                }
+            };
+            (i, pair)
+        });
     }
-    results
+
+    let mut indexed: Vec<(usize, (ValidationResult, Option<ValidatedFile>))> =
+        Vec::with_capacity(files.len());
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(item) => indexed.push(item),
+            Err(e) => tracing::warn!("validation task panicked: {e}"),
+        }
+    }
+    indexed.sort_by_key(|(i, _)| *i);
+    indexed.into_iter().map(|(_, pair)| pair).collect()
 }
 
 #[cfg(test)]
