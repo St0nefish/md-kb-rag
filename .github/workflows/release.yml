@@ -13,6 +13,10 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Compute sha tag from squash merge
         id: version
         env:
@@ -37,5 +41,5 @@ jobs:
       - name: Tag as latest
         run: |
           docker buildx imagetools create \
-            --tag ghcr.io/${{ github.repository }}:latest \
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.short_sha }}
+            --tag ${{ steps.image.outputs.name }}:latest \
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}

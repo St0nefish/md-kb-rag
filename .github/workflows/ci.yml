@@ -18,12 +18,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Rebase onto master
         run: |
           git config user.email "ci@stonefish.tech"
           git config user.name "CI"
           git fetch origin master
           git rebase origin/master
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -68,8 +77,8 @@ jobs:
           docker buildx build \
             --builder ci-builder \
             --push \
-            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}:buildcache \
-            --cache-to type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max \
-            --tag ghcr.io/${{ github.repository }}:${{ steps.version.outputs.short_sha }} \
+            --cache-from type=registry,ref=${{ steps.image.outputs.name }}:buildcache \
+            --cache-to type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max \
+            --tag ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }} \
             --file ./Dockerfile \
             .
