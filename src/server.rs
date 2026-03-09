@@ -32,16 +32,48 @@ struct HealthState {
     embed: Arc<EmbedClient>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverallStatus {
+    Healthy,
+    Degraded,
+}
+
+impl std::fmt::Display for OverallStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::Degraded => write!(f, "degraded"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComponentStatus {
+    Ok,
+    Unavailable,
+}
+
+impl std::fmt::Display for ComponentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => write!(f, "ok"),
+            Self::Unavailable => write!(f, "unavailable"),
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct HealthResponse {
-    pub status: String,
+    pub status: OverallStatus,
     pub qdrant: ComponentHealth,
     pub embeddings: ComponentHealth,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ComponentHealth {
-    pub status: String,
+    pub status: ComponentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -52,13 +84,13 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
 
     let qdrant = match &qdrant_result {
         Ok(()) => ComponentHealth {
-            status: "ok".into(),
+            status: ComponentStatus::Ok,
             error: None,
         },
         Err(e) => {
             warn!("qdrant health check failed: {e:#}");
             ComponentHealth {
-                status: "unavailable".into(),
+                status: ComponentStatus::Unavailable,
                 error: None,
             }
         }
@@ -66,20 +98,24 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
 
     let embeddings = match &embed_result {
         Ok(()) => ComponentHealth {
-            status: "ok".into(),
+            status: ComponentStatus::Ok,
             error: None,
         },
         Err(e) => {
             warn!("embeddings health check failed: {e:#}");
             ComponentHealth {
-                status: "unavailable".into(),
+                status: ComponentStatus::Unavailable,
                 error: None,
             }
         }
     };
 
     let all_ok = qdrant_result.is_ok() && embed_result.is_ok();
-    let status = if all_ok { "healthy" } else { "degraded" };
+    let status = if all_ok {
+        OverallStatus::Healthy
+    } else {
+        OverallStatus::Degraded
+    };
     let code = if all_ok {
         StatusCode::OK
     } else {
@@ -89,7 +125,7 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
     (
         code,
         Json(HealthResponse {
-            status: status.into(),
+            status,
             qdrant,
             embeddings,
         }),
@@ -153,13 +189,14 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
 
     let mcp_service = StreamableHttpService::new(
         move || {
-            Ok(KbSearchServer::new(
+            KbSearchServer::new(
                 Arc::clone(&embed_for_mcp),
                 Arc::clone(&qdrant_for_mcp),
                 collection.clone(),
                 data_path.clone(),
                 &include_patterns,
-            ))
+            )
+            .map_err(std::io::Error::other)
         },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig {
@@ -268,11 +305,19 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
+        let sigterm_result =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match sigterm_result {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            Err(e) => {
+                warn!("Failed to register SIGTERM handler: {e}, falling back to ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
         }
         info!("Shutting down server");
         ct.cancel();

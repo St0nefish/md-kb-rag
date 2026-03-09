@@ -31,9 +31,11 @@ fn split_sections(body: &str) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
     let mut current = String::new();
     let mut section_start: usize = 1;
+    let mut last_line_num: usize = 0;
 
     for (i, line) in body.lines().enumerate() {
         let line_num = i + 1; // 1-based
+        last_line_num = line_num;
         if line.starts_with('#') && !current.trim().is_empty() {
             let line_end = line_num - 1;
             sections.push(Section {
@@ -50,11 +52,10 @@ fn split_sections(body: &str) -> Vec<Section> {
         current.push_str(line);
     }
     if !current.trim().is_empty() {
-        let total_lines = body.lines().count();
         sections.push(Section {
             text: current,
             line_start: section_start,
-            line_end: total_lines,
+            line_end: last_line_num,
         });
     }
     sections

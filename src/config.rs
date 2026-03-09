@@ -208,7 +208,7 @@ pub struct ValidationConfig {
 impl Default for ValidationConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: default_true(),
             strict: false,
             lint_command: None,
         }
@@ -264,8 +264,8 @@ pub struct McpConfig {
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
-            port: 8001,
-            bearer_token_env: "MCP_BEARER_TOKEN".into(),
+            port: default_mcp_port(),
+            bearer_token_env: default_bearer_token_env(),
             allow_unauthenticated: false,
         }
     }

@@ -111,13 +111,13 @@ fn walk_dir(
         let rel_str = rel.to_string_lossy();
 
         // Must match at least one include pattern
-        if !include_set.is_match(rel) && !include_set.is_match(rel_str.as_ref()) {
+        if !include_set.is_match(rel_str.as_ref()) {
             continue;
         }
 
         // Must not match any exclude pattern
         if let Some(excl) = exclude_set
-            && (excl.is_match(rel) || excl.is_match(rel_str.as_ref()))
+            && excl.is_match(rel_str.as_ref())
         {
             debug!("Excluding file: {}", path.display());
             continue;
@@ -335,8 +335,9 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
         let embeddings = &all_embeddings[*start..*start + *count];
 
+        let base_payload = pf.frontmatter.clone();
         for (chunk, vector) in pf.chunks.iter().zip(embeddings.iter()) {
-            let mut payload: HashMap<String, serde_json::Value> = pf.frontmatter.clone();
+            let mut payload: HashMap<String, serde_json::Value> = base_payload.clone();
             payload.insert(
                 "file_path".to_string(),
                 serde_json::Value::String(pf.file_path.clone()),
