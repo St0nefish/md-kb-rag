@@ -14,15 +14,16 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use subtle::ConstantTimeEq;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tower_governor::{
     GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::ResolvedConfig;
 use crate::embed::EmbedClient;
-use crate::mcp::KbSearchServer;
+use crate::mcp::{self, KbSearchServer};
 use crate::qdrant::QdrantStore;
 use crate::webhook::{self, WebhookState};
 
@@ -161,6 +162,31 @@ async fn bearer_auth(
     }
 }
 
+/// Build MCP server instructions by combining config narrative with
+/// dynamically discovered filter values from Qdrant.
+async fn build_instructions(
+    base: &str,
+    qdrant: &QdrantStore,
+    collection: &str,
+    indexed_fields: &[String],
+) -> String {
+    let mut instructions = base.to_string();
+
+    for field in indexed_fields {
+        if field == "file_path" {
+            continue;
+        }
+        match qdrant.fetch_facet_values(collection, field, 50).await {
+            Ok(values) if !values.is_empty() => {
+                instructions.push_str(&format!("\nAvailable {field}: {}", values.join(", ")));
+            }
+            _ => {}
+        }
+    }
+
+    instructions
+}
+
 pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let config = Arc::new(config);
 
@@ -178,14 +204,59 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         .await
         .context("Failed to ensure Qdrant collection")?;
 
+    // Build dynamic MCP instructions
+    let base_instructions = config
+        .mcp
+        .instructions
+        .as_deref()
+        .unwrap_or(mcp::DEFAULT_INSTRUCTIONS);
+    let indexed_fields = config.effective_indexed_fields();
+    let initial_instructions = build_instructions(
+        base_instructions,
+        &qdrant,
+        &config.qdrant.collection,
+        &indexed_fields,
+    )
+    .await;
+    let shared_instructions = Arc::new(RwLock::new(initial_instructions));
+
+    // Spawn metadata refresh task
+    let refresh_instructions = Arc::clone(&shared_instructions);
+    let refresh_qdrant = Arc::clone(&qdrant);
+    let refresh_collection = config.qdrant.collection.clone();
+    let refresh_base = base_instructions.to_string();
+    let refresh_fields = indexed_fields.clone();
+    let refresh_secs = config.mcp.metadata_refresh_secs;
+
+    let ct = CancellationToken::new();
+    let refresh_ct = ct.child_token();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(refresh_secs)) => {}
+                () = refresh_ct.cancelled() => {
+                    break;
+                }
+            }
+            let updated = build_instructions(
+                &refresh_base,
+                &refresh_qdrant,
+                &refresh_collection,
+                &refresh_fields,
+            )
+            .await;
+            *refresh_instructions.write().await = updated;
+            debug!("Refreshed MCP instructions metadata");
+        }
+    });
+
     // MCP service
     let collection = config.qdrant.collection.clone();
     let data_path = std::path::PathBuf::from(config.data_path());
     let include_patterns = config.indexing.include.clone();
     let embed_for_mcp = Arc::clone(&embed_client);
     let qdrant_for_mcp = Arc::clone(&qdrant);
-
-    let ct = CancellationToken::new();
 
     let mcp_service = StreamableHttpService::new(
         move || {
@@ -195,6 +266,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
                 collection.clone(),
                 data_path.clone(),
                 &include_patterns,
+                Arc::clone(&shared_instructions),
             )
             .map_err(std::io::Error::other)
         },

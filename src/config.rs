@@ -259,6 +259,11 @@ pub struct McpConfig {
     pub bearer_token_env: String,
     #[serde(default)]
     pub allow_unauthenticated: bool,
+    /// Custom narrative for MCP server instructions.
+    pub instructions: Option<String>,
+    /// How often (in seconds) to refresh discovered metadata from Qdrant.
+    #[serde(default = "default_metadata_refresh_secs")]
+    pub metadata_refresh_secs: u64,
 }
 
 impl Default for McpConfig {
@@ -267,8 +272,14 @@ impl Default for McpConfig {
             port: default_mcp_port(),
             bearer_token_env: default_bearer_token_env(),
             allow_unauthenticated: false,
+            instructions: None,
+            metadata_refresh_secs: default_metadata_refresh_secs(),
         }
     }
+}
+
+fn default_metadata_refresh_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -908,6 +919,25 @@ source:
     fn state_db_path_uses_default_data_path() {
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.state_db_path(), "/data/state.db");
+    }
+
+    #[test]
+    fn mcp_config_defaults_for_new_fields() {
+        let cfg = Config::from_str_raw("{}").unwrap();
+        assert!(cfg.mcp.instructions.is_none());
+        assert_eq!(cfg.mcp.metadata_refresh_secs, 300);
+    }
+
+    #[test]
+    fn mcp_config_custom_instructions() {
+        let yaml = r#"
+mcp:
+  instructions: "My custom KB description."
+  metadata_refresh_secs: 60
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.mcp.instructions.as_deref(), Some("My custom KB description."));
+        assert_eq!(cfg.mcp.metadata_refresh_secs, 60);
     }
 
     #[test]

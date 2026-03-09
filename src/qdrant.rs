@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
-    Distance, FieldCondition, FieldType, Filter, Match, PointStruct, SearchPointsBuilder,
-    UpsertPointsBuilder, Value as QdrantValue, VectorParamsBuilder, value::Kind,
+    Distance, FacetCountsBuilder, FacetHit, FieldCondition, FieldType, Filter, Match, PointStruct,
+    SearchPointsBuilder, UpsertPointsBuilder, Value as QdrantValue, VectorParamsBuilder,
+    facet_value, value::Kind,
 };
 use tracing::{debug, info};
 
@@ -291,6 +292,18 @@ impl VectorStore for QdrantStore {
     }
 }
 
+/// Extract string values from facet hits, skipping non-string variants.
+fn extract_facet_strings(hits: Vec<FacetHit>) -> Vec<String> {
+    hits.into_iter()
+        .filter_map(|hit| {
+            hit.value.and_then(|v| match v.variant {
+                Some(facet_value::Variant::StringValue(s)) => Some(s),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
 impl QdrantStore {
     pub async fn search(
         &self,
@@ -330,6 +343,27 @@ impl QdrantStore {
             .await
             .context("Qdrant health check failed")?;
         Ok(())
+    }
+
+    /// Fetch distinct values for a keyword-indexed payload field via Qdrant facets.
+    ///
+    /// Returns up to `limit` unique string values. Gracefully returns an empty
+    /// vec on errors (e.g. empty collection, unindexed field).
+    pub async fn fetch_facet_values(
+        &self,
+        collection: &str,
+        field: &str,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        let builder = FacetCountsBuilder::new(collection, field).limit(limit);
+        let response = match self.client.facet(builder).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                debug!("Facet query for field '{}' failed (may be empty collection): {e}", field);
+                return Ok(vec![]);
+            }
+        };
+        Ok(extract_facet_strings(response.hits))
     }
 
     pub async fn collection_info(&self, collection: &str) -> Result<Option<u64>> {
@@ -633,6 +667,163 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
+
+        store
+            .client
+            .delete_collection(&config.collection)
+            .await
+            .unwrap();
+    }
+
+    fn make_string_facet_hit(value: &str, count: u64) -> FacetHit {
+        use qdrant_client::qdrant::FacetValue;
+        FacetHit {
+            value: Some(FacetValue {
+                variant: Some(facet_value::Variant::StringValue(value.to_string())),
+            }),
+            count,
+        }
+    }
+
+    #[test]
+    fn extract_facet_strings_returns_string_values() {
+        let hits = vec![
+            make_string_facet_hit("networking", 5),
+            make_string_facet_hit("docker", 3),
+            make_string_facet_hit("storage", 1),
+        ];
+        let values = extract_facet_strings(hits);
+        assert_eq!(values, vec!["networking", "docker", "storage"]);
+    }
+
+    #[test]
+    fn extract_facet_strings_skips_non_string_variants() {
+        use qdrant_client::qdrant::FacetValue;
+        let hits = vec![
+            make_string_facet_hit("valid", 2),
+            FacetHit {
+                value: Some(FacetValue {
+                    variant: Some(facet_value::Variant::IntegerValue(42)),
+                }),
+                count: 1,
+            },
+            FacetHit {
+                value: Some(FacetValue {
+                    variant: Some(facet_value::Variant::BoolValue(true)),
+                }),
+                count: 1,
+            },
+            make_string_facet_hit("also-valid", 1),
+        ];
+        let values = extract_facet_strings(hits);
+        assert_eq!(values, vec!["valid", "also-valid"]);
+    }
+
+    #[test]
+    fn extract_facet_strings_handles_empty_hits() {
+        let values = extract_facet_strings(vec![]);
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn extract_facet_strings_skips_none_value() {
+        let hits = vec![
+            make_string_facet_hit("present", 3),
+            FacetHit {
+                value: None,
+                count: 1,
+            },
+        ];
+        let values = extract_facet_strings(hits);
+        assert_eq!(values, vec!["present"]);
+    }
+
+    #[test]
+    fn extract_facet_strings_skips_none_variant() {
+        use qdrant_client::qdrant::FacetValue;
+        let hits = vec![
+            make_string_facet_hit("present", 3),
+            FacetHit {
+                value: Some(FacetValue { variant: None }),
+                count: 1,
+            },
+        ];
+        let values = extract_facet_strings(hits);
+        assert_eq!(values, vec!["present"]);
+    }
+
+    /// Integration test: upsert points with keyword fields, then fetch facet values.
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test facet_values_returns_distinct_strings -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn facet_values_returns_distinct_strings() {
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test-facet-values".into(),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        store
+            .ensure_collection(
+                &config.collection,
+                4,
+                &["domain".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let make_point = |id: &str, domain: &str, vec: Vec<f32>| {
+            let mut payload = HashMap::new();
+            payload.insert("domain".into(), serde_json::json!(domain));
+            QdrantPoint {
+                id: id.into(),
+                vector: vec,
+                payload,
+            }
+        };
+
+        let points = vec![
+            make_point(
+                "00000000-0000-0000-0000-000000000001",
+                "networking",
+                vec![1.0, 0.0, 0.0, 0.0],
+            ),
+            make_point(
+                "00000000-0000-0000-0000-000000000002",
+                "docker",
+                vec![0.0, 1.0, 0.0, 0.0],
+            ),
+            make_point(
+                "00000000-0000-0000-0000-000000000003",
+                "networking",
+                vec![0.0, 0.0, 1.0, 0.0],
+            ),
+        ];
+        store
+            .upsert_points(&config.collection, points)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let values = store
+            .fetch_facet_values(&config.collection, "domain", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(values.len(), 2, "should have 2 distinct domains");
+        assert!(values.contains(&"networking".to_string()));
+        assert!(values.contains(&"docker".to_string()));
+
+        // Non-existent field returns empty (graceful degradation)
+        let empty = store
+            .fetch_facet_values(&config.collection, "nonexistent", 10)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
 
         store
             .client
