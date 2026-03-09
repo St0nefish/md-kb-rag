@@ -18,6 +18,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Rebase onto master
         run: |
           git config user.email "ci@stonefish.tech"
@@ -73,8 +77,8 @@ jobs:
           docker buildx build \
             --builder ci-builder \
             --push \
-            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}:buildcache \
-            --cache-to type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max \
-            --tag ghcr.io/${{ github.repository }}:${{ steps.version.outputs.short_sha }} \
+            --cache-from type=registry,ref=${{ steps.image.outputs.name }}:buildcache \
+            --cache-to type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max \
+            --tag ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }} \
             --file ./Dockerfile \
             .
