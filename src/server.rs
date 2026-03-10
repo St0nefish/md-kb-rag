@@ -180,7 +180,10 @@ async fn build_instructions(
             Ok(values) if !values.is_empty() => {
                 instructions.push_str(&format!("\nAvailable {field}: {}", values.join(", ")));
             }
-            _ => {}
+            Ok(_) => {}
+            Err(e) => {
+                warn!(field, collection, "Failed to fetch facet values: {e:#}");
+            }
         }
     }
 
@@ -246,7 +249,13 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
                 &refresh_fields,
             )
             .await;
-            *refresh_instructions.write().unwrap() = updated;
+            match refresh_instructions.write() {
+                Ok(mut guard) => *guard = updated,
+                Err(poisoned) => {
+                    warn!("Instructions RwLock poisoned on write; recovering");
+                    *poisoned.into_inner() = updated;
+                }
+            }
             debug!("Refreshed MCP instructions metadata");
         }
     });
