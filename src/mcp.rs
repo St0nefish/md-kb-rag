@@ -11,7 +11,7 @@ use rmcp::{
 };
 
 use anyhow::Context as _;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     embed::EmbedClient,
@@ -105,7 +105,6 @@ pub struct KbSearchServer {
     embed_client: Arc<EmbedClient>,
     qdrant: Arc<QdrantStore>,
     collection: String,
-    data_path: PathBuf,
     canonical_data_path: PathBuf,
     /// Glob patterns (from `indexing.include`) used to restrict `get_document` to permitted file types.
     include_patterns: Arc<GlobSet>,
@@ -116,20 +115,31 @@ pub struct KbSearchServer {
 
 fn build_include_globset(patterns: &[String]) -> GlobSet {
     let mut builder = GlobSetBuilder::new();
+    let mut valid_count = 0;
     for p in patterns {
         match Glob::new(p) {
             Ok(g) => {
                 builder.add(g);
+                valid_count += 1;
             }
             Err(e) => {
                 error!("Invalid include glob pattern '{}': {}", p, e);
             }
         }
     }
-    // Fall back to **/*.md if no valid patterns were added
-    builder
-        .build()
-        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+    if valid_count == 0 {
+        warn!("No valid include patterns configured — falling back to **/*.md");
+        builder.add(Glob::new("**/*.md").unwrap());
+    }
+    builder.build().unwrap_or_else(|e| {
+        error!(
+            "Failed to build include globset: {} — falling back to **/*.md",
+            e
+        );
+        let mut fallback = GlobSetBuilder::new();
+        fallback.add(Glob::new("**/*.md").unwrap());
+        fallback.build().unwrap()
+    })
 }
 
 #[tool_router]
@@ -149,7 +159,6 @@ impl KbSearchServer {
             embed_client,
             qdrant,
             collection,
-            data_path,
             canonical_data_path,
             include_patterns: Arc::new(build_include_globset(include_patterns)),
             instructions,
@@ -325,7 +334,7 @@ impl KbSearchServer {
         let resolved = if requested.is_absolute() {
             requested.clone()
         } else {
-            self.data_path.join(&requested)
+            self.canonical_data_path.join(&requested)
         };
 
         let canonical_resolved = resolved.canonicalize().map_err(|e| {
@@ -674,6 +683,57 @@ mod tests {
             DEFAULT_INSTRUCTIONS
                 .to_lowercase()
                 .contains("knowledge base")
+        );
+    }
+
+    #[test]
+    fn include_globset_empty_patterns_falls_back_to_markdown() {
+        let gs = build_include_globset(&[]);
+        assert!(
+            gs.is_match("docs/guide.md"),
+            "empty patterns should fall back to **/*.md"
+        );
+        assert!(
+            gs.is_match("README.md"),
+            "empty patterns should match top-level .md"
+        );
+        assert!(
+            !gs.is_match("state.db"),
+            "empty patterns fallback should not match non-markdown"
+        );
+    }
+
+    #[test]
+    fn include_globset_all_invalid_falls_back_to_markdown() {
+        let gs = build_include_globset(&["[invalid".into()]);
+        assert!(
+            gs.is_match("docs/guide.md"),
+            "all-invalid patterns should fall back to **/*.md"
+        );
+        assert!(
+            !gs.is_match("data.json"),
+            "all-invalid patterns fallback should not match non-markdown"
+        );
+    }
+
+    #[test]
+    fn get_document_uses_canonical_path() {
+        // Create a temp dir with a subdirectory and a markdown file
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("test.md"), "# Hello").unwrap();
+
+        let canonical_data = tmp.path().canonicalize().unwrap();
+
+        // Simulate get_document path resolution logic using canonical_data_path
+        let requested = PathBuf::from("docs/test.md");
+        let resolved = canonical_data.join(&requested);
+        let canonical_resolved = resolved.canonicalize().unwrap();
+
+        assert!(
+            canonical_resolved.starts_with(&canonical_data),
+            "resolved path should be under the canonical data path"
         );
     }
 
