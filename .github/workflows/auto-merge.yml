@@ -3,46 +3,24 @@ name: Auto-merge
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  # Close linked issues after bot-merged PRs (GitHub doesn't auto-close
-  # issues when github-actions[bot] performs the merge).
-  pull_request_target:
-    types: [closed]
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
 
 jobs:
   auto-merge:
-    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Enable auto-merge
         run: gh pr merge "$PR_NUMBER" --auto --squash --repo "$REPO"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-
-  close-issues:
-    if: >-
-      github.event.action == 'closed'
-      && github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
-    steps:
-      - name: Close linked issues
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          # Get issue numbers linked via closing keywords in the merge commit
-          ISSUES=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body' \
-            | grep -ioE '(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#[0-9]+' \
-            | grep -oE '[0-9]+')
-          for issue in $ISSUES; do
-            echo "Closing issue #$issue"
-            gh issue close "$issue" --repo "$REPO" --reason completed \
-              --comment "Closed by #$PR_NUMBER."
-          done
