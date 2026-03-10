@@ -58,6 +58,11 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Audit dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
       - name: Compute version
         id: version
         run: |
