@@ -5,8 +5,8 @@ services:
     volumes:
       - ./data/qdrant:/qdrant/storage
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"   # REST API (debugging only)
+      - "127.0.0.1:6334:6334"   # gRPC (used by kb-rag)
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
       interval: 10s
@@ -18,9 +18,9 @@ services:
     image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b8233
     restart: unless-stopped
     volumes:
-      - ${MODEL_PATH}:/models:ro
+      - ${MODEL_PATH:-./data/models}:/models:ro
     command: >
-      --model /models/${MODEL_FILE}
+      --model /models/${MODEL_FILE:-model.gguf}
       --host 0.0.0.0 --port 8080
       --embeddings --flash-attn on -ngl 999
     devices:
@@ -47,7 +47,7 @@ services:
       - EMBEDDING_VECTOR_SIZE=768
       - QDRANT_URL=http://qdrant:6334
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
-      - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN}
+      - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN:-}
       - RUST_LOG=${RUST_LOG:-info}
     ports:
       - "${MCP_PORT:-8001}:8001"

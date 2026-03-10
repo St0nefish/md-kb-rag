@@ -52,11 +52,17 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Audit dependencies
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall cargo-audit --no-confirm
+          cargo audit
+
       - name: Compute version
         id: version
         run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          echo "short_sha=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          FULL_SHA="${{ github.event.pull_request.head.sha }}"
+          echo "short_sha=sha-${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Login to container registry
         run: |
