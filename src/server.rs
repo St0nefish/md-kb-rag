@@ -339,8 +339,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
             "/health",
             axum::routing::get(health_handler).with_state(health_state),
         )
-        .merge(mcp_router)
-        .layer(GovernorLayer::new(Arc::clone(&governor_conf)));
+        .merge(mcp_router);
 
     if let Some(secret) = webhook_secret {
         let webhook_state = WebhookState {
@@ -362,6 +361,8 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
             config.webhook.secret_env
         );
     }
+
+    let app = app.layer(GovernorLayer::new(Arc::clone(&governor_conf)));
 
     let mcp_port = config.mcp.port;
     let bind_addr = format!("0.0.0.0:{}", mcp_port);
@@ -512,6 +513,41 @@ mod tests {
         let req = Request::builder()
             .uri("/test")
             .header("x-forwarded-for", "5.6.7.8")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_covers_all_routes() {
+        let governor_conf = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_second(1)
+                .burst_size(2)
+                .key_extractor(SmartIpKeyExtractor)
+                .finish()
+                .unwrap(),
+        );
+        // Mirror production topology: base route, then merge a second router, then apply rate limit
+        let base = Router::new().route("/base", get(|| async { "ok" }));
+        let extra = Router::new().route("/webhook", get(|| async { "ok" }));
+        let app = base.merge(extra).layer(GovernorLayer::new(governor_conf));
+
+        // Exhaust burst on /base
+        for _ in 0..2 {
+            let req = Request::builder()
+                .uri("/base")
+                .header("x-forwarded-for", "9.9.9.9")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // /webhook must also be rate-limited
+        let req = Request::builder()
+            .uri("/webhook")
+            .header("x-forwarded-for", "9.9.9.9")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
