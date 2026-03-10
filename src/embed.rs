@@ -110,7 +110,20 @@ fn embed_backoff() -> ExponentialBackoff {
 }
 
 fn is_retryable(err: &async_openai::error::OpenAIError) -> bool {
-    matches!(err, async_openai::error::OpenAIError::Reqwest(e) if e.is_connect() || e.is_timeout())
+    use async_openai::error::OpenAIError;
+    match err {
+        OpenAIError::Reqwest(e) => e.is_connect() || e.is_timeout(),
+        OpenAIError::ApiError(api_err) => {
+            let code = api_err.code.as_deref().unwrap_or("");
+            let err_type = api_err.r#type.as_deref().unwrap_or("");
+            let msg = api_err.message.to_lowercase();
+            code == "rate_limit_exceeded"
+                || err_type == "server_error"
+                || msg.contains("service unavailable")
+                || msg.contains("overloaded")
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +214,61 @@ mod tests {
 
         assert_eq!(result.unwrap(), "success");
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn test_is_retryable_rate_limit_code() {
+        let openai_err = OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "Rate limit exceeded".into(),
+            r#type: None,
+            param: None,
+            code: Some("rate_limit_exceeded".into()),
+        });
+        assert!(is_retryable(&openai_err));
+    }
+
+    #[test]
+    fn test_is_retryable_server_error_type() {
+        let openai_err = OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "Internal server error".into(),
+            r#type: Some("server_error".into()),
+            param: None,
+            code: None,
+        });
+        assert!(is_retryable(&openai_err));
+    }
+
+    #[test]
+    fn test_is_retryable_service_unavailable_message() {
+        let openai_err = OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "Service Unavailable".into(),
+            r#type: None,
+            param: None,
+            code: None,
+        });
+        assert!(is_retryable(&openai_err));
+    }
+
+    #[test]
+    fn test_is_retryable_overloaded_message() {
+        let openai_err = OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "The server is overloaded right now".into(),
+            r#type: None,
+            param: None,
+            code: None,
+        });
+        assert!(is_retryable(&openai_err));
+    }
+
+    #[test]
+    fn test_is_retryable_insufficient_quota() {
+        let openai_err = OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "You exceeded your current quota".into(),
+            r#type: Some("insufficient_quota".into()),
+            param: None,
+            code: None,
+        });
+        assert!(!is_retryable(&openai_err));
     }
 
     #[test]

@@ -390,7 +390,14 @@ with optional filters for domain, type, and tags.";
 #[tool_handler]
 impl ServerHandler for KbSearchServer {
     fn get_info(&self) -> ServerInfo {
-        let instructions = self.instructions.read().unwrap().clone();
+        let instructions = self
+            .instructions
+            .read()
+            .unwrap_or_else(|poisoned| {
+                warn!("Instructions RwLock poisoned on read; using last value");
+                poisoned.into_inner()
+            })
+            .clone();
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(instructions)
@@ -674,6 +681,30 @@ mod tests {
 
         let info = server.get_info();
         assert_eq!(info.instructions.unwrap(), "Updated with metadata");
+    }
+
+    #[test]
+    fn test_get_info_recovers_from_poisoned_lock() {
+        use std::panic;
+
+        let lock = Arc::new(RwLock::new("valid instructions".to_string()));
+        let lock_clone = Arc::clone(&lock);
+
+        // Poison the lock by panicking while holding a write guard
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _guard = lock_clone.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        }));
+
+        assert!(lock.read().is_err(), "lock should be poisoned");
+
+        // Verify recovery via unwrap_or_else
+        let recovered = lock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        assert_eq!(recovered, "valid instructions");
     }
 
     #[test]
