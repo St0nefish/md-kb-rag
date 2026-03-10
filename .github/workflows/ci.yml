@@ -61,8 +61,9 @@ jobs:
       - name: Compute version
         id: version
         run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          echo "short_sha=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          # Use PR branch head SHA so release.yml can find this image via headRefOid
+          FULL_SHA="${{ github.event.pull_request.head.sha }}"
+          echo "short_sha=sha-${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Login to container registry
         run: |
