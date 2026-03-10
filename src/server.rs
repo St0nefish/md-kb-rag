@@ -13,8 +13,8 @@ use axum::{
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use std::sync::RwLock;
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tower_governor::{
     GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
@@ -246,7 +246,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
                 &refresh_fields,
             )
             .await;
-            *refresh_instructions.write().await = updated;
+            *refresh_instructions.write().unwrap() = updated;
             debug!("Refreshed MCP instructions metadata");
         }
     });
