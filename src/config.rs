@@ -406,6 +406,15 @@ impl Config {
         if self.chunking.max_chunk_size == 0 {
             anyhow::bail!("chunking.max_chunk_size must be >= 1");
         }
+        if self.rate_limit.per_second == 0 {
+            anyhow::bail!("rate_limit.per_second must be >= 1");
+        }
+        if self.rate_limit.burst_size == 0 {
+            anyhow::bail!("rate_limit.burst_size must be >= 1");
+        }
+        if self.mcp.metadata_refresh_secs < 10 {
+            anyhow::bail!("mcp.metadata_refresh_secs must be >= 10");
+        }
 
         // Validate required fields
         let mut missing = Vec::new();
@@ -1194,5 +1203,92 @@ qdrant:
         let count = fields.iter().filter(|f| f.as_str() == "file_path").count();
         assert_eq!(count, 1, "file_path should appear exactly once");
         assert!(fields.contains(&"domain".to_string()));
+    }
+
+    #[test]
+    fn zero_per_second_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
+        let yaml = r#"
+rate_limit:
+  per_second: 0
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("rate_limit.per_second"),
+            "error should mention rate_limit.per_second: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+    }
+
+    #[test]
+    fn zero_burst_size_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
+        let yaml = r#"
+rate_limit:
+  burst_size: 0
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("rate_limit.burst_size"),
+            "error should mention rate_limit.burst_size: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+    }
+
+    #[test]
+    fn low_metadata_refresh_secs_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
+        let yaml = r#"
+mcp:
+  metadata_refresh_secs: 5
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mcp.metadata_refresh_secs"),
+            "error should mention mcp.metadata_refresh_secs: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
     }
 }
