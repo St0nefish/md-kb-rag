@@ -60,7 +60,7 @@ jobs:
 
       - name: Audit dependencies
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --no-default-features
           cargo audit
 
       - name: Compute version
