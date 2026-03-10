@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
@@ -381,7 +381,7 @@ with optional filters for domain, type, and tags.";
 #[tool_handler]
 impl ServerHandler for KbSearchServer {
     fn get_info(&self) -> ServerInfo {
-        let instructions = self.instructions.blocking_read().clone();
+        let instructions = self.instructions.read().unwrap().clone();
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(instructions)
@@ -661,7 +661,7 @@ mod tests {
         .unwrap();
 
         // Simulate a refresh
-        *instructions.blocking_write() = "Updated with metadata".to_string();
+        *instructions.write().unwrap() = "Updated with metadata".to_string();
 
         let info = server.get_info();
         assert_eq!(info.instructions.unwrap(), "Updated with metadata");
