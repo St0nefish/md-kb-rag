@@ -5,6 +5,9 @@
 # Every field shown below is optional and displays its default value.
 # The config file itself is optional — if missing, all defaults apply.
 #
+# STRICT SCHEMA: Unknown fields cause a startup error. If you copied this
+# file previously and the schema has changed, remove any unrecognized keys.
+#
 # RESOLUTION ORDER (highest wins):
 #   1. Environment variable    (connection settings only — see [env] tags)
 #   2. Config file value

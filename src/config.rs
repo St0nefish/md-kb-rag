@@ -352,7 +352,14 @@ impl Config {
         let config = if path.exists() {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
-            serde_yaml_ng::from_str(&content)?
+            serde_yaml_ng::from_str(&content).with_context(|| {
+                format!(
+                    "Failed to parse config file '{}'. \
+                     If you see 'unknown field', compare your config against \
+                     config.example.yaml — fields may have been added or removed.",
+                    path.display()
+                )
+            })?
         } else {
             warn!("Config file '{}' not found, using defaults", path.display());
             Config::default()
@@ -1131,6 +1138,28 @@ embedding:
             fields.contains(&"file_path".to_string()),
             "effective_indexed_fields must include file_path"
         );
+    }
+
+    #[test]
+    fn unknown_field_gives_helpful_error() {
+        let dir = std::env::temp_dir().join("md-kb-rag-test-unknown-field");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        std::fs::write(&config_path, "chunking:\n  strategy: \"markdown\"\n").unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("config.example.yaml"),
+            "error should mention config.example.yaml: {err}"
+        );
+        assert!(
+            err.contains("unknown field"),
+            "error should mention 'unknown field': {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
