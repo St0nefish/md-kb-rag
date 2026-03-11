@@ -33,7 +33,7 @@ services:
       start_period: 30s
 
   kb-rag:
-    build: .
+    image: ghcr.io/st0nefish/md-kb-rag:latest
     restart: unless-stopped
     # user: "1000:1000"  # recommended: run as non-root
     volumes:
