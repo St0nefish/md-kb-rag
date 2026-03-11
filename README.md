@@ -116,6 +116,76 @@ Common alternatives:
 
 **Note:** Changing `vector_size` requires a full reindex (`index --full`) which drops and recreates the Qdrant collection.
 
+### Context Window Override
+
+nomic-embed-text-v2-moe natively supports 8192-token context windows, but the GGUF file metadata incorrectly reports a 512-token limit. The `docker-compose.yml` command includes `--override-kv nomic-bert-moe.context_length=int:8192` to correct this, along with matching `--ctx-size`, `--batch-size`, and `--ubatch-size` flags. This allows embedding larger markdown chunks in a single pass. If you switch to a different model, adjust or remove these overrides accordingly.
+
+## GPU Backends
+
+The `embeddings` service uses [llama.cpp](https://github.com/ggml-org/llama.cpp) for local GPU-accelerated inference. The `LLAMA_IMAGE_TAG` env var selects the GPU backend (defaults to `server-vulkan`).
+
+| Backend | `LLAMA_IMAGE_TAG` | GPU Support | Device Passthrough |
+|---|---|---|---|
+| Vulkan (default) | `server-vulkan` | AMD, Intel, NVIDIA | `/dev/dri` |
+| ROCm | `server-rocm` | AMD (RX 7000/9000) | `/dev/kfd` + specific render nodes |
+| CUDA | `server-cuda` | NVIDIA | NVIDIA Container Toolkit runtime |
+
+### Vulkan (default)
+
+Works out of the box on most GPUs. No extra configuration needed beyond the default `docker-compose.yml`.
+
+### ROCm (AMD)
+
+For AMD GPUs using ROCm (e.g. RX 7900 XTX, RX 9700 XT), replace the device passthrough and add ROCm-specific settings. Create a `docker-compose.override.yml`:
+
+```yaml
+services:
+  embeddings:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri/cardN:/dev/dri/cardN       # replace N with your GPU card number
+      - /dev/dri/renderDN:/dev/dri/renderDN  # replace N with your GPU render node
+    group_add:
+      - "video"
+      - "render"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=12.0.1  # adjust for your GPU architecture
+      - HIP_VISIBLE_DEVICES=0
+```
+
+Set in `.env`:
+
+```env
+LLAMA_IMAGE_TAG=server-rocm
+```
+
+Find your device nodes with `ls /dev/dri/` and match card/render numbers to your target GPU. The `group_add` GIDs correspond to the `video` and `render` groups — check `getent group video render` for the correct values on your system. `HSA_OVERRIDE_GFX_VERSION` depends on your GPU — e.g. `11.0.0` for RDNA 3 (RX 7000), `12.0.1` for RDNA 4 (RX 9000).
+
+### CUDA (NVIDIA)
+
+For NVIDIA GPUs, use the CUDA image with the NVIDIA Container Toolkit. Create a `docker-compose.override.yml`:
+
+```yaml
+services:
+  embeddings:
+    devices: []  # clear the default /dev/dri
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+```
+
+Set in `.env`:
+
+```env
+LLAMA_IMAGE_TAG=server-cuda
+```
+
 ## MCP Search Tool
 
 The `search` tool accepts:

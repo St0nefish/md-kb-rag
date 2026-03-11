@@ -15,25 +15,35 @@ services:
       start_period: 10s
 
   embeddings:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b8233
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_IMAGE_TAG:-server-vulkan}
     restart: unless-stopped
     volumes:
       - ${MODEL_PATH}:/models:ro
+    # nomic-embed-text-v2-moe supports 8192-token context but the GGUF metadata
+    # incorrectly reports 512. The --override-kv flag corrects this so the full
+    # context window is usable, enabling larger markdown chunks per embedding.
+    # The --ctx-size, --batch-size, and --ubatch-size flags are set to match.
     command: >
       --model /models/${MODEL_FILE}
       --host 0.0.0.0 --port 8080
       --embeddings --flash-attn on -ngl 999
+      --ctx-size 8192
+      --ubatch-size 8192
+      --batch-size 8192
+      --override-kv nomic-bert-moe.context_length=int:8192
+    # GPU passthrough — default is Vulkan (/dev/dri). For ROCm or CUDA
+    # see the "GPU Backends" section in README.md.
     devices:
       - /dev/dri:/dev/dri
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+      interval: 30s
+      timeout: 10s
+      retries: 3
       start_period: 30s
 
   kb-rag:
-    build: .
+    image: ghcr.io/st0nefish/md-kb-rag:latest
     restart: unless-stopped
     # user: "1000:1000"  # recommended: run as non-root
     volumes:
