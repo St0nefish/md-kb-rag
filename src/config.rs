@@ -961,7 +961,7 @@ mcp:
 
     #[test]
     fn example_config_deserializes() {
-        let yaml = include_str!("../config.example.yaml");
+        let yaml = include_str!("../deploy/config.example.yaml");
         let cfg: Config = serde_yaml_ng::from_str(yaml).expect("config.example.yaml should parse");
         // Spot-check a few values to catch drift between example and struct
         assert_eq!(cfg.source.branch, "master");

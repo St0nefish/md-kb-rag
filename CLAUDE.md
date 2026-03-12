@@ -4,7 +4,7 @@ Rust binary with subcommands: `serve`, `index`, `validate`, `status`.
 
 ## Hosting context
 
-This project is hosted on **GitHub** (issues, PRs, CI). The knowledge bases it indexes live on separate Git hosts (typically Gitea). Do not conflate the two — webhook provider config, signature headers, and the `actions/gitea-reindex.yml` workflow all refer to the *indexed knowledge base's* Git host, not this repo's host.
+This project is hosted on **GitHub** (issues, PRs, CI). The knowledge bases it indexes live on separate Git hosts (typically Gitea). Do not conflate the two — webhook provider config, signature headers, and the `deploy/ci-examples/gitea-reindex.yml` workflow all refer to the *indexed knowledge base's* Git host, not this repo's host.
 
 ## Architecture
 

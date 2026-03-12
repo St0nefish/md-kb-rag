@@ -33,7 +33,7 @@ The chunker splits at heading boundaries, so each major section
 becomes part of a chunk.
 ```
 
-A complete sample file is available at [`docs/sample-document.md`](sample-document.md).
+A complete sample file is available at [`docs/sample-document.md`](../docs/sample-document.md).
 
 **Frontmatter fields used by the system:**
 
@@ -130,7 +130,7 @@ Organize your markdown files in a directory. Subdirectories are fine — the ind
 
 ### 2. Create your config (optional)
 
-Skip this step if the default chunking and frontmatter settings work for your knowledge base. Otherwise, start from the [config.example.yaml](../config.example.yaml) and customize:
+Skip this step if the default chunking and frontmatter settings work for your knowledge base. Otherwise, start from the [config.example.yaml](config.example.yaml) and customize:
 
 ```yaml
 # config.yaml — minimal production config
@@ -159,7 +159,7 @@ All other sections (`embedding`, `qdrant`, `mcp`, `webhook`) use defaults that w
 
 ### 3. Set up environment variables
 
-Create a `.env` file (see `.env.example`):
+Create a `.env` file (see [`.env.example`](.env.example)):
 
 ```env
 # Required

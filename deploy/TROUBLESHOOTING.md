@@ -8,7 +8,7 @@ Common issues and fixes for md-kb-rag.
 
 Your `config.yaml` has fields that no longer exist (e.g. `chunking.strategy`, `chunking.chunk_overlap`, `webhook.port`). The schema uses `#[serde(deny_unknown_fields)]`, so any unrecognized key is a hard error.
 
-**Fix:** Compare your config against [config.example.yaml](../config.example.yaml) and remove any fields not present in the example.
+**Fix:** Compare your config against [config.example.yaml](config.example.yaml) and remove any fields not present in the example.
 
 ### `Missing required configuration` (embedding.base_url, embedding.model, qdrant.url)
 
@@ -34,7 +34,7 @@ The server refuses to start without an MCP bearer token (unless `mcp.allow_unaut
 
 Usually means the Docker image doesn't match your hardware. The CPU image (`server`) works everywhere but is slower. GPU images need matching drivers.
 
-**Fix:** Check the [Embedding Backends](../README.md#embedding-backends) section in the README and pick the right image for your hardware.
+**Fix:** Check the compose templates in `deploy/templates/` or the [Embedding Backends](../README.md#embedding-backends) section in the README and pick the right image for your hardware.
 
 ### `model file not found`
 
