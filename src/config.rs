@@ -583,6 +583,7 @@ mcp:
 
     #[test]
     fn default_data_path() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.data_path(), "/data");
     }
@@ -933,6 +934,7 @@ source:
 
     #[test]
     fn state_db_path_uses_default_data_path() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.state_db_path(), "/data/state.db");
     }
