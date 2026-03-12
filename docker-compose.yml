@@ -15,22 +15,61 @@ services:
       start_period: 10s
 
   embeddings:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b8233
+    # CPU image — works everywhere, no GPU drivers needed.
+    # Pin to a build tag (e.g. server-b8233) for reproducibility.
+    image: ghcr.io/ggml-org/llama.cpp:server
     restart: unless-stopped
     volumes:
       - ${MODEL_PATH:-./data/models}:/models:ro
     command: >
       --model /models/${MODEL_FILE:-model.gguf}
       --host 0.0.0.0 --port 8080
-      --embeddings --flash-attn on -ngl 999
-    devices:
-      - /dev/dri:/dev/dri
+      --embeddings
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
+
+    # -------------------------------------------------------------------------
+    # GPU BACKENDS — uncomment ONE block below to replace the CPU default above.
+    # Each block overrides image, command, and adds device access.
+    # Pin tags for reproducibility (e.g. server-cuda12-b8233).
+    # -------------------------------------------------------------------------
+
+    ## --- NVIDIA CUDA ---
+    # image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+    # command: >
+    #   --model /models/${MODEL_FILE:-model.gguf}
+    #   --host 0.0.0.0 --port 8080
+    #   --embeddings -ngl 999
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+    ## --- AMD ROCm ---
+    # image: ghcr.io/ggml-org/llama.cpp:server-rocm
+    # command: >
+    #   --model /models/${MODEL_FILE:-model.gguf}
+    #   --host 0.0.0.0 --port 8080
+    #   --embeddings -ngl 999
+    # devices:
+    #   - /dev/kfd:/dev/kfd
+    #   - /dev/dri:/dev/dri
+
+    ## --- AMD Vulkan ---
+    # image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    # command: >
+    #   --model /models/${MODEL_FILE:-model.gguf}
+    #   --host 0.0.0.0 --port 8080
+    #   --embeddings -ngl 999
+    # devices:
+    #   - /dev/dri:/dev/dri
 
   kb-rag:
     build: .
