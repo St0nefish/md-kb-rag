@@ -40,6 +40,7 @@ services:
       - EMBEDDING_MODEL=nomic-embed-text-v2-moe
       - EMBEDDING_VECTOR_SIZE=768
       - QDRANT_URL=http://qdrant:6334
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
       - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN:-}
       - RUST_LOG=${RUST_LOG:-info}

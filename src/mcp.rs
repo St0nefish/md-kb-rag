@@ -626,6 +626,7 @@ mod tests {
         let embed_config = crate::config::ResolvedEmbeddingConfig {
             base_url: "http://localhost:8080/v1".into(),
             model: "test".into(),
+            api_key: None,
             vector_size: 768,
             batch_size: 32,
         };
@@ -661,6 +662,7 @@ mod tests {
         let embed_config = crate::config::ResolvedEmbeddingConfig {
             base_url: "http://localhost:8080/v1".into(),
             model: "test".into(),
+            api_key: None,
             vector_size: 768,
             batch_size: 32,
         };

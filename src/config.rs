@@ -149,6 +149,7 @@ fn default_target_chunk_size() -> Option<usize> {
 pub struct EmbeddingConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub api_key: Option<String>,
     #[serde(default = "default_vector_size")]
     pub vector_size: u64,
     #[serde(default = "default_batch_size")]
@@ -160,6 +161,7 @@ impl Default for EmbeddingConfig {
         Self {
             base_url: None,
             model: None,
+            api_key: None,
             vector_size: default_vector_size(),
             batch_size: default_batch_size(),
         }
@@ -321,6 +323,7 @@ fn default_bearer_token_env() -> String {
 pub struct ResolvedEmbeddingConfig {
     pub base_url: String,
     pub model: String,
+    pub api_key: Option<String>,
     pub vector_size: u64,
     pub batch_size: usize,
 }
@@ -375,6 +378,9 @@ impl Config {
         }
         if let Ok(val) = std::env::var("EMBEDDING_MODEL") {
             self.embedding.model = Some(val);
+        }
+        if let Ok(val) = std::env::var("EMBEDDING_API_KEY") {
+            self.embedding.api_key = Some(val);
         }
         if let Ok(val) = std::env::var("EMBEDDING_VECTOR_SIZE") {
             self.embedding.vector_size = val
@@ -443,6 +449,7 @@ impl Config {
             embedding: ResolvedEmbeddingConfig {
                 base_url: self.embedding.base_url.unwrap(),
                 model: self.embedding.model.unwrap(),
+                api_key: self.embedding.api_key,
                 vector_size: self.embedding.vector_size,
                 batch_size: self.embedding.batch_size,
             },
@@ -832,6 +839,7 @@ chunking:
             embedding: ResolvedEmbeddingConfig {
                 base_url: "http://embed:8080/v1".into(),
                 model: "test-model".into(),
+                api_key: None,
                 vector_size: 768,
                 batch_size: 32,
             },
@@ -1291,6 +1299,93 @@ mcp:
             std::env::remove_var("EMBEDDING_BASE_URL");
             std::env::remove_var("EMBEDDING_MODEL");
             std::env::remove_var("QDRANT_URL");
+        }
+    }
+
+    #[test]
+    fn api_key_absent_defaults_to_none() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_API_KEY");
+        }
+
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert!(
+            cfg.embedding.api_key.is_none(),
+            "api_key should be None when absent from config and env"
+        );
+    }
+
+    #[test]
+    fn api_key_from_config_file() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_API_KEY");
+        }
+
+        let yaml = r#"
+source:
+  git_url: "https://example.com/repo.git"
+embedding:
+  base_url: "http://localhost:8080/v1"
+  model: "test-model"
+  api_key: "sk-from-config"
+qdrant:
+  url: "http://localhost:6334"
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(cfg.embedding.api_key.as_deref(), Some("sk-from-config"));
+    }
+
+    #[test]
+    fn api_key_env_overrides_config() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_API_KEY", "sk-from-env");
+        }
+
+        let yaml = r#"
+source:
+  git_url: "https://example.com/repo.git"
+embedding:
+  base_url: "http://localhost:8080/v1"
+  model: "test-model"
+  api_key: "sk-from-config"
+qdrant:
+  url: "http://localhost:6334"
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.embedding.api_key.as_deref(),
+            Some("sk-from-env"),
+            "env var should override config file value"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_API_KEY");
+        }
+    }
+
+    #[test]
+    fn api_key_env_alone() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_API_KEY", "sk-env-only");
+        }
+
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(
+            cfg.embedding.api_key.as_deref(),
+            Some("sk-env-only"),
+            "env var should work without config file field"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_API_KEY");
         }
     }
 }

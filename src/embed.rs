@@ -18,13 +18,15 @@ pub struct EmbedClient {
     http_client: reqwest::Client,
     model: String,
     batch_size: usize,
+    api_key: Option<String>,
 }
 
 impl EmbedClient {
     pub fn new(config: &ResolvedEmbeddingConfig) -> Self {
+        let api_key = config.api_key.as_deref().unwrap_or("not-needed");
         let openai_config = OpenAIConfig::new()
             .with_api_base(&config.base_url)
-            .with_api_key("not-needed");
+            .with_api_key(api_key);
 
         let client = Client::with_config(openai_config);
 
@@ -33,6 +35,7 @@ impl EmbedClient {
             http_client: reqwest::Client::new(),
             model: config.model.clone(),
             batch_size: config.batch_size,
+            api_key: config.api_key.clone(),
         }
     }
 
@@ -82,9 +85,11 @@ impl EmbedClient {
             "{}/models",
             self.client.config().api_base().trim_end_matches('/')
         );
-        self.http_client
-            .get(&url)
-            .send()
+        let mut req = self.http_client.get(&url);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        req.send()
             .await
             .and_then(|r| r.error_for_status())
             .map_err(|e| anyhow::anyhow!("Embeddings service health check failed: {e}"))?;
@@ -272,10 +277,37 @@ mod tests {
     }
 
     #[test]
+    fn api_key_set_in_openai_config() {
+        let config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test-model".into(),
+            api_key: Some("sk-test-key-123".into()),
+            vector_size: 768,
+            batch_size: 32,
+        };
+        let client = EmbedClient::new(&config);
+        assert_eq!(client.api_key.as_deref(), Some("sk-test-key-123"));
+    }
+
+    #[test]
+    fn api_key_absent_uses_fallback() {
+        let config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test-model".into(),
+            api_key: None,
+            vector_size: 768,
+            batch_size: 32,
+        };
+        let client = EmbedClient::new(&config);
+        assert!(client.api_key.is_none());
+    }
+
+    #[test]
     fn api_base_trailing_slash_trimmed() {
         let config = crate::config::ResolvedEmbeddingConfig {
             base_url: "http://localhost:8080/v1/".into(),
             model: "test-model".into(),
+            api_key: None,
             vector_size: 768,
             batch_size: 32,
         };

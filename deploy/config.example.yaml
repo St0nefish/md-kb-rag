@@ -132,6 +132,12 @@ embedding:
   # [env] EMBEDDING_MODEL — overrides this value if set.
   model: "nomic-embed-text-v2-moe"        # REQUIRED (or set env var)
 
+  # API key for the embedding provider. Required for OpenAI, hosted Ollama,
+  # or any authenticated embedding service. Omit for local/unauthenticated
+  # servers (e.g. bundled llama.cpp).
+  # [env] EMBEDDING_API_KEY — overrides this value if set.
+  # api_key: null
+
   # Dimensionality of the embedding vectors. Must match the model's output.
   # IMPORTANT: changing this requires a full reindex (drops + recreates the
   # Qdrant collection).

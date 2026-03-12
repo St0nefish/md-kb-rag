@@ -614,6 +614,7 @@ mod tests {
             embedding: crate::config::ResolvedEmbeddingConfig {
                 base_url: "http://test:8080/v1".into(),
                 model: "test-model".into(),
+                api_key: None,
                 vector_size: 768,
                 batch_size: 32,
             },
