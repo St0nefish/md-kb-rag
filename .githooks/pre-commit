@@ -12,3 +12,8 @@ cargo fmt
 git diff --name-only | grep '\.rs$' | xargs -r git add
 
 cargo clippy -- -D warnings
+
+# Validate config.example.yaml parses if it was changed
+if git diff --cached --name-only | grep -q 'config\.example\.yaml$'; then
+  cargo test -q -- config::tests::example_config_deserializes
+fi

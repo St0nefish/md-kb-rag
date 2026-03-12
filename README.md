@@ -4,16 +4,25 @@ A Docker-first RAG server that indexes markdown knowledge bases with YAML frontm
 
 Built as a single Rust binary for type safety, small Docker images, and simple deployment.
 
+## Documentation
+
+- [`docs/USAGE.md`](docs/USAGE.md) — Setup guide, configuration, frontmatter, chunking
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — Common issues and fixes
+- [`config.example.yaml`](config.example.yaml) — Full annotated config reference
+- [`actions/`](actions/) — Sample CI workflows for webhook-triggered reindex
+
 ## Quick Start
 
 ```bash
 # Clone and configure
-git clone https://github.com/you/md-kb-rag.git
+git clone https://github.com/St0nefish/md-kb-rag.git
 cd md-kb-rag
 cp .env.example .env
 # Edit .env: set MCP_BEARER_TOKEN and MODEL_PATH/MODEL_FILE
 
-# Start the stack
+# Download the embedding model (see "Embedding Models" below)
+
+# Start the stack (CPU mode by default)
 docker compose up -d
 
 # Initial full index
@@ -25,24 +34,15 @@ claude mcp add --transport http kb-search \
   --header "Authorization: Bearer $TOKEN"
 ```
 
-No `config.yaml` needed — connection settings are wired through environment variables in `docker-compose.yml`. To customize behavior (chunking, frontmatter rules, etc.), mount a config file:
+No `config.yaml` needed — connection settings are wired through environment variables in `docker-compose.yml`. To customize behavior (chunking, frontmatter rules, etc.), copy the example and mount it:
 
-```yaml
-# docker-compose.yml override
-volumes:
-  - ./config.yaml:/app/config.yaml:ro
+```bash
+cp config.example.yaml config.yaml
+# Edit config.yaml, then uncomment the volume mount in docker-compose.yml:
+#   - ./config.yaml:/app/config.yaml:ro
 ```
 
 See [config.example.yaml](config.example.yaml) for all available options and their defaults.
-
-## Usage Guide
-
-See [docs/USAGE.md](docs/USAGE.md) for detailed setup instructions, including:
-
-- Sample markdown document with frontmatter
-- How the chunking algorithm works
-- Frontmatter validation configuration
-- Step-by-step project setup walkthrough
 
 ## Architecture
 
@@ -92,7 +92,27 @@ See [config.example.yaml](config.example.yaml) for all options:
 
 ## Embedding Models
 
-The default config is tuned for **nomic-embed-text-v2-moe** (768 dimensions, GGUF via llama.cpp). Download the GGUF file and set `MODEL_PATH`/`MODEL_FILE` in `.env`.
+The default config is tuned for **nomic-embed-text-v2-moe** (768 dimensions, GGUF via llama.cpp).
+
+### Download
+
+```bash
+# Download from Hugging Face (requires huggingface-cli: pip install huggingface_hub)
+huggingface-cli download nomic-ai/nomic-embed-text-v2-moe-GGUF \
+  nomic-embed-text-v2-moe-Q8_0.gguf --local-dir ./data/models
+
+# Or download directly from:
+# https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe-GGUF
+```
+
+Then set in `.env`:
+
+```env
+MODEL_PATH=./data/models
+MODEL_FILE=nomic-embed-text-v2-moe-Q8_0.gguf
+```
+
+### Alternative Models
 
 To use a different model, override in `.env`:
 
@@ -104,8 +124,6 @@ MODEL_FILE=bge-large-en-v1.5-q8_0.gguf
 
 Or in `config.yaml` (env vars take priority if both are set).
 
-Common alternatives:
-
 | Model | `vector_size` | Notes |
 |---|---|---|
 | nomic-embed-text-v2-moe (default) | 768 | Recommended. MoE, strong quality/speed. |
@@ -115,6 +133,37 @@ Common alternatives:
 | mxbai-embed-large-v1 | 1024 | Good alternative to bge. |
 
 **Note:** Changing `vector_size` requires a full reindex (`index --full`) which drops and recreates the Qdrant collection.
+
+## Embedding Backends
+
+The `docker-compose.yml` defaults to **CPU mode** which works on any hardware. To use GPU acceleration, uncomment the appropriate block in the compose file.
+
+### CPU (default)
+
+Works everywhere with no special drivers. Good for small knowledge bases or initial testing. The compose file uses `ghcr.io/ggml-org/llama.cpp:server`.
+
+### NVIDIA CUDA
+
+Most common GPU backend. Requires [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed on the host. Uses `server-cuda12` image with `deploy.resources.reservations.devices` for GPU access.
+
+### AMD ROCm
+
+Best performance on AMD GPUs. Requires ROCm userspace drivers on the host. Uses `server-rocm` image with `/dev/kfd` and `/dev/dri` device access.
+
+### AMD Vulkan
+
+Simpler driver setup than ROCm — works with standard Mesa Vulkan drivers. Uses `server-vulkan` image with `/dev/dri` device access. Supports multi-GPU setups.
+
+### Apple Silicon (Metal)
+
+Metal GPU acceleration is **not available in Docker** (Docker on macOS runs a Linux VM). Options:
+
+1. **Run llama-server natively** — `brew install llama.cpp`, then start it with your model and point `EMBEDDING_BASE_URL` at it (`http://host.docker.internal:8080/v1` if kb-rag runs in Docker).
+2. **Use the CPU Docker image** — works but is slower than native Metal.
+
+### External API
+
+Skip the bundled embedding service entirely. Point `EMBEDDING_BASE_URL` at any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, TEI) and remove the `embeddings` service from compose.
 
 ## MCP Search Tool
 
@@ -153,10 +202,21 @@ Point IDs are deterministic UUIDs (v5) derived from `file_path::chunk_index`.
 ## Development
 
 ```bash
-cargo build
+# Set up git hooks (fmt + clippy on commit)
+./scripts/setup-dev.sh
+
+# Start only the dependencies
+docker compose up qdrant embeddings -d
+
+# Run the server locally (requires env vars for connection settings)
+export EMBEDDING_BASE_URL=http://localhost:8080/v1
+export EMBEDDING_MODEL=nomic-embed-text-v2-moe
+export QDRANT_URL=http://localhost:6334
+export MCP_BEARER_TOKEN=dev-token
 cargo run -- serve
-cargo run -- index --full
 ```
+
+Typical workflow: develop locally, push to a feature branch, CI builds and tests, merge via PR. See [docs/USAGE.md](docs/USAGE.md) for full setup walkthrough.
 
 ## License
 

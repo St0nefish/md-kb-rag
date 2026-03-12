@@ -128,9 +128,9 @@ Run `md-kb-rag validate` to check all files without indexing — useful for CI o
 
 Organize your markdown files in a directory. Subdirectories are fine — the indexer walks recursively. Add YAML frontmatter to each file with at least the fields you mark as required.
 
-### 2. Create your config
+### 2. Create your config (optional)
 
-Start from the [config.example.yaml](../config.example.yaml) and customize:
+Skip this step if the default chunking and frontmatter settings work for your knowledge base. Otherwise, start from the [config.example.yaml](../config.example.yaml) and customize:
 
 ```yaml
 # config.yaml — minimal production config
