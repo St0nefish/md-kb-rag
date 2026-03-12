@@ -1,0 +1,56 @@
+# md-kb-rag — Apple Silicon (Metal) deployment
+#
+# Metal GPU acceleration is NOT available inside Docker (macOS Docker runs a
+# Linux VM). Run llama-server natively on the host for Metal performance:
+#
+#   brew install llama.cpp
+#   llama-server \
+#     --model /path/to/nomic-embed-text-v2-moe-Q8_0.gguf \
+#     --host 0.0.0.0 --port 8080 \
+#     --embeddings
+#
+# This compose file runs only qdrant + kb-rag. The kb-rag service connects
+# to your native llama-server via host.docker.internal.
+#
+# Usage: cp compose-apple-silicon.yml docker-compose.yml && docker compose up -d
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.17.0
+    restart: unless-stopped
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  kb-rag:
+    image: ghcr.io/st0nefish/md-kb-rag:latest
+    restart: unless-stopped
+    volumes:
+      - ${KB_PATH:-./data/repo}:/data:rw
+      - ./data/state:/app/data:rw
+      # Optional: mount config.yaml for overrides beyond env vars
+      # - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-http://host.docker.internal:8080/v1}
+      - EMBEDDING_MODEL=nomic-embed-text-v2-moe
+      - EMBEDDING_VECTOR_SIZE=768
+      - QDRANT_URL=http://qdrant:6334
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
+      - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN:-}
+      - RUST_LOG=${RUST_LOG:-info}
+    ports:
+      - "${MCP_PORT:-8001}:8001"
+    healthcheck:
+      test: ["CMD", "md-kb-rag", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      qdrant:
+        condition: service_healthy

@@ -6,10 +6,10 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 
 ## Documentation
 
-- [`docs/USAGE.md`](docs/USAGE.md) — Setup guide, configuration, frontmatter, chunking
-- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — Common issues and fixes
-- [`config.example.yaml`](config.example.yaml) — Full annotated config reference
-- [`actions/`](actions/) — Sample CI workflows for webhook-triggered reindex
+- [`deploy/USAGE.md`](deploy/USAGE.md) — Setup guide, configuration, frontmatter, chunking
+- [`deploy/TROUBLESHOOTING.md`](deploy/TROUBLESHOOTING.md) — Common issues and fixes
+- [`deploy/config.example.yaml`](deploy/config.example.yaml) — Full annotated config reference
+- [`deploy/ci-examples/`](deploy/ci-examples/) — Sample CI workflows for webhook-triggered reindex
 
 ## Quick Start
 
@@ -17,7 +17,7 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 # Clone and configure
 git clone https://github.com/St0nefish/md-kb-rag.git
 cd md-kb-rag
-cp .env.example .env
+cp deploy/.env.example .env
 # Edit .env: set MCP_BEARER_TOKEN and MODEL_PATH/MODEL_FILE
 
 # Download the embedding model (see "Embedding Models" below)
@@ -37,12 +37,12 @@ claude mcp add --transport http kb-search \
 No `config.yaml` needed — connection settings are wired through environment variables in `docker-compose.yml`. To customize behavior (chunking, frontmatter rules, etc.), copy the example and mount it:
 
 ```bash
-cp config.example.yaml config.yaml
+cp deploy/config.example.yaml config.yaml
 # Edit config.yaml, then uncomment the volume mount in docker-compose.yml:
 #   - ./config.yaml:/app/config.yaml:ro
 ```
 
-See [config.example.yaml](config.example.yaml) for all available options and their defaults.
+See [deploy/config.example.yaml](deploy/config.example.yaml) for all available options and their defaults.
 
 ## Architecture
 
@@ -78,7 +78,7 @@ Config is loaded from `config.yaml` (or the path passed via `--config`). Every f
 
 Env vars take priority over config file values. If neither is set for required fields (`embedding.base_url`, `embedding.model`, `qdrant.url`), the server exits with a clear error.
 
-See [config.example.yaml](config.example.yaml) for all options:
+See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 
 - **source** — Git URL or bind-mount path for your knowledge base
 - **indexing** — Include/exclude glob patterns
@@ -136,7 +136,7 @@ Or in `config.yaml` (env vars take priority if both are set).
 
 ## Embedding Backends
 
-The `docker-compose.yml` defaults to **CPU mode** which works on any hardware. To use GPU acceleration, uncomment the appropriate block in the compose file.
+The dev `docker-compose.yml` defaults to **CPU mode** which works on any hardware. For production deployment, pick a hardware-specific template from `deploy/templates/`.
 
 ### CPU (default)
 
@@ -186,7 +186,7 @@ POST to `/hooks/reindex` triggers:
 3. `git pull --ff-only` (if git_url configured)
 4. Incremental reindex
 
-The webhook endpoint is only available if `WEBHOOK_SECRET` is set to a non-empty value. See `actions/` for sample CI workflows.
+The webhook endpoint is only available if `WEBHOOK_SECRET` is set to a non-empty value. See [`deploy/ci-examples/`](deploy/ci-examples/) for sample CI workflows.
 
 ## Incremental Indexing
 
@@ -198,6 +198,19 @@ Files are tracked by SHA256 content hash in a SQLite state database. On each run
 - **Unchanged files** — skip
 
 Point IDs are deterministic UUIDs (v5) derived from `file_path::chunk_index`.
+
+## Deployment
+
+All deployment artifacts live in [`deploy/`](deploy/):
+
+- **Compose templates** — `deploy/templates/` has self-contained compose files for each hardware backend (CPU, NVIDIA, ROCm, Vulkan, Apple Silicon)
+- **Config examples** — `deploy/.env.example` and `deploy/config.example.yaml`
+- **CI examples** — `deploy/ci-examples/` has sample webhook workflows for Gitea and GitHub
+- **Deploy script** — `deploy/deploy.sh` pulls and restarts via Docker context (configure with `deploy/deploy.env`)
+
+**Claude Code users:** Run `/deploy-md-rag` for an interactive guided setup that walks through hardware selection, model download, configuration, and MCP client connection.
+
+**Manual setup:** Copy the matching template from `deploy/templates/` to your target as `docker-compose.yml`, configure `.env` from the example, and follow [`deploy/USAGE.md`](deploy/USAGE.md).
 
 ## Development
 
@@ -216,7 +229,7 @@ export MCP_BEARER_TOKEN=dev-token
 cargo run -- serve
 ```
 
-Typical workflow: develop locally, push to a feature branch, CI builds and tests, merge via PR. See [docs/USAGE.md](docs/USAGE.md) for full setup walkthrough.
+Typical workflow: develop locally, push to a feature branch, CI builds and tests, merge via PR. See [deploy/USAGE.md](deploy/USAGE.md) for full setup walkthrough.
 
 ## License
 

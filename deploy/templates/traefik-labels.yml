@@ -1,0 +1,30 @@
+# Traefik reverse proxy labels for the kb-rag service.
+#
+# Merge these labels into your docker-compose.yml kb-rag service.
+# Replace placeholders:
+#   {{HOSTNAME}}        — your domain (e.g. kb-rag.example.com)
+#   {{RESOLVER}}        — your ACME resolver name (e.g. letsencrypt)
+#   {{TRAEFIK_NETWORK}} — your Traefik Docker network (e.g. traefik)
+#
+# When using Traefik, remove the `ports:` mapping from the kb-rag service
+# since Traefik routes traffic directly via the Docker network.
+
+# Add to kb-rag service:
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.kb-rag.rule=Host(`{{HOSTNAME}}`)"
+  - "traefik.http.routers.kb-rag.entrypoints=websecure"
+  - "traefik.http.routers.kb-rag.tls.certresolver={{RESOLVER}}"
+  - "traefik.http.services.kb-rag.loadbalancer.server.port=8001"
+
+# Add to top-level networks:
+networks:
+  default:
+  traefik:
+    external: true
+    name: {{TRAEFIK_NETWORK}}
+
+# Add to kb-rag service:
+# networks:
+#   - default
+#   - traefik

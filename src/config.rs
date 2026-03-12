@@ -583,6 +583,7 @@ mcp:
 
     #[test]
     fn default_data_path() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.data_path(), "/data");
     }
@@ -933,6 +934,7 @@ source:
 
     #[test]
     fn state_db_path_uses_default_data_path() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.state_db_path(), "/data/state.db");
     }
@@ -961,7 +963,7 @@ mcp:
 
     #[test]
     fn example_config_deserializes() {
-        let yaml = include_str!("../config.example.yaml");
+        let yaml = include_str!("../deploy/config.example.yaml");
         let cfg: Config = serde_yaml_ng::from_str(yaml).expect("config.example.yaml should parse");
         // Spot-check a few values to catch drift between example and struct
         assert_eq!(cfg.source.branch, "master");
