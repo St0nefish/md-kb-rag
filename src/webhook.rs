@@ -26,6 +26,50 @@ static REINDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 pub struct WebhookState {
     pub config: Arc<ResolvedConfig>,
     pub secret: String,
+    pub git_token: Option<String>,
+}
+
+/// Inject a token into an HTTPS URL for authenticated git fetch.
+/// SSH URLs are returned unchanged.
+fn inject_token_into_url(url: &str, token: &str) -> String {
+    if let Some(rest) = url.strip_prefix("https://") {
+        format!("https://{}@{}", token, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        format!("http://{}@{}", token, rest)
+    } else {
+        // SSH or other scheme — pass through unchanged
+        url.to_string()
+    }
+}
+
+/// Redact tokens embedded in URLs (e.g. `https://token@host/path` → `https://***@host/path`).
+/// Handles URLs embedded in larger strings (like git stderr output).
+fn redact_url(s: &str) -> String {
+    let mut result = s.to_string();
+    for prefix in &["https://", "http://"] {
+        let mut search_from = 0;
+        while let Some(start) = result[search_from..].find(prefix) {
+            let abs_start = search_from + start;
+            let after_scheme = abs_start + prefix.len();
+            let rest = &result[after_scheme..];
+            if let Some(at_pos) = rest.find('@') {
+                // Check there's no '/' before the '@' — the token is between scheme and @
+                let before_at = &rest[..at_pos];
+                if !before_at.contains('/') && !before_at.is_empty() {
+                    result = format!(
+                        "{}***{}",
+                        &result[..after_scheme],
+                        &result[after_scheme + at_pos..]
+                    );
+                    // Advance past the redacted portion
+                    search_from = after_scheme + 3; // len("***")
+                    continue;
+                }
+            }
+            search_from = after_scheme;
+        }
+    }
+    result
 }
 
 /// Verify HMAC signature from webhook headers.
@@ -115,30 +159,85 @@ pub async fn handle_webhook(
         return resp;
     }
 
-    // Git pull if git_url is configured
-    if state.config.source.git_url.is_some() {
+    // Git fetch + merge if git_url is configured
+    if let Some(ref git_url) = state.config.source.git_url {
         let data_path = state.config.data_path();
-        info!("Running git pull in {}", data_path);
-        let output = Command::new("git")
-            .args(["pull", "--ff-only"])
+        let branch = &state.config.source.branch;
+
+        // Build fetch URL with optional token injection
+        let fetch_url = match &state.git_token {
+            Some(token) => inject_token_into_url(git_url, token),
+            None => git_url.clone(),
+        };
+
+        info!(
+            "Running git fetch in {} from {}",
+            data_path,
+            redact_url(&fetch_url)
+        );
+
+        // git fetch --no-tags <url> <branch>
+        let fetch_output = Command::new("git")
+            .args([
+                "-c",
+                &format!("safe.directory={}", data_path),
+                "fetch",
+                "--no-tags",
+                &fetch_url,
+                branch,
+            ])
             .current_dir(data_path)
             .output()
             .await;
 
-        match output {
+        match fetch_output {
             Ok(o) if o.status.success() => {
-                info!("Git pull succeeded");
+                info!("Git fetch succeeded");
             }
             Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                error!("Git pull failed: {}", stderr);
+                let stderr = redact_url(&String::from_utf8_lossy(&o.stderr));
+                error!("Git fetch failed: {}", stderr);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Git pull failed".to_string(),
+                    "Git fetch failed".to_string(),
                 );
             }
             Err(e) => {
-                error!("Failed to run git: {}", e);
+                error!("Failed to run git fetch: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to run git".to_string(),
+                );
+            }
+        }
+
+        // git merge --ff-only FETCH_HEAD
+        let merge_output = Command::new("git")
+            .args([
+                "-c",
+                &format!("safe.directory={}", data_path),
+                "merge",
+                "--ff-only",
+                "FETCH_HEAD",
+            ])
+            .current_dir(data_path)
+            .output()
+            .await;
+
+        match merge_output {
+            Ok(o) if o.status.success() => {
+                info!("Git merge (ff-only) succeeded");
+            }
+            Ok(o) => {
+                let stderr = redact_url(&String::from_utf8_lossy(&o.stderr));
+                error!("Git merge failed: {}", stderr);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Git merge failed".to_string(),
+                );
+            }
+            Err(e) => {
+                error!("Failed to run git merge: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to run git".to_string(),
@@ -340,12 +439,70 @@ mod tests {
         assert!(err.1.contains("No ref"));
     }
 
+    // --- inject_token_into_url tests ---
+
+    #[test]
+    fn inject_token_into_https_url() {
+        let url = "https://gitea.example.com/user/repo.git";
+        let result = inject_token_into_url(url, "ghp_abc123");
+        assert_eq!(result, "https://ghp_abc123@gitea.example.com/user/repo.git");
+    }
+
+    #[test]
+    fn inject_token_leaves_ssh_url_unchanged() {
+        let url = "git@gitea.example.com:user/repo.git";
+        let result = inject_token_into_url(url, "ghp_abc123");
+        assert_eq!(result, url);
+    }
+
+    #[test]
+    fn inject_token_empty_token() {
+        let url = "https://gitea.example.com/user/repo.git";
+        let result = inject_token_into_url(url, "");
+        assert_eq!(result, "https://@gitea.example.com/user/repo.git");
+    }
+
+    // --- redact_url tests ---
+
+    #[test]
+    fn redact_url_hides_token() {
+        let url = "https://ghp_abc123@gitea.example.com/user/repo.git";
+        let result = redact_url(url);
+        assert_eq!(result, "https://***@gitea.example.com/user/repo.git");
+        assert!(!result.contains("ghp_abc123"));
+    }
+
+    #[test]
+    fn redact_url_no_token_unchanged() {
+        let url = "https://gitea.example.com/user/repo.git";
+        let result = redact_url(url);
+        assert_eq!(result, url);
+    }
+
+    #[test]
+    fn redact_url_ssh_unchanged() {
+        let url = "git@gitea.example.com:user/repo.git";
+        let result = redact_url(url);
+        assert_eq!(result, url);
+    }
+
+    #[test]
+    fn redact_url_on_stderr_with_embedded_url() {
+        let stderr = "fatal: could not read from remote repository 'https://ghp_secret@gitea.example.com/user/repo.git': not found";
+        let result = redact_url(stderr);
+        assert!(result.contains("https://***@gitea.example.com/user/repo.git"));
+        assert!(!result.contains("ghp_secret"));
+    }
+
+    // --- integration tests ---
+
     fn minimal_config() -> Arc<ResolvedConfig> {
         Arc::new(ResolvedConfig {
             source: crate::config::SourceConfig {
                 git_url: None,
                 branch: "master".into(),
                 data_path: Some("/tmp".into()),
+                git_token_env: "GIT_PULL_TOKEN".into(),
             },
             indexing: Default::default(),
             frontmatter: Default::default(),
@@ -380,6 +537,7 @@ mod tests {
         let state = WebhookState {
             config,
             secret: secret.to_string(),
+            git_token: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -405,6 +563,7 @@ mod tests {
         let state = WebhookState {
             config,
             secret: "correct-secret".to_string(),
+            git_token: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -433,6 +592,7 @@ mod tests {
         let state = WebhookState {
             config,
             secret: secret.to_string(),
+            git_token: None,
         };
 
         let mut headers = HeaderMap::new();

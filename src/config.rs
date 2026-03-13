@@ -38,6 +38,9 @@ pub struct SourceConfig {
     /// Path to the knowledge base root (defaults to /data in Docker)
     #[serde(default = "default_data_path")]
     pub data_path: Option<String>,
+    /// Name of the env var containing the personal access token for git fetch over HTTPS.
+    #[serde(default = "default_git_token_env")]
+    pub git_token_env: String,
 }
 
 impl Default for SourceConfig {
@@ -46,12 +49,17 @@ impl Default for SourceConfig {
             git_url: None,
             branch: default_branch(),
             data_path: default_data_path(),
+            git_token_env: default_git_token_env(),
         }
     }
 }
 
 fn default_branch() -> String {
     "master".into()
+}
+
+fn default_git_token_env() -> String {
+    "GIT_PULL_TOKEN".into()
 }
 
 fn default_data_path() -> Option<String> {
@@ -547,6 +555,7 @@ source:
   git_url: "https://example.com/repo.git"
   branch: "main"
   data_path: "/custom/path"
+  git_token_env: "MY_GIT_TOKEN"
 indexing:
   include: ["**/*.md"]
   exclude: [".git/**"]
@@ -580,6 +589,7 @@ mcp:
         let cfg = Config::from_str_raw(yaml).unwrap();
         assert_eq!(cfg.source.branch, "main");
         assert_eq!(cfg.source.data_path.as_deref(), Some("/custom/path"));
+        assert_eq!(cfg.source.git_token_env, "MY_GIT_TOKEN");
         assert_eq!(cfg.embedding.vector_size, 512);
         assert_eq!(cfg.qdrant.collection, "my-kb");
         assert!(!cfg.validation.enabled);
@@ -601,6 +611,7 @@ mcp:
         assert_eq!(cfg.source.branch, "master");
         assert_eq!(cfg.source.data_path.as_deref(), Some("/data"));
         assert_eq!(cfg.source.git_url, None);
+        assert_eq!(cfg.source.git_token_env, "GIT_PULL_TOKEN");
         assert_eq!(cfg.indexing.include, vec!["**/*.md"]);
         assert_eq!(
             cfg.indexing.exclude,

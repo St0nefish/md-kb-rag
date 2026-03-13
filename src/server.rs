@@ -308,6 +308,11 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     };
     let auth_state = AuthState { bearer_token };
 
+    // Git pull token — resolved once at startup, same pattern as other secrets
+    let git_pull_token = std::env::var(&config.source.git_token_env)
+        .ok()
+        .filter(|s| !s.is_empty());
+
     // Webhook state — optional, skip if secret is unset/empty
     let webhook_secret = std::env::var(&config.webhook.secret_env)
         .ok()
@@ -354,6 +359,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         let webhook_state = WebhookState {
             config: Arc::clone(&config),
             secret,
+            git_token: git_pull_token.clone(),
         };
         let webhook_router = Router::new()
             .route(
