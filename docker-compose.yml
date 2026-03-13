@@ -86,7 +86,9 @@ services:
       - EMBEDDING_VECTOR_SIZE=768
       - QDRANT_URL=http://qdrant:6334
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
+      - GIT_PULL_TOKEN=${GIT_PULL_TOKEN:-}
       - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN:-}
+      - HOME=/tmp
       - RUST_LOG=${RUST_LOG:-info}
     ports:
       - "${MCP_PORT:-8001}:8001"

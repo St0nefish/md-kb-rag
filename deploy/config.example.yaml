@@ -34,6 +34,11 @@ source:
   # Branch to track when using git_url.
   branch: "master"
 
+  # Name of the env var containing the personal access token for git fetch
+  # over HTTPS. Token is injected transiently and never written to disk.
+  # Omit or leave the env var unset for public repositories.
+  git_token_env: "GIT_PULL_TOKEN"
+
   # Filesystem path to the knowledge base root. In Docker, bind-mount your
   # repo to this path. The indexer walks this directory for markdown files.
   data_path: "/data"
