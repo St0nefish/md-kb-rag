@@ -10,7 +10,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Determine which jobs need to run based on changed files
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - "src/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "Dockerfile"
+              - "docker-compose.yml"
+              - "migrations/**"
+              - ".github/workflows/ci.yml"
+
   test:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: self-hosted
 
     steps:
@@ -89,3 +111,19 @@ jobs:
             --tag ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }} \
             --file ./Dockerfile \
             .
+
+  # Gate job for branch protection — set "ci-pass" as the required status check.
+  # Passes when test succeeds or was skipped (doc-only changes).
+  ci-pass:
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check result
+        run: |
+          if [[ "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "CI passed (test: ${{ needs.test.result }})"
+          else
+            echo "CI failed (test: ${{ needs.test.result }})"
+            exit 1
+          fi
