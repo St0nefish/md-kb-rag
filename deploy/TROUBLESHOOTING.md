@@ -28,6 +28,12 @@ The server refuses to start without an MCP bearer token (unless `mcp.allow_unaut
 
 **Fix:** Set `MCP_BEARER_TOKEN` in your `.env` file.
 
+### `destination path '.' already exists and is not an empty directory`
+
+The auto-clone on startup found a non-empty `data_path` without a `.git` directory. This happens when files already exist in the volume (e.g. leftover data from a previous setup).
+
+**Fix:** Either clear the volume (`docker volume rm <project>_kb_data`) so the auto-clone can start fresh, or manually `git clone` into the volume.
+
 ## Embedding Service
 
 ### Container exits immediately

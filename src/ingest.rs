@@ -430,6 +430,21 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
         "Starting indexing run"
     );
 
+    // Ensure git repo exists if git_url is configured
+    if let Some(ref git_url) = config.source.git_url {
+        let token = std::env::var(&config.source.git_token_env)
+            .ok()
+            .filter(|s| !s.is_empty());
+        crate::git::ensure_repo(
+            git_url,
+            &config.source.branch,
+            config.data_path(),
+            token.as_deref(),
+        )
+        .await
+        .context("Failed to ensure git repository")?;
+    }
+
     // ── Infrastructure ──────────────────────────────────────────────────────
     let db_path = config.state_db_path();
     let state = StateDb::new(Path::new(&db_path))

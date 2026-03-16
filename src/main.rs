@@ -1,6 +1,7 @@
 mod chunk;
 mod config;
 mod embed;
+mod git;
 mod ingest;
 mod mcp;
 mod qdrant;
