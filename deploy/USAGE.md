@@ -122,11 +122,68 @@ validation:
 
 Run `md-kb-rag validate` to check all files without indexing — useful for CI or pre-commit hooks.
 
+## Knowledge Base Storage
+
+There are two ways to provide your knowledge base to the container. The **named volume** approach is recommended for most deployments.
+
+### Named volume with `git_url` (recommended)
+
+The container manages the knowledge base itself: it clones the repo on first start, and pulls updates via webhook. No host-side git operations needed.
+
+```yaml
+# config.yaml
+source:
+  git_url: "https://your-forge.example.com/org/knowledge-base.git"
+  branch: "master"
+```
+
+```yaml
+# docker-compose.yml (kb-rag service)
+volumes:
+  - kb_data:/data:rw
+
+# top-level
+volumes:
+  kb_data:
+```
+
+On first start with an empty volume, the server automatically shallow-clones the repo and runs a full index. Subsequent updates come through the webhook (`git fetch` + `git merge --ff-only` + incremental reindex).
+
+**Why this is preferred:**
+
+- No risk of accidental edits on the host breaking `git merge --ff-only`
+- Simpler setup — no pre-cloning step, no `KB_PATH` to configure
+- The container owns the data lifecycle end-to-end
+- Rebuilding from scratch is just `docker volume rm` + restart
+
+**Volume ownership:** If you run the container with a non-root `user:` directive, the named volume is created as root and the container won't be able to write to it. Fix this once after creating the volume:
+
+```bash
+docker run --rm -v kb_data:/data --user root --entrypoint chown \
+  ghcr.io/st0nefish/md-kb-rag:latest 1000:1000 /data
+```
+
+Replace `1000:1000` with the UID:GID from your compose `user:` setting.
+
+### Bind-mount (alternative)
+
+Mount a pre-cloned repo from the host. Useful when you need direct host access to the files or can't use `git_url` (e.g. local-only repos).
+
+```yaml
+# docker-compose.yml (kb-rag service)
+volumes:
+  - ${KB_PATH:-./data/repo}:/data:rw
+```
+
+With this approach, you're responsible for keeping the directory up to date. If `source.git_url` is also set, the webhook will still run `git fetch` + `git merge` inside the container, but having the directory accessible on the host risks accidental modifications that could cause merge conflicts.
+
+Without `git_url`, you'll need an external process to update the bind-mounted directory and trigger a reindex (either via webhook or by running `docker compose exec kb-rag md-kb-rag index`).
+
 ## Configuring Your Project
 
 ### 1. Prepare your knowledge base
 
-Organize your markdown files in a directory. Subdirectories are fine — the indexer walks recursively. Add YAML frontmatter to each file with at least the fields you mark as required.
+Organize your markdown files in a git repository. Subdirectories are fine — the indexer walks recursively. Add YAML frontmatter to each file with at least the fields you mark as required.
 
 ### 2. Create your config (optional)
 
@@ -135,7 +192,8 @@ Skip this step if the default chunking and frontmatter settings work for your kn
 ```yaml
 # config.yaml — minimal production config
 source:
-  data_path: "/data"              # where your KB is mounted
+  git_url: "https://your-forge.example.com/org/knowledge-base.git"
+  branch: "master"
 
 indexing:
   include: ["**/*.md"]
@@ -167,14 +225,13 @@ MCP_BEARER_TOKEN=your-secret-token-here
 MODEL_PATH=/path/to/your/models
 MODEL_FILE=nomic-embed-text-v2-moe-Q8_0.gguf
 
-# Optional
-KB_PATH=/path/to/your/knowledge-base
-WEBHOOK_SECRET=your-webhook-secret
+# Optional — needed for private repos over HTTPS
 GIT_PULL_TOKEN=your-gitea-or-github-pat
+WEBHOOK_SECRET=your-webhook-secret
 RUST_LOG=info
 ```
 
-If you set `source.git_url` in your config (see step 7), also set `GIT_PULL_TOKEN` to a personal access token with read-only repository access. The token is injected transiently into the HTTPS fetch URL and never written to disk. SSH URLs don't need a token.
+If you set `source.git_url` in your config, also set `GIT_PULL_TOKEN` to a personal access token with read-only repository access. The token is injected transiently into the HTTPS clone/fetch URL and never written to disk. SSH URLs don't need a token.
 
 ### 4. Start the stack
 
@@ -184,17 +241,17 @@ docker compose up -d
 
 This starts Qdrant, the embedding server, and the md-kb-rag service. The kb-rag service waits for both dependencies to be healthy before starting.
 
-### 5. Run the initial index
+If `source.git_url` is configured and the data volume is empty, the server **automatically clones the repo and runs a full index** — no manual step needed. Check progress with `docker logs -f kb-rag`.
 
-If `source.git_url` is configured and the data volume is empty, the server **automatically clones the repo and runs a full index on first start** — no manual step needed.
+### 5. Run the initial index (bind-mount only)
 
-Otherwise (bind-mount workflow without `git_url`), run the initial index manually:
+If you're using the bind-mount approach without `git_url`, run the initial index manually:
 
 ```bash
 docker compose exec kb-rag md-kb-rag index --full
 ```
 
-Full index drops any existing Qdrant collection and re-processes every file. Use this on first run or after changing `vector_size`.
+Full index drops any existing Qdrant collection and re-processes every file. Also use this after changing `vector_size`.
 
 ### 6. Connect an MCP client
 
@@ -206,19 +263,7 @@ claude mcp add --transport http kb-search \
 
 ### 7. Set up incremental reindexing (optional)
 
-When a webhook fires, the service verifies the HMAC signature, optionally runs `git fetch` + `git merge --ff-only` (if `source.git_url` is set), and triggers an incremental reindex of changed files.
-
-#### Enable git pull on webhook
-
-If you want the container to pull changes itself (instead of relying on an external process to update the bind-mounted directory), add the `source` section to your `config.yaml`:
-
-```yaml
-source:
-  git_url: "https://your-forge.example.com/org/knowledge-base.git"
-  branch: "master"   # branch to track (default: "master")
-```
-
-Then set the `GIT_PULL_TOKEN` env var in `.env` to a personal access token with **read-only repository access**. The token is needed for private repos over HTTPS. SSH URLs are passed through unchanged (no token needed), but the container must have SSH keys configured.
+When a webhook fires, the service verifies the HMAC signature, runs `git fetch` + `git merge --ff-only` (if `source.git_url` is set), and triggers an incremental reindex of changed files.
 
 #### Option A: Native forge webhook (recommended)
 
