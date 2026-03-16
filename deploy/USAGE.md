@@ -170,8 +170,11 @@ MODEL_FILE=nomic-embed-text-v2-moe-Q8_0.gguf
 # Optional
 KB_PATH=/path/to/your/knowledge-base
 WEBHOOK_SECRET=your-webhook-secret
+GIT_PULL_TOKEN=your-gitea-or-github-pat
 RUST_LOG=info
 ```
+
+If you set `source.git_url` in your config (see step 7), also set `GIT_PULL_TOKEN` to a personal access token with read-only repository access. The token is injected transiently into the HTTPS fetch URL and never written to disk. SSH URLs don't need a token.
 
 ### 4. Start the stack
 
@@ -199,7 +202,65 @@ claude mcp add --transport http kb-search \
 
 ### 7. Set up incremental reindexing (optional)
 
-Configure a webhook in your Git forge (Gitea, GitHub, GitLab) pointing at `http://your-host:8001/hooks/reindex`. Set the `WEBHOOK_SECRET` env var to the same secret configured in the webhook. On push to the tracked branch, the service pulls changes and reindexes only modified files.
+When a webhook fires, the service verifies the HMAC signature, optionally runs `git fetch` + `git merge --ff-only` (if `source.git_url` is set), and triggers an incremental reindex of changed files.
+
+#### Enable git pull on webhook
+
+If you want the container to pull changes itself (instead of relying on an external process to update the bind-mounted directory), add the `source` section to your `config.yaml`:
+
+```yaml
+source:
+  git_url: "https://your-forge.example.com/org/knowledge-base.git"
+  branch: "master"   # branch to track (default: "master")
+```
+
+Then set the `GIT_PULL_TOKEN` env var in `.env` to a personal access token with **read-only repository access**. The token is needed for private repos over HTTPS. SSH URLs are passed through unchanged (no token needed), but the container must have SSH keys configured.
+
+#### Option A: Native forge webhook (recommended)
+
+The simplest approach — configure the webhook directly in your Git forge's settings. No CI runner required.
+
+**Gitea** — via UI or CLI:
+
+```bash
+# Using tea CLI
+tea webhooks create \
+  --repo org/knowledge-base \
+  --login your-login \
+  --type gitea \
+  --secret "$WEBHOOK_SECRET" \
+  --events push \
+  --active \
+  --branch-filter master \
+  "https://your-host/hooks/reindex"
+```
+
+Or in the Gitea UI: Repository → Settings → Webhooks → Add Webhook (Gitea), set the target URL, secret, and push event.
+
+**GitHub** — via CLI:
+
+```bash
+# Using gh CLI
+gh api repos/org/knowledge-base/hooks --method POST \
+  -f name=web \
+  -f active=true \
+  -f 'events[]=push' \
+  -f 'config[url]=https://your-host/hooks/reindex' \
+  -f 'config[content_type]=json' \
+  -f "config[secret]=$WEBHOOK_SECRET"
+```
+
+Or in the GitHub UI: Repository → Settings → Webhooks → Add webhook.
+
+**GitLab** — in the UI: Repository → Settings → Webhooks. GitLab uses a shared token (not HMAC), so set the same value for both `X-Gitlab-Token` and `WEBHOOK_SECRET`.
+
+Make sure `webhook.provider` in your config matches your forge (`gitea`, `github`, or `gitlab`). The default is `gitea`.
+
+#### Option B: CI workflow
+
+If you prefer to trigger the webhook from a CI pipeline (e.g. to add logging or conditional logic), see the sample workflows in [`ci-examples/`](ci-examples/). These craft and send the HMAC-signed request as a CI step.
+
+> **Note:** The CI examples use `master` (Gitea) and `main` (GitHub) as default branch names. Adjust the branch name in both the trigger and the payload `ref` field to match your repository.
 
 ### File Include/Exclude Patterns
 
