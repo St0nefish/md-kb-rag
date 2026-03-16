@@ -88,6 +88,27 @@ The push was to a branch that doesn't match `source.branch`.
 
 **Fix:** Check that the webhook fires on pushes to the branch configured in `source.branch` (default: `master`).
 
+### Git fetch failed (500 Internal Server Error)
+
+The webhook verified successfully but the in-container `git fetch` or `git merge` failed. Common causes:
+
+- **Wrong `source.git_url`** — check the URL is correct and reachable from inside the container.
+- **Bad or expired `GIT_PULL_TOKEN`** — for private HTTPS repos, the token must have read-only repository access. Regenerate it in your forge's settings.
+- **SSH URL without keys** — SSH URLs bypass token injection, but the container needs SSH keys configured. For Docker deployments, HTTPS with a token is simpler.
+- **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. This usually means someone modified files directly in the bind-mounted directory.
+
+**Fix:** Check `docker logs kb-rag` for the specific error (tokens are redacted in log output). Verify the URL and token work from the host:
+
+```bash
+git ls-remote "https://<token>@your-forge.example.com/org/repo.git"
+```
+
+### 302 redirect on webhook
+
+Your reverse proxy is redirecting HTTP to HTTPS, but the webhook is configured with an HTTP URL.
+
+**Fix:** Update the webhook URL in your forge to use `https://`.
+
 ## Model / Vector Issues
 
 ### Qdrant dimension mismatch after model change

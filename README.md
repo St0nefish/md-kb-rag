@@ -74,7 +74,11 @@ Config is loaded from `config.yaml` (or the path passed via `--config`). Every f
 | `EMBEDDING_BASE_URL` | `embedding.base_url` | `http://embeddings:8080/v1` |
 | `EMBEDDING_MODEL` | `embedding.model` | `nomic-embed-text-v2-moe` |
 | `EMBEDDING_VECTOR_SIZE` | `embedding.vector_size` | `768` |
+| `EMBEDDING_API_KEY` | `embedding.api_key` | *(unset)* |
 | `QDRANT_URL` | `qdrant.url` | `http://qdrant:6334` |
+| `WEBHOOK_SECRET` | `webhook.secret_env` | *(unset — webhook disabled)* |
+| `GIT_PULL_TOKEN` | `source.git_token_env` | *(unset — no auth for git fetch)* |
+| `MCP_BEARER_TOKEN` | `mcp.bearer_token_env` | *(required)* |
 
 Env vars take priority over config file values. If neither is set for required fields (`embedding.base_url`, `embedding.model`, `qdrant.url`), the server exits with a clear error.
 
@@ -182,11 +186,18 @@ The `search` tool accepts:
 POST to `/hooks/reindex` triggers:
 
 1. HMAC signature verification (Gitea/GitHub/GitLab)
-2. Branch matching
-3. `git pull --ff-only` (if git_url configured)
-4. Incremental reindex
+2. Branch matching against `source.branch`
+3. `git fetch` + `git merge --ff-only` (if `source.git_url` is configured)
+4. Incremental reindex of changed files
 
-The webhook endpoint is only available if `WEBHOOK_SECRET` is set to a non-empty value. See [`deploy/ci-examples/`](deploy/ci-examples/) for sample CI workflows.
+The webhook endpoint is only available if `WEBHOOK_SECRET` is set to a non-empty value.
+
+**Setup options:**
+
+- **Native forge webhook** (recommended) — configure directly in your Git forge's webhook settings (or via `tea`/`gh` CLI). No CI runner needed.
+- **CI workflow** — trigger from a pipeline step. See [`deploy/ci-examples/`](deploy/ci-examples/) for sample Gitea and GitHub workflows.
+
+**Git pull on webhook:** Set `source.git_url` in your config and `GIT_PULL_TOKEN` in `.env` (for private HTTPS repos) to have the container pull changes automatically when the webhook fires. See [`deploy/USAGE.md`](deploy/USAGE.md#7-set-up-incremental-reindexing-optional) for detailed setup instructions.
 
 ## Incremental Indexing
 
