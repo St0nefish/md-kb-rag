@@ -27,8 +27,11 @@
 # ----------------------------------------------------------------------------
 source:
 
-  # Git remote to clone/pull from. If omitted, the knowledge base must be
-  # provided via a bind-mount at data_path (the typical Docker workflow).
+  # Git remote URL. When set, the server auto-clones the repo into data_path
+  # on first start (if data_path is not already a git repo) and runs a full
+  # initial index. Subsequent updates are pulled via the webhook endpoint.
+  # If omitted, the knowledge base must be provided via a bind-mount at
+  # data_path (the classic Docker workflow).
   git_url: null
 
   # Branch to track when using git_url.

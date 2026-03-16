@@ -186,6 +186,10 @@ This starts Qdrant, the embedding server, and the md-kb-rag service. The kb-rag 
 
 ### 5. Run the initial index
 
+If `source.git_url` is configured and the data volume is empty, the server **automatically clones the repo and runs a full index on first start** — no manual step needed.
+
+Otherwise (bind-mount workflow without `git_url`), run the initial index manually:
+
 ```bash
 docker compose exec kb-rag md-kb-rag index --full
 ```

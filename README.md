@@ -84,7 +84,7 @@ Env vars take priority over config file values. If neither is set for required f
 
 See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 
-- **source** — Git URL or bind-mount path for your knowledge base
+- **source** — Git URL (auto-cloned on first start) or bind-mount path for your knowledge base
 - **indexing** — Include/exclude glob patterns
 - **frontmatter** — Required fields, indexed fields, defaults
 - **chunking** — Markdown-aware splitting with configurable chunk size

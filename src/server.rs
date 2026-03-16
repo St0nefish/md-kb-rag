@@ -23,6 +23,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::ResolvedConfig;
 use crate::embed::EmbedClient;
+use crate::git;
+use crate::ingest;
 use crate::mcp::{self, KbSearchServer};
 use crate::qdrant::QdrantStore;
 use crate::webhook::{self, WebhookState};
@@ -193,6 +195,29 @@ async fn build_instructions(
 pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let config = Arc::new(config);
 
+    // Resolve git token early (reused by ensure_repo and later by WebhookState)
+    let git_pull_token = std::env::var(&config.source.git_token_env)
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    // Auto-clone if git_url is set and data_path isn't a repo yet
+    if let Some(ref git_url) = config.source.git_url {
+        let fresh = git::ensure_repo(
+            git_url,
+            &config.source.branch,
+            config.data_path(),
+            git_pull_token.as_deref(),
+        )
+        .await
+        .context("Failed to ensure git repository")?;
+        if fresh {
+            info!("Fresh clone — running initial full index");
+            ingest::run_index(&config, true)
+                .await
+                .context("Initial index after clone failed")?;
+        }
+    }
+
     // Set up shared services
     let embed_client = Arc::new(EmbedClient::new(&config.embedding));
     let qdrant = Arc::new(QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?);
@@ -307,11 +332,6 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         }
     };
     let auth_state = AuthState { bearer_token };
-
-    // Git pull token — resolved once at startup, same pattern as other secrets
-    let git_pull_token = std::env::var(&config.source.git_token_env)
-        .ok()
-        .filter(|s| !s.is_empty());
 
     // Webhook state — optional, skip if secret is unset/empty
     let webhook_secret = std::env::var(&config.webhook.secret_env)

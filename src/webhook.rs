@@ -15,6 +15,7 @@ use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
 use crate::config::{ResolvedConfig, WebhookProvider};
+use crate::git::{inject_token_into_url, redact_url};
 use crate::ingest;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -27,49 +28,6 @@ pub struct WebhookState {
     pub config: Arc<ResolvedConfig>,
     pub secret: String,
     pub git_token: Option<String>,
-}
-
-/// Inject a token into an HTTPS URL for authenticated git fetch.
-/// SSH URLs are returned unchanged.
-fn inject_token_into_url(url: &str, token: &str) -> String {
-    if let Some(rest) = url.strip_prefix("https://") {
-        format!("https://{}@{}", token, rest)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        format!("http://{}@{}", token, rest)
-    } else {
-        // SSH or other scheme — pass through unchanged
-        url.to_string()
-    }
-}
-
-/// Redact tokens embedded in URLs (e.g. `https://token@host/path` → `https://***@host/path`).
-/// Handles URLs embedded in larger strings (like git stderr output).
-fn redact_url(s: &str) -> String {
-    let mut result = s.to_string();
-    for prefix in &["https://", "http://"] {
-        let mut search_from = 0;
-        while let Some(start) = result[search_from..].find(prefix) {
-            let abs_start = search_from + start;
-            let after_scheme = abs_start + prefix.len();
-            let rest = &result[after_scheme..];
-            if let Some(at_pos) = rest.find('@') {
-                // Check there's no '/' before the '@' — the token is between scheme and @
-                let before_at = &rest[..at_pos];
-                if !before_at.contains('/') && !before_at.is_empty() {
-                    result = format!(
-                        "{}***{}",
-                        &result[..after_scheme],
-                        &result[after_scheme + at_pos..]
-                    );
-                    // Advance past the redacted portion
-                    search_from = after_scheme + 3; // len("***")
-                    continue;
-                }
-            }
-            search_from = after_scheme;
-        }
-    }
-    result
 }
 
 /// Verify HMAC signature from webhook headers.
@@ -437,61 +395,6 @@ mod tests {
         let body = b"not json at all";
         let err = check_branch(body, "main").unwrap_err();
         assert!(err.1.contains("No ref"));
-    }
-
-    // --- inject_token_into_url tests ---
-
-    #[test]
-    fn inject_token_into_https_url() {
-        let url = "https://gitea.example.com/user/repo.git";
-        let result = inject_token_into_url(url, "ghp_abc123");
-        assert_eq!(result, "https://ghp_abc123@gitea.example.com/user/repo.git");
-    }
-
-    #[test]
-    fn inject_token_leaves_ssh_url_unchanged() {
-        let url = "git@gitea.example.com:user/repo.git";
-        let result = inject_token_into_url(url, "ghp_abc123");
-        assert_eq!(result, url);
-    }
-
-    #[test]
-    fn inject_token_empty_token() {
-        let url = "https://gitea.example.com/user/repo.git";
-        let result = inject_token_into_url(url, "");
-        assert_eq!(result, "https://@gitea.example.com/user/repo.git");
-    }
-
-    // --- redact_url tests ---
-
-    #[test]
-    fn redact_url_hides_token() {
-        let url = "https://ghp_abc123@gitea.example.com/user/repo.git";
-        let result = redact_url(url);
-        assert_eq!(result, "https://***@gitea.example.com/user/repo.git");
-        assert!(!result.contains("ghp_abc123"));
-    }
-
-    #[test]
-    fn redact_url_no_token_unchanged() {
-        let url = "https://gitea.example.com/user/repo.git";
-        let result = redact_url(url);
-        assert_eq!(result, url);
-    }
-
-    #[test]
-    fn redact_url_ssh_unchanged() {
-        let url = "git@gitea.example.com:user/repo.git";
-        let result = redact_url(url);
-        assert_eq!(result, url);
-    }
-
-    #[test]
-    fn redact_url_on_stderr_with_embedded_url() {
-        let stderr = "fatal: could not read from remote repository 'https://ghp_secret@gitea.example.com/user/repo.git': not found";
-        let result = redact_url(stderr);
-        assert!(result.contains("https://***@gitea.example.com/user/repo.git"));
-        assert!(!result.contains("ghp_secret"));
     }
 
     // --- integration tests ---
