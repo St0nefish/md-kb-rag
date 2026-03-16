@@ -32,7 +32,26 @@ The server refuses to start without an MCP bearer token (unless `mcp.allow_unaut
 
 The auto-clone on startup found a non-empty `data_path` without a `.git` directory. This happens when files already exist in the volume (e.g. leftover data from a previous setup).
 
-**Fix:** Either clear the volume (`docker volume rm <project>_kb_data`) so the auto-clone can start fresh, or manually `git clone` into the volume.
+**Fix:** Remove the volume and let the auto-clone start fresh:
+
+```bash
+docker compose down kb-rag
+docker volume rm <project>_kb_data
+docker compose up -d kb-rag
+```
+
+### `/data/.git: Permission denied` on startup
+
+The named volume was created as root but the container runs with a non-root `user:` directive. The container can't write to the volume.
+
+**Fix:** Set the volume ownership to match your container user before starting:
+
+```bash
+docker run --rm -v <volume_name>:/data --user root --entrypoint chown \
+  ghcr.io/st0nefish/md-kb-rag:latest <uid>:<gid> /data
+```
+
+Replace `<uid>:<gid>` with the values from your compose `user:` setting (e.g. `1000:1000`). This only needs to be done once per volume.
 
 ## Embedding Service
 
@@ -101,7 +120,7 @@ The webhook verified successfully but the in-container `git fetch` or `git merge
 - **Wrong `source.git_url`** — check the URL is correct and reachable from inside the container.
 - **Bad or expired `GIT_PULL_TOKEN`** — for private HTTPS repos, the token must have read-only repository access. Regenerate it in your forge's settings.
 - **SSH URL without keys** — SSH URLs bypass token injection, but the container needs SSH keys configured. For Docker deployments, HTTPS with a token is simpler.
-- **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. This usually means someone modified files directly in the bind-mounted directory.
+- **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. This usually means someone modified files directly in the bind-mounted directory. Using a named volume (recommended) avoids this by keeping the repo inaccessible from the host.
 
 **Fix:** Check `docker logs kb-rag` for the specific error (tokens are redacted in log output). Verify the URL and token work from the host:
 

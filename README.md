@@ -18,15 +18,18 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 git clone https://github.com/St0nefish/md-kb-rag.git
 cd md-kb-rag
 cp deploy/.env.example .env
-# Edit .env: set MCP_BEARER_TOKEN and MODEL_PATH/MODEL_FILE
+# Edit .env: set MCP_BEARER_TOKEN, MODEL_PATH/MODEL_FILE, and GIT_PULL_TOKEN
 
 # Download the embedding model (see "Embedding Models" below)
 
-# Start the stack (CPU mode by default)
-docker compose up -d
+# Set source.git_url in config.yaml to point at your knowledge base repo
+cp deploy/config.example.yaml config.yaml
+# Edit config.yaml — at minimum, set source.git_url and uncomment the mount:
+#   - ./config.yaml:/app/config.yaml:ro
 
-# Initial full index
-docker compose exec kb-rag md-kb-rag index --full
+# Start the stack (CPU mode by default)
+# With git_url set, the server auto-clones the repo and runs a full index on first start
+docker compose up -d
 
 # Add MCP to Claude Code
 claude mcp add --transport http kb-search \
@@ -34,13 +37,7 @@ claude mcp add --transport http kb-search \
   --header "Authorization: Bearer $TOKEN"
 ```
 
-No `config.yaml` needed — connection settings are wired through environment variables in `docker-compose.yml`. To customize behavior (chunking, frontmatter rules, etc.), copy the example and mount it:
-
-```bash
-cp deploy/config.example.yaml config.yaml
-# Edit config.yaml, then uncomment the volume mount in docker-compose.yml:
-#   - ./config.yaml:/app/config.yaml:ro
-```
+The recommended setup uses a **named Docker volume** for the knowledge base. The container clones the repo on first start and pulls updates via webhook — no host-side git operations needed. See [deploy/USAGE.md](deploy/USAGE.md#knowledge-base-storage) for details on this approach vs. bind-mounting.
 
 See [deploy/config.example.yaml](deploy/config.example.yaml) for all available options and their defaults.
 
