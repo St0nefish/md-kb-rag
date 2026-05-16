@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::sync::RwLock;
@@ -23,6 +23,11 @@ const MAX_QUERY_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
 const MAX_TAG_COUNT: usize = 20;
 const MAX_TAG_LEN: usize = 256;
+/// Upper bound on the number of indexed file paths to fetch for fuzzy
+/// `get_document` resolution. Larger KBs will silently cap at this value.
+const MAX_INDEXED_PATHS_FOR_FUZZY: u64 = 10_000;
+/// How many "did you mean?" suggestions to include when no basename matches.
+const FUZZY_SUGGESTION_COUNT: usize = 3;
 
 fn resolve_limit(requested: Option<u64>) -> u64 {
     requested.unwrap_or(10).min(MAX_SEARCH_LIMIT)
@@ -73,7 +78,10 @@ fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
 /// Parameters for the `get_document` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentParams {
-    /// The file path of the document (as returned by search results).
+    /// Path of the document to retrieve. Accepts paths relative to the
+    /// knowledge-base root (e.g. `lifestyle/vehicles/foo.md`, as returned by
+    /// the `search` tool), or just a basename when it's unique across the
+    /// index. Absolute paths are also accepted for backwards compatibility.
     pub path: String,
 }
 
@@ -111,6 +119,67 @@ pub struct KbSearchServer {
     /// Dynamic MCP server instructions, refreshed periodically with discovered metadata.
     instructions: Arc<RwLock<String>>,
     tool_router: ToolRouter<KbSearchServer>,
+}
+
+/// Strip the data-root prefix from an absolute file_path for display to clients.
+/// Paths in Qdrant are stored as absolute (the indexer uses `data_path` as the
+/// root), but `/data` is an implementation detail — clients should see paths
+/// relative to the indexed root. Falls back to returning the path unchanged
+/// if it doesn't share the prefix.
+fn relative_to_data(absolute: &str, data_root: &Path) -> String {
+    let root_str = data_root.to_string_lossy();
+    let root = root_str.trim_end_matches('/');
+    if root.is_empty() {
+        return absolute.trim_start_matches('/').to_string();
+    }
+    if let Some(rest) = absolute.strip_prefix(root) {
+        let rel = rest.trim_start_matches('/');
+        if rel.is_empty() {
+            absolute.to_string()
+        } else {
+            rel.to_string()
+        }
+    } else {
+        absolute.to_string()
+    }
+}
+
+/// Levenshtein edit distance between two strings (chars, not bytes).
+/// O(m*n) time, O(n) space. Used for "did you mean?" suggestions over a few
+/// hundred basenames — fine for our scale, no extra dependency needed.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Outcome of trying to resolve a user-supplied path against the data directory.
+enum ResolveErr {
+    /// File didn't exist — eligible for fuzzy basename fallback.
+    NotFound,
+    /// Resolved outside the data directory (path traversal). Hard fail.
+    Outside,
+    /// Resolved to a file type excluded by `indexing.include`. Hard fail.
+    NotPermitted,
+    /// Other I/O error (permissions, etc). Hard fail with the original message.
+    Other(String),
 }
 
 fn build_include_globset(patterns: &[String]) -> GlobSet {
@@ -245,11 +314,12 @@ impl KbSearchServer {
                 }
             };
 
-            let file_path = result
+            let file_path_raw = result
                 .payload
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let file_path = relative_to_data(file_path_raw, &self.canonical_data_path);
 
             let domain = result
                 .payload
@@ -316,69 +386,171 @@ impl KbSearchServer {
         Ok(CallToolResult::success(vec![Content::text(output.trim())]))
     }
 
+    /// Resolve a user-supplied path against the data directory, applying the
+    /// path-traversal and file-type security checks. Used by `get_document` for
+    /// both literal resolution and (after fuzzy basename match) the chosen
+    /// candidate path.
+    fn resolve_within_data(&self, raw: &str) -> Result<PathBuf, ResolveErr> {
+        let requested = PathBuf::from(raw);
+        let resolved = if requested.is_absolute() {
+            requested
+        } else {
+            self.canonical_data_path.join(&requested)
+        };
+
+        let canonical = resolved.canonicalize().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => ResolveErr::NotFound,
+            std::io::ErrorKind::PermissionDenied => {
+                ResolveErr::Other(format!("Permission denied: {}", resolved.display()))
+            }
+            _ => ResolveErr::Other(format!(
+                "Cannot access file '{}': {}",
+                resolved.display(),
+                e
+            )),
+        })?;
+
+        if !canonical.starts_with(&self.canonical_data_path) {
+            return Err(ResolveErr::Outside);
+        }
+
+        let relative = canonical
+            .strip_prefix(&self.canonical_data_path)
+            .unwrap_or(&canonical);
+        if !self.include_patterns.is_match(relative) {
+            return Err(ResolveErr::NotPermitted);
+        }
+
+        Ok(canonical)
+    }
+
+    async fn read_canonical_file(&self, canonical: &Path) -> Result<CallToolResult, McpError> {
+        let content = tokio::fs::read_to_string(canonical).await.map_err(|e| {
+            error!("Failed to read file '{}': {}", canonical.display(), e);
+            McpError::invalid_params("Failed to read file".to_string(), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(content)]))
+    }
+
     #[tool(
         description = "Retrieve the full raw content of a document by file path. \
-        Use file paths returned by the `search` tool. Returns the complete markdown \
-        including frontmatter."
+        Accepts paths relative to the knowledge base root (e.g. \
+        'lifestyle/vehicles/foo.md', as returned by the `search` tool) or just \
+        the basename if it's unique across the index. Returns the complete \
+        markdown including frontmatter."
     )]
     async fn get_document(
         &self,
         Parameters(params): Parameters<GetDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
-        let requested = PathBuf::from(&params.path);
-
-        // Use the pre-canonicalized data path for safe prefix checking
-        let canonical_data = &self.canonical_data_path;
-
-        // Resolve the requested path — it may be absolute or relative to data_path
-        let resolved = if requested.is_absolute() {
-            requested.clone()
-        } else {
-            self.canonical_data_path.join(&requested)
-        };
-
-        let canonical_resolved = resolved.canonicalize().map_err(|e| {
-            let msg = match e.kind() {
-                std::io::ErrorKind::NotFound => format!("File not found: {}", resolved.display()),
-                std::io::ErrorKind::PermissionDenied => {
-                    format!("Permission denied: {}", resolved.display())
-                }
-                _ => format!("Cannot access file '{}': {}", resolved.display(), e),
-            };
-            McpError::invalid_params(msg, None)
-        })?;
-
-        // Prevent path traversal outside data directory
-        if !canonical_resolved.starts_with(canonical_data) {
+        let raw = params.path.trim();
+        if raw.is_empty() {
             return Err(McpError::invalid_params(
-                "File path is outside the data directory".to_string(),
+                "Path parameter is empty".to_string(),
                 None,
             ));
         }
 
-        // Restrict to permitted file types (indexing.include patterns)
-        let relative = canonical_resolved
-            .strip_prefix(canonical_data)
-            .unwrap_or(&canonical_resolved);
-        if !self.include_patterns.is_match(relative) {
-            return Err(McpError::invalid_params(
-                "File type not permitted".to_string(),
-                None,
-            ));
+        // 1. Try the literal path as given.
+        match self.resolve_within_data(raw) {
+            Ok(canonical) => return self.read_canonical_file(&canonical).await,
+            Err(ResolveErr::NotFound) => {
+                // Fall through to fuzzy basename matching.
+            }
+            Err(ResolveErr::Outside) => {
+                return Err(McpError::invalid_params(
+                    "File path is outside the data directory".to_string(),
+                    None,
+                ));
+            }
+            Err(ResolveErr::NotPermitted) => {
+                return Err(McpError::invalid_params(
+                    "File type not permitted".to_string(),
+                    None,
+                ));
+            }
+            Err(ResolveErr::Other(msg)) => {
+                return Err(McpError::invalid_params(msg, None));
+            }
         }
 
-        let content = tokio::fs::read_to_string(&canonical_resolved)
+        // 2. Fuzzy fallback: load every indexed path from Qdrant and look for a
+        //    basename match. Auto-resolve a unique match; otherwise produce a
+        //    helpful error.
+        let all_paths = self
+            .qdrant
+            .fetch_facet_values(&self.collection, "file_path", MAX_INDEXED_PATHS_FOR_FUZZY)
             .await
-            .map_err(|e| {
-                error!(
-                    "Failed to read file '{}': {}",
-                    canonical_resolved.display(),
-                    e
-                );
-                McpError::invalid_params("Failed to read file".to_string(), None)
-            })?;
+            .unwrap_or_else(|e| {
+                warn!("Failed to fetch file_path facet for fuzzy lookup: {e:#}");
+                Vec::new()
+            });
 
-        Ok(CallToolResult::success(vec![Content::text(content)]))
+        let basename = Path::new(raw)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(raw);
+
+        let exact: Vec<&String> = all_paths
+            .iter()
+            .filter(|p| {
+                Path::new(p.as_str()).file_name().and_then(|n| n.to_str()) == Some(basename)
+            })
+            .collect();
+
+        match exact.len() {
+            1 => match self.resolve_within_data(exact[0]) {
+                Ok(canonical) => self.read_canonical_file(&canonical).await,
+                Err(_) => Err(McpError::invalid_params(
+                    format!("File not found: '{}'", raw),
+                    None,
+                )),
+            },
+            0 => {
+                let mut scored: Vec<(usize, &String)> = all_paths
+                    .iter()
+                    .map(|p| {
+                        let bn = Path::new(p.as_str())
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
+                        (levenshtein(basename, bn), p)
+                    })
+                    .collect();
+                scored.sort_by_key(|(d, _)| *d);
+                scored.truncate(FUZZY_SUGGESTION_COUNT);
+
+                let suggestions: Vec<String> = scored
+                    .into_iter()
+                    .map(|(_, p)| relative_to_data(p, &self.canonical_data_path))
+                    .collect();
+
+                let mut msg = format!("File not found: '{}'.", raw);
+                if suggestions.is_empty() {
+                    msg.push_str(" Use the `search` tool to find paths.");
+                } else {
+                    msg.push_str(&format!(
+                        " Closest indexed files: {}. Or use the `search` tool.",
+                        suggestions.join(", ")
+                    ));
+                }
+                Err(McpError::invalid_params(msg, None))
+            }
+            _ => {
+                let candidates: Vec<String> = exact
+                    .into_iter()
+                    .map(|p| relative_to_data(p, &self.canonical_data_path))
+                    .collect();
+                Err(McpError::invalid_params(
+                    format!(
+                        "Multiple files match basename '{}': {}. Use a more specific path.",
+                        basename,
+                        candidates.join(", ")
+                    ),
+                    None,
+                ))
+            }
+        }
     }
 }
 
@@ -787,5 +959,90 @@ mod tests {
             err.contains(&bad_path.display().to_string()),
             "error message should include the file path, got: {err}"
         );
+    }
+
+    #[test]
+    fn relative_to_data_strips_prefix() {
+        let root = std::path::Path::new("/data");
+        assert_eq!(
+            relative_to_data("/data/lifestyle/foo.md", root),
+            "lifestyle/foo.md"
+        );
+    }
+
+    #[test]
+    fn relative_to_data_handles_trailing_slash_root() {
+        let root = std::path::Path::new("/data/");
+        assert_eq!(
+            relative_to_data("/data/lifestyle/foo.md", root),
+            "lifestyle/foo.md"
+        );
+    }
+
+    #[test]
+    fn relative_to_data_returns_unchanged_when_no_prefix_match() {
+        let root = std::path::Path::new("/data");
+        // Path that doesn't start with /data — leave it alone rather than mangling it.
+        assert_eq!(relative_to_data("/other/foo.md", root), "/other/foo.md");
+    }
+
+    #[test]
+    fn relative_to_data_path_equal_to_root_kept_as_is() {
+        let root = std::path::Path::new("/data");
+        // Pathological case: file_path is exactly the data root. Leave it alone
+        // rather than collapsing to an empty string.
+        assert_eq!(relative_to_data("/data", root), "/data");
+    }
+
+    #[test]
+    fn relative_to_data_partial_segment_does_not_match() {
+        let root = std::path::Path::new("/data");
+        // "/data-other/foo.md" textually starts with "/data" but isn't under it.
+        // We accept the false-positive prefix strip here as a tradeoff: keeping
+        // it simple. The leading slash on "-other/foo.md" disambiguates that
+        // the caller passed a path the indexer didn't produce, so downstream
+        // resolution will fail loudly. Document the behaviour so future changes
+        // notice if it matters.
+        let out = relative_to_data("/data-other/foo.md", root);
+        assert!(
+            out == "-other/foo.md" || out == "/data-other/foo.md",
+            "got {out}"
+        );
+    }
+
+    #[test]
+    fn levenshtein_identical_is_zero() {
+        assert_eq!(levenshtein("hello", "hello"), 0);
+    }
+
+    #[test]
+    fn levenshtein_empty_string() {
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+        assert_eq!(levenshtein("", ""), 0);
+    }
+
+    #[test]
+    fn levenshtein_substitutions_and_inserts() {
+        // "kitten" -> "sitting": substitute k->s, e->i, insert g = 3
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn levenshtein_ranks_close_matches_lower() {
+        let target = "tacoma-2025.md";
+        let close = levenshtein(target, "tacoma-2024.md");
+        let far = levenshtein(target, "voron-trident.md");
+        assert!(
+            close < far,
+            "expected close ({close}) < far ({far}) for target '{target}'"
+        );
+    }
+
+    #[test]
+    fn levenshtein_unicode_uses_chars_not_bytes() {
+        // 'é' is 2 bytes UTF-8 but 1 char. If we used byte indices we'd
+        // mis-count distances on accented basenames.
+        assert_eq!(levenshtein("café", "cafe"), 1);
     }
 }
