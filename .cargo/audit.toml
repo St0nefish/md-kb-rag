@@ -1,0 +1,15 @@
+[advisories]
+# Advisories ignored here are all transitive dependencies we don't directly
+# control. Revisit when the named upstream crates publish updates.
+ignore = [
+    # rustls-pemfile is unmaintained. Reached via qdrant-client → tonic 0.12.
+    # Removed when qdrant-client / tonic move to rustls-pki-types-only.
+    "RUSTSEC-2025-0134",
+
+    # rand 0.8 / 0.9 / 0.10 unsound with a custom logger using `rand::rng()`.
+    # We don't install a custom logger, so the unsound path is unreachable for
+    # us in practice. Pulled in transitively via backoff, async-openai,
+    # qdrant-client, reqwest (quinn), governor, and rmcp. Drop when those
+    # crates publish a release with the fixed `rand`.
+    "RUSTSEC-2026-0097",
+]
