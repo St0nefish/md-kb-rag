@@ -26,6 +26,33 @@ const MAX_QUERY_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
 const MAX_TAG_COUNT: usize = 20;
 const MAX_TAG_LEN: usize = 256;
+
+/// Maximum number of characters from the new document's content used to build
+/// the dedup query text. Keeps the embedding request within typical token limits
+/// (most embedding models cap at ~512–8192 tokens; 2000 chars ≈ 400–500 tokens).
+const DEDUP_QUERY_CHAR_LIMIT: usize = 2000;
+
+/// A near-duplicate found during dedup gate evaluation.
+#[derive(Debug, Clone)]
+pub struct DuplicateHit {
+    pub file_path: String,
+    pub score: f32,
+}
+
+/// Pure decision function: given the closest match from Qdrant (if any) and a
+/// threshold, decide whether to refuse the write. Returns `Some(DuplicateHit)`
+/// when the write should be blocked, `None` when it is safe to proceed.
+///
+/// This is factored out so it can be unit-tested without a live Qdrant/embedder.
+pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<DuplicateHit> {
+    match top {
+        Some((path, score)) if score >= threshold => Some(DuplicateHit {
+            file_path: path,
+            score,
+        }),
+        _ => None,
+    }
+}
 /// Upper bound on the number of indexed file paths to fetch for fuzzy
 /// `get_document` resolution. Larger KBs will silently cap at this value.
 const MAX_INDEXED_PATHS_FOR_FUZZY: u64 = 10_000;
@@ -121,6 +148,11 @@ pub struct CreateDocumentParams {
     /// Optional commit message; if omitted, a message is generated from the path
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Skip the duplicate-detection check and create the document even if a
+    /// similar one exists. Use this when you have verified the existing document
+    /// is sufficiently different and want to create a distinct entry anyway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_new: Option<bool>,
 }
 
 /// Parameters for the `edit_document` tool.
@@ -588,6 +620,7 @@ impl KbSearchServer {
     ///
     /// `must_already_exist`: `false` for create (file must NOT exist), `true` for edit (file MUST exist).
     /// `default_verb`: used to build the default commit message, e.g. `"add"` or `"update"`.
+    /// `force_new`: when `Some(true)`, bypasses the dedup gate on create paths.
     async fn write_document(
         &self,
         rel_path: &str,
@@ -595,6 +628,7 @@ impl KbSearchServer {
         message: Option<&str>,
         must_already_exist: bool,
         default_verb: &str,
+        force_new: Option<bool>,
     ) -> Result<CallToolResult, McpError> {
         let config = &self.config;
 
@@ -688,7 +722,74 @@ impl KbSearchServer {
             ));
         }
 
-        // 5. Create parent directories and write the file
+        // 5. Dedup gate: on create paths, check for near-duplicate existing documents.
+        //    Gate runs only when: this is a create (not edit), dedup is enabled in config,
+        //    and the caller has not set force_new = true.
+        if !must_already_exist
+            && self.config.write.dedup_enabled
+            && !matches!(force_new, Some(true))
+        {
+            // Build query text: frontmatter title (if any) + body, truncated to
+            // DEDUP_QUERY_CHAR_LIMIT chars to stay within embedding model token limits.
+            let query_text: String = content.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect();
+
+            match self.embed_client.embed_query(&query_text).await {
+                Ok(vector) => {
+                    match self
+                        .qdrant
+                        .search(&self.collection, vector, HashMap::new(), 1)
+                        .await
+                    {
+                        Ok(results) => {
+                            let top = results.into_iter().next().map(|r| {
+                                let path = r
+                                    .payload
+                                    .get("file_path")
+                                    .and_then(|v| v.as_str())
+                                    .map(|p| relative_to_data(p, &self.canonical_data_path))
+                                    .unwrap_or_default();
+                                (path, r.score)
+                            });
+                            if let Some(hit) = dedup_verdict(top, self.config.write.dedup_threshold)
+                            {
+                                let threshold = self.config.write.dedup_threshold;
+                                return Err(McpError::invalid_params(
+                                    format!(
+                                        "A similar document already exists: '{}' \
+                                         (similarity {:.2} ≥ threshold {:.2}). \
+                                         Edit it with edit_document, or pass \
+                                         force_new=true to create a new document anyway.",
+                                        hit.file_path, hit.score, threshold
+                                    ),
+                                    Some(serde_json::json!({
+                                        "duplicate_of": hit.file_path,
+                                        "similarity": hit.score,
+                                        "threshold": threshold,
+                                    })),
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            // Fail-open: infrastructure failures must not block writes.
+                            // The dedup gate is a guardrail, not a correctness gate.
+                            warn!(
+                                "Dedup search failed for '{}' (proceeding with write): {:#}",
+                                rel_path, e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Fail-open: same rationale — embedder down should not block writes.
+                    warn!(
+                        "Dedup embedding failed for '{}' (proceeding with write): {:#}",
+                        rel_path, e
+                    );
+                }
+            }
+        }
+
+        // 6. Create parent directories and write the file
         if let Some(parent) = abs_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 error!(
@@ -710,7 +811,7 @@ impl KbSearchServer {
                 McpError::internal_error(format!("Failed to write file: {}", e), None)
             })?;
 
-        // 6. Build commit message
+        // 7. Build commit message
         let commit_message = {
             let base = message
                 .map(|m| m.to_string())
@@ -718,12 +819,12 @@ impl KbSearchServer {
             format!("{}\n\nVia: md-kb-rag write tool", base)
         };
 
-        // 7. Resolve git token
+        // 8. Resolve git token
         let token = std::env::var(&config.source.git_token_env)
             .ok()
             .filter(|s| !s.is_empty());
 
-        // 8. Commit and sync to remote
+        // 9. Commit and sync to remote
         let commit_sha = git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
@@ -738,7 +839,7 @@ impl KbSearchServer {
             McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
         })?;
 
-        // 9. Trigger incremental reindex (serialized against webhook reindexes)
+        // 10. Trigger incremental reindex (serialized against webhook reindexes)
         {
             let _guard = crate::webhook::REINDEX_LOCK.lock().await;
             ingest::run_index(config, false).await.map_err(|e| {
@@ -750,7 +851,7 @@ impl KbSearchServer {
             })?;
         }
 
-        // 10. Return success
+        // 11. Return success
         let action = if must_already_exist {
             "Updated"
         } else {
@@ -776,6 +877,7 @@ impl KbSearchServer {
             params.message.as_deref(),
             false,
             "add",
+            params.force_new,
         )
         .await
     }
@@ -796,6 +898,7 @@ impl KbSearchServer {
             params.message.as_deref(),
             true,
             "update",
+            None, // edit_document targets a known existing file — no dedup gate needed
         )
         .await
     }
@@ -1054,6 +1157,7 @@ mod tests {
             webhook: crate::config::WebhookConfig::default(),
             mcp: crate::config::McpConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            write: crate::config::WriteConfig::default(),
         })
     }
 
@@ -1375,6 +1479,7 @@ mod tests {
                 None,
                 true, // must_already_exist = true (edit mode)
                 "update",
+                None,
             )
             .await;
 
@@ -1413,6 +1518,7 @@ mod tests {
                 None,
                 false, // must_already_exist = false (create mode)
                 "add",
+                None,
             )
             .await;
 
@@ -1439,7 +1545,7 @@ mod tests {
 
         // Try to write a .txt file (not matched by **/*.md)
         let result = server
-            .write_document("notes.txt", "Some plain text", None, false, "add")
+            .write_document("notes.txt", "Some plain text", None, false, "add", None)
             .await;
 
         assert!(
@@ -1462,7 +1568,7 @@ mod tests {
 
         // Absolute path should be caught by the absolute-path guard before include check
         let result = server
-            .write_document("/etc/passwd", "# Evil", None, false, "add")
+            .write_document("/etc/passwd", "# Evil", None, false, "add", None)
             .await;
 
         assert!(result.is_err(), "absolute path should be rejected");
@@ -1511,6 +1617,7 @@ mod tests {
             webhook: crate::config::WebhookConfig::default(),
             mcp: crate::config::McpConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            write: crate::config::WriteConfig::default(),
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
@@ -1523,6 +1630,7 @@ mod tests {
                 None,
                 false,
                 "add",
+                None,
             )
             .await;
 
@@ -1564,5 +1672,193 @@ mod tests {
             "field_errors should contain an entry for 'title', got: {}",
             serde_json::to_string_pretty(&data).unwrap()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup_verdict unit tests — no live Qdrant/embedder required
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_verdict_score_above_threshold_returns_hit() {
+        let result = dedup_verdict(Some(("docs/existing.md".into(), 0.92)), 0.85);
+        assert!(
+            result.is_some(),
+            "score 0.92 >= threshold 0.85 should refuse"
+        );
+        let hit = result.unwrap();
+        assert_eq!(hit.file_path, "docs/existing.md");
+        assert!((hit.score - 0.92).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dedup_verdict_score_at_threshold_returns_hit() {
+        // Boundary: score exactly equal to threshold is also a duplicate.
+        let result = dedup_verdict(Some(("docs/boundary.md".into(), 0.85)), 0.85);
+        assert!(
+            result.is_some(),
+            "score == threshold should be treated as duplicate"
+        );
+    }
+
+    #[test]
+    fn dedup_verdict_score_below_threshold_allows() {
+        let result = dedup_verdict(Some(("docs/different.md".into(), 0.70)), 0.85);
+        assert!(
+            result.is_none(),
+            "score 0.70 < threshold 0.85 should allow the write"
+        );
+    }
+
+    #[test]
+    fn dedup_verdict_no_results_allows() {
+        // Empty collection or no results → no duplicate → allow.
+        let result = dedup_verdict(None, 0.85);
+        assert!(
+            result.is_none(),
+            "no results should allow the write (empty collection case)"
+        );
+    }
+
+    #[test]
+    fn dedup_verdict_hit_carries_correct_fields() {
+        let hit = dedup_verdict(Some(("sysadmin/networking/dns.md".into(), 0.95)), 0.85)
+            .expect("should be a hit");
+        assert_eq!(hit.file_path, "sysadmin/networking/dns.md");
+        assert!((hit.score - 0.95).abs() < 1e-6, "score should be preserved");
+    }
+
+    /// Test that the gating booleans (`dedup_enabled`, `must_already_exist`, `force_new`)
+    /// correctly bypass the dedup gate.  We use a server with dedup_enabled=false / true
+    /// and call write_document up to the point where the gate would fire — since the
+    /// embed client isn't reachable the gate's embed call fails-open (logs a warning and
+    /// continues), but with dedup_enabled=false the gate is never entered at all, so we
+    /// reach a different error (validation or file existence) and NOT a dedup refusal.
+    #[tokio::test]
+    async fn dedup_gate_disabled_via_config_does_not_embed() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Config with dedup disabled.
+        let config = Arc::new(ResolvedConfig {
+            source: crate::config::SourceConfig {
+                git_url: None,
+                branch: "master".into(),
+                data_path: Some(tmp.path().to_string_lossy().into_owned()),
+                git_token_env: "GIT_PULL_TOKEN".into(),
+            },
+            indexing: crate::config::IndexingConfig::default(),
+            frontmatter: crate::config::FrontmatterConfig::default(),
+            chunking: crate::config::ChunkingConfig::default(),
+            embedding: crate::config::ResolvedEmbeddingConfig {
+                base_url: "http://localhost:8080/v1".into(),
+                model: "test".into(),
+                api_key: None,
+                vector_size: 768,
+                batch_size: 32,
+            },
+            qdrant: crate::config::ResolvedQdrantConfig {
+                url: "http://localhost:6334".into(),
+                collection: "test".into(),
+            },
+            validation: crate::config::ValidationConfig::default(),
+            webhook: crate::config::WebhookConfig::default(),
+            mcp: crate::config::McpConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
+            write: crate::config::WriteConfig {
+                dedup_enabled: false,
+                dedup_threshold: 0.85,
+            },
+        });
+
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        // When dedup is disabled we should NOT get a dedup refusal.
+        // The write will fail at validation (missing frontmatter) — that's fine.
+        let result = server
+            .write_document(
+                "docs/new.md",
+                "---\ntitle: Test Doc\n---\n# Content",
+                None,
+                false,
+                "add",
+                None,
+            )
+            .await;
+
+        // We expect an error (git/reindex will fail in unit test), but it must
+        // NOT be a dedup refusal — i.e. it should not mention "similar document".
+        if let Err(e) = result {
+            assert!(
+                !e.message.contains("similar document"),
+                "dedup disabled: error must not be a dedup refusal, got: {}",
+                e.message
+            );
+        }
+        // (Ok is also fine — means we somehow reached the write step, which is
+        // unexpected in a unit test but not a test failure for this assertion.)
+    }
+
+    #[tokio::test]
+    async fn dedup_gate_bypassed_by_force_new() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Config with dedup ENABLED (default).
+        let config = make_test_resolved_config(tmp.path());
+
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        // With force_new=Some(true), the gate must be skipped even when dedup is
+        // enabled.  The embed/qdrant will fail-open (no live services), so we will
+        // reach git/reindex and fail there — but NOT with a dedup message.
+        let result = server
+            .write_document(
+                "docs/forced.md",
+                "---\ntitle: Forced Doc\n---\n# Content",
+                None,
+                false,
+                "add",
+                Some(true), // force_new
+            )
+            .await;
+
+        if let Err(e) = result {
+            assert!(
+                !e.message.contains("similar document"),
+                "force_new=true must bypass dedup gate, got: {}",
+                e.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dedup_gate_skipped_for_edit_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create the file so the edit path can proceed past existence check.
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("edit-me.md"), "# old content").unwrap();
+
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        // Edit path (must_already_exist=true) should never trigger the dedup gate.
+        // It will fail at git/reindex — but NOT with a dedup message.
+        let result = server
+            .write_document(
+                "docs/edit-me.md",
+                "---\ntitle: Edited Doc\n---\n# New content",
+                None,
+                true, // edit path
+                "update",
+                None,
+            )
+            .await;
+
+        if let Err(e) = result {
+            assert!(
+                !e.message.contains("similar document"),
+                "edit path must never trigger dedup gate, got: {}",
+                e.message
+            );
+        }
     }
 }

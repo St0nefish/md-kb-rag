@@ -27,6 +27,8 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub write: WriteConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -327,6 +329,37 @@ fn default_mcp_port() -> u16 {
     8001
 }
 
+/// Configuration for write-tool behaviour (create_document / edit_document).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteConfig {
+    /// If true, creating a new document runs a similarity check against the
+    /// existing collection and refuses if a near-duplicate exists.
+    #[serde(default = "default_dedup_enabled")]
+    pub dedup_enabled: bool,
+    /// Cosine similarity at or above which a new document is treated as a
+    /// duplicate and the write is refused (unless `force_new = true`).
+    #[serde(default = "default_dedup_threshold")]
+    pub dedup_threshold: f32,
+}
+
+fn default_dedup_enabled() -> bool {
+    true
+}
+
+fn default_dedup_threshold() -> f32 {
+    0.85
+}
+
+impl Default for WriteConfig {
+    fn default() -> Self {
+        Self {
+            dedup_enabled: default_dedup_enabled(),
+            dedup_threshold: default_dedup_threshold(),
+        }
+    }
+}
+
 fn default_bearer_token_env() -> String {
     "MCP_BEARER_TOKEN".into()
 }
@@ -361,6 +394,7 @@ pub struct ResolvedConfig {
     pub webhook: WebhookConfig,
     pub mcp: McpConfig,
     pub rate_limit: RateLimitConfig,
+    pub write: WriteConfig,
 }
 
 impl Config {
@@ -474,6 +508,7 @@ impl Config {
             webhook: self.webhook,
             mcp: self.mcp,
             rate_limit: self.rate_limit,
+            write: self.write,
         })
     }
 }
@@ -867,6 +902,7 @@ chunking:
             webhook: WebhookConfig::default(),
             mcp: McpConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            write: WriteConfig::default(),
         };
 
         // All fields are directly accessible — no unwrap, no panic path.

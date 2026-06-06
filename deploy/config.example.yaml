@@ -267,6 +267,26 @@ mcp:
 
 
 # ----------------------------------------------------------------------------
+# write — behaviour of the create_document / edit_document MCP write tools
+# ----------------------------------------------------------------------------
+write:
+
+  # When true (the default), creating a new document first embeds its content
+  # and searches the collection for near-duplicates. If a document with
+  # cosine similarity >= dedup_threshold is found, the write is refused with a
+  # structured error naming the duplicate file. The agent can override the
+  # check by passing `force_new=true` in the tool call.
+  # Set to false to disable the check entirely (e.g. during bulk migrations).
+  dedup_enabled: true
+
+  # Cosine similarity score at or above which a candidate is treated as a
+  # duplicate and the create is refused. Range: 0.0–1.0 (1.0 = identical).
+  # 0.85 works well for most embedding models; lower it to 0.75–0.80 for
+  # shorter or more domain-specific documents.
+  dedup_threshold: 0.85
+
+
+# ----------------------------------------------------------------------------
 # rate_limit — per-IP rate limiting for all HTTP endpoints
 # ----------------------------------------------------------------------------
 # Uses the Governor algorithm (token bucket) with per-IP tracking. Behind a

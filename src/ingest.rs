@@ -644,6 +644,7 @@ mod tests {
             webhook: Default::default(),
             mcp: Default::default(),
             rate_limit: Default::default(),
+            write: Default::default(),
         }
     }
 
