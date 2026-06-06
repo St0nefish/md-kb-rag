@@ -1027,6 +1027,8 @@ impl KbSearchServer {
         Writes the file, commits it to the git repository, and triggers an incremental reindex. \
         The document must not already exist — use edit_document for existing files. \
         Content must include valid YAML frontmatter. \
+        Required frontmatter fields and any fixed allowed values (e.g. for type/status) are \
+        listed in this server's instructions. \
         If a very similar document already exists, the create is refused and the close match is \
         reported — edit that document instead, or set force_new=true to create a new one anyway.")]
     async fn create_document(
@@ -1088,7 +1090,8 @@ impl KbSearchServer {
         \n\
         FULL-REPLACE MODE — provide content (mutually exclusive with old_string/new_string):\n\
         Replaces the entire file content with the provided content, which must include valid \
-        YAML frontmatter.\n\
+        YAML frontmatter. Required frontmatter fields and any fixed allowed values \
+        (e.g. for type/status) are listed in this server's instructions.\n\
         \n\
         In both modes the result is validated, committed, and an incremental reindex is \
         triggered. The path is resolved like get_document: relative to the KB root, a unique \
@@ -1322,9 +1325,12 @@ impl KbSearchServer {
 }
 
 /// Default instructions used when no custom instructions are configured.
-pub const DEFAULT_INSTRUCTIONS: &str = "Knowledge base semantic search server. \
-Use the `search` tool to find relevant documents by natural-language query, \
-with optional filters for domain, type, and tags.";
+/// The server appends discovered filter values ("Available ...") and a full
+/// write-authoring section after this base, so keep this short.
+pub const DEFAULT_INSTRUCTIONS: &str = "Knowledge base server. \
+Read with `search` (natural-language query; optional domain/type/tags filters) \
+and `get_document`. \
+Write with `create_document`, `edit_document`, and `delete_document`.";
 
 #[tool_handler]
 impl ServerHandler for KbSearchServer {

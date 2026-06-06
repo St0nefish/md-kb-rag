@@ -255,10 +255,12 @@ mcp:
   allow_unauthenticated: false
 
   # Custom narrative for MCP server instructions. Tells agents what this
-  # knowledge base covers. If omitted, a generic description is used.
+  # knowledge base covers. If omitted, a generic read+write description is used.
   # The server automatically appends discovered filter values (domains, types,
-  # tags, etc.) from the indexed data.
-  # instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring."
+  # tags, etc.) from the indexed data, then a write-authoring section that lists
+  # required frontmatter fields and any fixed allowed values from the config.
+  # Keep this short — the dynamic sections add the detail.
+  # instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document; write with create_document, edit_document, delete_document."
 
   # How often (in seconds) to refresh discovered metadata (filter values)
   # from Qdrant. Appended to the instructions so agents know what filters
