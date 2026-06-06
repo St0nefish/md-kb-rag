@@ -113,6 +113,11 @@ pub struct FrontmatterConfig {
     pub indexed_fields: Vec<String>,
     #[serde(default)]
     pub defaults: HashMap<String, String>,
+    /// Maps a frontmatter field name to its closed set of allowed values.
+    /// If a field is present in a document but its value is not in the set,
+    /// validation fails. Absent fields are not checked (use `required` for that).
+    #[serde(default)]
+    pub allowed: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -123,6 +123,18 @@ pub struct CreateDocumentParams {
     pub message: Option<String>,
 }
 
+/// Parameters for the `edit_document` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct EditDocumentParams {
+    /// Path of the existing document to overwrite, relative to the knowledge base root.
+    pub path: String,
+    /// Full new markdown content (full-content replacement, not a patch), INCLUDING YAML frontmatter.
+    pub content: String,
+    /// Optional commit message; if omitted, a message is generated from the path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct KbSearchServer {
     embed_client: Arc<EmbedClient>,
@@ -572,18 +584,22 @@ impl KbSearchServer {
         }
     }
 
-    #[tool(description = "Create a new document in the knowledge base. \
-        Writes the file, commits it to the git repository, and triggers an incremental reindex. \
-        The document must not already exist — use edit_document for existing files. \
-        Content must include valid YAML frontmatter.")]
-    async fn create_document(
+    /// Shared implementation for create_document and edit_document.
+    ///
+    /// `must_already_exist`: `false` for create (file must NOT exist), `true` for edit (file MUST exist).
+    /// `default_verb`: used to build the default commit message, e.g. `"add"` or `"update"`.
+    async fn write_document(
         &self,
-        Parameters(params): Parameters<CreateDocumentParams>,
+        rel_path: &str,
+        content: &str,
+        message: Option<&str>,
+        must_already_exist: bool,
+        default_verb: &str,
     ) -> Result<CallToolResult, McpError> {
         let config = &self.config;
 
         // 1. Security: reject absolute paths and path traversal
-        let requested = std::path::Path::new(&params.path);
+        let requested = std::path::Path::new(rel_path);
         if requested.is_absolute() {
             return Err(McpError::invalid_params(
                 "path must be relative to the knowledge base root".to_string(),
@@ -600,14 +616,9 @@ impl KbSearchServer {
             }
         }
 
-        let abs_path = std::path::PathBuf::from(config.data_path()).join(&params.path);
-
-        // Normalize: the parent must exist after we create it, but we can check the
-        // constructed path stays within data_path by lexically verifying.
-        // We'll do a stricter runtime check after parent dir creation. For now,
-        // the component loop above plus the is_absolute check covers the main attack
-        // surface. We also verify after canonicalizing the parent.
         let data_root = std::path::PathBuf::from(config.data_path());
+        let abs_path = data_root.join(rel_path);
+
         // Lexical check: constructed abs_path must start with data_root
         if !abs_path.starts_with(&data_root) {
             return Err(McpError::invalid_params(
@@ -616,42 +627,68 @@ impl KbSearchServer {
             ));
         }
 
-        // 2. Reject if file already exists
-        if abs_path.exists() {
+        // 2. Include-pattern guard: reject paths that the indexer would not pick up.
+        // discover_files matches against the path relative to data_path (same form as rel_path).
+        if !self.include_patterns.is_match(rel_path) {
             return Err(McpError::invalid_params(
                 format!(
-                    "File '{}' already exists. Use edit_document to modify existing files.",
-                    params.path
+                    "path '{}' does not match any indexable include pattern \
+                     (e.g. must be a markdown file under an included path)",
+                    rel_path
                 ),
                 None,
             ));
         }
 
-        // 3. Validate content before writing
+        // 3. Existence check
+        let file_exists = abs_path.exists();
+        if must_already_exist && !file_exists {
+            return Err(McpError::invalid_params(
+                format!(
+                    "File '{}' does not exist. Use create_document to create new files.",
+                    rel_path
+                ),
+                None,
+            ));
+        }
+        if !must_already_exist && file_exists {
+            return Err(McpError::invalid_params(
+                format!(
+                    "File '{}' already exists. Use edit_document to modify existing files.",
+                    rel_path
+                ),
+                None,
+            ));
+        }
+
+        // 4. Validate content before writing
         let (validation_result, _) = validate::validate_content(
-            std::path::Path::new(&params.path),
-            &params.content,
+            std::path::Path::new(rel_path),
+            content,
             &config.frontmatter,
             &config.validation,
         )
         .await
         .map_err(|e| {
-            error!("Validation error for '{}': {:#}", params.path, e);
+            error!("Validation error for '{}': {:#}", rel_path, e);
             McpError::internal_error(format!("Failed to validate content: {}", e), None)
         })?;
 
         if !validation_result.valid {
+            let data = Some(serde_json::json!({
+                "field_errors": validation_result.field_errors
+            }));
             return Err(McpError::invalid_params(
                 format!(
-                    "Content validation failed for '{}': {}",
-                    params.path,
+                    "frontmatter validation failed for '{}': {}",
+                    rel_path,
                     validation_result.errors.join("; ")
                 ),
-                None,
+                data,
             ));
         }
 
-        // 4. Create parent directories and write the file
+        // 5. Create parent directories and write the file
         if let Some(parent) = abs_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 error!(
@@ -666,57 +703,101 @@ impl KbSearchServer {
             })?;
         }
 
-        tokio::fs::write(&abs_path, params.content.as_bytes())
+        tokio::fs::write(&abs_path, content.as_bytes())
             .await
             .map_err(|e| {
                 error!("Failed to write file '{}': {}", abs_path.display(), e);
                 McpError::internal_error(format!("Failed to write file: {}", e), None)
             })?;
 
-        // 5. Build commit message
+        // 6. Build commit message
         let commit_message = {
-            let base = params
-                .message
-                .as_deref()
+            let base = message
                 .map(|m| m.to_string())
-                .unwrap_or_else(|| format!("docs: add {}", params.path));
+                .unwrap_or_else(|| format!("docs: {} {}", default_verb, rel_path));
             format!("{}\n\nVia: md-kb-rag write tool", base)
         };
 
-        // 6. Resolve git token
+        // 7. Resolve git token
         let token = std::env::var(&config.source.git_token_env)
             .ok()
             .filter(|s| !s.is_empty());
 
-        // 7. Commit and sync to remote
+        // 8. Commit and sync to remote
         let commit_sha = git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
             config.data_path(),
             token.as_deref(),
-            &params.path,
+            rel_path,
             &commit_message,
         )
         .await
         .map_err(|e| {
-            error!("commit_and_sync failed for '{}': {:#}", params.path, e);
+            error!("commit_and_sync failed for '{}': {:#}", rel_path, e);
             McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
         })?;
 
-        // 8. Trigger incremental reindex (serialized against webhook reindexes)
+        // 9. Trigger incremental reindex (serialized against webhook reindexes)
         {
             let _guard = crate::webhook::REINDEX_LOCK.lock().await;
             ingest::run_index(config, false).await.map_err(|e| {
-                error!("Reindex after create_document failed: {:#}", e);
+                error!(
+                    "Reindex after write_document failed for '{}': {:#}",
+                    rel_path, e
+                );
                 McpError::internal_error(format!("Reindex failed: {}", e), None)
             })?;
         }
 
-        // 9. Return success
+        // 10. Return success
+        let action = if must_already_exist {
+            "Updated"
+        } else {
+            "Created"
+        };
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Created '{}' (commit {})",
-            params.path, commit_sha
+            "{} '{}' (commit {})",
+            action, rel_path, commit_sha
         ))]))
+    }
+
+    #[tool(description = "Create a new document in the knowledge base. \
+        Writes the file, commits it to the git repository, and triggers an incremental reindex. \
+        The document must not already exist — use edit_document for existing files. \
+        Content must include valid YAML frontmatter.")]
+    async fn create_document(
+        &self,
+        Parameters(params): Parameters<CreateDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.write_document(
+            &params.path,
+            &params.content,
+            params.message.as_deref(),
+            false,
+            "add",
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Edit (overwrite) an existing document in the knowledge base. \
+        Replaces the entire file content, commits it to the git repository, and triggers \
+        an incremental reindex. The document must already exist — use create_document for \
+        new files. Content must include valid YAML frontmatter."
+    )]
+    async fn edit_document(
+        &self,
+        Parameters(params): Parameters<EditDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.write_document(
+            &params.path,
+            &params.content,
+            params.message.as_deref(),
+            true,
+            "update",
+        )
+        .await
     }
 }
 
@@ -1241,5 +1322,247 @@ mod tests {
         // 'é' is 2 bytes UTF-8 but 1 char. If we used byte indices we'd
         // mis-count distances on accented basenames.
         assert_eq!(levenshtein("café", "cafe"), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // write_document helper tests
+    // -----------------------------------------------------------------------
+
+    /// Build a KbSearchServer suitable for write_document unit tests.
+    /// Uses a temp directory as the data path. No real Qdrant/git required
+    /// for tests that fail before those steps.
+    fn make_write_test_server(
+        tmp: &tempfile::TempDir,
+        include_patterns: &[String],
+        config: Arc<ResolvedConfig>,
+    ) -> KbSearchServer {
+        let qdrant_config = crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        };
+        let qdrant = Arc::new(QdrantStore::new(&qdrant_config).unwrap());
+        let embed_config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            api_key: None,
+            vector_size: 768,
+            batch_size: 32,
+        };
+        let embed = Arc::new(EmbedClient::new(&embed_config));
+        let instructions = Arc::new(RwLock::new(String::new()));
+        KbSearchServer::new(
+            embed,
+            qdrant,
+            "test".into(),
+            tmp.path().to_path_buf(),
+            include_patterns,
+            instructions,
+            config,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn edit_document_on_nonexistent_file_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let result = server
+            .write_document(
+                "docs/nonexistent.md",
+                "---\ntitle: Test\n---\n# Body",
+                None,
+                true, // must_already_exist = true (edit mode)
+                "update",
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "edit of non-existent file should return Err"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("does not exist"),
+            "error message should mention 'does not exist', got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("create_document"),
+            "error should mention create_document, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn create_document_on_existing_file_returns_use_edit_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pre-create the file
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("existing.md"), "# Already here").unwrap();
+
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let result = server
+            .write_document(
+                "docs/existing.md",
+                "---\ntitle: Test\n---\n# New content",
+                None,
+                false, // must_already_exist = false (create mode)
+                "add",
+            )
+            .await;
+
+        assert!(result.is_err(), "create on existing file should return Err");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("already exists"),
+            "error message should mention 'already exists', got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("edit_document"),
+            "error should mention edit_document, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn include_pattern_guard_rejects_non_matching_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        // Only markdown files are indexed
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        // Try to write a .txt file (not matched by **/*.md)
+        let result = server
+            .write_document("notes.txt", "Some plain text", None, false, "add")
+            .await;
+
+        assert!(
+            result.is_err(),
+            "non-matching path should be rejected by include-pattern guard"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("indexable include pattern"),
+            "error should mention include pattern, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn include_pattern_guard_rejects_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        // Absolute path should be caught by the absolute-path guard before include check
+        let result = server
+            .write_document("/etc/passwd", "# Evil", None, false, "add")
+            .await;
+
+        assert!(result.is_err(), "absolute path should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("relative"),
+            "error should mention relative path requirement, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_failure_carries_field_errors_in_data() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Config with validation enabled requiring "title" field
+        let config = Arc::new(ResolvedConfig {
+            source: crate::config::SourceConfig {
+                git_url: None,
+                branch: "master".into(),
+                data_path: Some(tmp.path().to_string_lossy().into_owned()),
+                git_token_env: "GIT_PULL_TOKEN".into(),
+            },
+            indexing: crate::config::IndexingConfig::default(),
+            frontmatter: crate::config::FrontmatterConfig {
+                required: vec!["title".into()],
+                ..Default::default()
+            },
+            chunking: crate::config::ChunkingConfig::default(),
+            embedding: crate::config::ResolvedEmbeddingConfig {
+                base_url: "http://localhost:8080/v1".into(),
+                model: "test".into(),
+                api_key: None,
+                vector_size: 768,
+                batch_size: 32,
+            },
+            qdrant: crate::config::ResolvedQdrantConfig {
+                url: "http://localhost:6334".into(),
+                collection: "test".into(),
+            },
+            validation: crate::config::ValidationConfig {
+                enabled: true,
+                strict: false,
+                lint_command: None,
+            },
+            webhook: crate::config::WebhookConfig::default(),
+            mcp: crate::config::McpConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
+        });
+
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        // Content intentionally missing the "title" frontmatter field
+        let result = server
+            .write_document(
+                "guide/missing-title.md",
+                "---\ntype: guide\n---\n# No title in frontmatter",
+                None,
+                false,
+                "add",
+            )
+            .await;
+
+        assert!(result.is_err(), "validation failure should return Err");
+        let err = result.unwrap_err();
+
+        // Message should be human-readable
+        assert!(
+            err.message.contains("frontmatter validation failed"),
+            "error message should describe validation failure, got: {}",
+            err.message
+        );
+
+        // Data field must contain structured field_errors
+        let data = err.data.expect("error should carry structured data");
+        let field_errors = data
+            .get("field_errors")
+            .expect("data must have field_errors key");
+        assert!(
+            field_errors.is_array(),
+            "field_errors must be a JSON array, got: {}",
+            field_errors
+        );
+        let arr = field_errors.as_array().unwrap();
+        assert!(
+            !arr.is_empty(),
+            "field_errors array must be non-empty for a validation failure"
+        );
+
+        // At least one entry should mention "title" as the failed field
+        let mentions_title = arr.iter().any(|fe| {
+            fe.get("field")
+                .and_then(|f| f.as_str())
+                .map(|f| f == "title")
+                .unwrap_or(false)
+        });
+        assert!(
+            mentions_title,
+            "field_errors should contain an entry for 'title', got: {}",
+            serde_json::to_string_pretty(&data).unwrap()
+        );
     }
 }

@@ -95,6 +95,26 @@ frontmatter:
   # Example: { status: "active" }
   defaults: {}
 
+  # Closed-set (enum) enforcement. Maps a frontmatter field to its exhaustive
+  # list of allowed values. A file whose field value is NOT in the list fails
+  # validation. Absent fields are not checked here — use `required` for that.
+  # Open-ended fields (domain, tags) should be omitted from this map.
+  allowed:
+    type:
+      - guide
+      - reference
+      - research
+      - config
+      - troubleshooting
+      - architecture
+      - project
+      - decision-record
+      - migration
+    status:
+      - active
+      - draft
+      - archived
+
 
 # ----------------------------------------------------------------------------
 # chunking — how markdown files are split into vector chunks
