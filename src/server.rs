@@ -21,7 +21,7 @@ use tower_governor::{
 };
 use tracing::{debug, info, warn};
 
-use crate::config::ResolvedConfig;
+use crate::config::{FrontmatterConfig, ResolvedConfig};
 use crate::embed::EmbedClient;
 use crate::git;
 use crate::ingest;
@@ -164,13 +164,63 @@ async fn bearer_auth(
     }
 }
 
+/// Build the write-authoring section of MCP instructions from frontmatter config.
+///
+/// Always names the write tools so agents know they exist. Conditionally adds:
+/// - A "Required frontmatter fields" line when `frontmatter.required` is non-empty.
+/// - Per-field "must be one of" clauses for every entry in `frontmatter.allowed`,
+///   iterated in stable (sorted) order so output is deterministic.
+///
+/// This section is APPENDED to any base instructions (custom or default), so a
+/// custom `mcp.instructions` override cannot suppress the authoring guidance.
+pub fn build_authoring_section(frontmatter: &FrontmatterConfig) -> String {
+    let mut s = String::new();
+
+    s.push_str(
+        "\n\nWriting documents: use create_document (new file), \
+         edit_document (modify — surgical old_string/new_string or full content), \
+         and delete_document (remove). \
+         New/edited documents must include valid YAML frontmatter.",
+    );
+
+    if !frontmatter.required.is_empty() {
+        s.push_str(&format!(
+            "\nRequired frontmatter fields: {}.",
+            frontmatter.required.join(", ")
+        ));
+    }
+
+    if !frontmatter.allowed.is_empty() {
+        // Sort by field name for deterministic output.
+        let mut allowed_pairs: Vec<(&String, &Vec<String>)> = frontmatter.allowed.iter().collect();
+        allowed_pairs.sort_by_key(|(k, _)| k.as_str());
+
+        let clauses: Vec<String> = allowed_pairs
+            .into_iter()
+            .map(|(field, values)| format!("{field} must be one of: {}", values.join(", ")))
+            .collect();
+        s.push_str(&format!("\nFixed-value fields — {}.", clauses.join("; ")));
+    }
+
+    if !frontmatter.required.is_empty() || !frontmatter.allowed.is_empty() {
+        s.push_str(
+            "\nOther fields (e.g. domain, tags) are open; \
+             see the \"Available ...\" lines above for values already in use.",
+        );
+    }
+
+    s
+}
+
 /// Build MCP server instructions by combining config narrative with
-/// dynamically discovered filter values from Qdrant.
+/// dynamically discovered filter values from Qdrant, then appending
+/// write-authoring guidance derived from the frontmatter schema.
 async fn build_instructions(
     base: &str,
     qdrant: &QdrantStore,
     collection: &str,
     indexed_fields: &[String],
+    frontmatter: &FrontmatterConfig,
 ) -> String {
     let mut instructions = base.to_string();
 
@@ -189,6 +239,7 @@ async fn build_instructions(
         }
     }
 
+    instructions.push_str(&build_authoring_section(frontmatter));
     instructions
 }
 
@@ -244,6 +295,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         &qdrant,
         &config.qdrant.collection,
         &indexed_fields,
+        &config.frontmatter,
     )
     .await;
     let shared_instructions = Arc::new(RwLock::new(initial_instructions));
@@ -254,6 +306,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let refresh_collection = config.qdrant.collection.clone();
     let refresh_base = base_instructions.to_string();
     let refresh_fields = indexed_fields.clone();
+    let refresh_frontmatter = config.frontmatter.clone();
     let refresh_secs = config.mcp.metadata_refresh_secs;
 
     let ct = CancellationToken::new();
@@ -272,6 +325,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
                 &refresh_qdrant,
                 &refresh_collection,
                 &refresh_fields,
+                &refresh_frontmatter,
             )
             .await;
             match refresh_instructions.write() {
@@ -620,5 +674,134 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- build_authoring_section tests ---
+
+    #[test]
+    fn authoring_section_with_required_and_allowed() {
+        let fm = FrontmatterConfig {
+            required: vec![
+                "title".into(),
+                "description".into(),
+                "type".into(),
+                "tags".into(),
+            ],
+            allowed: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "type".into(),
+                    vec!["guide".into(), "reference".into(), "research".into()],
+                );
+                m.insert(
+                    "status".into(),
+                    vec!["active".into(), "draft".into(), "archived".into()],
+                );
+                m
+            },
+            ..Default::default()
+        };
+
+        let section = build_authoring_section(&fm);
+
+        // Always names the write tools.
+        assert!(
+            section.contains("create_document"),
+            "should mention create_document: {section}"
+        );
+        assert!(
+            section.contains("edit_document"),
+            "should mention edit_document: {section}"
+        );
+        assert!(
+            section.contains("delete_document"),
+            "should mention delete_document: {section}"
+        );
+
+        // Required fields line.
+        assert!(
+            section.contains("Required frontmatter fields:"),
+            "should contain required fields line: {section}"
+        );
+        assert!(
+            section.contains("title"),
+            "should list required field 'title': {section}"
+        );
+        assert!(
+            section.contains("tags"),
+            "should list required field 'tags': {section}"
+        );
+
+        // Fixed-value fields — stable (sorted) order: status before type.
+        let status_pos = section
+            .find("status must be one of")
+            .expect("status clause missing");
+        let type_pos = section
+            .find("type must be one of")
+            .expect("type clause missing");
+        assert!(
+            status_pos < type_pos,
+            "status should appear before type (sorted): {section}"
+        );
+
+        // Both fields list their values.
+        assert!(
+            section.contains("active"),
+            "should list 'active' for status: {section}"
+        );
+        assert!(
+            section.contains("guide"),
+            "should list 'guide' for type: {section}"
+        );
+    }
+
+    #[test]
+    fn authoring_section_empty_required_and_allowed() {
+        let fm = FrontmatterConfig::default(); // required: [], allowed: {}
+
+        let section = build_authoring_section(&fm);
+
+        // Write tools always advertised.
+        assert!(
+            section.contains("create_document"),
+            "should still mention create_document: {section}"
+        );
+        assert!(
+            section.contains("edit_document"),
+            "should still mention edit_document: {section}"
+        );
+        assert!(
+            section.contains("delete_document"),
+            "should still mention delete_document: {section}"
+        );
+
+        // No required or fixed-value lines when config is empty.
+        assert!(
+            !section.contains("Required frontmatter fields"),
+            "should not emit required line when required is empty: {section}"
+        );
+        assert!(
+            !section.contains("must be one of"),
+            "should not emit fixed-value clause when allowed is empty: {section}"
+        );
+    }
+
+    #[test]
+    fn authoring_section_is_deterministic() {
+        let fm = FrontmatterConfig {
+            required: vec!["title".into(), "type".into()],
+            allowed: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("type".into(), vec!["guide".into(), "reference".into()]);
+                m.insert("status".into(), vec!["active".into(), "draft".into()]);
+                m.insert("domain".into(), vec!["dev".into(), "ops".into()]);
+                m
+            },
+            ..Default::default()
+        };
+
+        let first = build_authoring_section(&fm);
+        let second = build_authoring_section(&fm);
+        assert_eq!(first, second, "output must be identical across calls");
     }
 }
