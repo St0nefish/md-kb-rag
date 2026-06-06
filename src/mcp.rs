@@ -230,13 +230,118 @@ pub struct CreateDocumentParams {
 /// Parameters for the `edit_document` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct EditDocumentParams {
-    /// Path of the existing document to overwrite, relative to the knowledge base root.
+    /// Path of the document to edit. Resolved like get_document (relative to the KB
+    /// root, a unique basename, or absolute).
     pub path: String,
-    /// Full new markdown content (full-content replacement, not a patch), INCLUDING YAML frontmatter.
-    pub content: String,
-    /// Optional commit message; if omitted, a message is generated from the path.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Surgical edit: exact text to find. Must occur EXACTLY ONCE in the document.
+    /// Provide together with new_string. Mutually exclusive with `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_string: Option<String>,
+    /// Surgical edit: text that replaces old_string. Provide together with old_string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_string: Option<String>,
+    /// Full replace: the entire new content of the document, including YAML
+    /// frontmatter. Mutually exclusive with old_string/new_string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Optional commit message; defaults to "docs: update {path}".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// Validated edit mode, produced by `parse_edit_mode`.
+#[derive(Debug, PartialEq)]
+pub enum EditMode {
+    /// Replace `old_string` with `new_string` (must appear exactly once).
+    Surgical { old: String, new: String },
+    /// Replace the entire document content.
+    Full { content: String },
+}
+
+/// Parse and validate the mode fields of `EditDocumentParams`, returning a
+/// typed `EditMode` or a human-readable error string.
+///
+/// Rules:
+/// - SURGICAL = `old_string` AND `new_string` both `Some`, `content` is `None`.
+/// - FULL = `content` is `Some`, both `old_string` and `new_string` are `None`.
+/// - Any other combination is rejected.
+/// - Surgical with `old_string == new_string` is rejected (no-op).
+pub fn parse_edit_mode(params: &EditDocumentParams) -> Result<EditMode, String> {
+    let has_content = params.content.is_some();
+    let has_old = params.old_string.is_some();
+    let has_new = params.new_string.is_some();
+
+    match (has_content, has_old, has_new) {
+        // Full mode
+        (true, false, false) => Ok(EditMode::Full {
+            content: params.content.clone().unwrap(),
+        }),
+        // Surgical mode
+        (false, true, true) => {
+            let old = params.old_string.clone().unwrap();
+            let new = params.new_string.clone().unwrap();
+            if old == new {
+                return Err(
+                    "old_string and new_string are identical — no change would be made".to_string(),
+                );
+            }
+            Ok(EditMode::Surgical { old, new })
+        }
+        // Both modes set
+        (true, _, _) if has_old || has_new => {
+            Err("content is mutually exclusive with old_string/new_string; \
+             provide either content (full replace) or old_string+new_string (surgical edit)"
+                .to_string())
+        }
+        // Only one of old_string/new_string
+        (false, true, false) => {
+            Err("old_string requires new_string; provide both for a surgical edit".to_string())
+        }
+        (false, false, true) => {
+            Err("new_string requires old_string; provide both for a surgical edit".to_string())
+        }
+        // Neither mode
+        (false, false, false) => Err(
+            "must provide either content (full replace) or old_string+new_string (surgical edit)"
+                .to_string(),
+        ),
+        // Unreachable combinations (content=true, old=true, new=true or content=true, old/new only)
+        _ => Err("content is mutually exclusive with old_string/new_string; \
+             provide either content (full replace) or old_string+new_string (surgical edit)"
+            .to_string()),
+    }
+}
+
+/// Apply a surgical edit: replace the single occurrence of `old_string` with
+/// `new_string` in `old_content`.
+///
+/// Returns the new content string on success, or a descriptive error string.
+pub fn apply_surgical(
+    old_content: &str,
+    old_string: &str,
+    new_string: &str,
+) -> Result<String, String> {
+    let count = old_content.matches(old_string).count();
+    match count {
+        0 => Err("old_string not found in document".to_string()),
+        1 => Ok(old_content.replacen(old_string, new_string, 1)),
+        n => Err(format!(
+            "old_string is not unique in document (found {n} occurrences); \
+             include more surrounding context to disambiguate"
+        )),
+    }
+}
+
+/// Render a unified diff between `old` and `new` content, labelled with
+/// `a/<relpath>` and `b/<relpath>`. Returns an empty string if there is no
+/// diff (shouldn't happen for a real change).
+pub fn render_unified_diff(old: &str, new: &str, relpath: &str) -> String {
+    use similar::TextDiff;
+    let diff = TextDiff::from_lines(old, new);
+    diff.unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{relpath}"), &format!("b/{relpath}"))
+        .to_string()
 }
 
 #[derive(Clone)]
@@ -688,65 +793,39 @@ impl KbSearchServer {
         }
     }
 
-    /// Shared implementation for create_document and edit_document.
+    /// Shared pipeline for create_document and edit_document.
     ///
-    /// `must_already_exist`: `false` for create (file must NOT exist), `true` for edit (file MUST exist).
-    /// `default_verb`: used to build the default commit message, e.g. `"add"` or `"update"`.
-    /// `force_new`: when `Some(true)`, bypasses the dedup gate on create paths.
+    /// Callers are responsible for resolving paths and computing old/new content
+    /// before calling this. This function handles validation, optional dedup
+    /// gating (create only), filesystem write, git commit, reindex, and diff output.
+    ///
+    /// * `old_content` – empty string for create; existing file bytes for edit.
+    /// * `new_content` – the content to write (already computed by caller).
+    /// * `abs_path`    – canonical absolute path of the target file.
+    /// * `rel_path`    – repo-relative path (used for git add/commit and messages).
+    /// * `is_create`   – `true` for create (dedup gate active), `false` for edit.
+    /// * `message`     – optional custom commit message.
+    /// * `default_verb`– verb for the default commit message, e.g. `"add"` or `"update"`.
+    /// * `force_new`   – when `Some(true)`, bypasses the dedup gate on create paths.
+    #[allow(clippy::too_many_arguments)]
     async fn write_document(
         &self,
+        old_content: &str,
+        new_content: &str,
+        abs_path: &Path,
         rel_path: &str,
-        content: &str,
+        is_create: bool,
         message: Option<&str>,
-        must_already_exist: bool,
         default_verb: &str,
         force_new: Option<bool>,
     ) -> Result<CallToolResult, McpError> {
         let config = &self.config;
 
-        // 1. Security: reject absolute paths, path traversal, and symlinked ancestors.
-        let data_root = std::path::PathBuf::from(config.data_path());
-        let abs_path = resolve_safe_write_path(&data_root, rel_path)
-            .map_err(|e| McpError::invalid_params(e, None))?;
-
-        // 2. Include-pattern guard: reject paths that the indexer would not pick up.
-        // discover_files matches against the path relative to data_path (same form as rel_path).
-        if !self.include_patterns.is_match(rel_path) {
-            return Err(McpError::invalid_params(
-                format!(
-                    "path '{}' does not match any indexable include pattern \
-                     (e.g. must be a markdown file under an included path)",
-                    rel_path
-                ),
-                None,
-            ));
-        }
-
-        // 3. Existence check
-        let file_exists = abs_path.exists();
-        if must_already_exist && !file_exists {
-            return Err(McpError::invalid_params(
-                format!(
-                    "File '{}' does not exist. Use create_document to create new files.",
-                    rel_path
-                ),
-                None,
-            ));
-        }
-        if !must_already_exist && file_exists {
-            return Err(McpError::invalid_params(
-                format!(
-                    "File '{}' already exists. Use edit_document to modify existing files.",
-                    rel_path
-                ),
-                None,
-            ));
-        }
-
-        // 4. Validate content before writing
+        // 1. Validate new_content before writing (catches frontmatter errors in
+        //    both full-replace and surgical edits before touching the filesystem).
         let (validation_result, _) = validate::validate_content(
             std::path::Path::new(rel_path),
-            content,
+            new_content,
             &config.frontmatter,
             &config.validation,
         )
@@ -770,16 +849,13 @@ impl KbSearchServer {
             ));
         }
 
-        // 5. Dedup gate: on create paths, check for near-duplicate existing documents.
-        //    Gate runs only when: this is a create (not edit), dedup is enabled in config,
-        //    and the caller has not set force_new = true.
-        if !must_already_exist
-            && self.config.write.dedup_enabled
-            && !matches!(force_new, Some(true))
-        {
-            // Build query text: frontmatter title (if any) + body, truncated to
-            // DEDUP_QUERY_CHAR_LIMIT chars to stay within embedding model token limits.
-            let query_text: String = content.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect();
+        // 2. Dedup gate: on create paths, check for near-duplicate existing documents.
+        //    Gate runs only when: this is a create (not edit), dedup is enabled in
+        //    config, and the caller has not set force_new = true.
+        if is_create && self.config.write.dedup_enabled && !matches!(force_new, Some(true)) {
+            // Build query text truncated to DEDUP_QUERY_CHAR_LIMIT chars to stay
+            // within embedding model token limits.
+            let query_text: String = new_content.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect();
 
             match self.embed_client.embed_query(&query_text).await {
                 Ok(vector) => {
@@ -837,7 +913,7 @@ impl KbSearchServer {
             }
         }
 
-        // 6. Create parent directories and write the file
+        // 3. Create parent directories and write the file
         if let Some(parent) = abs_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 error!(
@@ -852,14 +928,14 @@ impl KbSearchServer {
             })?;
         }
 
-        tokio::fs::write(&abs_path, content.as_bytes())
+        tokio::fs::write(abs_path, new_content.as_bytes())
             .await
             .map_err(|e| {
                 error!("Failed to write file '{}': {}", abs_path.display(), e);
                 McpError::internal_error(format!("Failed to write file: {}", e), None)
             })?;
 
-        // 7. Build commit message
+        // 4. Build commit message
         let commit_message = {
             let base = message
                 .map(|m| m.to_string())
@@ -867,12 +943,12 @@ impl KbSearchServer {
             format!("{}\n\nVia: md-kb-rag write tool", base)
         };
 
-        // 8. Resolve git token
+        // 5. Resolve git token
         let token = std::env::var(&config.source.git_token_env)
             .ok()
             .filter(|s| !s.is_empty());
 
-        // 9. Commit and sync to remote
+        // 6. Commit and sync to remote
         let commit_sha = git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
@@ -887,7 +963,7 @@ impl KbSearchServer {
             McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
         })?;
 
-        // 10. Trigger incremental reindex (serialized against webhook reindexes)
+        // 7. Trigger incremental reindex (serialized against webhook reindexes)
         {
             let _guard = crate::webhook::REINDEX_LOCK.lock().await;
             ingest::run_index(config, false).await.map_err(|e| {
@@ -899,16 +975,16 @@ impl KbSearchServer {
             })?;
         }
 
-        // 11. Return success
-        let action = if must_already_exist {
-            "Updated"
+        // 8. Build unified diff and return success
+        let action = if is_create { "Created" } else { "Edited" };
+        let summary = format!("{} '{}' (commit {})", action, rel_path, commit_sha);
+        let diff = render_unified_diff(old_content, new_content, rel_path);
+        let result_text = if diff.is_empty() {
+            summary
         } else {
-            "Created"
+            format!("{}\n\n{}", summary, diff)
         };
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "{} '{}' (commit {})",
-            action, rel_path, commit_sha
-        ))]))
+        Ok(CallToolResult::success(vec![Content::text(result_text)]))
     }
 
     #[tool(description = "Create a new document in the knowledge base. \
@@ -921,34 +997,144 @@ impl KbSearchServer {
         &self,
         Parameters(params): Parameters<CreateDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
+        let config = &self.config;
+
+        // Resolve path: must be relative, no traversal, not already existing.
+        let data_root = std::path::PathBuf::from(config.data_path());
+        let abs_path = resolve_safe_write_path(&data_root, &params.path)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        // Include-pattern guard: reject paths the indexer would not pick up.
+        if !self.include_patterns.is_match(&params.path) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "path '{}' does not match any indexable include pattern \
+                     (e.g. must be a markdown file under an included path)",
+                    params.path
+                ),
+                None,
+            ));
+        }
+
+        // File must not already exist for create.
+        if abs_path.exists() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "File '{}' already exists. Use edit_document to modify existing files.",
+                    params.path
+                ),
+                None,
+            ));
+        }
+
         self.write_document(
-            &params.path,
+            "", // old_content: empty for new files
             &params.content,
+            &abs_path,
+            &params.path,
+            true, // is_create
             params.message.as_deref(),
-            false,
             "add",
             params.force_new,
         )
         .await
     }
 
-    #[tool(
-        description = "Edit (overwrite) an existing document in the knowledge base. \
-        Replaces the entire file content, commits it to the git repository, and triggers \
-        an incremental reindex. The document must already exist — use create_document for \
-        new files. Content must include valid YAML frontmatter."
-    )]
+    #[tool(description = "Edit an existing document in the knowledge base. \
+        Supports two modes:\n\
+        \n\
+        SURGICAL MODE — provide old_string and new_string (mutually exclusive with content):\n\
+        Finds old_string in the document (must appear exactly once) and replaces it with \
+        new_string. Ideal for small, targeted edits without sending the whole file. \
+        old_string must be unique in the document; include more surrounding context if the \
+        tool reports multiple occurrences.\n\
+        \n\
+        FULL-REPLACE MODE — provide content (mutually exclusive with old_string/new_string):\n\
+        Replaces the entire file content with the provided content, which must include valid \
+        YAML frontmatter.\n\
+        \n\
+        In both modes the result is validated, committed, and an incremental reindex is \
+        triggered. The path is resolved like get_document: relative to the KB root, a unique \
+        basename, or absolute. The document must already exist — use create_document for new files.")]
     async fn edit_document(
         &self,
         Parameters(params): Parameters<EditDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Parse and validate the edit mode (surgical vs full-replace).
+        let mode = parse_edit_mode(&params).map_err(|e| McpError::invalid_params(e, None))?;
+
+        // Resolve the path using the get_document resolver (forgiving: relative/
+        // absolute/basename, canonicalized, include-pattern + containment checked).
+        let raw = params.path.trim();
+        if raw.is_empty() {
+            return Err(McpError::invalid_params(
+                "path parameter is empty".to_string(),
+                None,
+            ));
+        }
+
+        let canonical = match self.resolve_within_data(raw) {
+            Ok(c) => c,
+            Err(ResolveErr::NotFound) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Document '{}' does not exist. Use create_document to create new files.",
+                        raw
+                    ),
+                    None,
+                ));
+            }
+            Err(ResolveErr::Outside) => {
+                return Err(McpError::invalid_params(
+                    "File path is outside the data directory".to_string(),
+                    None,
+                ));
+            }
+            Err(ResolveErr::NotPermitted) => {
+                return Err(McpError::invalid_params(
+                    "File type not permitted".to_string(),
+                    None,
+                ));
+            }
+            Err(ResolveErr::Other(msg)) => {
+                return Err(McpError::invalid_params(msg, None));
+            }
+        };
+
+        // Derive the repo-relative path from the canonical absolute path.
+        let rel_path = canonical
+            .strip_prefix(&self.canonical_data_path)
+            .unwrap_or(&canonical)
+            .to_string_lossy()
+            .into_owned();
+
+        // Read the existing file content.
+        let old_content = tokio::fs::read_to_string(&canonical).await.map_err(|e| {
+            error!("Failed to read '{}': {}", canonical.display(), e);
+            McpError::internal_error(format!("Failed to read existing file: {}", e), None)
+        })?;
+
+        // Compute new_content based on mode.
+        let new_content = match mode {
+            EditMode::Full { content } => content,
+            EditMode::Surgical { old, new } => {
+                apply_surgical(&old_content, &old, &new).map_err(|e| {
+                    // Enrich the error with the resolved relative path for context.
+                    let msg = e.replace("document", &format!("'{}'", rel_path));
+                    McpError::invalid_params(msg, None)
+                })?
+            }
+        };
+
         self.write_document(
-            &params.path,
-            &params.content,
+            &old_content,
+            &new_content,
+            &canonical,
+            &rel_path,
+            false, // is_create
             params.message.as_deref(),
-            true,
             "update",
-            None, // edit_document targets a known existing file — no dedup gate needed
+            None, // no dedup gate for edit
         )
         .await
     }
@@ -1522,16 +1708,15 @@ mod tests {
         let config = make_test_resolved_config(tmp.path());
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
-        let result = server
-            .write_document(
-                "docs/nonexistent.md",
-                "---\ntitle: Test\n---\n# Body",
-                None,
-                true, // must_already_exist = true (edit mode)
-                "update",
-                None,
-            )
-            .await;
+        // edit_document now goes through resolve_within_data; NotFound → clear error.
+        let params = EditDocumentParams {
+            path: "docs/nonexistent.md".to_string(),
+            old_string: None,
+            new_string: None,
+            content: Some("---\ntitle: Test\n---\n# Body".to_string()),
+            message: None,
+        };
+        let result = server.edit_document(Parameters(params)).await;
 
         assert!(
             result.is_err(),
@@ -1561,16 +1746,13 @@ mod tests {
         let config = make_test_resolved_config(tmp.path());
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
-        let result = server
-            .write_document(
-                "docs/existing.md",
-                "---\ntitle: Test\n---\n# New content",
-                None,
-                false, // must_already_exist = false (create mode)
-                "add",
-                None,
-            )
-            .await;
+        let params = CreateDocumentParams {
+            path: "docs/existing.md".to_string(),
+            content: "---\ntitle: Test\n---\n# New content".to_string(),
+            message: None,
+            force_new: None,
+        };
+        let result = server.create_document(Parameters(params)).await;
 
         assert!(result.is_err(), "create on existing file should return Err");
         let err = result.unwrap_err();
@@ -1594,9 +1776,13 @@ mod tests {
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
         // Try to write a .txt file (not matched by **/*.md)
-        let result = server
-            .write_document("notes.txt", "Some plain text", None, false, "add", None)
-            .await;
+        let params = CreateDocumentParams {
+            path: "notes.txt".to_string(),
+            content: "Some plain text".to_string(),
+            message: None,
+            force_new: None,
+        };
+        let result = server.create_document(Parameters(params)).await;
 
         assert!(
             result.is_err(),
@@ -1617,9 +1803,13 @@ mod tests {
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
         // Absolute path should be caught by the absolute-path guard before include check
-        let result = server
-            .write_document("/etc/passwd", "# Evil", None, false, "add", None)
-            .await;
+        let params = CreateDocumentParams {
+            path: "/etc/passwd".to_string(),
+            content: "# Evil".to_string(),
+            message: None,
+            force_new: None,
+        };
+        let result = server.create_document(Parameters(params)).await;
 
         assert!(result.is_err(), "absolute path should be rejected");
         let err = result.unwrap_err();
@@ -1673,16 +1863,13 @@ mod tests {
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
         // Content intentionally missing the "title" frontmatter field
-        let result = server
-            .write_document(
-                "guide/missing-title.md",
-                "---\ntype: guide\n---\n# No title in frontmatter",
-                None,
-                false,
-                "add",
-                None,
-            )
-            .await;
+        let params = CreateDocumentParams {
+            path: "guide/missing-title.md".to_string(),
+            content: "---\ntype: guide\n---\n# No title in frontmatter".to_string(),
+            message: None,
+            force_new: None,
+        };
+        let result = server.create_document(Parameters(params)).await;
 
         assert!(result.is_err(), "validation failure should return Err");
         let err = result.unwrap_err();
@@ -1822,17 +2009,14 @@ mod tests {
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
         // When dedup is disabled we should NOT get a dedup refusal.
-        // The write will fail at validation (missing frontmatter) — that's fine.
-        let result = server
-            .write_document(
-                "docs/new.md",
-                "---\ntitle: Test Doc\n---\n# Content",
-                None,
-                false,
-                "add",
-                None,
-            )
-            .await;
+        // The write will fail at git/reindex (no live services) — that's fine.
+        let params = CreateDocumentParams {
+            path: "docs/new.md".to_string(),
+            content: "---\ntitle: Test Doc\n---\n# Content".to_string(),
+            message: None,
+            force_new: None,
+        };
+        let result = server.create_document(Parameters(params)).await;
 
         // We expect an error (git/reindex will fail in unit test), but it must
         // NOT be a dedup refusal — i.e. it should not mention "similar document".
@@ -1859,16 +2043,13 @@ mod tests {
         // With force_new=Some(true), the gate must be skipped even when dedup is
         // enabled.  The embed/qdrant will fail-open (no live services), so we will
         // reach git/reindex and fail there — but NOT with a dedup message.
-        let result = server
-            .write_document(
-                "docs/forced.md",
-                "---\ntitle: Forced Doc\n---\n# Content",
-                None,
-                false,
-                "add",
-                Some(true), // force_new
-            )
-            .await;
+        let params = CreateDocumentParams {
+            path: "docs/forced.md".to_string(),
+            content: "---\ntitle: Forced Doc\n---\n# Content".to_string(),
+            message: None,
+            force_new: Some(true),
+        };
+        let result = server.create_document(Parameters(params)).await;
 
         if let Err(e) = result {
             assert!(
@@ -1885,23 +2066,25 @@ mod tests {
         // Create the file so the edit path can proceed past existence check.
         let sub = tmp.path().join("docs");
         std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("edit-me.md"), "# old content").unwrap();
+        std::fs::write(
+            sub.join("edit-me.md"),
+            "---\ntitle: Old Doc\n---\n# old content",
+        )
+        .unwrap();
 
         let config = make_test_resolved_config(tmp.path());
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
-        // Edit path (must_already_exist=true) should never trigger the dedup gate.
+        // Edit path should never trigger the dedup gate.
         // It will fail at git/reindex — but NOT with a dedup message.
-        let result = server
-            .write_document(
-                "docs/edit-me.md",
-                "---\ntitle: Edited Doc\n---\n# New content",
-                None,
-                true, // edit path
-                "update",
-                None,
-            )
-            .await;
+        let params = EditDocumentParams {
+            path: "docs/edit-me.md".to_string(),
+            old_string: None,
+            new_string: None,
+            content: Some("---\ntitle: Edited Doc\n---\n# New content".to_string()),
+            message: None,
+        };
+        let result = server.edit_document(Parameters(params)).await;
 
         if let Err(e) = result {
             assert!(
@@ -1979,5 +2162,205 @@ mod tests {
             msg.contains("symlink") || msg.contains("escapes"),
             "error should mention symlink or escape, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_edit_mode unit tests
+    // -----------------------------------------------------------------------
+
+    fn make_edit_params(
+        content: Option<&str>,
+        old_string: Option<&str>,
+        new_string: Option<&str>,
+    ) -> EditDocumentParams {
+        EditDocumentParams {
+            path: "docs/test.md".to_string(),
+            content: content.map(|s| s.to_string()),
+            old_string: old_string.map(|s| s.to_string()),
+            new_string: new_string.map(|s| s.to_string()),
+            message: None,
+        }
+    }
+
+    #[test]
+    fn parse_edit_mode_full_replace_is_recognized() {
+        let params = make_edit_params(Some("new content"), None, None);
+        let mode = parse_edit_mode(&params).unwrap();
+        assert_eq!(
+            mode,
+            EditMode::Full {
+                content: "new content".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_surgical_is_recognized() {
+        let params = make_edit_params(None, Some("old text"), Some("new text"));
+        let mode = parse_edit_mode(&params).unwrap();
+        assert_eq!(
+            mode,
+            EditMode::Surgical {
+                old: "old text".to_string(),
+                new: "new text".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_both_modes_rejected() {
+        let params = make_edit_params(Some("full content"), Some("old"), Some("new"));
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected 'mutually exclusive' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_neither_mode_rejected() {
+        let params = make_edit_params(None, None, None);
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(
+            err.contains("must provide"),
+            "expected 'must provide' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_only_old_string_rejected() {
+        let params = make_edit_params(None, Some("old"), None);
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(
+            err.contains("new_string"),
+            "expected mention of new_string in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_only_new_string_rejected() {
+        let params = make_edit_params(None, None, Some("new"));
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(
+            err.contains("old_string"),
+            "expected mention of old_string in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_identical_old_new_rejected() {
+        let params = make_edit_params(None, Some("same text"), Some("same text"));
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(
+            err.contains("identical"),
+            "expected 'identical' in error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_surgical unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_surgical_single_occurrence_replaced() {
+        let old = "Hello world!\nGoodbye earth!";
+        let result = apply_surgical(old, "world", "Rust").unwrap();
+        assert_eq!(result, "Hello Rust!\nGoodbye earth!");
+    }
+
+    #[test]
+    fn apply_surgical_not_found_returns_error() {
+        let old = "Hello world!";
+        let err = apply_surgical(old, "missing text", "replacement").unwrap_err();
+        assert!(
+            err.contains("not found"),
+            "expected 'not found' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_surgical_multiple_occurrences_returns_error_with_count() {
+        let old = "foo bar foo baz foo";
+        let err = apply_surgical(old, "foo", "qux").unwrap_err();
+        assert!(
+            err.contains("3"),
+            "error should mention occurrence count (3), got: {err}"
+        );
+        assert!(
+            err.contains("not unique"),
+            "error should mention 'not unique', got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_surgical_exact_single_unique_string() {
+        let old = "---\ntitle: My Doc\n---\n# Content\nSome text here.";
+        let result = apply_surgical(old, "Some text here.", "Updated text.").unwrap();
+        assert_eq!(result, "---\ntitle: My Doc\n---\n# Content\nUpdated text.");
+    }
+
+    // -----------------------------------------------------------------------
+    // render_unified_diff unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_unified_diff_shows_added_lines() {
+        let old = "line1\nline2\n";
+        let new = "line1\nline2\nline3\n";
+        let diff = render_unified_diff(old, new, "docs/test.md");
+        assert!(
+            !diff.is_empty(),
+            "diff should be non-empty for a changed doc"
+        );
+        assert!(
+            diff.contains("+line3"),
+            "diff should show added line, got:\n{diff}"
+        );
+        assert!(
+            diff.contains("a/docs/test.md"),
+            "diff header should name the file, got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn render_unified_diff_shows_removed_lines() {
+        let old = "line1\nline2\nline3\n";
+        let new = "line1\nline3\n";
+        let diff = render_unified_diff(old, new, "docs/test.md");
+        assert!(
+            diff.contains("-line2"),
+            "diff should show removed line, got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn render_unified_diff_identical_content_is_empty() {
+        let content = "line1\nline2\n";
+        let diff = render_unified_diff(content, content, "docs/test.md");
+        assert!(
+            diff.is_empty(),
+            "identical content should produce empty diff, got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn render_unified_diff_create_shows_all_as_additions() {
+        let old = "";
+        let new = "---\ntitle: New Doc\n---\n# Hello\n";
+        let diff = render_unified_diff(old, new, "docs/new.md");
+        assert!(!diff.is_empty(), "new file diff should be non-empty");
+        // Every non-header line should be an addition.
+        for line in diff.lines() {
+            if !line.starts_with("---")
+                && !line.starts_with("+++")
+                && !line.starts_with("@@")
+                && !line.is_empty()
+            {
+                assert!(
+                    line.starts_with('+'),
+                    "all content lines in a create diff should be additions, got: {line}"
+                );
+            }
+        }
     }
 }
