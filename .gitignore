@@ -8,3 +8,4 @@ deploy/deploy.env
 *.db-wal
 *.db-shm
 .claude/
+.serena/
