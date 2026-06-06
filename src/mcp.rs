@@ -105,6 +105,78 @@ fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
     Ok(())
 }
 
+/// Validate that `rel_path` is safe to write inside `data_root`, returning the
+/// absolute target path on success or an error string on failure.
+///
+/// Checks performed (in order):
+/// 1. Reject absolute paths.
+/// 2. Reject any `..` component.
+/// 3. Lexical `starts_with` check on the joined abs path.
+/// 4. Canonicalize the deepest *existing* ancestor of the target; verify it
+///    still `starts_with` the canonical data_root. This catches a symlinked
+///    ancestor directory that resolves to a location outside data_root.
+pub fn resolve_safe_write_path(data_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    // 1. Reject absolute paths.
+    let requested = Path::new(rel_path);
+    if requested.is_absolute() {
+        return Err("path must be relative to the knowledge base root".to_string());
+    }
+
+    // 2. Reject any `..` component.
+    for component in requested.components() {
+        if component == std::path::Component::ParentDir {
+            return Err("path must not contain '..' components".to_string());
+        }
+    }
+
+    let abs_path = data_root.join(rel_path);
+
+    // 3. Lexical starts_with check.
+    if !abs_path.starts_with(data_root) {
+        return Err("path escapes the knowledge base root".to_string());
+    }
+
+    // 4. Canonical-ancestor check: canonicalize data_root, then walk up from
+    //    abs_path to find the deepest ancestor that actually exists on disk,
+    //    canonicalize it, and confirm it still sits under canonical data_root.
+    let canonical_root = data_root.canonicalize().map_err(|e| {
+        format!(
+            "cannot canonicalize data root '{}': {}",
+            data_root.display(),
+            e
+        )
+    })?;
+
+    // Walk from abs_path upward until we find an existing ancestor.
+    let mut candidate = abs_path.as_path();
+    let existing_ancestor = loop {
+        if candidate.exists() {
+            break candidate;
+        }
+        match candidate.parent() {
+            Some(p) => candidate = p,
+            None => {
+                // No ancestor exists at all (shouldn't happen since data_root must exist).
+                break data_root;
+            }
+        }
+    };
+
+    let canonical_ancestor = existing_ancestor.canonicalize().map_err(|e| {
+        format!(
+            "cannot canonicalize ancestor '{}': {}",
+            existing_ancestor.display(),
+            e
+        )
+    })?;
+
+    if !canonical_ancestor.starts_with(&canonical_root) {
+        return Err("path escapes the knowledge base root (symlink detected)".to_string());
+    }
+
+    Ok(abs_path)
+}
+
 /// Parameters for the `get_document` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentParams {
@@ -632,34 +704,10 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         let config = &self.config;
 
-        // 1. Security: reject absolute paths and path traversal
-        let requested = std::path::Path::new(rel_path);
-        if requested.is_absolute() {
-            return Err(McpError::invalid_params(
-                "path must be relative to the knowledge base root".to_string(),
-                None,
-            ));
-        }
-        // Reject any component that is literally ".."
-        for component in requested.components() {
-            if component == std::path::Component::ParentDir {
-                return Err(McpError::invalid_params(
-                    "path must not contain '..' components".to_string(),
-                    None,
-                ));
-            }
-        }
-
+        // 1. Security: reject absolute paths, path traversal, and symlinked ancestors.
         let data_root = std::path::PathBuf::from(config.data_path());
-        let abs_path = data_root.join(rel_path);
-
-        // Lexical check: constructed abs_path must start with data_root
-        if !abs_path.starts_with(&data_root) {
-            return Err(McpError::invalid_params(
-                "path escapes the knowledge base root".to_string(),
-                None,
-            ));
-        }
+        let abs_path = resolve_safe_write_path(&data_root, rel_path)
+            .map_err(|e| McpError::invalid_params(e, None))?;
 
         // 2. Include-pattern guard: reject paths that the indexer would not pick up.
         // discover_files matches against the path relative to data_path (same form as rel_path).
@@ -866,7 +914,9 @@ impl KbSearchServer {
     #[tool(description = "Create a new document in the knowledge base. \
         Writes the file, commits it to the git repository, and triggers an incremental reindex. \
         The document must not already exist — use edit_document for existing files. \
-        Content must include valid YAML frontmatter.")]
+        Content must include valid YAML frontmatter. \
+        If a very similar document already exists, the create is refused and the close match is \
+        reported — edit that document instead, or set force_new=true to create a new one anyway.")]
     async fn create_document(
         &self,
         Parameters(params): Parameters<CreateDocumentParams>,
@@ -1860,5 +1910,74 @@ mod tests {
                 e.message
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_safe_write_path unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safe_write_path_rejects_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = resolve_safe_write_path(tmp.path(), "/etc/passwd");
+        assert!(result.is_err(), "absolute path must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("relative"),
+            "error should mention relative requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn safe_write_path_rejects_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = resolve_safe_write_path(tmp.path(), "../../etc/shadow");
+        assert!(result.is_err(), "parent-dir component must be rejected");
+        let msg = result.unwrap_err();
+        assert!(msg.contains(".."), "error should mention '..', got: {msg}");
+    }
+
+    #[test]
+    fn safe_write_path_accepts_normal_nested_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The file doesn't need to exist; the ancestor (tmp itself) does.
+        let result = resolve_safe_write_path(tmp.path(), "subdir/docs/guide.md");
+        assert!(
+            result.is_ok(),
+            "normal nested path should be accepted, got: {:?}",
+            result
+        );
+        let abs = result.unwrap();
+        assert!(
+            abs.starts_with(tmp.path()),
+            "returned path should be under data_root"
+        );
+    }
+
+    #[test]
+    fn safe_write_path_rejects_symlinked_ancestor_outside_root() {
+        // Create two separate temp directories.
+        let inside_tmp = tempfile::tempdir().unwrap();
+        let outside_tmp = tempfile::tempdir().unwrap();
+
+        // Create a subdirectory inside inside_tmp that is actually a symlink
+        // pointing to outside_tmp.
+        let escaped_dir = inside_tmp.path().join("escaped");
+        std::os::unix::fs::symlink(outside_tmp.path(), &escaped_dir)
+            .expect("failed to create symlink");
+
+        // A path through the symlink: "escaped/secret.md"
+        // Lexically this is under inside_tmp, but canonically it resolves outside.
+        let result = resolve_safe_write_path(inside_tmp.path(), "escaped/secret.md");
+
+        assert!(
+            result.is_err(),
+            "path through symlinked ancestor pointing outside root must be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("symlink") || msg.contains("escapes"),
+            "error should mention symlink or escape, got: {msg}"
+        );
     }
 }
