@@ -108,6 +108,7 @@ pub async fn ensure_repo(
 /// On a rebase conflict, abort the rebase (so the working tree is left clean at the local
 /// commit) and return an Err whose message clearly identifies it as a rebase/merge conflict
 /// on the file, distinct from other git failures.
+#[allow(clippy::too_many_arguments)]
 pub async fn commit_and_sync(
     git_url: Option<&str>,
     branch: &str,
@@ -115,6 +116,8 @@ pub async fn commit_and_sync(
     token: Option<&str>,
     rel_path: &str,
     message: &str,
+    author_name: &str,
+    author_email: &str,
 ) -> anyhow::Result<String> {
     // Helper: build a base git command with safe.directory set and cwd pointing at data_path.
     // Returns (Command,) ready to have more args appended.
@@ -137,16 +140,17 @@ pub async fn commit_and_sync(
     }
 
     // --- git commit -m <message> ---
-    // Set a bot identity inline so the command is self-contained even in environments
-    // without a global git user configured.
+    // Set the author identity inline so the command is self-contained even in
+    // environments without a global git user configured. Both author and committer
+    // derive from user.* when not otherwise specified.
     let commit_out = Command::new("git")
         .args([
             "-c",
             &format!("safe.directory={}", data_path),
             "-c",
-            "user.name=md-kb-rag",
+            &format!("user.name={}", author_name),
             "-c",
-            "user.email=md-kb-rag@localhost",
+            &format!("user.email={}", author_email),
             "commit",
             "-m",
             message,
@@ -573,6 +577,8 @@ mod tests {
             None,
             "notes.md",
             "add notes.md\n\nmd-kb-rag bot commit",
+            "test-bot",
+            "test-bot@localhost",
         )
         .await
         .unwrap();
@@ -626,6 +632,8 @@ mod tests {
             None,
             "article.md",
             "add article.md",
+            "test-bot",
+            "test-bot@localhost",
         )
         .await
         .unwrap();
@@ -661,6 +669,8 @@ mod tests {
             None,
             "conflict.md",
             "add conflict.md from A",
+            "test-bot",
+            "test-bot@localhost",
         )
         .await
         .unwrap();
@@ -709,6 +719,8 @@ mod tests {
             None,
             "conflict.md",
             "add conflict.md from B",
+            "test-bot",
+            "test-bot@localhost",
         )
         .await;
 

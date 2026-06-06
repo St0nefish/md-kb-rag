@@ -285,6 +285,12 @@ write:
   # shorter or more domain-specific documents.
   dedup_threshold: 0.85
 
+  # Git author identity used for commits made by the write tools (create_document,
+  # edit_document). Setting these to a bot identity makes tool-authored commits
+  # easy to distinguish from your own hand-made commits in `git log`.
+  commit_author_name: "md-kb-rag"
+  commit_author_email: "md-kb-rag@localhost"
+
 
 # ----------------------------------------------------------------------------
 # rate_limit — per-IP rate limiting for all HTTP endpoints

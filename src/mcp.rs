@@ -344,6 +344,27 @@ pub fn render_unified_diff(old: &str, new: &str, relpath: &str) -> String {
         .to_string()
 }
 
+/// Build a commit message with git trailers identifying the tool and operation.
+///
+/// The resulting message has the form:
+/// ```text
+/// <subject line>
+///
+/// Tool: md-kb-rag
+/// Operation: <operation>
+/// ```
+///
+/// `user_subject` is the caller-supplied commit message (if any). When absent,
+/// `default_subject` is used. The trailer block is always appended after a blank line.
+pub fn build_commit_message(
+    user_subject: Option<&str>,
+    default_subject: &str,
+    operation: &str,
+) -> String {
+    let subject = user_subject.unwrap_or(default_subject);
+    format!("{}\n\nTool: md-kb-rag\nOperation: {}", subject, operation)
+}
+
 #[derive(Clone)]
 pub struct KbSearchServer {
     embed_client: Arc<EmbedClient>,
@@ -807,6 +828,7 @@ impl KbSearchServer {
     /// * `message`     – optional custom commit message.
     /// * `default_verb`– verb for the default commit message, e.g. `"add"` or `"update"`.
     /// * `force_new`   – when `Some(true)`, bypasses the dedup gate on create paths.
+    /// * `operation`   – label for the `Operation:` git trailer, e.g. `"create_document"`.
     #[allow(clippy::too_many_arguments)]
     async fn write_document(
         &self,
@@ -818,6 +840,7 @@ impl KbSearchServer {
         message: Option<&str>,
         default_verb: &str,
         force_new: Option<bool>,
+        operation: &str,
     ) -> Result<CallToolResult, McpError> {
         let config = &self.config;
 
@@ -935,13 +958,12 @@ impl KbSearchServer {
                 McpError::internal_error(format!("Failed to write file: {}", e), None)
             })?;
 
-        // 4. Build commit message
-        let commit_message = {
-            let base = message
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| format!("docs: {} {}", default_verb, rel_path));
-            format!("{}\n\nVia: md-kb-rag write tool", base)
-        };
+        // 4. Build commit message with git trailers
+        let commit_message = build_commit_message(
+            message,
+            &format!("docs: {} {}", default_verb, rel_path),
+            operation,
+        );
 
         // 5. Resolve git token
         let token = std::env::var(&config.source.git_token_env)
@@ -956,6 +978,8 @@ impl KbSearchServer {
             token.as_deref(),
             rel_path,
             &commit_message,
+            &config.write.commit_author_name,
+            &config.write.commit_author_email,
         )
         .await
         .map_err(|e| {
@@ -1036,6 +1060,7 @@ impl KbSearchServer {
             params.message.as_deref(),
             "add",
             params.force_new,
+            "create_document",
         )
         .await
     }
@@ -1114,15 +1139,16 @@ impl KbSearchServer {
             McpError::internal_error(format!("Failed to read existing file: {}", e), None)
         })?;
 
-        // Compute new_content based on mode.
-        let new_content = match mode {
-            EditMode::Full { content } => content,
+        // Compute new_content and operation label based on mode.
+        let (new_content, operation) = match mode {
+            EditMode::Full { content } => (content, "edit_document (full replace)"),
             EditMode::Surgical { old, new } => {
-                apply_surgical(&old_content, &old, &new).map_err(|e| {
+                let result = apply_surgical(&old_content, &old, &new).map_err(|e| {
                     // Enrich the error with the resolved relative path for context.
                     let msg = e.replace("document", &format!("'{}'", rel_path));
                     McpError::invalid_params(msg, None)
-                })?
+                })?;
+                (result, "edit_document (surgical replace)")
             }
         };
 
@@ -1135,6 +1161,7 @@ impl KbSearchServer {
             params.message.as_deref(),
             "update",
             None, // no dedup gate for edit
+            operation,
         )
         .await
     }
@@ -1165,6 +1192,78 @@ impl ServerHandler for KbSearchServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- build_commit_message tests ---
+
+    #[test]
+    fn commit_message_create_document_trailer() {
+        let msg = build_commit_message(None, "docs: add notes/guide.md", "create_document");
+        assert!(
+            msg.contains("Tool: md-kb-rag"),
+            "should contain Tool trailer: {msg}"
+        );
+        assert!(
+            msg.contains("Operation: create_document"),
+            "should contain Operation trailer: {msg}"
+        );
+        assert!(
+            msg.starts_with("docs: add notes/guide.md"),
+            "should start with default subject: {msg}"
+        );
+    }
+
+    #[test]
+    fn commit_message_edit_surgical_trailer() {
+        let msg = build_commit_message(
+            None,
+            "docs: update notes/guide.md",
+            "edit_document (surgical replace)",
+        );
+        assert!(
+            msg.contains("Operation: edit_document (surgical replace)"),
+            "should contain surgical operation label: {msg}"
+        );
+    }
+
+    #[test]
+    fn commit_message_edit_full_replace_trailer() {
+        let msg = build_commit_message(
+            None,
+            "docs: update notes/guide.md",
+            "edit_document (full replace)",
+        );
+        assert!(
+            msg.contains("Operation: edit_document (full replace)"),
+            "should contain full replace operation label: {msg}"
+        );
+    }
+
+    #[test]
+    fn commit_message_user_subject_overrides_default() {
+        let msg = build_commit_message(
+            Some("fix: correct typo in introduction"),
+            "docs: update notes/guide.md",
+            "edit_document (surgical replace)",
+        );
+        assert!(
+            msg.starts_with("fix: correct typo in introduction"),
+            "user subject should take precedence: {msg}"
+        );
+        assert!(
+            msg.contains("Operation: edit_document (surgical replace)"),
+            "trailer should still be appended: {msg}"
+        );
+    }
+
+    #[test]
+    fn commit_message_trailer_separated_by_blank_line() {
+        let msg = build_commit_message(None, "docs: add test.md", "create_document");
+        // Git requires a blank line between subject and trailer block
+        assert!(
+            msg.contains("\n\nTool: md-kb-rag"),
+            "blank line must precede trailer block: {msg}"
+        );
+    }
 
     #[test]
     fn default_limit_is_ten() {
@@ -2003,6 +2102,8 @@ mod tests {
             write: crate::config::WriteConfig {
                 dedup_enabled: false,
                 dedup_threshold: 0.85,
+                commit_author_name: "md-kb-rag".to_string(),
+                commit_author_email: "md-kb-rag@localhost".to_string(),
             },
         });
 
