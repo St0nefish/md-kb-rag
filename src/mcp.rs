@@ -18,6 +18,7 @@ use crate::{
     embed::EmbedClient,
     git, ingest,
     qdrant::{QdrantStore, SearchResult},
+    state::StateDb,
     validate,
 };
 
@@ -245,6 +246,17 @@ pub struct EditDocumentParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Optional commit message; defaults to "docs: update {path}".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Parameters for the `delete_document` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DeleteDocumentParams {
+    /// Path of the document to delete. Resolved like get_document (relative to the
+    /// KB root, a unique basename, or absolute).
+    pub path: String,
+    /// Optional commit message; defaults to "docs: delete {path}".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -1164,6 +1176,148 @@ impl KbSearchServer {
             operation,
         )
         .await
+    }
+
+    #[tool(description = "Delete a document from the knowledge base. \
+        Removes the file from disk, commits the deletion to git with provenance trailers \
+        (just like create_document/edit_document), pushes the commit, and explicitly purges \
+        the document's vectors from the Qdrant search index and its state-DB row. \
+        The path resolves like get_document: relative to the KB root \
+        (e.g. 'sysadmin/guide.md'), a unique basename, or absolute. \
+        The document must already exist — use search to find the correct path. \
+        Returns a summary line with the commit SHA and a unified diff of the removed content.")]
+    async fn delete_document(
+        &self,
+        Parameters(params): Parameters<DeleteDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = &self.config;
+
+        let raw = params.path.trim();
+        if raw.is_empty() {
+            return Err(McpError::invalid_params(
+                "path parameter is empty".to_string(),
+                None,
+            ));
+        }
+
+        // 1. Resolve the path (must already exist on disk).
+        let canonical = match self.resolve_within_data(raw) {
+            Ok(c) => c,
+            Err(ResolveErr::NotFound) => {
+                return Err(McpError::invalid_params(
+                    format!("document does not exist: '{}'", raw),
+                    None,
+                ));
+            }
+            Err(ResolveErr::Outside) => {
+                return Err(McpError::invalid_params(
+                    "File path is outside the data directory".to_string(),
+                    None,
+                ));
+            }
+            Err(ResolveErr::NotPermitted) => {
+                return Err(McpError::invalid_params(
+                    "File type not permitted".to_string(),
+                    None,
+                ));
+            }
+            Err(ResolveErr::Other(msg)) => {
+                return Err(McpError::invalid_params(msg, None));
+            }
+        };
+
+        // Derive repo-relative path (used for git staging, commit messages, index purge).
+        let rel_path = canonical
+            .strip_prefix(&self.canonical_data_path)
+            .unwrap_or(&canonical)
+            .to_string_lossy()
+            .into_owned();
+
+        // 2. Read file content before removal (used for diff output).
+        let old_content = tokio::fs::read_to_string(&canonical).await.map_err(|e| {
+            error!("Failed to read '{}': {}", canonical.display(), e);
+            McpError::internal_error(format!("Failed to read file before deletion: {}", e), None)
+        })?;
+
+        // 3. Remove the file from disk.
+        tokio::fs::remove_file(&canonical).await.map_err(|e| {
+            error!("Failed to remove '{}': {}", canonical.display(), e);
+            McpError::internal_error(format!("Failed to remove file: {}", e), None)
+        })?;
+
+        // 4. Commit + push the deletion.
+        let commit_message = build_commit_message(
+            params.message.as_deref(),
+            &format!("docs: delete {}", rel_path),
+            "delete_document",
+        );
+
+        let token = std::env::var(&config.source.git_token_env)
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let commit_sha = git::commit_and_sync(
+            config.source.git_url.as_deref(),
+            &config.source.branch,
+            config.data_path(),
+            token.as_deref(),
+            &rel_path,
+            &commit_message,
+            &config.write.commit_author_name,
+            &config.write.commit_author_email,
+        )
+        .await
+        .map_err(|e| {
+            error!("commit_and_sync failed for '{}': {:#}", rel_path, e);
+            McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
+        })?;
+
+        // 5 & 6. Purge from Qdrant and state DB under REINDEX_LOCK.
+        {
+            let _guard = crate::webhook::REINDEX_LOCK.lock().await;
+
+            // Purge vectors from Qdrant.
+            self.qdrant
+                .delete_by_files(&self.collection, &[rel_path.as_str()])
+                .await
+                .map_err(|e| {
+                    error!("delete_by_files failed for '{}': {:#}", rel_path, e);
+                    McpError::internal_error(
+                        format!("Failed to purge document from search index: {}", e),
+                        None,
+                    )
+                })?;
+
+            // Remove state-DB row so incremental reindex bookkeeping stays correct.
+            // Use a short-lived handle; SQLite WAL + REINDEX_LOCK serializes writers.
+            let db_path = config.state_db_path();
+            match StateDb::new(std::path::Path::new(&db_path)).await {
+                Ok(state) => {
+                    if let Err(e) = state.delete(&rel_path).await {
+                        // Non-fatal: stale state DB row causes the next incremental
+                        // reindex to attempt re-processing, which will succeed because
+                        // the file is gone (orphan removal path). Log and continue.
+                        error!("Failed to remove state DB row for '{}': {:#}", rel_path, e);
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to open state DB for '{}' cleanup: {:#}",
+                        rel_path, e
+                    );
+                }
+            }
+        }
+
+        // 7. Return success with summary + diff of removed content.
+        let summary = format!("Deleted '{}' (commit {})", rel_path, commit_sha);
+        let diff = render_unified_diff(&old_content, "", &rel_path);
+        let result_text = if diff.is_empty() {
+            summary
+        } else {
+            format!("{}\n\n{}", summary, diff)
+        };
+        Ok(CallToolResult::success(vec![Content::text(result_text)]))
     }
 }
 
@@ -2191,6 +2345,162 @@ mod tests {
             assert!(
                 !e.message.contains("similar document"),
                 "edit path must never trigger dedup gate, got: {}",
+                e.message
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_document unit tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_document_nonexistent_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let params = DeleteDocumentParams {
+            path: "docs/nonexistent.md".to_string(),
+            message: None,
+        };
+        let result = server.delete_document(Parameters(params)).await;
+
+        assert!(
+            result.is_err(),
+            "delete of non-existent file should return Err"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("does not exist"),
+            "error should mention 'does not exist', got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn delete_document_relpath_derivation() {
+        // Verify that the relpath strip logic produces the expected relative path.
+        let canonical_data = std::path::PathBuf::from("/data/kb");
+        let canonical_file = std::path::PathBuf::from("/data/kb/sysadmin/networking/dns.md");
+        let rel = canonical_file
+            .strip_prefix(&canonical_data)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(rel, "sysadmin/networking/dns.md");
+    }
+
+    #[test]
+    fn delete_document_diff_shows_all_as_removals() {
+        // When deleting a file, render_unified_diff(old, "", path) should show all
+        // lines as removals (every non-header line starts with '-').
+        let old = "---\ntitle: My Doc\n---\n# Content\nSome text.\n";
+        let diff = render_unified_diff(old, "", "docs/my-doc.md");
+        assert!(!diff.is_empty(), "delete diff should be non-empty");
+        for line in diff.lines() {
+            if !line.starts_with("---")
+                && !line.starts_with("+++")
+                && !line.starts_with("@@")
+                && !line.is_empty()
+            {
+                assert!(
+                    line.starts_with('-'),
+                    "all content lines in a delete diff should be removals, got: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delete_document_commit_message_has_correct_trailers() {
+        let msg = build_commit_message(None, "docs: delete notes/guide.md", "delete_document");
+        assert!(
+            msg.contains("Tool: md-kb-rag"),
+            "should contain Tool trailer: {msg}"
+        );
+        assert!(
+            msg.contains("Operation: delete_document"),
+            "should contain Operation: delete_document trailer: {msg}"
+        );
+        assert!(
+            msg.starts_with("docs: delete notes/guide.md"),
+            "should start with delete subject: {msg}"
+        );
+    }
+
+    #[test]
+    fn delete_document_user_message_overrides_default() {
+        let msg = build_commit_message(
+            Some("chore: remove obsolete guide"),
+            "docs: delete notes/guide.md",
+            "delete_document",
+        );
+        assert!(
+            msg.starts_with("chore: remove obsolete guide"),
+            "user subject should override default: {msg}"
+        );
+        assert!(
+            msg.contains("Operation: delete_document"),
+            "trailer still present: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_empty_path_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let params = DeleteDocumentParams {
+            path: "   ".to_string(), // whitespace-only
+            message: None,
+        };
+        let result = server.delete_document(Parameters(params)).await;
+
+        assert!(result.is_err(), "empty path should return Err");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("empty"),
+            "error should mention empty path, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_existing_file_proceeds_to_git_step() {
+        // Create a real file in tmp; the tool should resolve it and proceed past
+        // path-resolution and file-removal to the git step (which will fail since
+        // there's no git repo). The error must NOT be a path-resolution error.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("delete-me.md"),
+            "---\ntitle: Delete Me\n---\n# Body",
+        )
+        .unwrap();
+
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let params = DeleteDocumentParams {
+            path: "docs/delete-me.md".to_string(),
+            message: None,
+        };
+        let result = server.delete_document(Parameters(params)).await;
+
+        // File removal happens before git; the file should be gone regardless.
+        assert!(
+            !sub.join("delete-me.md").exists(),
+            "file should have been removed from disk"
+        );
+
+        // The error (if any) should be git- or index-related, not path-resolution.
+        if let Err(e) = result {
+            assert!(
+                !e.message.contains("does not exist"),
+                "error should not be path-resolution, got: {}",
                 e.message
             );
         }
