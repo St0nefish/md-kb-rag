@@ -46,7 +46,11 @@ enum Commands {
         full: bool,
     },
     /// Validate all markdown files without indexing
-    Validate,
+    Validate {
+        /// Exit non-zero if any file fails validation, regardless of config strict setting
+        #[arg(long)]
+        strict: bool,
+    },
     /// Print collection stats and state DB info
     Status,
     /// Check if the server is healthy
@@ -81,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
             }
             ingest::run_index(&cfg, full).await?;
         }
-        Commands::Validate => {
+        Commands::Validate { strict } => {
             let data_path = Path::new(cfg.data_path());
             let files = ingest::discover_files(data_path, &cfg.indexing)?;
             info!("Validating {} files", files.len());
@@ -109,7 +113,8 @@ async fn main() -> anyhow::Result<()> {
                 "Validation complete"
             );
 
-            if invalid_count > 0 && cfg.validation.strict {
+            let strict = cfg.validation.strict || strict;
+            if invalid_count > 0 && strict {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
             }
         }

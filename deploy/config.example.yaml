@@ -95,6 +95,26 @@ frontmatter:
   # Example: { status: "active" }
   defaults: {}
 
+  # Closed-set (enum) enforcement. Maps a frontmatter field to its exhaustive
+  # list of allowed values. A file whose field value is NOT in the list fails
+  # validation. Absent fields are not checked here — use `required` for that.
+  # Open-ended fields (domain, tags) should be omitted from this map.
+  allowed:
+    type:
+      - guide
+      - reference
+      - research
+      - config
+      - troubleshooting
+      - architecture
+      - project
+      - decision-record
+      - migration
+    status:
+      - active
+      - draft
+      - archived
+
 
 # ----------------------------------------------------------------------------
 # chunking — how markdown files are split into vector chunks
@@ -244,6 +264,32 @@ mcp:
   # from Qdrant. Appended to the instructions so agents know what filters
   # are available. Default: 300 (5 minutes).
   # metadata_refresh_secs: 300
+
+
+# ----------------------------------------------------------------------------
+# write — behaviour of the create_document / edit_document MCP write tools
+# ----------------------------------------------------------------------------
+write:
+
+  # When true (the default), creating a new document first embeds its content
+  # and searches the collection for near-duplicates. If a document with
+  # cosine similarity >= dedup_threshold is found, the write is refused with a
+  # structured error naming the duplicate file. The agent can override the
+  # check by passing `force_new=true` in the tool call.
+  # Set to false to disable the check entirely (e.g. during bulk migrations).
+  dedup_enabled: true
+
+  # Cosine similarity score at or above which a candidate is treated as a
+  # duplicate and the create is refused. Range: 0.0–1.0 (1.0 = identical).
+  # 0.85 works well for most embedding models; lower it to 0.75–0.80 for
+  # shorter or more domain-specific documents.
+  dedup_threshold: 0.85
+
+  # Git author identity used for commits made by the write tools (create_document,
+  # edit_document). Setting these to a bot identity makes tool-authored commits
+  # easy to distinguish from your own hand-made commits in `git log`.
+  commit_author_name: "md-kb-rag"
+  commit_author_email: "md-kb-rag@localhost"
 
 
 # ----------------------------------------------------------------------------

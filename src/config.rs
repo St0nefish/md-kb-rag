@@ -27,6 +27,8 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub write: WriteConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,6 +115,11 @@ pub struct FrontmatterConfig {
     pub indexed_fields: Vec<String>,
     #[serde(default)]
     pub defaults: HashMap<String, String>,
+    /// Maps a frontmatter field name to its closed set of allowed values.
+    /// If a field is present in a document but its value is not in the set,
+    /// validation fails. Absent fields are not checked (use `required` for that).
+    #[serde(default)]
+    pub allowed: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,6 +329,55 @@ fn default_mcp_port() -> u16 {
     8001
 }
 
+/// Configuration for write-tool behaviour (create_document / edit_document).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteConfig {
+    /// If true, creating a new document runs a similarity check against the
+    /// existing collection and refuses if a near-duplicate exists.
+    #[serde(default = "default_dedup_enabled")]
+    pub dedup_enabled: bool,
+    /// Cosine similarity at or above which a new document is treated as a
+    /// duplicate and the write is refused (unless `force_new = true`).
+    #[serde(default = "default_dedup_threshold")]
+    pub dedup_threshold: f32,
+    /// Git author name used for commits made by the write tools.
+    /// Distinguishes tool-authored commits from hand-made commits.
+    #[serde(default = "default_commit_author_name")]
+    pub commit_author_name: String,
+    /// Git author email used for commits made by the write tools.
+    /// Distinguishes tool-authored commits from hand-made commits.
+    #[serde(default = "default_commit_author_email")]
+    pub commit_author_email: String,
+}
+
+fn default_dedup_enabled() -> bool {
+    true
+}
+
+fn default_dedup_threshold() -> f32 {
+    0.85
+}
+
+fn default_commit_author_name() -> String {
+    "md-kb-rag".to_string()
+}
+
+fn default_commit_author_email() -> String {
+    "md-kb-rag@localhost".to_string()
+}
+
+impl Default for WriteConfig {
+    fn default() -> Self {
+        Self {
+            dedup_enabled: default_dedup_enabled(),
+            dedup_threshold: default_dedup_threshold(),
+            commit_author_name: default_commit_author_name(),
+            commit_author_email: default_commit_author_email(),
+        }
+    }
+}
+
 fn default_bearer_token_env() -> String {
     "MCP_BEARER_TOKEN".into()
 }
@@ -356,6 +412,7 @@ pub struct ResolvedConfig {
     pub webhook: WebhookConfig,
     pub mcp: McpConfig,
     pub rate_limit: RateLimitConfig,
+    pub write: WriteConfig,
 }
 
 impl Config {
@@ -469,6 +526,7 @@ impl Config {
             webhook: self.webhook,
             mcp: self.mcp,
             rate_limit: self.rate_limit,
+            write: self.write,
         })
     }
 }
@@ -862,6 +920,7 @@ chunking:
             webhook: WebhookConfig::default(),
             mcp: McpConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            write: WriteConfig::default(),
         };
 
         // All fields are directly accessible — no unwrap, no panic path.
@@ -996,6 +1055,44 @@ mcp:
         assert!(!cfg.validation.strict);
         assert_eq!(cfg.webhook.provider, WebhookProvider::Gitea);
         assert_eq!(cfg.mcp.port, 8001);
+        // Verify new write identity fields round-trip from the example config
+        assert_eq!(cfg.write.commit_author_name, "md-kb-rag");
+        assert_eq!(cfg.write.commit_author_email, "md-kb-rag@localhost");
+    }
+
+    #[test]
+    fn write_config_commit_author_defaults() {
+        // Config without a write section should still produce the default bot identity.
+        let cfg = Config::from_str_raw("{}").unwrap();
+        assert_eq!(cfg.write.commit_author_name, "md-kb-rag");
+        assert_eq!(cfg.write.commit_author_email, "md-kb-rag@localhost");
+    }
+
+    #[test]
+    fn write_config_without_commit_author_fields_still_loads() {
+        // A config that has a write section but omits the new identity fields must
+        // still deserialize successfully (serde defaults fill them in).
+        let yaml = r#"
+write:
+  dedup_enabled: false
+  dedup_threshold: 0.90
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert!(!cfg.write.dedup_enabled);
+        assert_eq!(cfg.write.commit_author_name, "md-kb-rag");
+        assert_eq!(cfg.write.commit_author_email, "md-kb-rag@localhost");
+    }
+
+    #[test]
+    fn write_config_custom_commit_author() {
+        let yaml = r#"
+write:
+  commit_author_name: "kb-bot"
+  commit_author_email: "kb-bot@example.com"
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.write.commit_author_name, "kb-bot");
+        assert_eq!(cfg.write.commit_author_email, "kb-bot@example.com");
     }
 
     #[test]

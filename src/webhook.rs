@@ -21,7 +21,7 @@ use crate::ingest;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Prevents concurrent reindex tasks from interleaving Qdrant/SQLite operations.
-static REINDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+pub(crate) static REINDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone)]
 pub struct WebhookState {
@@ -425,6 +425,7 @@ mod tests {
             webhook: Default::default(),
             mcp: Default::default(),
             rate_limit: Default::default(),
+            write: Default::default(),
         })
     }
 
