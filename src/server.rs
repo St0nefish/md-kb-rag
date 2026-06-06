@@ -291,6 +291,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let include_patterns = config.indexing.include.clone();
     let embed_for_mcp = Arc::clone(&embed_client);
     let qdrant_for_mcp = Arc::clone(&qdrant);
+    let config_for_mcp = Arc::clone(&config);
 
     let mcp_service = StreamableHttpService::new(
         move || {
@@ -301,6 +302,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
                 data_path.clone(),
                 &include_patterns,
                 Arc::clone(&shared_instructions),
+                Arc::clone(&config_for_mcp),
             )
             .map_err(std::io::Error::other)
         },

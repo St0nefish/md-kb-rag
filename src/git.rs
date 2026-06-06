@@ -46,7 +46,7 @@ pub fn redact_url(s: &str) -> String {
 }
 
 /// Ensure a git repository exists at `data_path`. If the path is not already a
-/// git repo and `git_url` is provided, performs a shallow clone.
+/// git repo and `git_url` is provided, performs a full single-branch clone.
 ///
 /// Returns `Ok(true)` if a fresh clone was performed, `Ok(false)` if the repo
 /// already existed.
@@ -83,8 +83,6 @@ pub async fn ensure_repo(
             "--branch",
             branch,
             "--single-branch",
-            "--depth",
-            "1",
             &clone_url,
             ".",
         ])
@@ -100,6 +98,130 @@ pub async fn ensure_repo(
 
     info!("Clone complete");
     Ok(true)
+}
+
+/// Stage `rel_path`, commit with `message`, then (if `git_url` is Some) fetch the
+/// remote branch, rebase the local branch onto it, and push. Returns the new commit SHA.
+///
+/// `rel_path` is relative to `data_path`. `message` already includes any provenance trailer.
+/// If `git_url` is None, commit locally only (no fetch/rebase/push).
+/// On a rebase conflict, abort the rebase (so the working tree is left clean at the local
+/// commit) and return an Err whose message clearly identifies it as a rebase/merge conflict
+/// on the file, distinct from other git failures.
+pub async fn commit_and_sync(
+    git_url: Option<&str>,
+    branch: &str,
+    data_path: &str,
+    token: Option<&str>,
+    rel_path: &str,
+    message: &str,
+) -> anyhow::Result<String> {
+    // Helper: build a base git command with safe.directory set and cwd pointing at data_path.
+    // Returns (Command,) ready to have more args appended.
+    let git_cmd = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.args(["-c", &format!("safe.directory={}", data_path)])
+            .args(args)
+            .current_dir(data_path);
+        cmd
+    };
+
+    // --- git add -- <rel_path> ---
+    let add_out = git_cmd(&["add", "--", rel_path])
+        .output()
+        .await
+        .context("Failed to spawn git add")?;
+    if !add_out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&add_out.stderr));
+        anyhow::bail!("git add failed: {}", stderr);
+    }
+
+    // --- git commit -m <message> ---
+    // Set a bot identity inline so the command is self-contained even in environments
+    // without a global git user configured.
+    let commit_out = Command::new("git")
+        .args([
+            "-c",
+            &format!("safe.directory={}", data_path),
+            "-c",
+            "user.name=md-kb-rag",
+            "-c",
+            "user.email=md-kb-rag@localhost",
+            "commit",
+            "-m",
+            message,
+        ])
+        .current_dir(data_path)
+        .output()
+        .await
+        .context("Failed to spawn git commit")?;
+    if !commit_out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&commit_out.stderr));
+        anyhow::bail!("git commit failed: {}", stderr);
+    }
+
+    if let Some(url) = git_url {
+        let auth_url = match token {
+            Some(t) if !t.is_empty() => inject_token_into_url(url, t),
+            _ => url.to_string(),
+        };
+
+        // --- git fetch --no-tags <auth_url> <branch> ---
+        info!(
+            "Fetching {} branch {} for rebase",
+            redact_url(&auth_url),
+            branch
+        );
+        let fetch_out = git_cmd(&["fetch", "--no-tags", &auth_url, branch])
+            .output()
+            .await
+            .context("Failed to spawn git fetch")?;
+        if !fetch_out.status.success() {
+            let stderr = redact_url(&String::from_utf8_lossy(&fetch_out.stderr));
+            anyhow::bail!("git fetch failed: {}", stderr);
+        }
+
+        // --- git rebase FETCH_HEAD ---
+        let rebase_out = git_cmd(&["rebase", "FETCH_HEAD"])
+            .output()
+            .await
+            .context("Failed to spawn git rebase")?;
+        if !rebase_out.status.success() {
+            let stderr = redact_url(&String::from_utf8_lossy(&rebase_out.stderr));
+            // Abort the rebase so the working tree is left clean at the local commit.
+            let _ = git_cmd(&["rebase", "--abort"]).output().await;
+            anyhow::bail!(
+                "rebase conflict: git rebase onto FETCH_HEAD failed ({}). Rebase aborted. stderr: {}",
+                rel_path,
+                stderr
+            );
+        }
+
+        // --- git push <auth_url> HEAD:<branch> ---
+        info!("Pushing to {} branch {}", redact_url(&auth_url), branch);
+        let push_refspec = format!("HEAD:{}", branch);
+        let push_out = git_cmd(&["push", &auth_url, &push_refspec])
+            .output()
+            .await
+            .context("Failed to spawn git push")?;
+        if !push_out.status.success() {
+            let stderr = redact_url(&String::from_utf8_lossy(&push_out.stderr));
+            anyhow::bail!("git push failed: {}", stderr);
+        }
+    }
+
+    // --- git rev-parse HEAD ---
+    let rev_out = git_cmd(&["rev-parse", "HEAD"])
+        .output()
+        .await
+        .context("Failed to spawn git rev-parse")?;
+    if !rev_out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&rev_out.stderr));
+        anyhow::bail!("git rev-parse HEAD failed: {}", stderr);
+    }
+
+    let sha = String::from_utf8_lossy(&rev_out.stdout).trim().to_string();
+    Ok(sha)
 }
 
 #[cfg(test)]
@@ -413,5 +535,189 @@ mod tests {
         assert!(!result.contains("tok2"));
         assert!(result.contains("https://***@host1/r.git"));
         assert!(result.contains("https://***@host2/r.git"));
+    }
+
+    // --- commit_and_sync tests ---
+
+    /// Helper: create a local working clone of a bare repo.
+    fn clone_bare_repo(bare_path: &std::path::Path, branch: &str) -> tempfile::TempDir {
+        let work_dir = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["clone", bare_path.to_str().unwrap(), "."])
+            .current_dir(work_dir.path())
+            .output()
+            .unwrap();
+        // Ensure we're on the right branch
+        std::process::Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(work_dir.path())
+            .output()
+            .unwrap();
+        work_dir
+    }
+
+    /// Local-only path: commit a new file without any remote.
+    #[tokio::test]
+    async fn commit_and_sync_local_only() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        // Write a new file into the working repo
+        std::fs::write(work.path().join("notes.md"), "# Notes\nHello world").unwrap();
+
+        let sha = commit_and_sync(
+            None,
+            "main",
+            work_path,
+            None,
+            "notes.md",
+            "add notes.md\n\nmd-kb-rag bot commit",
+        )
+        .await
+        .unwrap();
+
+        // SHA should be a 40-char hex string
+        assert_eq!(sha.len(), 40, "Expected a 40-char SHA, got: {}", sha);
+        assert!(
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "SHA should be hex: {}",
+            sha
+        );
+
+        // The file should be committed (git show HEAD should include it)
+        let show_out = std::process::Command::new("git")
+            .args([
+                "-c",
+                &format!("safe.directory={}", work_path),
+                "show",
+                "--name-only",
+                "--format=",
+                "HEAD",
+            ])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let show_str = String::from_utf8_lossy(&show_out.stdout);
+        assert!(
+            show_str.contains("notes.md"),
+            "notes.md should appear in HEAD commit, got: {}",
+            show_str
+        );
+    }
+
+    /// Push path: commit a file and push to a local bare remote via file:// URL.
+    #[tokio::test]
+    async fn commit_and_sync_with_push_to_local_bare() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        // Use a file:// URL so git treats it like a real remote (allows push)
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+
+        // Write a new file into the working repo
+        std::fs::write(work.path().join("article.md"), "# Article\nContent here").unwrap();
+
+        let sha = commit_and_sync(
+            Some(&bare_url),
+            "main",
+            work_path,
+            None,
+            "article.md",
+            "add article.md",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sha.len(), 40, "Expected a 40-char SHA, got: {}", sha);
+
+        // Verify the commit made it to the bare remote by cloning it fresh
+        let verify_dir = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["clone", bare.path().to_str().unwrap(), "."])
+            .current_dir(verify_dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            verify_dir.path().join("article.md").exists(),
+            "article.md should exist in the remote after push"
+        );
+    }
+
+    /// Rebase conflict: two clones diverge on the same file, second push must detect conflict.
+    #[tokio::test]
+    async fn commit_and_sync_rebase_conflict_returns_distinguishable_error() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+
+        // Clone A: will push first
+        let work_a = clone_bare_repo(bare.path(), "main");
+        std::fs::write(work_a.path().join("conflict.md"), "version A").unwrap();
+        commit_and_sync(
+            Some(&bare_url),
+            "main",
+            work_a.path().to_str().unwrap(),
+            None,
+            "conflict.md",
+            "add conflict.md from A",
+        )
+        .await
+        .unwrap();
+
+        // Clone B (made from the original bare *before* A pushed): will try to push
+        // the same file with different content — rebase should conflict
+        let work_b = clone_bare_repo(bare.path(), "main");
+        // Manually reset work_b to the state before A's push by checking out the parent commit
+        // Instead, simulate divergence: work_b was cloned before A pushed,
+        // but since we clone after A pushed, we need to manually step back.
+        // Simpler approach: make work_b commit to a *detached* state that doesn't include A's commit.
+        // Actually the easiest way: create a second independent clone from the original state,
+        // which we saved before A pushed. Since we can't travel back in time, instead:
+        // - Let work_b clone from bare (which now has A's commit)
+        // - Then use git reset --hard to go back to the parent and commit something diverging
+        let log_out = std::process::Command::new("git")
+            .args(["log", "--format=%H", "-2"])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+        let commits: Vec<&str> = std::str::from_utf8(&log_out.stdout)
+            .unwrap()
+            .lines()
+            .collect();
+        // commits[0] = A's commit, commits[1] = initial commit
+        let parent_sha = commits[1].trim();
+
+        // Reset to before A's commit
+        std::process::Command::new("git")
+            .args(["reset", "--hard", parent_sha])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+
+        // Now write a conflicting version of the same file
+        std::fs::write(
+            work_b.path().join("conflict.md"),
+            "version B — conflicts with A",
+        )
+        .unwrap();
+
+        let result = commit_and_sync(
+            Some(&bare_url),
+            "main",
+            work_b.path().to_str().unwrap(),
+            None,
+            "conflict.md",
+            "add conflict.md from B",
+        )
+        .await;
+
+        assert!(result.is_err(), "Should fail due to rebase conflict");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.starts_with("rebase conflict:"),
+            "Error should start with 'rebase conflict:', got: {}",
+            err
+        );
     }
 }

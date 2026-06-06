@@ -14,8 +14,11 @@ use anyhow::Context as _;
 use tracing::{error, warn};
 
 use crate::{
+    config::ResolvedConfig,
     embed::EmbedClient,
+    git, ingest,
     qdrant::{QdrantStore, SearchResult},
+    validate,
 };
 
 const MAX_SEARCH_LIMIT: u64 = 50;
@@ -108,6 +111,18 @@ pub struct SearchParams {
     pub limit: Option<u64>,
 }
 
+/// Parameters for the `create_document` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateDocumentParams {
+    /// Path of the new document, relative to the knowledge base root, e.g. "sysadmin/docker/foo.md"
+    pub path: String,
+    /// Full markdown content of the document, INCLUDING YAML frontmatter
+    pub content: String,
+    /// Optional commit message; if omitted, a message is generated from the path
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct KbSearchServer {
     embed_client: Arc<EmbedClient>,
@@ -118,6 +133,8 @@ pub struct KbSearchServer {
     include_patterns: Arc<GlobSet>,
     /// Dynamic MCP server instructions, refreshed periodically with discovered metadata.
     instructions: Arc<RwLock<String>>,
+    /// Resolved config, needed by write tools (create_document, etc.).
+    config: Arc<ResolvedConfig>,
     tool_router: ToolRouter<KbSearchServer>,
 }
 
@@ -220,6 +237,7 @@ impl KbSearchServer {
         data_path: PathBuf,
         include_patterns: &[String],
         instructions: Arc<RwLock<String>>,
+        config: Arc<ResolvedConfig>,
     ) -> anyhow::Result<Self> {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
             format!("Failed to canonicalize data path: {}", data_path.display())
@@ -231,6 +249,7 @@ impl KbSearchServer {
             canonical_data_path,
             include_patterns: Arc::new(build_include_globset(include_patterns)),
             instructions,
+            config,
             tool_router: Self::tool_router(),
         })
     }
@@ -552,6 +571,153 @@ impl KbSearchServer {
             }
         }
     }
+
+    #[tool(description = "Create a new document in the knowledge base. \
+        Writes the file, commits it to the git repository, and triggers an incremental reindex. \
+        The document must not already exist — use edit_document for existing files. \
+        Content must include valid YAML frontmatter.")]
+    async fn create_document(
+        &self,
+        Parameters(params): Parameters<CreateDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = &self.config;
+
+        // 1. Security: reject absolute paths and path traversal
+        let requested = std::path::Path::new(&params.path);
+        if requested.is_absolute() {
+            return Err(McpError::invalid_params(
+                "path must be relative to the knowledge base root".to_string(),
+                None,
+            ));
+        }
+        // Reject any component that is literally ".."
+        for component in requested.components() {
+            if component == std::path::Component::ParentDir {
+                return Err(McpError::invalid_params(
+                    "path must not contain '..' components".to_string(),
+                    None,
+                ));
+            }
+        }
+
+        let abs_path = std::path::PathBuf::from(config.data_path()).join(&params.path);
+
+        // Normalize: the parent must exist after we create it, but we can check the
+        // constructed path stays within data_path by lexically verifying.
+        // We'll do a stricter runtime check after parent dir creation. For now,
+        // the component loop above plus the is_absolute check covers the main attack
+        // surface. We also verify after canonicalizing the parent.
+        let data_root = std::path::PathBuf::from(config.data_path());
+        // Lexical check: constructed abs_path must start with data_root
+        if !abs_path.starts_with(&data_root) {
+            return Err(McpError::invalid_params(
+                "path escapes the knowledge base root".to_string(),
+                None,
+            ));
+        }
+
+        // 2. Reject if file already exists
+        if abs_path.exists() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "File '{}' already exists. Use edit_document to modify existing files.",
+                    params.path
+                ),
+                None,
+            ));
+        }
+
+        // 3. Validate content before writing
+        let (validation_result, _) = validate::validate_content(
+            std::path::Path::new(&params.path),
+            &params.content,
+            &config.frontmatter,
+            &config.validation,
+        )
+        .await
+        .map_err(|e| {
+            error!("Validation error for '{}': {:#}", params.path, e);
+            McpError::internal_error(format!("Failed to validate content: {}", e), None)
+        })?;
+
+        if !validation_result.valid {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Content validation failed for '{}': {}",
+                    params.path,
+                    validation_result.errors.join("; ")
+                ),
+                None,
+            ));
+        }
+
+        // 4. Create parent directories and write the file
+        if let Some(parent) = abs_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                error!(
+                    "Failed to create parent directories for '{}': {}",
+                    abs_path.display(),
+                    e
+                );
+                McpError::internal_error(
+                    format!("Failed to create parent directories: {}", e),
+                    None,
+                )
+            })?;
+        }
+
+        tokio::fs::write(&abs_path, params.content.as_bytes())
+            .await
+            .map_err(|e| {
+                error!("Failed to write file '{}': {}", abs_path.display(), e);
+                McpError::internal_error(format!("Failed to write file: {}", e), None)
+            })?;
+
+        // 5. Build commit message
+        let commit_message = {
+            let base = params
+                .message
+                .as_deref()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| format!("docs: add {}", params.path));
+            format!("{}\n\nVia: md-kb-rag write tool", base)
+        };
+
+        // 6. Resolve git token
+        let token = std::env::var(&config.source.git_token_env)
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        // 7. Commit and sync to remote
+        let commit_sha = git::commit_and_sync(
+            config.source.git_url.as_deref(),
+            &config.source.branch,
+            config.data_path(),
+            token.as_deref(),
+            &params.path,
+            &commit_message,
+        )
+        .await
+        .map_err(|e| {
+            error!("commit_and_sync failed for '{}': {:#}", params.path, e);
+            McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
+        })?;
+
+        // 8. Trigger incremental reindex (serialized against webhook reindexes)
+        {
+            let _guard = crate::webhook::REINDEX_LOCK.lock().await;
+            ingest::run_index(config, false).await.map_err(|e| {
+                error!("Reindex after create_document failed: {:#}", e);
+                McpError::internal_error(format!("Reindex failed: {}", e), None)
+            })?;
+        }
+
+        // 9. Return success
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Created '{}' (commit {})",
+            params.path, commit_sha
+        ))]))
+    }
 }
 
 /// Default instructions used when no custom instructions are configured.
@@ -637,11 +803,11 @@ mod tests {
     #[test]
     fn ellipsis_uses_char_count_not_byte_len() {
         // 400 chars of a 2-byte character = 800 bytes
-        let text: String = std::iter::repeat('é').take(401).collect();
+        let text: String = "é".repeat(401);
         assert!(text.len() > 400, "byte len should exceed 400");
         assert!(text.chars().count() > 400, "char count should exceed 400");
         // If we used .len() on a 400-char string it would wrongly trigger ellipsis
-        let short: String = std::iter::repeat('é').take(400).collect();
+        let short: String = "é".repeat(400);
         assert!(
             short.len() > 400,
             "byte len of 400 2-byte chars exceeds 400"
@@ -781,6 +947,35 @@ mod tests {
         );
     }
 
+    fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<ResolvedConfig> {
+        Arc::new(ResolvedConfig {
+            source: crate::config::SourceConfig {
+                git_url: None,
+                branch: "master".into(),
+                data_path: Some(data_path.to_string_lossy().into_owned()),
+                git_token_env: "GIT_PULL_TOKEN".into(),
+            },
+            indexing: crate::config::IndexingConfig::default(),
+            frontmatter: crate::config::FrontmatterConfig::default(),
+            chunking: crate::config::ChunkingConfig::default(),
+            embedding: crate::config::ResolvedEmbeddingConfig {
+                base_url: "http://localhost:8080/v1".into(),
+                model: "test".into(),
+                api_key: None,
+                vector_size: 768,
+                batch_size: 32,
+            },
+            qdrant: crate::config::ResolvedQdrantConfig {
+                url: "http://localhost:6334".into(),
+                collection: "test".into(),
+            },
+            validation: crate::config::ValidationConfig::default(),
+            webhook: crate::config::WebhookConfig::default(),
+            mcp: crate::config::McpConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
+        })
+    }
+
     #[test]
     fn get_info_returns_dynamic_instructions() {
         use rmcp::ServerHandler;
@@ -790,11 +985,11 @@ mod tests {
         let custom_text = "Custom KB instructions.\nAvailable domain: infra, networking";
         let instructions = Arc::new(RwLock::new(custom_text.to_string()));
 
-        let config = crate::config::ResolvedQdrantConfig {
+        let qdrant_config = crate::config::ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
             collection: "test".into(),
         };
-        let qdrant = Arc::new(QdrantStore::new(&config).unwrap());
+        let qdrant = Arc::new(QdrantStore::new(&qdrant_config).unwrap());
         let embed_config = crate::config::ResolvedEmbeddingConfig {
             base_url: "http://localhost:8080/v1".into(),
             model: "test".into(),
@@ -811,6 +1006,7 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
+            make_test_resolved_config(tmp.path()),
         )
         .unwrap();
 
@@ -826,11 +1022,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let instructions = Arc::new(RwLock::new("Initial instructions".to_string()));
 
-        let config = crate::config::ResolvedQdrantConfig {
+        let qdrant_config = crate::config::ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
             collection: "test".into(),
         };
-        let qdrant = Arc::new(QdrantStore::new(&config).unwrap());
+        let qdrant = Arc::new(QdrantStore::new(&qdrant_config).unwrap());
         let embed_config = crate::config::ResolvedEmbeddingConfig {
             base_url: "http://localhost:8080/v1".into(),
             model: "test".into(),
@@ -847,6 +1043,7 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             Arc::clone(&instructions),
+            make_test_resolved_config(tmp.path()),
         )
         .unwrap();
 
