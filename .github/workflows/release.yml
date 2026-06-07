@@ -40,6 +40,13 @@ jobs:
 
       - name: Tag as latest
         run: |
+          IMAGE="${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}"
+          # CI only builds/pushes the sha image when code changed (see ci.yml path filter).
+          # Docs-only merges (e.g. .gitignore) produce no image, so there is nothing to retag.
+          if ! docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "No image $IMAGE for this push (docs-only change?) — skipping latest retag."
+            exit 0
+          fi
           docker buildx imagetools create \
             --tag ${{ steps.image.outputs.name }}:latest \
-            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}
+            "$IMAGE"
