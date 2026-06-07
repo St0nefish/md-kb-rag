@@ -109,6 +109,14 @@ frontmatter:
   defaults:
     status: "active"
 
+  # Closed-set (enum) enforcement. Maps a field to its exhaustive list of
+  # allowed values; a present field whose value isn't in the list fails
+  # validation. Absent fields are governed by `required`, not here. Leave a
+  # field out of this map to keep it open-ended (e.g. domain, tags).
+  allowed:
+    type: [guide, reference, research, config, troubleshooting, architecture, project, decision-record, migration]
+    status: [active, draft, archived]
+
 validation:
   enabled: true     # set false to skip all frontmatter checks
   strict: false     # true = abort indexing on first invalid file
@@ -120,7 +128,61 @@ validation:
 - `strict: false` (default) — invalid files are skipped with a warning; indexing continues.
 - `strict: true` — the first invalid file aborts the entire indexing run.
 
+`frontmatter.allowed` is enforced by both `md-kb-rag validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint`), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
+
 Run `md-kb-rag validate` to check all files without indexing — useful for CI or pre-commit hooks.
+
+## Agent Write Tools
+
+Beyond read-only search, the MCP server lets a connected agent **author the knowledge base directly**: `create_document`, `edit_document`, and `delete_document`. This turns the KB into a living document store that an assistant can curate as it learns, rather than a static index you maintain by hand.
+
+### What a write call does
+
+All three tools run the same pipeline server-side:
+
+1. **Resolve and guard the path** — relative to the KB root, a unique basename, or absolute. Absolute paths, `..` components, and symlinked ancestors that escape the data root are rejected, as are paths that don't match `indexing.include` (a file the indexer would never pick up).
+2. **Validate frontmatter** — required fields, `allowed` enums, and any `validation.lint_command`. Failures come back as structured `field_errors` (see [Frontmatter Validation](#frontmatter-validation)) so the agent can self-correct.
+3. **Write to disk** — in the container-owned KB clone.
+4. **Commit with provenance** — the commit message gets `Tool: md-kb-rag` and `Operation: <tool>` trailers, authored under the `write.commit_author_*` identity. Tool-authored commits are trivially distinguishable from your own in `git log`.
+5. **Push to the remote** — `add → commit → fetch → rebase → push`, so the KB's git host stays the source of truth.
+6. **Reindex** — incrementally, holding the same internal lock the webhook uses, so a write and a webhook-triggered pull can never race.
+
+Each tool returns a one-line summary with the commit SHA plus a unified diff of the change.
+
+### The tools
+
+- **`create_document`** — new file only (errors if it already exists). Before writing, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations). The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
+- **`edit_document`** — existing file only. **Surgical mode** (`old_string` + `new_string`) replaces a single unique occurrence; **full-replace mode** (`content`) swaps the whole file and re-validates its frontmatter. The two modes are mutually exclusive.
+- **`delete_document`** — removes the file, commits and pushes the deletion, then purges the document's vectors from Qdrant and its row from the state DB directly (no full reindex needed).
+
+### Configuration
+
+The `write` section of `config.yaml` (see [config.example.yaml](config.example.yaml)) controls this behaviour:
+
+```yaml
+write:
+  dedup_enabled: true            # near-duplicate check on create_document
+  dedup_threshold: 0.85          # cosine similarity at/above which a create is refused
+  commit_author_name: "md-kb-rag"
+  commit_author_email: "md-kb-rag@localhost"
+```
+
+For writes to push successfully, the container needs a writable, non-shallow clone of the KB and push credentials — i.e. `source.git_url` set and `GIT_PULL_TOKEN` carrying a token with **write** access (read-only is enough for webhook pulls, but not for the write tools).
+
+### Telling the agent what the KB is for
+
+The server advertises **dynamic instructions** to MCP clients on connect (and refreshes them periodically). They combine three pieces:
+
+1. Your `mcp.instructions` narrative — a short description of what this knowledge base covers. If omitted, a generic read+write description is used.
+2. The distinct filter values (domains, types, tags) discovered in the live index, so the agent knows what's already in use.
+3. A write-authoring section listing the required frontmatter fields and any fixed `allowed` values.
+
+Keep `mcp.instructions` short — the dynamic sections supply the detail. Example:
+
+```yaml
+mcp:
+  instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document; write with create_document, edit_document, delete_document."
+```
 
 ## Knowledge Base Storage
 
@@ -231,7 +293,7 @@ WEBHOOK_SECRET=your-webhook-secret
 RUST_LOG=info
 ```
 
-If you set `source.git_url` in your config, also set `GIT_PULL_TOKEN` to a personal access token with read-only repository access. The token is injected transiently into the HTTPS clone/fetch URL and never written to disk. SSH URLs don't need a token.
+If you set `source.git_url` in your config, also set `GIT_PULL_TOKEN` to a personal access token. Read access is enough for cloning and webhook pulls; grant **write** access if you plan to use the MCP write tools (they push commits back to the repo — see [Agent Write Tools](#agent-write-tools)). The token is injected transiently into the HTTPS clone/fetch URL and never written to disk. SSH URLs don't need a token.
 
 ### 4. Start the stack
 

@@ -32,8 +32,9 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 | `embed.rs` | Embedding API client |
 | `qdrant.rs` | Qdrant operations |
 | `state.rs` | SQLite state DB |
-| `mcp.rs` | MCP search tool (rmcp) |
-| `webhook.rs` | Webhook handler |
+| `mcp.rs` | MCP tools (rmcp): `search`, `get_document`, and write tools `create_document`/`edit_document`/`delete_document` |
+| `git.rs` | Git operations for the KB clone (clone, `commit_and_sync`: add→commit→fetch→rebase→push) |
+| `webhook.rs` | Webhook handler (owns `REINDEX_LOCK`, shared with write tools) |
 | `server.rs` | Axum server (MCP + webhook routes) |
 
 ## Workflow
