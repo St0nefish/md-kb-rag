@@ -118,7 +118,7 @@ The push was to a branch that doesn't match `source.branch`.
 The webhook verified successfully but the in-container `git fetch` or `git merge` failed. Common causes:
 
 - **Wrong `source.git_url`** — check the URL is correct and reachable from inside the container.
-- **Bad or expired `GIT_PULL_TOKEN`** — for private HTTPS repos, the token must have read-only repository access. Regenerate it in your forge's settings.
+- **Bad or expired `GIT_PULL_TOKEN`** — for private HTTPS repos, the token needs read repository access for webhook pulls (and **write** access if you use the MCP write tools, which push commits back). Regenerate it in your forge's settings.
 - **SSH URL without keys** — SSH URLs bypass token injection, but the container needs SSH keys configured. For Docker deployments, HTTPS with a token is simpler.
 - **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. This usually means someone modified files directly in the bind-mounted directory. Using a named volume (recommended) avoids this by keeping the repo inaccessible from the host.
 

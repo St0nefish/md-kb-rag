@@ -1,6 +1,6 @@
 # md-kb-rag
 
-A Docker-first RAG server that indexes markdown knowledge bases with YAML frontmatter into Qdrant and exposes semantic search via MCP (Streamable HTTP).
+A Docker-first RAG server that indexes markdown knowledge bases with YAML frontmatter into Qdrant and exposes them over MCP (Streamable HTTP) — semantic search, document retrieval, and agent-driven writes (create/edit/delete) that commit straight back to the knowledge base's git repo.
 
 Built as a single Rust binary for type safety, small Docker images, and simple deployment.
 
@@ -83,13 +83,14 @@ See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 
 - **source** — Git URL (auto-cloned on first start) or bind-mount path for your knowledge base
 - **indexing** — Include/exclude glob patterns
-- **frontmatter** — Required fields, indexed fields, defaults
+- **frontmatter** — Required fields, indexed fields, defaults, and `allowed` closed-set enums (enforced by `validate` and the write tools)
 - **chunking** — Markdown-aware splitting with configurable chunk size
 - **embedding** — OpenAI-compatible endpoint (works with llama.cpp, vLLM, etc.)
 - **qdrant** — Connection URL and collection name
 - **validation** — Strict/lenient mode, optional lint command
 - **webhook** — HMAC verification for Gitea/GitHub/GitLab (disabled if `WEBHOOK_SECRET` is unset)
-- **mcp** — Server port and bearer token authentication
+- **mcp** — Server port, bearer token authentication, and the instructions narrative
+- **write** — Behaviour of the write tools: near-duplicate detection (`dedup_enabled`, `dedup_threshold`) and the git commit identity
 
 ## Embedding Models
 
@@ -166,9 +167,13 @@ Metal GPU acceleration is **not available in Docker** (Docker on macOS runs a Li
 
 Skip the bundled embedding service entirely. Point `EMBEDDING_BASE_URL` at any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, TEI) and remove the `embeddings` service from compose.
 
-## MCP Search Tool
+## MCP Tools
 
-The `search` tool accepts:
+The server exposes a full read/write surface over MCP. Read tools (`search`, `get_document`) are always safe; write tools (`create_document`, `edit_document`, `delete_document`) mutate the knowledge base and commit to git.
+
+### Read
+
+**`search`** — semantic search; returns ranked chunks with title, score, snippet, and metadata.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -177,6 +182,49 @@ The `search` tool accepts:
 | `type` | string | no | Filter by document type |
 | `tags` | string[] | no | Filter by tags (match any) |
 | `limit` | integer | no | Max results (default: 10, max: 50) |
+
+**`get_document`** — fetch the full raw markdown (including frontmatter) for one document.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | Path relative to the KB root (as returned by `search`), a unique basename, or an absolute path |
+
+### Write
+
+All three write tools share the same pipeline: **path-safety guard** (no `..`, no symlink escapes, must match `indexing.include`) → **frontmatter validation** → **filesystem write** → **git commit with provenance trailers** (`Tool: md-kb-rag`, `Operation: <tool>`) → **push to the remote** → **incremental reindex** (serialized against webhook reindexes via an internal lock). Each returns a summary line with the commit SHA plus a unified diff. Commits are authored under the `write.commit_author_*` identity so tool edits are easy to spot in `git log`.
+
+**`create_document`** — create a new file. Validates that the document doesn't already exist, then runs a **near-duplicate check**: it embeds the content and, if an existing document scores above `write.dedup_threshold`, refuses the write and names the match (pass `force_new: true` to override).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | Relative path of the new document (e.g. `sysadmin/docker/foo.md`) |
+| `content` | string | yes | Full markdown including YAML frontmatter |
+| `message` | string | no | Commit subject (default: `docs: add <path>`) |
+| `force_new` | boolean | no | Skip the duplicate-detection gate (default: `false`) |
+
+**`edit_document`** — modify an existing file. Two mutually-exclusive modes:
+
+- **Surgical** — `old_string` + `new_string`: replaces a single unique occurrence (Claude Code-style). Errors if `old_string` is missing or appears more than once.
+- **Full-replace** — `content`: swaps the entire file (must include valid frontmatter).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | Resolved like `get_document` |
+| `old_string` | string | conditional | Surgical mode: exact text to find (must be unique) |
+| `new_string` | string | conditional | Surgical mode: replacement text |
+| `content` | string | conditional | Full-replace mode: entire new file content |
+| `message` | string | no | Commit subject (default: `docs: update <path>`) |
+
+**`delete_document`** — remove a file. Commits the deletion (with provenance trailers) and pushes, then purges the document's vectors from Qdrant and its row from the state DB directly.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | Resolved like `get_document` |
+| `message` | string | no | Commit subject (default: `docs: delete <path>`) |
+
+When validation fails, write tools return a structured error whose `data.field_errors` array names each offending `field`, the `rule` it broke (`required` / `allowed_value` / `lint`), and — for closed-set fields — the value it `got` and the values it `expected`, so an agent can self-correct.
+
+The server also advertises **dynamic instructions** to connected clients: the configured `mcp.instructions` narrative, the distinct filter values (domains, types, tags) discovered in the live index, and a write-authoring section listing the required frontmatter fields and any fixed allowed values. See the [`write` and `mcp` sections of the config reference](deploy/config.example.yaml) and [deploy/USAGE.md](deploy/USAGE.md#agent-write-tools) for details.
 
 ## Webhook
 
