@@ -188,6 +188,8 @@ mcp:
 
 There are two ways to provide your knowledge base to the container. The **named volume** approach is recommended for most deployments.
 
+**State database location:** The SQLite state database (`state.db`) is written to `<source.data_path>/state.db` — by default `/data/state.db`, i.e. inside the knowledge-base volume. With the named-volume setup this means `state.db` is automatically persisted alongside the repository content in `kb_data`. No separate mount is needed.
+
 ### Named volume with `git_url` (recommended)
 
 The container manages the knowledge base itself: it clones the repo on first start, and pulls updates via webhook. No host-side git operations needed.

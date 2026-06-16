@@ -506,20 +506,40 @@ impl Config {
             );
         }
 
+        // SAFETY: all three fields were checked for None above; bail! prevents reaching here
+        // with any of them absent. We use ok_or_else rather than unwrap so the compiler
+        // enforces the invariant — if the check block above is ever refactored, this will
+        // produce a proper error instead of a panic.
+        let embedding_base_url = self.embedding.base_url.ok_or_else(|| {
+            anyhow::anyhow!(
+                "embedding.base_url must be set (internal error: missing field after validation)"
+            )
+        })?;
+        let embedding_model = self.embedding.model.ok_or_else(|| {
+            anyhow::anyhow!(
+                "embedding.model must be set (internal error: missing field after validation)"
+            )
+        })?;
+        let qdrant_url = self.qdrant.url.ok_or_else(|| {
+            anyhow::anyhow!(
+                "qdrant.url must be set (internal error: missing field after validation)"
+            )
+        })?;
+
         Ok(ResolvedConfig {
             source: self.source,
             indexing: self.indexing,
             frontmatter: self.frontmatter,
             chunking: self.chunking,
             embedding: ResolvedEmbeddingConfig {
-                base_url: self.embedding.base_url.unwrap(),
-                model: self.embedding.model.unwrap(),
+                base_url: embedding_base_url,
+                model: embedding_model,
                 api_key: self.embedding.api_key,
                 vector_size: self.embedding.vector_size,
                 batch_size: self.embedding.batch_size,
             },
             qdrant: ResolvedQdrantConfig {
-                url: self.qdrant.url.unwrap(),
+                url: qdrant_url,
                 collection: self.qdrant.collection,
             },
             validation: self.validation,
@@ -549,7 +569,7 @@ impl ResolvedConfig {
     /// `frontmatter.indexed_fields`.
     pub fn effective_indexed_fields(&self) -> Vec<String> {
         let mut fields = self.frontmatter.indexed_fields.clone();
-        if !fields.contains(&"file_path".to_string()) {
+        if !fields.iter().any(|f| f == "file_path") {
             fields.push("file_path".to_string());
         }
         fields

@@ -42,7 +42,6 @@ services:
       # - ${KB_PATH:-./data/repo}:/data:rw
       # Option B: named volume — auto-cloned on first start when source.git_url is set
       - kb_data:/data:rw
-      - ./data/state:/app/data:rw
       # Optional: mount config.yaml for overrides beyond env vars
       # - ./config.yaml:/app/config.yaml:ro
     environment:

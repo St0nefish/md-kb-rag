@@ -1,29 +1,29 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
 use std::sync::RwLock;
 
+use anyhow::Context as _;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
     ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
 };
-
-use anyhow::Context as _;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     config::ResolvedConfig,
     embed::EmbedClient,
     git, ingest,
-    qdrant::{QdrantStore, SearchResult},
+    qdrant::QdrantStore,
+    retrieval::{self, GetDocumentError, RetrievalDeps, SearchFilters, SearchOptions},
     state::StateDb,
     validate,
 };
 
 const MAX_SEARCH_LIMIT: u64 = 50;
 const MAX_QUERY_LEN: usize = 4096;
+const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
 const MAX_TAG_COUNT: usize = 20;
 const MAX_TAG_LEN: usize = 256;
@@ -54,11 +54,6 @@ pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<Dupli
         _ => None,
     }
 }
-/// Upper bound on the number of indexed file paths to fetch for fuzzy
-/// `get_document` resolution. Larger KBs will silently cap at this value.
-const MAX_INDEXED_PATHS_FOR_FUZZY: u64 = 10_000;
-/// How many "did you mean?" suggestions to include when no basename matches.
-const FUZZY_SUGGESTION_COUNT: usize = 3;
 
 fn resolve_limit(requested: Option<u64>) -> u64 {
     requested.unwrap_or(10).min(MAX_SEARCH_LIMIT)
@@ -392,81 +387,13 @@ pub struct KbSearchServer {
     tool_router: ToolRouter<KbSearchServer>,
 }
 
-/// Strip the data-root prefix from an absolute file_path for display to clients.
-/// Paths in Qdrant are stored as absolute (the indexer uses `data_path` as the
-/// root), but `/data` is an implementation detail — clients should see paths
-/// relative to the indexed root. Falls back to returning the path unchanged
-/// if it doesn't share the prefix.
-fn relative_to_data(absolute: &str, data_root: &Path) -> String {
-    let root_str = data_root.to_string_lossy();
-    let root = root_str.trim_end_matches('/');
-    if root.is_empty() {
-        return absolute.trim_start_matches('/').to_string();
-    }
-    if let Some(rest) = absolute.strip_prefix(root) {
-        let rel = rest.trim_start_matches('/');
-        if rel.is_empty() {
-            absolute.to_string()
-        } else {
-            rel.to_string()
-        }
-    } else {
-        absolute.to_string()
-    }
-}
-
-/// Levenshtein edit distance between two strings (chars, not bytes).
-/// O(m*n) time, O(n) space. Used for "did you mean?" suggestions over a few
-/// hundred basenames — fine for our scale, no extra dependency needed.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let (m, n) = (a.len(), b.len());
-    if m == 0 {
-        return n;
-    }
-    if n == 0 {
-        return m;
-    }
-    let mut prev: Vec<usize> = (0..=n).collect();
-    let mut curr = vec![0usize; n + 1];
-    for i in 1..=m {
-        curr[0] = i;
-        for j in 1..=n {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[n]
-}
-
-/// Outcome of trying to resolve a user-supplied path against the data directory.
-enum ResolveErr {
-    /// File didn't exist — eligible for fuzzy basename fallback.
-    NotFound,
-    /// Resolved outside the data directory (path traversal). Hard fail.
-    Outside,
-    /// Resolved to a file type excluded by `indexing.include`. Hard fail.
-    NotPermitted,
-    /// Other I/O error (permissions, etc). Hard fail with the original message.
-    Other(String),
-}
-
+/// Build an include `GlobSet` for MCP path filtering, with a `**/*.md` fallback
+/// when no patterns are valid. Per-pattern parsing uses [`crate::ingest::parse_globs`]
+/// so both sites share the same skip-and-warn policy; this function keeps its own
+/// failure policy (fall back to `**/*.md` on empty or builder error) distinct from
+/// `ingest::build_globset`, which propagates errors to the caller.
 fn build_include_globset(patterns: &[String]) -> GlobSet {
-    let mut builder = GlobSetBuilder::new();
-    let mut valid_count = 0;
-    for p in patterns {
-        match Glob::new(p) {
-            Ok(g) => {
-                builder.add(g);
-                valid_count += 1;
-            }
-            Err(e) => {
-                error!("Invalid include glob pattern '{}': {}", p, e);
-            }
-        }
-    }
+    let (mut builder, valid_count) = crate::ingest::parse_globs(patterns);
     if valid_count == 0 {
         warn!("No valid include patterns configured — falling back to **/*.md");
         builder.add(Glob::new("**/*.md").unwrap());
@@ -478,7 +405,9 @@ fn build_include_globset(patterns: &[String]) -> GlobSet {
         );
         let mut fallback = GlobSetBuilder::new();
         fallback.add(Glob::new("**/*.md").unwrap());
-        fallback.build().unwrap()
+        fallback
+            .build()
+            .expect("hardcoded fallback glob '**/*.md' must compile")
     })
 }
 
@@ -508,6 +437,17 @@ impl KbSearchServer {
         })
     }
 
+    /// Build a `RetrievalDeps` bundle from this server's fields.
+    fn deps(&self) -> RetrievalDeps<'_, EmbedClient, QdrantStore> {
+        RetrievalDeps {
+            embed_client: &self.embed_client,
+            qdrant: &self.qdrant,
+            collection: &self.collection,
+            data_path: &self.canonical_data_path,
+            include_patterns: &self.include_patterns,
+        }
+    }
+
     #[tool(
         description = "Search the knowledge base using a natural-language query. \
         Returns ranked document chunks with title, relevance score, text snippet, and metadata. \
@@ -519,44 +459,45 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         validate_search_params(&params)?;
 
-        // Embed the query
-        let vector = self
-            .embed_client
-            .embed_query(&params.query)
-            .await
-            .map_err(|e| {
-                error!("Embedding query failed: {:#}", e);
-                McpError::internal_error("Failed to generate query embedding".to_string(), None)
-            })?;
-
-        // Build filter map from optional params
-        let mut filters: HashMap<String, serde_json::Value> = HashMap::new();
-
-        if let Some(domain) = params.domain {
-            filters.insert("domain".to_string(), serde_json::Value::String(domain));
-        }
-
-        if let Some(doc_type) = params.r#type {
-            filters.insert("type".to_string(), serde_json::Value::String(doc_type));
-        }
-
-        if let Some(tags) = params.tags {
-            let tag_values: Vec<serde_json::Value> =
-                tags.into_iter().map(serde_json::Value::String).collect();
-            filters.insert("tags".to_string(), serde_json::Value::Array(tag_values));
-        }
-
         let limit = resolve_limit(params.limit);
 
-        // Search Qdrant
-        let results: Vec<SearchResult> = self
-            .qdrant
-            .search(&self.collection, vector, filters, limit)
+        debug!(
+            query = %&params.query.chars().take(100).collect::<String>(),
+            limit,
+            has_domain = params.domain.is_some(),
+            has_type = params.r#type.is_some(),
+            has_tags = params.tags.is_some(),
+            "search called"
+        );
+
+        let filters = SearchFilters {
+            domain: params.domain,
+            r#type: params.r#type,
+            tags: params.tags,
+        };
+
+        let opts = SearchOptions {
+            limit,
+            min_score: None,
+            explain: false,
+            modified_after: None,
+            modified_before: None,
+        };
+
+        let results = retrieval::search(&self.deps(), &params.query, &filters, &opts)
             .await
-            .map_err(|e| {
-                error!("Qdrant search failed: {:#}", e);
-                McpError::internal_error("Search query failed".to_string(), None)
+            .map_err(|e| match e {
+                retrieval::SearchError::Embed(err) => {
+                    error!("Embedding query failed: {:#}", err);
+                    McpError::internal_error("Failed to generate query embedding".to_string(), None)
+                }
+                retrieval::SearchError::Search(err) => {
+                    error!("Qdrant search failed: {:#}", err);
+                    McpError::internal_error("Search query failed".to_string(), None)
+                }
             })?;
+
+        debug!(result_count = results.len(), "search returned results");
 
         if results.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -592,7 +533,7 @@ impl KbSearchServer {
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let file_path = relative_to_data(file_path_raw, &self.canonical_data_path);
+            let file_path = retrieval::relative_to_data(file_path_raw, &self.canonical_data_path);
 
             let domain = result
                 .payload
@@ -659,52 +600,6 @@ impl KbSearchServer {
         Ok(CallToolResult::success(vec![Content::text(output.trim())]))
     }
 
-    /// Resolve a user-supplied path against the data directory, applying the
-    /// path-traversal and file-type security checks. Used by `get_document` for
-    /// both literal resolution and (after fuzzy basename match) the chosen
-    /// candidate path.
-    fn resolve_within_data(&self, raw: &str) -> Result<PathBuf, ResolveErr> {
-        let requested = PathBuf::from(raw);
-        let resolved = if requested.is_absolute() {
-            requested
-        } else {
-            self.canonical_data_path.join(&requested)
-        };
-
-        let canonical = resolved.canonicalize().map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => ResolveErr::NotFound,
-            std::io::ErrorKind::PermissionDenied => {
-                ResolveErr::Other(format!("Permission denied: {}", resolved.display()))
-            }
-            _ => ResolveErr::Other(format!(
-                "Cannot access file '{}': {}",
-                resolved.display(),
-                e
-            )),
-        })?;
-
-        if !canonical.starts_with(&self.canonical_data_path) {
-            return Err(ResolveErr::Outside);
-        }
-
-        let relative = canonical
-            .strip_prefix(&self.canonical_data_path)
-            .unwrap_or(&canonical);
-        if !self.include_patterns.is_match(relative) {
-            return Err(ResolveErr::NotPermitted);
-        }
-
-        Ok(canonical)
-    }
-
-    async fn read_canonical_file(&self, canonical: &Path) -> Result<CallToolResult, McpError> {
-        let content = tokio::fs::read_to_string(canonical).await.map_err(|e| {
-            error!("Failed to read file '{}': {}", canonical.display(), e);
-            McpError::invalid_params("Failed to read file".to_string(), None)
-        })?;
-        Ok(CallToolResult::success(vec![Content::text(content)]))
-    }
-
     #[tool(
         description = "Retrieve the full raw content of a document by file path. \
         Accepts paths relative to the knowledge base root (e.g. \
@@ -723,81 +618,35 @@ impl KbSearchServer {
                 None,
             ));
         }
-
-        // 1. Try the literal path as given.
-        match self.resolve_within_data(raw) {
-            Ok(canonical) => return self.read_canonical_file(&canonical).await,
-            Err(ResolveErr::NotFound) => {
-                // Fall through to fuzzy basename matching.
-            }
-            Err(ResolveErr::Outside) => {
-                return Err(McpError::invalid_params(
-                    "File path is outside the data directory".to_string(),
-                    None,
-                ));
-            }
-            Err(ResolveErr::NotPermitted) => {
-                return Err(McpError::invalid_params(
-                    "File type not permitted".to_string(),
-                    None,
-                ));
-            }
-            Err(ResolveErr::Other(msg)) => {
-                return Err(McpError::invalid_params(msg, None));
-            }
+        if raw.len() > MAX_PATH_LEN {
+            return Err(McpError::invalid_params(
+                format!("path exceeds maximum length of {MAX_PATH_LEN} characters"),
+                None,
+            ));
         }
 
-        // 2. Fuzzy fallback: load every indexed path from Qdrant and look for a
-        //    basename match. Auto-resolve a unique match; otherwise produce a
-        //    helpful error.
-        let all_paths = self
-            .qdrant
-            .fetch_facet_values(&self.collection, "file_path", MAX_INDEXED_PATHS_FOR_FUZZY)
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Failed to fetch file_path facet for fuzzy lookup: {e:#}");
-                Vec::new()
-            });
+        debug!(path = %raw, "get_document called");
 
-        let basename = Path::new(raw)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(raw);
-
-        let exact: Vec<&String> = all_paths
-            .iter()
-            .filter(|p| {
-                Path::new(p.as_str()).file_name().and_then(|n| n.to_str()) == Some(basename)
-            })
-            .collect();
-
-        match exact.len() {
-            1 => match self.resolve_within_data(exact[0]) {
-                Ok(canonical) => self.read_canonical_file(&canonical).await,
-                Err(_) => Err(McpError::invalid_params(
-                    format!("File not found: '{}'", raw),
+        match retrieval::get_document(&self.deps(), raw).await {
+            Ok(doc) => {
+                debug!(path = %raw, "get_document served");
+                Ok(CallToolResult::success(vec![Content::text(doc.content)]))
+            }
+            Err(GetDocumentError::Outside) => {
+                warn!(path = %raw, "get_document: path outside data directory");
+                Err(McpError::invalid_params(
+                    "File path is outside the data directory".to_string(),
                     None,
-                )),
-            },
-            0 => {
-                let mut scored: Vec<(usize, &String)> = all_paths
-                    .iter()
-                    .map(|p| {
-                        let bn = Path::new(p.as_str())
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("");
-                        (levenshtein(basename, bn), p)
-                    })
-                    .collect();
-                scored.sort_by_key(|(d, _)| *d);
-                scored.truncate(FUZZY_SUGGESTION_COUNT);
-
-                let suggestions: Vec<String> = scored
-                    .into_iter()
-                    .map(|(_, p)| relative_to_data(p, &self.canonical_data_path))
-                    .collect();
-
+                ))
+            }
+            Err(GetDocumentError::NotPermitted) => {
+                warn!(path = %raw, "get_document: file type not permitted");
+                Err(McpError::invalid_params(
+                    "File type not permitted".to_string(),
+                    None,
+                ))
+            }
+            Err(GetDocumentError::NotFound { suggestions }) => {
                 let mut msg = format!("File not found: '{}'.", raw);
                 if suggestions.is_empty() {
                     msg.push_str(" Use the `search` tool to find paths.");
@@ -809,20 +658,21 @@ impl KbSearchServer {
                 }
                 Err(McpError::invalid_params(msg, None))
             }
-            _ => {
-                let candidates: Vec<String> = exact
-                    .into_iter()
-                    .map(|p| relative_to_data(p, &self.canonical_data_path))
-                    .collect();
+            Err(GetDocumentError::Ambiguous { matches }) => {
+                let basename = std::path::Path::new(raw)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(raw);
                 Err(McpError::invalid_params(
                     format!(
                         "Multiple files match basename '{}': {}. Use a more specific path.",
                         basename,
-                        candidates.join(", ")
+                        matches.join(", ")
                     ),
                     None,
                 ))
             }
+            Err(GetDocumentError::Io(msg)) => Err(McpError::invalid_params(msg, None)),
         }
     }
 
@@ -905,7 +755,9 @@ impl KbSearchServer {
                                     .payload
                                     .get("file_path")
                                     .and_then(|v| v.as_str())
-                                    .map(|p| relative_to_data(p, &self.canonical_data_path))
+                                    .map(|p| {
+                                        retrieval::relative_to_data(p, &self.canonical_data_path)
+                                    })
                                     .unwrap_or_default();
                                 (path, r.score)
                             });
@@ -1113,9 +965,13 @@ impl KbSearchServer {
             ));
         }
 
-        let canonical = match self.resolve_within_data(raw) {
+        let canonical = match retrieval::resolve_within_data(
+            raw,
+            &self.canonical_data_path,
+            &self.include_patterns,
+        ) {
             Ok(c) => c,
-            Err(ResolveErr::NotFound) => {
+            Err(retrieval::ResolveErr::NotFound) => {
                 return Err(McpError::invalid_params(
                     format!(
                         "Document '{}' does not exist. Use create_document to create new files.",
@@ -1124,19 +980,19 @@ impl KbSearchServer {
                     None,
                 ));
             }
-            Err(ResolveErr::Outside) => {
+            Err(retrieval::ResolveErr::Outside) => {
                 return Err(McpError::invalid_params(
                     "File path is outside the data directory".to_string(),
                     None,
                 ));
             }
-            Err(ResolveErr::NotPermitted) => {
+            Err(retrieval::ResolveErr::NotPermitted) => {
                 return Err(McpError::invalid_params(
                     "File type not permitted".to_string(),
                     None,
                 ));
             }
-            Err(ResolveErr::Other(msg)) => {
+            Err(retrieval::ResolveErr::Other(msg)) => {
                 return Err(McpError::invalid_params(msg, None));
             }
         };
@@ -1204,27 +1060,31 @@ impl KbSearchServer {
         }
 
         // 1. Resolve the path (must already exist on disk).
-        let canonical = match self.resolve_within_data(raw) {
+        let canonical = match retrieval::resolve_within_data(
+            raw,
+            &self.canonical_data_path,
+            &self.include_patterns,
+        ) {
             Ok(c) => c,
-            Err(ResolveErr::NotFound) => {
+            Err(retrieval::ResolveErr::NotFound) => {
                 return Err(McpError::invalid_params(
                     format!("document does not exist: '{}'", raw),
                     None,
                 ));
             }
-            Err(ResolveErr::Outside) => {
+            Err(retrieval::ResolveErr::Outside) => {
                 return Err(McpError::invalid_params(
                     "File path is outside the data directory".to_string(),
                     None,
                 ));
             }
-            Err(ResolveErr::NotPermitted) => {
+            Err(retrieval::ResolveErr::NotPermitted) => {
                 return Err(McpError::invalid_params(
                     "File type not permitted".to_string(),
                     None,
                 ));
             }
-            Err(ResolveErr::Other(msg)) => {
+            Err(retrieval::ResolveErr::Other(msg)) => {
                 return Err(McpError::invalid_params(msg, None));
             }
         };
@@ -1446,40 +1306,6 @@ mod tests {
     }
 
     #[test]
-    fn path_traversal_detection() {
-        // Raw PathBuf::join does NOT resolve `..` components — the resulting path
-        // still textually starts_with the data_path prefix, so a naive starts_with
-        // check is insufficient. canonicalize() is required to resolve `..`.
-        let data_path = std::path::PathBuf::from("/tmp/test-kb-data");
-        let traversal = data_path.join("../../../etc/passwd");
-        // starts_with returns true because the path is built on top of data_path
-        assert!(
-            traversal.starts_with(&data_path),
-            "raw join with .. still starts_with data_path — canonicalize() is needed"
-        );
-    }
-
-    #[test]
-    fn absolute_path_outside_data_rejected() {
-        let data_path = std::path::PathBuf::from("/tmp/test-kb-data");
-        let outside = std::path::PathBuf::from("/etc/passwd");
-        assert!(
-            !outside.starts_with(&data_path),
-            "/etc/passwd should not start_with /tmp/test-kb-data"
-        );
-    }
-
-    #[test]
-    fn relative_path_inside_data_accepted() {
-        let data_path = std::path::PathBuf::from("/tmp/test-kb-data");
-        let inside = data_path.join("docs/guide.md");
-        assert!(
-            inside.starts_with(&data_path),
-            "data_path/docs/guide.md should start_with data_path"
-        );
-    }
-
-    #[test]
     fn ellipsis_uses_char_count_not_byte_len() {
         // 400 chars of a 2-byte character = 800 bytes
         let text: String = "é".repeat(401);
@@ -1660,7 +1486,6 @@ mod tests {
     fn get_info_returns_dynamic_instructions() {
         use rmcp::ServerHandler;
 
-        // Create a temp directory to serve as data_path (must exist for canonicalize)
         let tmp = tempfile::tempdir().unwrap();
         let custom_text = "Custom KB instructions.\nAvailable domain: infra, networking";
         let instructions = Arc::new(RwLock::new(custom_text.to_string()));
@@ -1727,7 +1552,6 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate a refresh
         *instructions.write().unwrap() = "Updated with metadata".to_string();
 
         let info = server.get_info();
@@ -1741,7 +1565,6 @@ mod tests {
         let lock = Arc::new(RwLock::new("valid instructions".to_string()));
         let lock_clone = Arc::clone(&lock);
 
-        // Poison the lock by panicking while holding a write guard
         let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             let _guard = lock_clone.write().unwrap();
             panic!("intentional panic to poison the lock");
@@ -1749,7 +1572,6 @@ mod tests {
 
         assert!(lock.read().is_err(), "lock should be poisoned");
 
-        // Verify recovery via unwrap_or_else
         let recovered = lock
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1798,129 +1620,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn get_document_uses_canonical_path() {
-        // Create a temp dir with a subdirectory and a markdown file
+    #[tokio::test]
+    async fn get_document_rejects_overlong_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let sub = tmp.path().join("docs");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("test.md"), "# Hello").unwrap();
+        let instructions = Arc::new(RwLock::new("test".to_string()));
+        let config = crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        };
+        let qdrant = Arc::new(QdrantStore::new(&config).unwrap());
+        let embed_config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            api_key: None,
+            vector_size: 768,
+            batch_size: 32,
+        };
+        let embed = Arc::new(EmbedClient::new(&embed_config));
+        let server = KbSearchServer::new(
+            embed,
+            qdrant,
+            "test".into(),
+            tmp.path().to_path_buf(),
+            &["**/*.md".to_string()],
+            instructions,
+            make_test_resolved_config(tmp.path()),
+        )
+        .unwrap();
 
-        let canonical_data = tmp.path().canonicalize().unwrap();
-
-        // Simulate get_document path resolution logic using canonical_data_path
-        let requested = PathBuf::from("docs/test.md");
-        let resolved = canonical_data.join(&requested);
-        let canonical_resolved = resolved.canonicalize().unwrap();
-
-        assert!(
-            canonical_resolved.starts_with(&canonical_data),
-            "resolved path should be under the canonical data path"
-        );
-    }
-
-    #[test]
-    fn canonicalize_error_message_includes_path() {
-        let bad_path = std::path::PathBuf::from("/tmp/nonexistent-kb-test-dir/missing.md");
-        let err = bad_path
-            .canonicalize()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => format!("File not found: {}", bad_path.display()),
-                std::io::ErrorKind::PermissionDenied => {
-                    format!("Permission denied: {}", bad_path.display())
-                }
-                _ => format!("Cannot access file '{}': {}", bad_path.display(), e),
-            })
-            .unwrap_err();
-        assert!(
-            err.contains(&bad_path.display().to_string()),
-            "error message should include the file path, got: {err}"
-        );
-    }
-
-    #[test]
-    fn relative_to_data_strips_prefix() {
-        let root = std::path::Path::new("/data");
-        assert_eq!(
-            relative_to_data("/data/lifestyle/foo.md", root),
-            "lifestyle/foo.md"
-        );
-    }
-
-    #[test]
-    fn relative_to_data_handles_trailing_slash_root() {
-        let root = std::path::Path::new("/data/");
-        assert_eq!(
-            relative_to_data("/data/lifestyle/foo.md", root),
-            "lifestyle/foo.md"
-        );
-    }
-
-    #[test]
-    fn relative_to_data_returns_unchanged_when_no_prefix_match() {
-        let root = std::path::Path::new("/data");
-        // Path that doesn't start with /data — leave it alone rather than mangling it.
-        assert_eq!(relative_to_data("/other/foo.md", root), "/other/foo.md");
-    }
-
-    #[test]
-    fn relative_to_data_path_equal_to_root_kept_as_is() {
-        let root = std::path::Path::new("/data");
-        // Pathological case: file_path is exactly the data root. Leave it alone
-        // rather than collapsing to an empty string.
-        assert_eq!(relative_to_data("/data", root), "/data");
-    }
-
-    #[test]
-    fn relative_to_data_partial_segment_does_not_match() {
-        let root = std::path::Path::new("/data");
-        // "/data-other/foo.md" textually starts with "/data" but isn't under it.
-        // We accept the false-positive prefix strip here as a tradeoff: keeping
-        // it simple. The leading slash on "-other/foo.md" disambiguates that
-        // the caller passed a path the indexer didn't produce, so downstream
-        // resolution will fail loudly. Document the behaviour so future changes
-        // notice if it matters.
-        let out = relative_to_data("/data-other/foo.md", root);
-        assert!(
-            out == "-other/foo.md" || out == "/data-other/foo.md",
-            "got {out}"
-        );
-    }
-
-    #[test]
-    fn levenshtein_identical_is_zero() {
-        assert_eq!(levenshtein("hello", "hello"), 0);
-    }
-
-    #[test]
-    fn levenshtein_empty_string() {
-        assert_eq!(levenshtein("", "abc"), 3);
-        assert_eq!(levenshtein("abc", ""), 3);
-        assert_eq!(levenshtein("", ""), 0);
-    }
-
-    #[test]
-    fn levenshtein_substitutions_and_inserts() {
-        // "kitten" -> "sitting": substitute k->s, e->i, insert g = 3
-        assert_eq!(levenshtein("kitten", "sitting"), 3);
-    }
-
-    #[test]
-    fn levenshtein_ranks_close_matches_lower() {
-        let target = "tacoma-2025.md";
-        let close = levenshtein(target, "tacoma-2024.md");
-        let far = levenshtein(target, "voron-trident.md");
-        assert!(
-            close < far,
-            "expected close ({close}) < far ({far}) for target '{target}'"
-        );
-    }
-
-    #[test]
-    fn levenshtein_unicode_uses_chars_not_bytes() {
-        // 'é' is 2 bytes UTF-8 but 1 char. If we used byte indices we'd
-        // mis-count distances on accented basenames.
-        assert_eq!(levenshtein("café", "cafe"), 1);
+        let overlong_path = "a".repeat(MAX_PATH_LEN + 1);
+        let params = GetDocumentParams {
+            path: overlong_path,
+        };
+        let result = server.get_document(Parameters(params)).await;
+        assert!(result.is_err(), "overlong path should return an error");
     }
 
     // -----------------------------------------------------------------------

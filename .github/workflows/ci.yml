@@ -48,7 +48,19 @@ jobs:
         run: |
           git config user.email "ci@stonefish.tech"
           git config user.name "CI"
-          git fetch origin master
+          # Persistent self-hosted runner hygiene. Two failure modes to defend against:
+          #  1. A prior run whose rebase hit conflicts leaves a stale
+          #     .git/rebase-merge, making every later `git rebase` abort with
+          #     "already a rebase-merge directory".
+          #  2. actions/checkout may land on a stale cached refs/pull/N/merge,
+          #     so the workspace HEAD is an old (force-pushed-away) head and the
+          #     rebase replays obsolete commits that conflict.
+          # Clear any in-progress rebase, then force the workspace to the exact
+          # PR head SHA from the event before rebasing onto current master.
+          git rebase --abort 2>/dev/null || true
+          rm -rf .git/rebase-merge .git/rebase-apply
+          git fetch --force origin master "refs/pull/${{ github.event.pull_request.number }}/head"
+          git checkout --force --detach "${{ github.event.pull_request.head.sha }}"
           git rebase origin/master
 
       - name: Install system dependencies

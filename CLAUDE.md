@@ -14,7 +14,7 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 
 - All async code uses tokio
 - Config loaded from `config.yaml` (deserialized in `src/config.rs`)
-- State tracked in SQLite via sqlx (`data/state.db`)
+- State tracked in SQLite via sqlx (default `/data/state.db`, i.e. `<source.data_path>/state.db`)
 - Point IDs are UUID5 from `file_path::chunk_index`
 - Qdrant accessed via gRPC (port 6334)
 - Embeddings via OpenAI-compatible API (async-openai)
@@ -32,9 +32,10 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 | `embed.rs` | Embedding API client |
 | `qdrant.rs` | Qdrant operations |
 | `state.rs` | SQLite state DB |
-| `mcp.rs` | MCP tools (rmcp): `search`, `get_document`, and write tools `create_document`/`edit_document`/`delete_document` |
-| `git.rs` | Git operations for the KB clone (clone, `commit_and_sync`: add→commit→fetch→rebase→push) |
+| `retrieval.rs` | Shared retrieval core (`search` + `get_document`) used by MCP and (future) CLI |
+| `mcp.rs` | MCP tools (rmcp): `search`, `get_document` (thin handlers delegating to `retrieval`), and write tools `create_document`/`edit_document`/`delete_document` |
 | `webhook.rs` | Webhook handler (owns `REINDEX_LOCK`, shared with write tools) |
+| `git.rs` | Git operations for the KB clone (clone, fetch with timeout, `commit_and_sync`: add→commit→fetch→rebase→push) |
 | `server.rs` | Axum server (MCP + webhook routes) |
 
 ## Workflow

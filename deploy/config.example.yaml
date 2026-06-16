@@ -44,6 +44,9 @@ source:
 
   # Filesystem path to the knowledge base root. In Docker, bind-mount your
   # repo to this path. The indexer walks this directory for markdown files.
+  # The SQLite state database is written to <data_path>/state.db (default:
+  # /data/state.db), so it lives inside the knowledge-base volume — no
+  # separate state mount is needed.
   data_path: "/data"
 
 

@@ -5,6 +5,7 @@ mod git;
 mod ingest;
 mod mcp;
 mod qdrant;
+mod retrieval;
 mod server;
 mod state;
 mod validate;
@@ -65,7 +66,10 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|e| {
+                eprintln!("Warning: invalid RUST_LOG value ({e}); defaulting to info");
+                "info".into()
+            }),
         )
         .init();
 

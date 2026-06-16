@@ -18,7 +18,8 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 git clone https://github.com/St0nefish/md-kb-rag.git
 cd md-kb-rag
 cp deploy/.env.example .env
-# Edit .env: set MCP_BEARER_TOKEN, MODEL_PATH/MODEL_FILE, and GIT_PULL_TOKEN
+# Edit .env: set MCP_BEARER_TOKEN and MODEL_PATH/MODEL_FILE
+# (GIT_PULL_TOKEN is optional — only needed to clone/fetch a private knowledge-base repo)
 
 # Download the embedding model (see "Embedding Models" below)
 
@@ -66,6 +67,8 @@ md-kb-rag health             # Check if server is healthy
 
 Config is loaded from `config.yaml` (or the path passed via `--config`). Every field has a sensible default, so the file is optional. Connection settings can be set via environment variables:
 
+**Direct field overrides** — the env var value is used as the config field value:
+
 | Env Var | Config Path | Default (in compose) |
 |---|---|---|
 | `EMBEDDING_BASE_URL` | `embedding.base_url` | `http://embeddings:8080/v1` |
@@ -73,9 +76,16 @@ Config is loaded from `config.yaml` (or the path passed via `--config`). Every f
 | `EMBEDDING_VECTOR_SIZE` | `embedding.vector_size` | `768` |
 | `EMBEDDING_API_KEY` | `embedding.api_key` | *(unset)* |
 | `QDRANT_URL` | `qdrant.url` | `http://qdrant:6334` |
-| `WEBHOOK_SECRET` | `webhook.secret_env` | *(unset — webhook disabled)* |
-| `GIT_PULL_TOKEN` | `source.git_token_env` | *(unset — no auth for git fetch)* |
-| `MCP_BEARER_TOKEN` | `mcp.bearer_token_env` | *(required)* |
+
+**Indirected secret env vars** — the config field names *which* env var holds the secret (not the value itself). You can rename the env var by changing the config field:
+
+| Config Field | Default env var name | Default (in compose) |
+|---|---|---|
+| `webhook.secret_env` | `WEBHOOK_SECRET` | *(unset — webhook disabled)* |
+| `source.git_token_env` | `GIT_PULL_TOKEN` | *(unset — no auth for git fetch)* |
+| `mcp.bearer_token_env` | `MCP_BEARER_TOKEN` | *(required)* |
+
+For example, `webhook.secret_env: "WEBHOOK_SECRET"` tells the server to read the HMAC secret from the env var named `WEBHOOK_SECRET`. Change it in config if you want a different env var name.
 
 Env vars take priority over config file values. If neither is set for required fields (`embedding.base_url`, `embedding.model`, `qdrant.url`), the server exits with a clear error.
 

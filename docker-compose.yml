@@ -80,13 +80,13 @@ services:
       # - ${KB_PATH:-./data/repo}:/data:rw
       # Option B: named volume — auto-cloned on first start when source.git_url is set
       - kb_data:/data:rw
-      - ./data/state:/app/data:rw
       # Optional: mount config.yaml for overrides beyond env vars
       # - ./config.yaml:/app/config.yaml:ro
     environment:
       - EMBEDDING_BASE_URL=http://embeddings:8080/v1
       - EMBEDDING_MODEL=nomic-embed-text-v2-moe
       - EMBEDDING_VECTOR_SIZE=768
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
       - QDRANT_URL=http://qdrant:6334
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
       - GIT_PULL_TOKEN=${GIT_PULL_TOKEN:-}

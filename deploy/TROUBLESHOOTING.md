@@ -142,6 +142,50 @@ Changing the embedding model (or `vector_size`) makes existing vectors incompati
 
 **Fix:** Run `md-kb-rag index --full` to drop and recreate the Qdrant collection with the new dimensions.
 
+## Logging and Observability
+
+### `RUST_LOG` syntax and useful presets
+
+Set `RUST_LOG` in your `.env` file or compose environment. The server warns on stderr if the value is unparseable and falls back to `info`.
+
+| Value | Effect |
+|---|---|
+| `info` | Default — startup events, webhook accepts, indexing summaries |
+| `md_kb_rag=debug` | Verbose app logging: per-file decisions, search timing, per-batch embed progress |
+| `info,md_kb_rag::webhook=debug` | Info everywhere + detailed webhook trace |
+| `debug` | Very verbose — includes library internals (noisy) |
+
+### Key log events and how to find them
+
+`Bearer auth rejected` (WARN) — every request rejected by MCP bearer-token auth. A flood of these means a client is using the wrong token.
+
+`Webhook signature verification failed` (WARN) — HMAC mismatch between the forge secret and `WEBHOOK_SECRET`, logged with the provider name.
+
+`Webhook accepted, spawning incremental reindex` / `Reindex already in progress; coalescing/skipping this webhook` — the accept/coalesce audit trail. The first means the webhook passed signature + branch checks and a reindex was started. The second means a reindex was already running, so this webhook was **skipped** (coalesced) rather than queued — only one reindex runs at a time. Because reindexing is incremental over the repo's current state, the in-flight run already picks up everything pulled so far; a push that lands after that run's `git fetch` is caught by the next webhook. (If a forge sends a burst of pushes, expect one `accepted` followed by several `coalescing/skipping` lines.)
+
+`Indexing run complete` (INFO) — a structured per-run summary logged after every indexing run:
+
+```text
+Indexing run complete discovered=42 indexed=5 skipped=36 invalid=0 empty=0 read_errors=0 orphans_removed=1 elapsed_secs=3.2
+```
+
+| Field | Meaning |
+|---|---|
+| `discovered` | Total files matched by include/exclude patterns |
+| `indexed` | Files successfully embedded and upserted |
+| `skipped` | Unchanged files (hash matched state DB) — normal in incremental mode |
+| `invalid` | Files that failed frontmatter validation |
+| `empty` | Files that produced no chunks (blank body after frontmatter) |
+| `read_errors` | Files that could not be read (permissions, encoding errors) |
+| `orphans_removed` | Qdrant points removed for files no longer on disk |
+| `elapsed_secs` | Wall-clock time for the run |
+
+If a file you expected to be indexed shows up under `skipped`, its hash matches the last indexed version — it hasn't changed since the last run. If it shows under `invalid`, run `md-kb-rag validate` for details.
+
+`git fetch timed out after Xs` / `git merge timed out after Xs` (ERROR) — webhook-triggered git subprocess exceeded the 120-second timeout. Check that `source.git_url` is reachable from inside the container.
+
+`Could not read mtime for '...', defaulting to 0` (WARN) — filesystem metadata was unavailable. The file is still indexed; `mtime` in the Qdrant payload will be `0`.
+
 ## Apple Silicon / macOS
 
 ### No Metal support in Docker
