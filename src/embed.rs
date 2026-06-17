@@ -13,6 +13,10 @@ pub trait EmbedStore: Send + Sync {
     async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
 
+pub trait QueryEmbedder: Send + Sync {
+    async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>>;
+}
+
 pub struct EmbedClient {
     client: Client<OpenAIConfig>,
     http_client: reqwest::Client,
@@ -42,7 +46,7 @@ impl EmbedClient {
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
-        for batch in texts.chunks(self.batch_size) {
+        for (batch_index, batch) in texts.chunks(self.batch_size).enumerate() {
             let response = backoff::future::retry(embed_backoff(), || async {
                 let request = CreateEmbeddingRequestArgs::default()
                     .model(&self.model)
@@ -52,7 +56,11 @@ impl EmbedClient {
 
                 self.client.embeddings().create(request).await.map_err(|e| {
                     if is_retryable(&e) {
-                        tracing::warn!("Transient embedding error, retrying: {e}");
+                        tracing::warn!(
+                            batch = batch_index,
+                            texts = batch.len(),
+                            "Transient embedding error, retrying: {e}"
+                        );
                         backoff::Error::transient(e)
                     } else {
                         backoff::Error::permanent(e)
@@ -60,6 +68,8 @@ impl EmbedClient {
                 })
             })
             .await?;
+
+            tracing::debug!(batch = batch_index, texts = batch.len(), "Embedded batch");
 
             let mut data = response.data;
             data.sort_by_key(|e| e.index);
@@ -73,9 +83,21 @@ impl EmbedClient {
     }
 }
 
+/// Thin delegation impl — calls the identically-named inherent method.
+/// The inherent `EmbedClient::embed_texts` is the real implementation; this impl
+/// exists only to satisfy the `EmbedStore` trait used by `ingest.rs`.
 impl EmbedStore for EmbedClient {
     async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         EmbedClient::embed_texts(self, texts).await
+    }
+}
+
+/// Thin delegation impl — calls the identically-named inherent method.
+/// The inherent `EmbedClient::embed_query` is the real implementation; this impl
+/// exists only to satisfy the `QueryEmbedder` trait used by `retrieval.rs`.
+impl QueryEmbedder for EmbedClient {
+    async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
+        EmbedClient::embed_query(self, q).await
     }
 }
 

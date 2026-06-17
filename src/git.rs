@@ -1,6 +1,13 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use tokio::process::Command;
-use tracing::info;
+use tokio::time::timeout;
+use tracing::{error, info};
+
+/// Maximum time to wait for a git subprocess (clone) before treating it as
+/// hung and returning an error.
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Inject a token into an HTTPS URL for authenticated git operations.
 /// SSH URLs are returned unchanged.
@@ -77,19 +84,27 @@ pub async fn ensure_repo(
         data_path
     );
 
-    let output = Command::new("git")
-        .args([
-            "clone",
-            "--branch",
-            branch,
-            "--single-branch",
-            &clone_url,
-            ".",
-        ])
-        .current_dir(data_path)
-        .output()
-        .await
-        .context("Failed to run git clone")?;
+    // Full clone (no --depth): commit_and_sync needs history to fetch/rebase/push.
+    let output = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args([
+                "clone",
+                "--branch",
+                branch,
+                "--single-branch",
+                &clone_url,
+                ".",
+            ])
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_elapsed| {
+        error!("git clone timed out after {:?}", GIT_TIMEOUT);
+        anyhow::anyhow!("git clone timed out after {:?}", GIT_TIMEOUT)
+    })?
+    .context("Failed to run git clone")?;
 
     if !output.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&output.stderr));

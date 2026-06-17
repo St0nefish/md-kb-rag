@@ -99,11 +99,24 @@ pub fn chunk_markdown(
             // Split oversized section with MarkdownSplitter, but merge
             // small leading fragments (headings, code fence openers) forward
             // so they stay attached to the content they introduce.
-            // All sub-chunks share the section's line range since we can't
-            // reliably map splitter output back to exact line offsets.
             let splitter = MarkdownSplitter::new(max);
             let mut pending: Option<RawChunk> = None;
-            for part in splitter.chunks(&section.text) {
+            // Use chunk_indices to get each fragment's byte offset within
+            // section.text.  MarkdownSplitter trims leading/trailing whitespace
+            // from fragments (TRIM::PreserveIndentation), so the byte offset
+            // points to the first non-whitespace character of each fragment.
+            // Counting newlines in section.text[..byte_offset] gives the number
+            // of lines before the fragment starts — this is approximate when the
+            // splitter drops blank lines at boundaries, but it is monotonically
+            // increasing and far more useful than every sub-chunk sharing the
+            // same section-wide range.
+            for (byte_offset, part) in splitter.chunk_indices(&section.text) {
+                // Compute per-fragment line range relative to section.line_start.
+                let lines_before = section.text[..byte_offset].matches('\n').count();
+                let frag_line_start = section.line_start + lines_before;
+                let frag_line_end =
+                    (frag_line_start + part.matches('\n').count()).min(section.line_end);
+
                 if let Some(mut prev) = pending.take() {
                     let prev_len = prev.text.trim().len();
                     let combined = prev_len + 2 + part.trim().len();
@@ -112,7 +125,7 @@ pub fn chunk_markdown(
                     // Only reject the merge when prev is already a substantial chunk
                     // and combining would exceed max.
                     if combined <= max || prev_len < MIN_MERGE_SIZE {
-                        prev.append(part, section.line_end);
+                        prev.append(part, frag_line_end);
                         if prev.text.trim().len() < MIN_MERGE_SIZE {
                             pending = Some(prev);
                         } else {
@@ -125,28 +138,28 @@ pub fn chunk_markdown(
                         if part.trim().len() < MIN_MERGE_SIZE {
                             pending = Some(RawChunk {
                                 text: part.to_string(),
-                                line_start: section.line_start,
-                                line_end: section.line_end,
+                                line_start: frag_line_start,
+                                line_end: frag_line_end,
                             });
                         } else {
                             chunks.push(RawChunk {
                                 text: part.to_string(),
-                                line_start: section.line_start,
-                                line_end: section.line_end,
+                                line_start: frag_line_start,
+                                line_end: frag_line_end,
                             });
                         }
                     }
                 } else if part.trim().len() < MIN_MERGE_SIZE {
                     pending = Some(RawChunk {
                         text: part.to_string(),
-                        line_start: section.line_start,
-                        line_end: section.line_end,
+                        line_start: frag_line_start,
+                        line_end: frag_line_end,
                     });
                 } else {
                     chunks.push(RawChunk {
                         text: part.to_string(),
-                        line_start: section.line_start,
-                        line_end: section.line_end,
+                        line_start: frag_line_start,
+                        line_end: frag_line_end,
                     });
                 }
             }
@@ -453,5 +466,78 @@ mod tests {
                 max,
             );
         }
+    }
+
+    #[test]
+    fn oversized_section_sub_chunks_have_distinct_monotonic_line_starts() {
+        // Build a section large enough to produce at least 2 sub-chunks.
+        // Each paragraph is on its own line so splitter fragments land on
+        // different lines and we can verify monotonic line_start values.
+        let paragraphs: Vec<String> = (0..30)
+            .map(|i| {
+                format!(
+                    "Paragraph {}. {}",
+                    i,
+                    "Lorem ipsum dolor sit amet. ".repeat(5)
+                )
+            })
+            .collect();
+        // section_start is line 1 (the heading), paragraphs start at line 3
+        let body = format!("## Large Section\n\n{}", paragraphs.join("\n\n"));
+        let max = 600;
+        let chunks = chunk_markdown(&body, None, &cfg(max, Some(400), false));
+        assert!(
+            chunks.len() >= 2,
+            "Expected >=2 sub-chunks from oversized section, got {}",
+            chunks.len()
+        );
+        // Sub-chunk line_start values must be strictly increasing.
+        for w in chunks.windows(2) {
+            assert!(
+                w[1].line_start > w[0].line_start,
+                "line_start not monotonically increasing: chunk has line_start={} after chunk with line_start={}",
+                w[1].line_start,
+                w[0].line_start,
+            );
+        }
+        // All sub-chunks must stay within the document's line range.
+        let total_lines = body.lines().count();
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.line_start >= 1,
+                "Chunk {} line_start {} is below 1",
+                i,
+                chunk.line_start,
+            );
+            assert!(
+                chunk.line_end <= total_lines,
+                "Chunk {} line_end {} exceeds document line count {}",
+                i,
+                chunk.line_end,
+                total_lines,
+            );
+            assert!(
+                chunk.line_end >= chunk.line_start,
+                "Chunk {} has line_end {} < line_start {}",
+                i,
+                chunk.line_end,
+                chunk.line_start,
+            );
+        }
+    }
+
+    #[test]
+    fn single_chunk_section_has_correct_line_range() {
+        // A section that fits in one chunk must still report accurate line ranges.
+        // Line 1: "# Title"
+        // Line 2: "" (blank)
+        // Line 3: "Line two."
+        // Line 4: "Line three."
+        // Line 5: "Line four."
+        let body = "# Title\n\nLine two.\nLine three.\nLine four.";
+        let chunks = chunk_markdown(body, None, &cfg(1000, None, false));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].line_start, 1);
+        assert_eq!(chunks[0].line_end, 5);
     }
 }

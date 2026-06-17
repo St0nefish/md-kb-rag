@@ -15,6 +15,23 @@ use crate::config::ResolvedQdrantConfig;
 pub trait VectorStore: Send + Sync {
     async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()>;
     async fn delete_by_files(&self, collection: &str, file_paths: &[&str]) -> Result<()>;
+    async fn delete_points_by_ids(&self, collection: &str, ids: Vec<String>) -> Result<()>;
+}
+
+pub trait RetrievalStore: Send + Sync {
+    async fn search(
+        &self,
+        collection: &str,
+        vector: Vec<f32>,
+        filters: std::collections::HashMap<String, serde_json::Value>,
+        limit: u64,
+    ) -> Result<Vec<SearchResult>>;
+    async fn fetch_facet_values(
+        &self,
+        collection: &str,
+        field: &str,
+        limit: u64,
+    ) -> Result<Vec<String>>;
 }
 
 pub struct QdrantStore {
@@ -234,6 +251,27 @@ impl QdrantStore {
                 })?;
         }
 
+        // Ensure integer index on mtime for range-filter queries (idempotent).
+        self.client
+            .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                collection,
+                "mtime",
+                FieldType::Integer,
+            ))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create integer index on field 'mtime' in collection '{}'",
+                    collection
+                )
+            })?;
+
+        info!(
+            collection,
+            fields = indexed_fields.len(),
+            "Collection ready"
+        );
+
         Ok(())
     }
 
@@ -280,8 +318,30 @@ impl QdrantStore {
         );
         Ok(())
     }
+
+    pub async fn delete_points_by_ids(&self, collection: &str, ids: Vec<String>) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let point_count = ids.len();
+
+        self.client
+            .delete_points(DeletePointsBuilder::new(collection).points(ids))
+            .await
+            .context("Failed to delete points by IDs")?;
+
+        debug!(
+            "Deleted {} points by ID from collection '{}'",
+            point_count, collection
+        );
+        Ok(())
+    }
 }
 
+/// Thin delegation impls — each method calls the identically-named inherent method
+/// on `QdrantStore`. The inherent methods are the real implementations; these impls
+/// exist only to satisfy the `VectorStore` trait used by `ingest.rs`.
 impl VectorStore for QdrantStore {
     async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()> {
         QdrantStore::upsert_points(self, collection, points).await
@@ -289,6 +349,34 @@ impl VectorStore for QdrantStore {
 
     async fn delete_by_files(&self, collection: &str, file_paths: &[&str]) -> Result<()> {
         QdrantStore::delete_by_files(self, collection, file_paths).await
+    }
+
+    async fn delete_points_by_ids(&self, collection: &str, ids: Vec<String>) -> Result<()> {
+        QdrantStore::delete_points_by_ids(self, collection, ids).await
+    }
+}
+
+/// Thin delegation impls — each method calls the identically-named inherent method
+/// on `QdrantStore`. The inherent methods are the real implementations; these impls
+/// exist only to satisfy the `RetrievalStore` trait used by `retrieval.rs`.
+impl RetrievalStore for QdrantStore {
+    async fn search(
+        &self,
+        collection: &str,
+        vector: Vec<f32>,
+        filters: std::collections::HashMap<String, serde_json::Value>,
+        limit: u64,
+    ) -> Result<Vec<SearchResult>> {
+        QdrantStore::search(self, collection, vector, filters, limit).await
+    }
+
+    async fn fetch_facet_values(
+        &self,
+        collection: &str,
+        field: &str,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        QdrantStore::fetch_facet_values(self, collection, field, limit).await
     }
 }
 
@@ -850,7 +938,7 @@ mod tests {
     #[test]
     fn filter_float_returns_error() {
         let mut filters = HashMap::new();
-        filters.insert("score".to_string(), serde_json::json!(3.14f64));
+        filters.insert("score".to_string(), serde_json::json!(3.15f64));
         let err = build_conditions(&filters).unwrap_err();
         assert!(
             err.to_string()

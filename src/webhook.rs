@@ -1,5 +1,7 @@
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 use tokio::sync::Mutex;
 
@@ -20,8 +22,15 @@ use crate::ingest;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Maximum time to wait for a git subprocess (fetch, merge) before treating it
+/// as hung and returning an error.
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Prevents concurrent reindex tasks from interleaving Qdrant/SQLite operations.
-pub(crate) static REINDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// Wrapped in Arc so we can acquire OwnedMutexGuard and move it into tokio::spawn;
+/// `pub(crate)` so the MCP write tools can share the same single-flight lock.
+pub(crate) static REINDEX_LOCK: LazyLock<Arc<Mutex<()>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(())));
 
 #[derive(Clone)]
 pub struct WebhookState {
@@ -49,7 +58,7 @@ fn verify_signature(
             Err(_) => return false,
         },
         None => {
-            warn!("Missing webhook signature header: {}", header_name);
+            warn!(header = header_name, "Missing webhook signature header");
             return false;
         }
     };
@@ -107,7 +116,7 @@ pub async fn handle_webhook(
     let provider = &state.config.webhook.provider;
 
     if !verify_signature(&state.secret, &body, &headers, provider) {
-        warn!("Webhook signature verification failed");
+        warn!(provider = ?provider, "Webhook signature verification failed");
         return (StatusCode::UNAUTHORIZED, "Invalid signature".to_string());
     }
 
@@ -135,24 +144,41 @@ pub async fn handle_webhook(
         );
 
         // git fetch --no-tags <url> <branch>
-        let fetch_output = Command::new("git")
-            .args([
-                "-c",
-                &format!("safe.directory={}", data_path),
-                "fetch",
-                "--no-tags",
-                &fetch_url,
-                branch,
-            ])
-            .current_dir(data_path)
-            .output()
-            .await;
+        let fetch_result = timeout(
+            GIT_TIMEOUT,
+            Command::new("git")
+                .args([
+                    "-c",
+                    &format!("safe.directory={}", data_path),
+                    "fetch",
+                    "--no-tags",
+                    &fetch_url,
+                    branch,
+                ])
+                .current_dir(data_path)
+                .output(),
+        )
+        .await;
 
-        match fetch_output {
-            Ok(o) if o.status.success() => {
+        match fetch_result {
+            Err(_elapsed) => {
+                error!("git fetch timed out after {:?}", GIT_TIMEOUT);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Git fetch timed out".to_string(),
+                );
+            }
+            Ok(Err(e)) => {
+                error!("Failed to run git fetch: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to run git".to_string(),
+                );
+            }
+            Ok(Ok(o)) if o.status.success() => {
                 info!("Git fetch succeeded");
             }
-            Ok(o) => {
+            Ok(Ok(o)) => {
                 let stderr = redact_url(&String::from_utf8_lossy(&o.stderr));
                 error!("Git fetch failed: {}", stderr);
                 return (
@@ -160,33 +186,43 @@ pub async fn handle_webhook(
                     "Git fetch failed".to_string(),
                 );
             }
-            Err(e) => {
-                error!("Failed to run git fetch: {}", e);
+        }
+
+        // git merge --ff-only FETCH_HEAD
+        let merge_result = timeout(
+            GIT_TIMEOUT,
+            Command::new("git")
+                .args([
+                    "-c",
+                    &format!("safe.directory={}", data_path),
+                    "merge",
+                    "--ff-only",
+                    "FETCH_HEAD",
+                ])
+                .current_dir(data_path)
+                .output(),
+        )
+        .await;
+
+        match merge_result {
+            Err(_elapsed) => {
+                error!("git merge timed out after {:?}", GIT_TIMEOUT);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Git merge timed out".to_string(),
+                );
+            }
+            Ok(Err(e)) => {
+                error!("Failed to run git merge: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to run git".to_string(),
                 );
             }
-        }
-
-        // git merge --ff-only FETCH_HEAD
-        let merge_output = Command::new("git")
-            .args([
-                "-c",
-                &format!("safe.directory={}", data_path),
-                "merge",
-                "--ff-only",
-                "FETCH_HEAD",
-            ])
-            .current_dir(data_path)
-            .output()
-            .await;
-
-        match merge_output {
-            Ok(o) if o.status.success() => {
+            Ok(Ok(o)) if o.status.success() => {
                 info!("Git merge (ff-only) succeeded");
             }
-            Ok(o) => {
+            Ok(Ok(o)) => {
                 let stderr = redact_url(&String::from_utf8_lossy(&o.stderr));
                 error!("Git merge failed: {}", stderr);
                 return (
@@ -194,32 +230,36 @@ pub async fn handle_webhook(
                     "Git merge failed".to_string(),
                 );
             }
-            Err(e) => {
-                error!("Failed to run git merge: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to run git".to_string(),
-                );
-            }
         }
     }
 
-    // Trigger incremental reindex (serialized via mutex)
-    let config = Arc::clone(&state.config);
-    let task = tokio::spawn(async move {
-        let _guard = REINDEX_LOCK.lock().await;
-        info!("Webhook triggered incremental reindex");
-        if let Err(e) = ingest::run_index(&config, false).await {
-            error!("Reindex failed: {:#}", e);
+    // Attempt to acquire the reindex lock. If already held, coalesce (skip).
+    match Arc::clone(&REINDEX_LOCK).try_lock_owned() {
+        Ok(guard) => {
+            info!(provider = ?provider, branch = %state.config.source.branch, "Webhook accepted, spawning incremental reindex");
+            let config = Arc::clone(&state.config);
+            let task = tokio::spawn(async move {
+                let _guard = guard; // hold for the duration of the reindex
+                info!("Webhook triggered incremental reindex");
+                if let Err(e) = ingest::run_index(&config, false).await {
+                    error!("Reindex failed: {:#}", e);
+                }
+            });
+            tokio::spawn(async move {
+                if let Err(e) = task.await {
+                    error!("Reindex task panicked: {e}");
+                }
+            });
+            (StatusCode::OK, "Reindex triggered".to_string())
         }
-    });
-    tokio::spawn(async move {
-        if let Err(e) = task.await {
-            error!("Reindex task panicked: {e}");
+        Err(_) => {
+            info!(provider = ?provider, branch = %state.config.source.branch, "Reindex already in progress; coalescing/skipping this webhook");
+            (
+                StatusCode::OK,
+                "Reindex already in progress, webhook coalesced".to_string(),
+            )
         }
-    });
-
-    (StatusCode::OK, "Reindex triggered".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -510,5 +550,48 @@ mod tests {
             .into_response();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // NOTE: we intentionally do NOT unit-test the "lock free → triggered" body
+    // here. REINDEX_LOCK is a process-global shared with the MCP write tools, so
+    // under parallel test execution another test can legitimately hold it, making
+    // any "lock is free" assertion racy. The coalescing path below is deterministic
+    // because it holds the lock itself.
+    #[tokio::test]
+    async fn handle_webhook_coalesces_when_lock_held() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let secret = "test-secret";
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+        let sig = compute_hmac(secret, body);
+
+        let config = minimal_config();
+        let state = WebhookState {
+            config,
+            secret: secret.to_string(),
+            git_token: None,
+        };
+
+        // Hold the lock to simulate an in-progress reindex
+        let _guard = Arc::clone(&REINDEX_LOCK).lock_owned().await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-gitea-signature",
+            axum::http::HeaderValue::from_str(&sig).unwrap(),
+        );
+
+        let resp = handle_webhook(State(state), headers, Bytes::copy_from_slice(body))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(
+            body_str.contains("coalesced") || body_str.contains("already in progress"),
+            "Expected coalesced response, got: {body_str}"
+        );
     }
 }

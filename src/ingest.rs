@@ -20,13 +20,34 @@ use crate::{
 // File discovery
 // ---------------------------------------------------------------------------
 
-fn build_globset(patterns: &[String]) -> Result<GlobSet> {
+/// Parse `patterns` into a `GlobSetBuilder`, skipping (and warning on) any
+/// invalid entries. Returns the builder and the count of successfully added
+/// patterns. The caller decides what to do when the count is 0.
+///
+/// `mcp::build_include_globset` uses a similar loop but with its own fallback
+/// policy (fall back to `**/*.md`); both share this helper for the per-pattern
+/// parse, so glob-library error handling stays consistent.
+pub(crate) fn parse_globs(patterns: &[String]) -> (GlobSetBuilder, usize) {
     let mut builder = GlobSetBuilder::new();
+    let mut valid_count = 0;
     for pattern in patterns {
-        let glob =
-            Glob::new(pattern).with_context(|| format!("Invalid glob pattern: '{}'", pattern))?;
-        builder.add(glob);
+        match Glob::new(pattern) {
+            Ok(g) => {
+                builder.add(g);
+                valid_count += 1;
+            }
+            Err(e) => {
+                tracing::warn!("Skipping invalid glob pattern '{}': {}", pattern, e);
+            }
+        }
     }
+    (builder, valid_count)
+}
+
+/// Build a `GlobSet` from `patterns`, propagating any build errors.
+/// Invalid individual patterns are skipped with a warning (via [`parse_globs`]).
+fn build_globset(patterns: &[String]) -> Result<GlobSet> {
+    let (builder, _count) = parse_globs(patterns);
     Ok(builder.build()?)
 }
 
@@ -173,8 +194,11 @@ struct PendingFile {
     chunks: Vec<chunk::Chunk>,
     /// Content hash of the file on disk.
     hash: String,
-    /// True when the file already existed in the state DB (so we need to delete old points first).
-    was_indexed: bool,
+    /// Number of chunks from the previous index run (0 for new files).
+    /// Used to trim stale tail points after a successful upsert.
+    old_chunk_count: usize,
+    /// File modification time as Unix timestamp (seconds). Falls back to 0 on metadata/clock error.
+    mtime: i64,
 }
 
 /// Result of processing a single discovered file.
@@ -188,15 +212,31 @@ enum FileOutcome {
 /// Process a single file: hash, skip-if-unchanged, validate, chunk.
 async fn process_file(
     path: &Path,
+    rel_key: &str,
     content: &str,
     full: bool,
     state_entry: Option<IndexedFile>,
     config: &ResolvedConfig,
 ) -> Result<FileOutcome> {
-    let file_path = path.to_string_lossy().to_string();
+    let file_path = rel_key.to_string();
     let hash = compute_hash_from_bytes(content.as_bytes());
 
-    let was_indexed = state_entry.is_some();
+    // Capture mtime now — used in PendingFile regardless of validation path.
+    let mtime: i64 = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(|| {
+            warn!("Could not read mtime for '{}', defaulting to 0", file_path);
+            0
+        });
+
+    let old_chunk_count = state_entry
+        .as_ref()
+        .map(|e| e.chunk_count as usize)
+        .unwrap_or(0);
 
     // Skip unchanged files in incremental mode
     if !full
@@ -236,7 +276,8 @@ async fn process_file(
                     frontmatter: validated.frontmatter,
                     chunks,
                     hash,
-                    was_indexed,
+                    old_chunk_count,
+                    mtime,
                 }))
             }
             Ok((result, None)) => {
@@ -279,7 +320,8 @@ async fn process_file(
             frontmatter: HashMap::new(),
             chunks,
             hash,
-            was_indexed,
+            old_chunk_count,
+            mtime,
         }))
     }
 }
@@ -317,19 +359,7 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
         );
     }
 
-    // Phase A: batch-delete old points for changed files
-    let paths_to_delete: Vec<&str> = pending
-        .iter()
-        .filter(|pf| pf.was_indexed)
-        .map(|pf| pf.file_path.as_str())
-        .collect();
-
-    store
-        .delete_by_files(collection, &paths_to_delete)
-        .await
-        .context("Failed to batch-delete old points for changed files")?;
-
-    // Phase B: build all points, then batch-upsert
+    // Build all points, then batch-upsert (no pre-delete: deterministic IDs upsert in-place)
     let mut all_points: Vec<QdrantPoint> = Vec::new();
 
     for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
@@ -342,6 +372,7 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
                 "file_path".to_string(),
                 serde_json::Value::String(pf.file_path.clone()),
             );
+            payload.insert("mtime".to_string(), serde_json::json!(pf.mtime));
             payload.insert(
                 "chunk_index".to_string(),
                 serde_json::Value::Number(chunk.index.into()),
@@ -367,21 +398,33 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
         }
     }
 
-    if let Err(e) = store.upsert_points(collection, all_points).await {
-        // Upsert failed after old points were already deleted.
-        // Clean up state for all previously-indexed files so they are reprocessed.
-        for pf in pending.iter().filter(|pf| pf.was_indexed) {
-            if let Err(del_err) = state.delete(&pf.file_path).await {
-                error!(
-                    "Failed to clean up state DB entry for '{}' after upsert failure: {:#}",
-                    pf.file_path, del_err
+    store
+        .upsert_points(collection, all_points)
+        .await
+        .context("Failed to batch-upsert points")?;
+    // If upsert fails, old points remain and state DB is unchanged (old hash ≠ new hash),
+    // so the file will be retried on the next incremental run automatically.
+
+    // Tail trim: for files that shrank, delete stale high-index point IDs.
+    // Non-fatal: warn and continue; stale tail points will be cleaned on next --full.
+    for (pf, (_start, new_count)) in pending.iter().zip(file_boundaries.iter()) {
+        if pf.old_chunk_count > *new_count {
+            let stale_ids: Vec<String> = (*new_count..pf.old_chunk_count)
+                .map(|i| make_point_id(&pf.file_path, i))
+                .collect();
+            if let Err(e) = store.delete_points_by_ids(collection, stale_ids).await {
+                warn!(
+                    file = %pf.file_path,
+                    old = pf.old_chunk_count,
+                    new = new_count,
+                    "Tail-trim delete failed (non-fatal, will retry on next --full): {:#}",
+                    e
                 );
             }
         }
-        return Err(e).context("Failed to batch-upsert points");
     }
 
-    // Phase C: update state DB per file
+    // Update state DB per file
     for (pf, (_start, count)) in pending.iter().zip(file_boundaries.iter()) {
         state
             .upsert(&pf.file_path, &pf.hash, *count as i64)
@@ -425,8 +468,11 @@ async fn remove_orphans<Q: VectorStore>(
 }
 
 pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
+    let run_start = std::time::Instant::now();
     info!(
         mode = if full { "full" } else { "incremental" },
+        data_path = config.data_path(),
+        collection = %config.qdrant.collection,
         "Starting indexing run"
     );
 
@@ -458,10 +504,9 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
 
     let indexed_fields = config.effective_indexed_fields();
 
-    // ── Full-mode: wipe state and Qdrant collection so everything is clean ───
+    // ── Full-mode: drop Qdrant collection so it is recreated clean ───────────
     if full {
-        info!("Full reindex: clearing state DB and Qdrant collection");
-        state.clear().await.context("Failed to clear state DB")?;
+        info!("Full reindex: dropping Qdrant collection");
         store
             .drop_collection(collection)
             .await
@@ -473,12 +518,40 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
         .await
         .context("Failed to ensure Qdrant collection")?;
 
+    // Clear state only after the collection exists; a clear failure then leaves
+    // an empty collection + populated state, which recovers on the next run.
+    if full {
+        state.clear().await.context("Failed to clear state DB")?;
+    }
+
     let embedder = EmbedClient::new(&config.embedding);
 
     // ── File discovery ───────────────────────────────────────────────────────
-    let data_path = Path::new(config.data_path());
+    // Canonicalize data_path once so that strip_prefix is reliable even when
+    // the path contains symlinks. We do this AFTER ensure_repo so the directory
+    // should exist by now. If canonicalize fails (path still absent), fall back
+    // to the configured path with a warning — the git clone may create it later.
+    let configured_data_path = PathBuf::from(config.data_path());
+    let data_path: PathBuf = match configured_data_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "Could not canonicalize data_path '{}': {} — using configured path as-is",
+                configured_data_path.display(),
+                e
+            );
+            configured_data_path.clone()
+        }
+    };
+
+    // Offload the synchronous directory walk to a blocking thread so we don't
+    // stall the tokio executor on large knowledge bases.
+    let indexing_config = config.indexing.clone();
+    let walk_path = data_path.clone();
     let discovered =
-        discover_files(data_path, &config.indexing).context("Failed to discover files")?;
+        tokio::task::spawn_blocking(move || discover_files(&walk_path, &indexing_config))
+            .await
+            .context("File-discovery task panicked")??;
 
     info!("Discovered {} files", discovered.len());
 
@@ -486,7 +559,16 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
     let all_indexed = state.list_all().await.context("Failed to list state DB")?;
     let discovered_set: HashSet<String> = discovered
         .iter()
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| match p.strip_prefix(&data_path) {
+            Ok(rel) => rel.to_string_lossy().to_string(),
+            Err(_) => {
+                warn!(
+                    "Discovered file '{}' does not share data_path prefix",
+                    p.display()
+                );
+                p.to_string_lossy().to_string()
+            }
+        })
         .collect();
 
     let orphaned: Vec<String> = all_indexed
@@ -504,25 +586,37 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut skipped = 0usize;
     let mut invalid = 0usize;
+    let mut empty = 0usize;
+    let mut read_errors = 0usize;
 
     for path in &discovered {
-        let file_path = path.to_string_lossy().to_string();
+        let rel_key = match path.strip_prefix(&data_path) {
+            Ok(rel) => rel.to_string_lossy().to_string(),
+            Err(_) => {
+                warn!(
+                    "File path '{}' does not share data_path prefix — using absolute path as key",
+                    path.display()
+                );
+                path.to_string_lossy().to_string()
+            }
+        };
 
         // Read file once — used for hashing, validation, and chunking (fix TOCTOU #51)
         let content = match tokio::fs::read_to_string(path).await {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to read {}: {:#}", file_path, e);
+                error!("Failed to read {}: {:#}", rel_key, e);
+                read_errors += 1;
                 continue;
             }
         };
 
-        let state_entry = indexed_map.get(&file_path).cloned();
+        let state_entry = indexed_map.get(&rel_key).cloned();
 
-        match process_file(path, &content, full, state_entry, config).await? {
+        match process_file(path, &rel_key, &content, full, state_entry, config).await? {
             FileOutcome::Skipped => skipped += 1,
             FileOutcome::Invalid => invalid += 1,
-            FileOutcome::Empty => {}
+            FileOutcome::Empty => empty += 1,
             FileOutcome::Ready(pf) => pending.push(pf),
         }
     }
@@ -546,7 +640,10 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
         indexed = pending_count,
         skipped,
         invalid,
+        empty,
+        read_errors,
         orphans_removed = orphaned.len(),
+        elapsed_secs = run_start.elapsed().as_secs_f64(),
         "Indexing run complete"
     );
 
@@ -664,7 +761,7 @@ mod tests {
         });
 
         let config = config_no_validation();
-        let outcome = process_file(&path, content, false, state_entry, &config)
+        let outcome = process_file(&path, "doc.md", content, false, state_entry, &config)
             .await
             .unwrap();
         assert!(matches!(outcome, FileOutcome::Skipped));
@@ -685,13 +782,14 @@ mod tests {
         });
 
         let config = config_no_validation();
-        let outcome = process_file(&path, content, false, state_entry, &config)
+        let outcome = process_file(&path, "doc.md", content, false, state_entry, &config)
             .await
             .unwrap();
         match outcome {
             FileOutcome::Ready(pf) => {
                 assert!(!pf.chunks.is_empty());
-                assert!(pf.was_indexed);
+                // old_chunk_count > 0 means the file was previously indexed
+                assert!(pf.old_chunk_count > 0);
             }
             other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
         }
@@ -713,7 +811,7 @@ mod tests {
         });
 
         let config = config_no_validation();
-        let outcome = process_file(&path, content, true, state_entry, &config)
+        let outcome = process_file(&path, "doc.md", content, true, state_entry, &config)
             .await
             .unwrap();
         assert!(
@@ -723,18 +821,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_file_new_file_not_was_indexed() {
+    async fn process_file_new_file_no_old_chunks() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("doc.md");
         let content = "# Hello\nBody text.";
         std::fs::write(&path, content).unwrap();
 
         let config = config_no_validation();
-        let outcome = process_file(&path, content, false, None, &config)
+        let outcome = process_file(&path, "doc.md", content, false, None, &config)
             .await
             .unwrap();
         match outcome {
-            FileOutcome::Ready(pf) => assert!(!pf.was_indexed),
+            FileOutcome::Ready(pf) => assert_eq!(pf.old_chunk_count, 0),
             other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
         }
     }
@@ -747,7 +845,7 @@ mod tests {
         std::fs::write(&path, content).unwrap();
 
         let config = config_no_validation();
-        let outcome = process_file(&path, content, false, None, &config)
+        let outcome = process_file(&path, "doc.md", content, false, None, &config)
             .await
             .unwrap();
         assert!(matches!(outcome, FileOutcome::Empty));
@@ -770,7 +868,7 @@ mod tests {
             c
         };
 
-        let outcome = process_file(&path, content, false, None, &config)
+        let outcome = process_file(&path, "doc.md", content, false, None, &config)
             .await
             .unwrap();
         match outcome {
@@ -798,7 +896,7 @@ mod tests {
             c
         };
 
-        let outcome = process_file(&path, content, false, None, &config)
+        let outcome = process_file(&path, "doc.md", content, false, None, &config)
             .await
             .unwrap();
         assert!(matches!(outcome, FileOutcome::Invalid));
@@ -825,7 +923,7 @@ mod tests {
             c
         };
 
-        let result = process_file(&path, content, false, None, &config).await;
+        let result = process_file(&path, "doc.md", content, false, None, &config).await;
         assert!(result.is_err(), "Strict mode should propagate as Err");
     }
 
@@ -913,6 +1011,7 @@ mod tests {
         delete_result: Mutex<Result<()>>,
         upsert_result: Mutex<Result<()>>,
         upsert_called: Mutex<bool>,
+        upserted_points: Mutex<Vec<crate::qdrant::QdrantPoint>>,
     }
 
     impl MockVectorStore {
@@ -921,6 +1020,7 @@ mod tests {
                 delete_result: Mutex::new(Ok(())),
                 upsert_result: Mutex::new(Ok(())),
                 upsert_called: Mutex::new(false),
+                upserted_points: Mutex::new(Vec::new()),
             }
         }
 
@@ -929,6 +1029,7 @@ mod tests {
                 delete_result: Mutex::new(Err(anyhow::anyhow!("{}", msg))),
                 upsert_result: Mutex::new(Ok(())),
                 upsert_called: Mutex::new(false),
+                upserted_points: Mutex::new(Vec::new()),
             }
         }
 
@@ -937,6 +1038,7 @@ mod tests {
                 delete_result: Mutex::new(Ok(())),
                 upsert_result: Mutex::new(Err(anyhow::anyhow!("{}", msg))),
                 upsert_called: Mutex::new(false),
+                upserted_points: Mutex::new(Vec::new()),
             }
         }
     }
@@ -945,12 +1047,16 @@ mod tests {
         async fn upsert_points(
             &self,
             _collection: &str,
-            _points: Vec<crate::qdrant::QdrantPoint>,
+            points: Vec<crate::qdrant::QdrantPoint>,
         ) -> Result<()> {
             *self.upsert_called.lock().unwrap() = true;
             let guard = self.upsert_result.lock().unwrap();
             match &*guard {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    drop(guard);
+                    self.upserted_points.lock().unwrap().extend(points);
+                    Ok(())
+                }
                 Err(e) => anyhow::bail!("{}", e),
             }
         }
@@ -962,6 +1068,62 @@ mod tests {
                 Err(e) => anyhow::bail!("{}", e),
             }
         }
+
+        async fn delete_points_by_ids(&self, _collection: &str, _ids: Vec<String>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TrackingMockVectorStore {
+        delete_by_files_calls: Mutex<Vec<Vec<String>>>,
+        deleted_ids: Mutex<Vec<String>>,
+        upsert_result: Mutex<Result<()>>,
+        upsert_called: Mutex<bool>,
+        upserted_points: Mutex<Vec<crate::qdrant::QdrantPoint>>,
+    }
+
+    impl TrackingMockVectorStore {
+        fn all_ok() -> Self {
+            Self {
+                delete_by_files_calls: Mutex::new(Vec::new()),
+                deleted_ids: Mutex::new(Vec::new()),
+                upsert_result: Mutex::new(Ok(())),
+                upsert_called: Mutex::new(false),
+                upserted_points: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl VectorStore for TrackingMockVectorStore {
+        async fn upsert_points(
+            &self,
+            _collection: &str,
+            points: Vec<crate::qdrant::QdrantPoint>,
+        ) -> Result<()> {
+            *self.upsert_called.lock().unwrap() = true;
+            let guard = self.upsert_result.lock().unwrap();
+            match &*guard {
+                Ok(()) => {
+                    drop(guard);
+                    self.upserted_points.lock().unwrap().extend(points);
+                    Ok(())
+                }
+                Err(e) => anyhow::bail!("{}", e),
+            }
+        }
+
+        async fn delete_by_files(&self, _collection: &str, file_paths: &[&str]) -> Result<()> {
+            self.delete_by_files_calls
+                .lock()
+                .unwrap()
+                .push(file_paths.iter().map(|s| s.to_string()).collect());
+            Ok(())
+        }
+
+        async fn delete_points_by_ids(&self, _collection: &str, ids: Vec<String>) -> Result<()> {
+            self.deleted_ids.lock().unwrap().extend(ids);
+            Ok(())
+        }
     }
 
     async fn test_state_db(dir: &TempDir) -> StateDb {
@@ -969,7 +1131,7 @@ mod tests {
         StateDb::new(&db_path).await.unwrap()
     }
 
-    fn make_pending(file_path: &str, chunk_count: usize, was_indexed: bool) -> PendingFile {
+    fn make_pending(file_path: &str, chunk_count: usize, old_chunk_count: usize) -> PendingFile {
         let chunks: Vec<chunk::Chunk> = (0..chunk_count)
             .map(|i| chunk::Chunk {
                 text: format!("chunk {}", i),
@@ -983,7 +1145,8 @@ mod tests {
             frontmatter: HashMap::new(),
             chunks,
             hash: "abc123".to_string(),
-            was_indexed,
+            old_chunk_count,
+            mtime: 1_700_000_000,
         }
     }
 
@@ -993,7 +1156,7 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         // 2-chunk file but embedder returns only 1 vector
-        let pending = vec![make_pending("/data/test.md", 2, false)];
+        let pending = vec![make_pending("data/test.md", 2, 0)];
         let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]]);
         let store = MockVectorStore::all_ok();
 
@@ -1018,16 +1181,16 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         // Seed state DB with an entry
-        state.upsert("/data/orphan.md", "hash1", 3).await.unwrap();
+        state.upsert("data/orphan.md", "hash1", 3).await.unwrap();
 
         let store = MockVectorStore::with_delete_err("qdrant unavailable");
 
         let result =
-            remove_orphans(&["/data/orphan.md".to_string()], &store, &state, "test-col").await;
+            remove_orphans(&["data/orphan.md".to_string()], &store, &state, "test-col").await;
 
         assert!(result.is_err());
         // State DB entry should still exist
-        let entry = state.get("/data/orphan.md").await.unwrap();
+        let entry = state.get("data/orphan.md").await.unwrap();
         assert!(
             entry.is_some(),
             "State DB entry should be preserved on delete failure"
@@ -1035,25 +1198,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_failure_cleans_up_state() {
+    async fn upsert_failure_preserves_state_for_retry() {
         let dir = TempDir::new().unwrap();
         let state = test_state_db(&dir).await;
 
         // Seed state with a previously-indexed file
-        state.upsert("/data/test.md", "old-hash", 2).await.unwrap();
+        state.upsert("data/test.md", "old-hash", 2).await.unwrap();
 
-        let pending = vec![make_pending("/data/test.md", 2, true)];
+        let pending = vec![make_pending("data/test.md", 2, 2)];
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = MockVectorStore::with_upsert_err("upsert failed");
 
         let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
 
         assert!(result.is_err());
-        // State DB entry should be cleaned up (deleted) so file gets reprocessed
-        let entry = state.get("/data/test.md").await.unwrap();
+        // State DB entry should be PRESERVED — old hash still differs, so file will be retried
+        let entry = state.get("data/test.md").await.unwrap();
         assert!(
-            entry.is_none(),
-            "State DB entry should be deleted after upsert failure for was_indexed file"
+            entry.is_some(),
+            "State DB entry should be preserved after upsert failure (enables auto-retry)"
         );
     }
 
@@ -1062,7 +1225,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = test_state_db(&dir).await;
 
-        let pending = vec![make_pending("/data/test.md", 2, false)];
+        let pending = vec![make_pending("data/test.md", 2, 0)];
         let embedder = MockEmbedClient::err("embedding service unavailable");
         let store = MockVectorStore::all_ok();
 
@@ -1080,7 +1243,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = test_state_db(&dir).await;
 
-        let pending = vec![make_pending("/data/test.md", 2, false)];
+        let pending = vec![make_pending("data/test.md", 2, 0)];
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
         let store = MockVectorStore::all_ok();
 
@@ -1092,7 +1255,7 @@ mod tests {
             "upsert_points should be called"
         );
         // State DB should have the entry
-        let entry = state.get("/data/test.md").await.unwrap();
+        let entry = state.get("data/test.md").await.unwrap();
         assert!(
             entry.is_some(),
             "State DB should have entry after successful upsert"
@@ -1100,6 +1263,120 @@ mod tests {
         let entry = entry.unwrap();
         assert_eq!(entry.chunk_count, 2);
         assert_eq!(entry.content_hash, "abc123");
+
+        // Every upserted point must carry a positive integer "mtime" payload field,
+        // and file_path must be the relative key.
+        let points = store.upserted_points.lock().unwrap();
+        assert!(!points.is_empty(), "expected at least one upserted point");
+        for point in points.iter() {
+            let mtime_val = point
+                .payload
+                .get("mtime")
+                .expect("point payload must contain 'mtime'");
+            let mtime = mtime_val.as_i64().expect("'mtime' must be an integer");
+            assert!(
+                mtime > 0,
+                "'mtime' should be a positive integer, got {mtime}"
+            );
+            assert_eq!(
+                point.payload.get("file_path").and_then(|v| v.as_str()),
+                Some("data/test.md"),
+                "file_path payload must be the relative key"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_pending_no_pre_delete_for_changed_file() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        state.upsert("data/test.md", "old-hash", 2).await.unwrap();
+
+        let pending = vec![make_pending("data/test.md", 2, 2)];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        assert!(result.is_ok());
+        assert!(
+            store.delete_by_files_calls.lock().unwrap().is_empty(),
+            "delete_by_files should NOT be called for in-place update"
+        );
+        assert!(
+            *store.upsert_called.lock().unwrap(),
+            "upsert_points should be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_pending_tail_trim_on_shrink() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        state.upsert("data/shrink.md", "old-hash", 3).await.unwrap();
+
+        // File shrinks from 3 chunks to 1
+        let mut pf = make_pending("data/shrink.md", 1, 1);
+        pf.old_chunk_count = 3;
+
+        let pending = vec![pf];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        assert!(result.is_ok());
+
+        let deleted_ids = store.deleted_ids.lock().unwrap().clone();
+        assert_eq!(deleted_ids.len(), 2, "should delete 2 stale tail chunks");
+
+        let expected_id1 = make_point_id("data/shrink.md", 1);
+        let expected_id2 = make_point_id("data/shrink.md", 2);
+        assert!(
+            deleted_ids.contains(&expected_id1),
+            "should delete chunk index 1"
+        );
+        assert!(
+            deleted_ids.contains(&expected_id2),
+            "should delete chunk index 2"
+        );
+
+        let entry = state.get("data/shrink.md").await.unwrap().unwrap();
+        assert_eq!(entry.chunk_count, 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_pending_no_tail_trim_on_grow() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        state.upsert("data/grow.md", "old-hash", 1).await.unwrap();
+
+        let mut pf = make_pending("data/grow.md", 2, 1);
+        pf.old_chunk_count = 1;
+
+        let pending = vec![pf];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        assert!(result.is_ok());
+
+        let deleted_ids = store.deleted_ids.lock().unwrap().clone();
+        assert!(deleted_ids.is_empty(), "no tail trim when file grew");
+    }
+
+    #[test]
+    fn make_point_id_portable_across_runs() {
+        let id1 = make_point_id("docs/guide.md", 0);
+        let id2 = make_point_id("docs/guide.md", 0);
+        assert_eq!(id1, id2, "same relative path + chunk index → same point ID");
+
+        let id_abs = make_point_id("/data/docs/guide.md", 0);
+        assert_ne!(
+            id1, id_abs,
+            "relative and absolute paths produce different IDs"
+        );
     }
 
     #[test]
