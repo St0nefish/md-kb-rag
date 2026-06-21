@@ -4,9 +4,11 @@ use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
-    Distance, FacetCountsBuilder, FacetHit, FieldCondition, FieldType, Filter, Match, PointStruct,
-    SearchPointsBuilder, UpsertPointsBuilder, Value as QdrantValue, VectorParamsBuilder,
-    facet_value, value::Kind,
+    Distance, FacetCountsBuilder, FacetHit, FieldCondition, FieldType, Filter, Fusion, Match,
+    Modifier, NamedVectors, PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder,
+    SearchPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
+    UpsertPointsBuilder, Value as QdrantValue, Vector, VectorInput, VectorParamsBuilder,
+    VectorsConfigBuilder, facet_value, value::Kind,
 };
 use tracing::{debug, info};
 
@@ -26,6 +28,18 @@ pub trait RetrievalStore: Send + Sync {
         filters: std::collections::HashMap<String, serde_json::Value>,
         limit: u64,
     ) -> Result<Vec<SearchResult>>;
+    /// Hybrid sparse+dense retrieval: run a dense and a sparse prefetch arm and
+    /// fuse them server-side with Reciprocal Rank Fusion. `filters` are applied to
+    /// both arms; each arm fetches `rrf_candidates` candidates before fusion.
+    async fn hybrid_search(
+        &self,
+        collection: &str,
+        dense: Vec<f32>,
+        sparse: (Vec<u32>, Vec<f32>),
+        filters: std::collections::HashMap<String, serde_json::Value>,
+        limit: u64,
+        rrf_candidates: u64,
+    ) -> Result<Vec<SearchResult>>;
     async fn fetch_facet_values(
         &self,
         collection: &str,
@@ -42,6 +56,9 @@ pub struct QdrantStore {
 pub struct QdrantPoint {
     pub id: String,
     pub vector: Vec<f32>,
+    /// Sparse vector as `(indices, values)`. Attached as the named `sparse` vector
+    /// when present; `None` stores only the dense vector.
+    pub sparse: Option<(Vec<u32>, Vec<f32>)>,
     pub payload: HashMap<String, serde_json::Value>,
 }
 
@@ -219,10 +236,27 @@ impl QdrantStore {
 
         if !exists {
             info!("Creating Qdrant collection '{}'", collection);
+
+            // Named dense vector ("dense") + named sparse vector ("sparse") with the
+            // server-side IDF modifier. Both are always created so toggling
+            // `search.hybrid` never requires a reindex.
+            let mut vectors_config = VectorsConfigBuilder::default();
+            vectors_config.add_named_vector_params(
+                "dense",
+                VectorParamsBuilder::new(vector_size, Distance::Cosine),
+            );
+
+            let mut sparse_config = SparseVectorsConfigBuilder::default();
+            sparse_config.add_named_vector_params(
+                "sparse",
+                SparseVectorParamsBuilder::default().modifier(Modifier::Idf as i32),
+            );
+
             self.client
                 .create_collection(
                     CreateCollectionBuilder::new(collection)
-                        .vectors_config(VectorParamsBuilder::new(vector_size, Distance::Cosine)),
+                        .vectors_config(vectors_config)
+                        .sparse_vectors_config(sparse_config),
                 )
                 .await
                 .context("Failed to create collection")?;
@@ -285,7 +319,12 @@ impl QdrantStore {
             .into_iter()
             .map(|p| {
                 let payload = json_payload_to_qdrant(&p.payload);
-                PointStruct::new(p.id, p.vector, payload)
+                let mut vectors =
+                    NamedVectors::default().add_vector("dense", Vector::new_dense(p.vector));
+                if let Some((indices, values)) = p.sparse {
+                    vectors = vectors.add_vector("sparse", Vector::new_sparse(indices, values));
+                }
+                PointStruct::new(p.id, vectors, payload)
             })
             .collect();
 
@@ -370,6 +409,27 @@ impl RetrievalStore for QdrantStore {
         QdrantStore::search(self, collection, vector, filters, limit).await
     }
 
+    async fn hybrid_search(
+        &self,
+        collection: &str,
+        dense: Vec<f32>,
+        sparse: (Vec<u32>, Vec<f32>),
+        filters: std::collections::HashMap<String, serde_json::Value>,
+        limit: u64,
+        rrf_candidates: u64,
+    ) -> Result<Vec<SearchResult>> {
+        QdrantStore::hybrid_search(
+            self,
+            collection,
+            dense,
+            sparse,
+            filters,
+            limit,
+            rrf_candidates,
+        )
+        .await
+    }
+
     async fn fetch_facet_values(
         &self,
         collection: &str,
@@ -402,7 +462,11 @@ impl QdrantStore {
     ) -> Result<Vec<SearchResult>> {
         let conditions = build_conditions(&filters)?;
 
-        let mut builder = SearchPointsBuilder::new(collection, vector, limit).with_payload(true);
+        // Target the named "dense" vector (the collection no longer has an unnamed
+        // default vector after the named-vector migration).
+        let mut builder = SearchPointsBuilder::new(collection, vector, limit)
+            .vector_name("dense")
+            .with_payload(true);
         if !conditions.is_empty() {
             builder = builder.filter(Filter::must(conditions));
         }
@@ -412,6 +476,66 @@ impl QdrantStore {
             .search_points(builder)
             .await
             .context("Failed to search points")?;
+
+        let results = response
+            .result
+            .into_iter()
+            .map(|scored| SearchResult {
+                score: scored.score,
+                payload: qdrant_payload_to_json(&scored.payload),
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Hybrid sparse+dense retrieval via the Qdrant Query API.
+    ///
+    /// Runs two prefetch arms — dense (named `dense`) and sparse (named `sparse`) —
+    /// each fetching `rrf_candidates` candidates with `filters` applied, then fuses
+    /// them server-side with Reciprocal Rank Fusion and returns the top `limit`.
+    pub async fn hybrid_search(
+        &self,
+        collection: &str,
+        dense: Vec<f32>,
+        sparse: (Vec<u32>, Vec<f32>),
+        filters: HashMap<String, serde_json::Value>,
+        limit: u64,
+        rrf_candidates: u64,
+    ) -> Result<Vec<SearchResult>> {
+        let conditions = build_conditions(&filters)?;
+        let (sparse_indices, sparse_values) = sparse;
+
+        let mut dense_arm = PrefetchQueryBuilder::default()
+            .using("dense")
+            .query(Query::new_nearest(VectorInput::new_dense(dense)))
+            .limit(rrf_candidates);
+        let mut sparse_arm = PrefetchQueryBuilder::default()
+            .using("sparse")
+            .query(Query::new_nearest(VectorInput::new_sparse(
+                sparse_indices,
+                sparse_values,
+            )))
+            .limit(rrf_candidates);
+
+        // Carry the same payload filters into both arms.
+        if !conditions.is_empty() {
+            dense_arm = dense_arm.filter(Filter::must(conditions.clone()));
+            sparse_arm = sparse_arm.filter(Filter::must(conditions));
+        }
+
+        let builder = QueryPointsBuilder::new(collection)
+            .add_prefetch(dense_arm)
+            .add_prefetch(sparse_arm)
+            .query(Query::new_fusion(Fusion::Rrf))
+            .limit(limit)
+            .with_payload(true);
+
+        let response = self
+            .client
+            .query(builder)
+            .await
+            .context("Failed to run hybrid search")?;
 
         let results = response
             .result
@@ -559,6 +683,7 @@ mod tests {
         let point = QdrantPoint {
             id: "00000000-0000-0000-0000-000000000001".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
+            sparse: None,
             payload,
         };
         store
@@ -631,6 +756,7 @@ mod tests {
             QdrantPoint {
                 id: id.into(),
                 vector: vec,
+                sparse: None,
                 payload,
             }
         };
@@ -730,6 +856,7 @@ mod tests {
         let point = QdrantPoint {
             id: "00000000-0000-0000-0000-000000000001".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
+            sparse: None,
             payload,
         };
         store
@@ -868,6 +995,7 @@ mod tests {
             QdrantPoint {
                 id: id.into(),
                 vector: vec,
+                sparse: None,
                 payload,
             }
         };

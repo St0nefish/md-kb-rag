@@ -1,19 +1,27 @@
 #!/bin/sh
-# Pre-commit hook: auto-format and lint Rust code
+# Pre-commit hook: auto-format and lint the Rust code staged for this commit.
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "cargo not found, skipping fmt/clippy"
     exit 0
 fi
 
-cargo fmt
+# Rust files staged for THIS commit (Added/Copied/Modified — not Deleted).
+# Captured before `cargo fmt` so we know exactly which paths to re-stage.
+staged_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$')
 
-# Re-stage any files that were reformatted
-git diff --name-only | grep '\.rs$' | xargs -r git add
+if [ -n "$staged_rs" ]; then
+    cargo fmt
 
-cargo clippy -- -D warnings
+    # Re-stage ONLY the files that were already staged (fmt may have rewritten
+    # them). Never `git add` files that weren't staged — doing so would silently
+    # pull unrelated working-tree changes into the commit.
+    echo "$staged_rs" | xargs -r git add
 
-# Validate config.example.yaml parses if it was changed
+    cargo clippy -- -D warnings
+fi
+
+# Validate config.example.yaml parses if it was changed.
 if git diff --cached --name-only | grep -q 'config\.example\.yaml$'; then
-  cargo test -q -- config::tests::example_config_deserializes
+    cargo test -q -- config::tests::example_config_deserializes
 fi

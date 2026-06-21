@@ -29,6 +29,8 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub write: WriteConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -382,6 +384,34 @@ fn default_bearer_token_env() -> String {
     "MCP_BEARER_TOKEN".into()
 }
 
+/// Configuration for retrieval (search) behaviour.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Enable hybrid sparse+dense retrieval with RRF fusion. When `false`, search
+    /// uses the dense vector only (legacy behaviour). Toggling this does NOT require
+    /// a reindex — both named vectors are always stored.
+    #[serde(default = "default_true")]
+    pub hybrid: bool,
+    /// Number of candidates fetched from each arm (dense + sparse) before RRF fusion.
+    /// Higher values improve recall at the cost of latency.
+    #[serde(default = "default_rrf_candidates")]
+    pub rrf_candidates: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            hybrid: true,
+            rrf_candidates: default_rrf_candidates(),
+        }
+    }
+}
+
+fn default_rrf_candidates() -> usize {
+    50
+}
+
 /// Resolved embedding config — all required fields are guaranteed present.
 #[derive(Debug, Clone)]
 pub struct ResolvedEmbeddingConfig {
@@ -413,6 +443,7 @@ pub struct ResolvedConfig {
     pub mcp: McpConfig,
     pub rate_limit: RateLimitConfig,
     pub write: WriteConfig,
+    pub search: SearchConfig,
 }
 
 impl Config {
@@ -547,6 +578,7 @@ impl Config {
             mcp: self.mcp,
             rate_limit: self.rate_limit,
             write: self.write,
+            search: self.search,
         })
     }
 }
@@ -941,6 +973,7 @@ chunking:
             mcp: McpConfig::default(),
             rate_limit: RateLimitConfig::default(),
             write: WriteConfig::default(),
+            search: SearchConfig::default(),
         };
 
         // All fields are directly accessible — no unwrap, no panic path.
@@ -1078,6 +1111,41 @@ mcp:
         // Verify new write identity fields round-trip from the example config
         assert_eq!(cfg.write.commit_author_name, "md-kb-rag");
         assert_eq!(cfg.write.commit_author_email, "md-kb-rag@localhost");
+        // Verify search section round-trips from the example config
+        assert!(cfg.search.hybrid);
+        assert_eq!(cfg.search.rrf_candidates, 50);
+    }
+
+    #[test]
+    fn search_config_defaults() {
+        // A config with no `search` section gets hybrid=true, rrf_candidates=50.
+        let cfg = Config::from_str_raw("{}").unwrap();
+        assert!(cfg.search.hybrid);
+        assert_eq!(cfg.search.rrf_candidates, 50);
+    }
+
+    #[test]
+    fn search_config_custom_values() {
+        let yaml = r#"
+search:
+  hybrid: false
+  rrf_candidates: 100
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert!(!cfg.search.hybrid);
+        assert_eq!(cfg.search.rrf_candidates, 100);
+    }
+
+    #[test]
+    fn search_config_partial_uses_defaults_for_missing() {
+        // Only hybrid specified — rrf_candidates falls back to the default.
+        let yaml = r#"
+search:
+  hybrid: false
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert!(!cfg.search.hybrid);
+        assert_eq!(cfg.search.rrf_candidates, 50);
     }
 
     #[test]

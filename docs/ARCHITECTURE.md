@@ -168,7 +168,11 @@ Keyword and array fields listed in `frontmatter.indexed_fields` get Qdrant keywo
 
 `retrieval.rs` provides two shared functions consumed by `mcp.rs`:
 
-**`search`** — embeds the query, builds a Qdrant filter map from the optional `domain`/`type`/`tags` parameters, issues a cosine-similarity search, applies an optional `min_score` floor, and returns raw results. Timing (embed + search ms) is logged at `debug`.
+**`search`** — embeds the query, builds a Qdrant filter map from the optional `domain`/`type`/`tags` parameters, runs the retrieval (see below), applies an optional `min_score` floor, and returns raw results. Timing (embed + search ms) is logged at `debug`.
+
+When `search.hybrid` is enabled (the default), retrieval is **hybrid**: the query is embedded into a dense vector *and* tokenized into a BM25-style sparse vector (`sparse.rs`, pure-Rust; Qdrant applies IDF weighting server-side via the `sparse` named vector's `Modifier::Idf`). Both arms run as Query-API prefetches — each fetching `search.rrf_candidates` candidates with the same payload filters — and are fused server-side with Reciprocal Rank Fusion (RRF). This sharply improves recall for exact tokens (hostnames, error codes, CLI flags, config keys) that pure dense search ranks poorly. With `search.hybrid: false`, only the dense (`dense`) named vector is queried.
+
+**Vector schema & migration** — collections are created with two named vectors: `dense` (cosine, `embedding.vector_size`) and `sparse` (`Modifier::Idf`). Both are always written at index time, so toggling `search.hybrid` never requires a reindex. Upgrading a knowledge base indexed by a pre-hybrid version (single unnamed vector) *does* require a one-time full reindex (`index --full`) to migrate to the named-vector schema.
 
 **`get_document`** — resolves a user-supplied path to a file on disk:
 
@@ -231,4 +235,4 @@ See [`deploy/config.example.yaml`](../deploy/config.example.yaml) for all option
 
 ## Roadmap
 
-Future retrieval enhancements (hybrid sparse+dense search, reranking, power-ups) are tracked in GitHub issues #55–#57.
+Hybrid sparse+dense retrieval with RRF fusion (#55) is implemented (see [Retrieval](#retrieval)). Remaining retrieval enhancements — cross-encoder reranking (#56) and power-ups such as score explanation, recency filters, and a local CLI search (#57) — are tracked in GitHub issues.
