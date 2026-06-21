@@ -747,6 +747,7 @@ mod tests {
             rate_limit: Default::default(),
             write: Default::default(),
             search: Default::default(),
+            reranking: None,
         }
     }
 

@@ -27,6 +27,7 @@ use crate::git;
 use crate::ingest;
 use crate::mcp::{self, KbSearchServer};
 use crate::qdrant::QdrantStore;
+use crate::rerank::RerankClient;
 use crate::webhook::{self, WebhookState};
 
 #[derive(Clone)]
@@ -390,6 +391,10 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let embed_for_mcp = Arc::clone(&embed_client);
     let qdrant_for_mcp = Arc::clone(&qdrant);
     let config_for_mcp = Arc::clone(&config);
+    let rerank_for_mcp: Option<Arc<RerankClient>> = config
+        .reranking
+        .as_ref()
+        .map(|r| Arc::new(RerankClient::new(r)));
 
     let mcp_service = StreamableHttpService::new(
         move || {
@@ -401,6 +406,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
                 &include_patterns,
                 Arc::clone(&shared_instructions),
                 Arc::clone(&config_for_mcp),
+                rerank_for_mcp.clone(),
             )
             .map_err(std::io::Error::other)
         },

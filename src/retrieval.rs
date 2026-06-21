@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 use crate::{
     embed::QueryEmbedder,
     qdrant::{RetrievalStore, SearchResult},
+    rerank::Reranker,
 };
 
 /// Upper bound on the number of indexed file paths to fetch for fuzzy
@@ -22,6 +23,7 @@ pub struct RetrievalDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub collection: &'a str,
     pub data_path: &'a Path,
     pub include_patterns: &'a GlobSet,
+    pub reranker: Option<&'a (dyn Reranker + Send + Sync)>,
 }
 
 /// Filters to apply when searching.
@@ -50,6 +52,9 @@ pub struct SearchOptions {
     /// Plumbing for later phases — carried, not yet read.
     #[allow(dead_code)] // wired in Phase 3
     pub modified_before: Option<i64>,
+    /// When reranking is enabled, the number of candidates to fetch before reranking.
+    /// Ignored when `reranker` is None on RetrievalDeps.
+    pub rerank_candidate_limit: Option<u64>,
 }
 
 /// A successfully retrieved document.
@@ -225,6 +230,12 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
         filter_map.insert("tags".to_string(), serde_json::Value::Array(tag_values));
     }
 
+    let fetch_limit = if deps.reranker.is_some() {
+        opts.rerank_candidate_limit.unwrap_or(opts.limit)
+    } else {
+        opts.limit
+    };
+
     let search_start = std::time::Instant::now();
     let mut results = if opts.hybrid {
         // Tokenize the raw query into a sparse vector and fuse with the dense arm.
@@ -233,7 +244,7 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
         let sparse = crate::sparse::tokenize(query);
         if sparse.0.is_empty() {
             deps.qdrant
-                .search(deps.collection, vector, filter_map, opts.limit)
+                .search(deps.collection, vector, filter_map, fetch_limit)
                 .await
                 .map_err(SearchError::Search)?
         } else {
@@ -243,7 +254,7 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
                     vector,
                     sparse,
                     filter_map,
-                    opts.limit,
+                    fetch_limit,
                     opts.rrf_candidates,
                 )
                 .await
@@ -251,7 +262,7 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
         }
     } else {
         deps.qdrant
-            .search(deps.collection, vector, filter_map, opts.limit)
+            .search(deps.collection, vector, filter_map, fetch_limit)
             .await
             .map_err(SearchError::Search)?
     };
@@ -261,6 +272,47 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
     // current behaviour.
     if let Some(s) = opts.min_score {
         results.retain(|r| r.score >= s);
+    }
+
+    if let Some(reranker) = deps.reranker {
+        let docs_with_indices: Vec<(usize, &str)> = results
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                r.payload
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| (i, s))
+            })
+            .collect();
+        let docs: Vec<&str> = docs_with_indices.iter().map(|(_, s)| *s).collect();
+        let top_k = opts.limit as usize;
+        match reranker.rerank(query, &docs).await {
+            Ok(ranked) => {
+                let mut indexed: Vec<(usize, f32)> = ranked
+                    .iter()
+                    .map(|r| (docs_with_indices[r.index].0, r.relevance_score))
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                results = indexed
+                    .into_iter()
+                    .take(top_k)
+                    .filter_map(|(orig_i, score)| {
+                        results.get(orig_i).map(|r| {
+                            let mut hit = r.clone();
+                            hit.score = score;
+                            hit
+                        })
+                    })
+                    .collect();
+            }
+            Err(e) => {
+                warn!("Reranker unavailable, falling back to fused order: {e:#}");
+                results.truncate(top_k);
+            }
+        }
+    } else {
+        results.truncate(opts.limit as usize);
     }
 
     debug!(
@@ -780,6 +832,7 @@ mod tests {
             collection: "test-col",
             data_path,
             include_patterns,
+            reranker: None,
         }
     }
 
@@ -792,6 +845,7 @@ mod tests {
             explain: false,
             modified_after: None,
             modified_before: None,
+            rerank_candidate_limit: None,
         }
     }
 
@@ -1273,5 +1327,150 @@ mod tests {
                 }
             ),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // reranker tests
+    // ------------------------------------------------------------------
+
+    struct MockReranker {
+        fail: bool,
+    }
+
+    impl crate::rerank::Reranker for MockReranker {
+        fn rerank<'a>(
+            &'a self,
+            _query: &'a str,
+            documents: &'a [&'a str],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<Vec<crate::rerank::RerankResult>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let fail = self.fail;
+            let n = documents.len();
+            Box::pin(async move {
+                if fail {
+                    anyhow::bail!("down");
+                }
+                // Reverse the order: highest score to lowest-indexed document
+                Ok((0..n)
+                    .rev()
+                    .enumerate()
+                    .map(|(rank, i)| crate::rerank::RerankResult {
+                        index: i,
+                        relevance_score: (n - rank) as f32,
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reranker_reorders_results() {
+        let mut r0 = make_search_result(0.9);
+        r0.payload
+            .insert("content".into(), serde_json::json!("doc A"));
+        let mut r1 = make_search_result(0.8);
+        r1.payload
+            .insert("content".into(), serde_json::json!("doc B"));
+        let mut r2 = make_search_result(0.7);
+        r2.payload
+            .insert("content".into(), serde_json::json!("doc C"));
+
+        let store = MockRetrievalStore::with_results(vec![r0, r1, r2]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 3,
+            rerank_candidate_limit: None,
+            ..default_opts()
+        };
+
+        let results = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        // MockReranker reverses order: last doc gets highest score
+        assert_eq!(results.len(), 3);
+        // The last original result (index 2, doc C) should now be first
+        assert_eq!(
+            results[0].payload.get("content").and_then(|v| v.as_str()),
+            Some("doc C"),
+            "reranked order should put last doc first"
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_failure_returns_fused_order() {
+        let mut r0 = make_search_result(0.9);
+        r0.payload
+            .insert("content".into(), serde_json::json!("doc A"));
+        let mut r1 = make_search_result(0.8);
+        r1.payload
+            .insert("content".into(), serde_json::json!("doc B"));
+
+        let store = MockRetrievalStore::with_results(vec![r0, r1]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: true };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 2,
+            rerank_candidate_limit: None,
+            ..default_opts()
+        };
+
+        let results = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        // Should still return results (fail-soft), in original fused order
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].payload.get("content").and_then(|v| v.as_str()),
+            Some("doc A"),
+            "on reranker failure, should return fused order"
+        );
     }
 }

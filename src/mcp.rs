@@ -15,6 +15,7 @@ use crate::{
     embed::EmbedClient,
     git, ingest,
     qdrant::QdrantStore,
+    rerank::RerankClient,
     retrieval::{self, GetDocumentError, RetrievalDeps, SearchFilters, SearchOptions},
     state::StateDb,
     validate,
@@ -384,6 +385,7 @@ pub struct KbSearchServer {
     instructions: Arc<RwLock<String>>,
     /// Resolved config, needed by write tools (create_document, etc.).
     config: Arc<ResolvedConfig>,
+    rerank_client: Option<Arc<RerankClient>>,
     tool_router: ToolRouter<KbSearchServer>,
 }
 
@@ -413,6 +415,7 @@ fn build_include_globset(patterns: &[String]) -> GlobSet {
 
 #[tool_router]
 impl KbSearchServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         embed_client: Arc<EmbedClient>,
         qdrant: Arc<QdrantStore>,
@@ -421,6 +424,7 @@ impl KbSearchServer {
         include_patterns: &[String],
         instructions: Arc<RwLock<String>>,
         config: Arc<ResolvedConfig>,
+        rerank_client: Option<Arc<RerankClient>>,
     ) -> anyhow::Result<Self> {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
             format!("Failed to canonicalize data path: {}", data_path.display())
@@ -433,6 +437,7 @@ impl KbSearchServer {
             include_patterns: Arc::new(build_include_globset(include_patterns)),
             instructions,
             config,
+            rerank_client,
             tool_router: Self::tool_router(),
         })
     }
@@ -445,6 +450,10 @@ impl KbSearchServer {
             collection: &self.collection,
             data_path: &self.canonical_data_path,
             include_patterns: &self.include_patterns,
+            reranker: self
+                .rerank_client
+                .as_ref()
+                .map(|c| c.as_ref() as &(dyn crate::rerank::Reranker + Send + Sync)),
         }
     }
 
@@ -484,6 +493,11 @@ impl KbSearchServer {
             explain: false,
             modified_after: None,
             modified_before: None,
+            rerank_candidate_limit: self
+                .config
+                .reranking
+                .as_ref()
+                .map(|r| r.candidate_limit as u64),
         };
 
         let results = retrieval::search(&self.deps(), &params.query, &filters, &opts)
@@ -783,6 +797,7 @@ impl KbSearchServer {
                 explain: false,
                 modified_after: None,
                 modified_before: None,
+                rerank_candidate_limit: None,
             };
             let empty_filters = SearchFilters {
                 domain: None,
@@ -1576,6 +1591,7 @@ mod tests {
             rate_limit: crate::config::RateLimitConfig::default(),
             write: crate::config::WriteConfig::default(),
             search: crate::config::SearchConfig::default(),
+            reranking: None,
         })
     }
 
@@ -1609,6 +1625,7 @@ mod tests {
             &["**/*.md".to_string()],
             instructions,
             make_test_resolved_config(tmp.path()),
+            None,
         )
         .unwrap();
 
@@ -1646,6 +1663,7 @@ mod tests {
             &["**/*.md".to_string()],
             Arc::clone(&instructions),
             make_test_resolved_config(tmp.path()),
+            None,
         )
         .unwrap();
 
@@ -1742,6 +1760,7 @@ mod tests {
             &["**/*.md".to_string()],
             instructions,
             make_test_resolved_config(tmp.path()),
+            None,
         )
         .unwrap();
 
@@ -1787,6 +1806,7 @@ mod tests {
             include_patterns,
             instructions,
             config,
+            None,
         )
         .unwrap()
     }
@@ -1948,6 +1968,7 @@ mod tests {
             rate_limit: crate::config::RateLimitConfig::default(),
             write: crate::config::WriteConfig::default(),
             search: crate::config::SearchConfig::default(),
+            reranking: None,
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
@@ -2097,6 +2118,7 @@ mod tests {
                 commit_author_email: "md-kb-rag@localhost".to_string(),
             },
             search: crate::config::SearchConfig::default(),
+            reranking: None,
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);

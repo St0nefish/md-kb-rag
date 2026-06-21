@@ -93,6 +93,12 @@ services:
       - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN:-}
       - HOME=/tmp
       - RUST_LOG=${RUST_LOG:-info}
+      # --- Optional cross-encoder reranking (uncomment to enable) ---
+      # - RERANKING_ENABLED=true
+      # - RERANKING_BASE_URL=http://reranker:8081/v1
+      # - RERANKING_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+      # - RERANKING_API_KEY=${RERANKING_API_KEY:-}
+      # - RERANKING_CANDIDATE_LIMIT=50
     ports:
       - "${MCP_PORT:-8001}:8001"
     healthcheck:
@@ -106,6 +112,22 @@ services:
         condition: service_healthy
       embeddings:
         condition: service_healthy
+      # reranker:
+      #   condition: service_healthy
+
+  # --- Optional cross-encoder reranker service (uncomment to enable) ---
+  # reranker:
+  #   image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+  #   restart: unless-stopped
+  #   command: --model-id cross-encoder/ms-marco-MiniLM-L-6-v2 --port 8081
+  #   ports:
+  #     - "127.0.0.1:8081:8081"
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 10
+  #     start_period: 60s
 
 volumes:
   kb_data:
