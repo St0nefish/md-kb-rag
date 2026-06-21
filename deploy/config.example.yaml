@@ -315,3 +315,25 @@ rate_limit:
   # kicks in. After the burst is exhausted, requests are limited to the
   # per_second rate.
   burst_size: 10
+
+
+# ----------------------------------------------------------------------------
+# search — retrieval behaviour
+# ----------------------------------------------------------------------------
+search:
+
+  # Enable hybrid sparse+dense retrieval with Reciprocal Rank Fusion (RRF).
+  # A pure-Rust BM25-style sparse arm (Qdrant applies IDF server-side) is fused
+  # with the dense vector arm, which sharply improves recall for exact tokens —
+  # hostnames (ares, atlas), error codes, CLI flags, config keys (state.db).
+  # Set to false for legacy dense-only search.
+  #
+  # No reindex is needed to toggle this: both named vectors are always stored.
+  # NOTE: upgrading an EXISTING pre-hybrid collection (single unnamed vector)
+  # does require a one-time full reindex (`index --full`) to migrate to the
+  # named-vector schema.
+  hybrid: true
+
+  # Candidates fetched from each arm (dense + sparse) before RRF fusion.
+  # Higher values improve recall at the cost of query latency.
+  rrf_candidates: 50

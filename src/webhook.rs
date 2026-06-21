@@ -466,6 +466,7 @@ mod tests {
             mcp: Default::default(),
             rate_limit: Default::default(),
             write: Default::default(),
+            search: Default::default(),
         })
     }
 

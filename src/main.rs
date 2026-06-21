@@ -7,6 +7,7 @@ mod mcp;
 mod qdrant;
 mod retrieval;
 mod server;
+mod sparse;
 mod state;
 mod validate;
 mod webhook;

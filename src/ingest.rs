@@ -393,6 +393,10 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
             all_points.push(QdrantPoint {
                 id: make_point_id(&pf.file_path, chunk.index),
                 vector: vector.clone(),
+                // Sparse vector for hybrid retrieval, computed from the chunk text
+                // (pure-Rust tokenizer; Qdrant applies IDF server-side). Always
+                // stored so toggling search.hybrid never requires a reindex.
+                sparse: Some(crate::sparse::tokenize(&chunk.text)),
                 payload,
             });
         }
@@ -742,6 +746,7 @@ mod tests {
             mcp: Default::default(),
             rate_limit: Default::default(),
             write: Default::default(),
+            search: Default::default(),
         }
     }
 

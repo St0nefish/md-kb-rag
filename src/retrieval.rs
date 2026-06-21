@@ -35,6 +35,12 @@ pub struct SearchFilters {
 pub struct SearchOptions {
     pub limit: u64,
     pub min_score: Option<f32>,
+    /// When true, use hybrid sparse+dense retrieval with RRF fusion; otherwise
+    /// dense-only. Sourced from `search.hybrid`.
+    pub hybrid: bool,
+    /// Candidates fetched from each arm before RRF fusion. Sourced from
+    /// `search.rrf_candidates`. Only consulted when `hybrid` is true.
+    pub rrf_candidates: u64,
     /// Plumbing for later phases — carried, not yet read.
     #[allow(dead_code)] // wired in Phase 3
     pub explain: bool,
@@ -220,11 +226,26 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
     }
 
     let search_start = std::time::Instant::now();
-    let mut results = deps
-        .qdrant
-        .search(deps.collection, vector, filter_map, opts.limit)
-        .await
-        .map_err(SearchError::Search)?;
+    let mut results = if opts.hybrid {
+        // Tokenize the raw query into a sparse vector and fuse with the dense arm.
+        let sparse = crate::sparse::tokenize(query);
+        deps.qdrant
+            .hybrid_search(
+                deps.collection,
+                vector,
+                sparse,
+                filter_map,
+                opts.limit,
+                opts.rrf_candidates,
+            )
+            .await
+            .map_err(SearchError::Search)?
+    } else {
+        deps.qdrant
+            .search(deps.collection, vector, filter_map, opts.limit)
+            .await
+            .map_err(SearchError::Search)?
+    };
     let search_ms = search_start.elapsed().as_millis();
 
     // Apply min_score floor only when Some — None is a no-op, preserving
@@ -643,6 +664,10 @@ mod tests {
         search_ok: Vec<SearchResult>,
         facet_paths: Vec<String>,
         received_filters: std::sync::Mutex<Option<HashMap<String, serde_json::Value>>>,
+        /// Sparse vector captured by `hybrid_search` (None until called).
+        received_sparse: std::sync::Mutex<Option<(Vec<u32>, Vec<f32>)>>,
+        /// Which method was last invoked: "search" or "hybrid_search".
+        last_call: std::sync::Mutex<Option<&'static str>>,
     }
 
     impl MockRetrievalStore {
@@ -652,6 +677,8 @@ mod tests {
                 search_ok: results,
                 facet_paths: Vec::new(),
                 received_filters: std::sync::Mutex::new(None),
+                received_sparse: std::sync::Mutex::new(None),
+                last_call: std::sync::Mutex::new(None),
             }
         }
         fn with_search_err(msg: &str) -> Self {
@@ -660,6 +687,8 @@ mod tests {
                 search_ok: Vec::new(),
                 facet_paths: Vec::new(),
                 received_filters: std::sync::Mutex::new(None),
+                received_sparse: std::sync::Mutex::new(None),
+                last_call: std::sync::Mutex::new(None),
             }
         }
         fn with_facet_paths(paths: Vec<String>) -> Self {
@@ -668,6 +697,8 @@ mod tests {
                 search_ok: Vec::new(),
                 facet_paths: paths,
                 received_filters: std::sync::Mutex::new(None),
+                received_sparse: std::sync::Mutex::new(None),
+                last_call: std::sync::Mutex::new(None),
             }
         }
     }
@@ -680,7 +711,26 @@ mod tests {
             filters: HashMap<String, serde_json::Value>,
             _limit: u64,
         ) -> anyhow::Result<Vec<SearchResult>> {
+            *self.last_call.lock().unwrap() = Some("search");
             *self.received_filters.lock().unwrap() = Some(filters);
+            if let Some(ref msg) = self.search_err {
+                anyhow::bail!("{}", msg);
+            }
+            Ok(self.search_ok.clone())
+        }
+
+        async fn hybrid_search(
+            &self,
+            _collection: &str,
+            _dense: Vec<f32>,
+            sparse: (Vec<u32>, Vec<f32>),
+            filters: HashMap<String, serde_json::Value>,
+            _limit: u64,
+            _rrf_candidates: u64,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            *self.last_call.lock().unwrap() = Some("hybrid_search");
+            *self.received_filters.lock().unwrap() = Some(filters);
+            *self.received_sparse.lock().unwrap() = Some(sparse);
             if let Some(ref msg) = self.search_err {
                 anyhow::bail!("{}", msg);
             }
@@ -722,6 +772,8 @@ mod tests {
         SearchOptions {
             limit: 10,
             min_score: None,
+            hybrid: false,
+            rrf_candidates: 50,
             explain: false,
             modified_after: None,
             modified_before: None,
@@ -925,6 +977,136 @@ mod tests {
         .await
         .unwrap();
         assert!(returned.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // hybrid search routing tests
+    // ------------------------------------------------------------------
+
+    fn hybrid_opts() -> SearchOptions {
+        SearchOptions {
+            hybrid: true,
+            ..default_opts()
+        }
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_routes_to_hybrid_search() {
+        let embed = MockEmbedder::ok(vec![0.1, 0.2, 0.3]);
+        let store = MockRetrievalStore::with_results(vec![make_search_result(0.9)]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let filters = SearchFilters {
+            domain: Some("sysadmin".to_string()),
+            r#type: None,
+            tags: None,
+        };
+
+        let query = "node:ares state.db";
+        let _ = search(&deps, query, &filters, &hybrid_opts())
+            .await
+            .unwrap();
+
+        // Routed to the hybrid arm, not the dense-only one.
+        assert_eq!(
+            *store.last_call.lock().unwrap(),
+            Some("hybrid_search"),
+            "hybrid=true must route to hybrid_search"
+        );
+
+        // The exact query text was tokenized into a non-empty sparse vector and
+        // matches what the sparse module would produce for that query.
+        let captured = store.received_sparse.lock().unwrap().clone().unwrap();
+        assert!(
+            !captured.0.is_empty(),
+            "sparse query vector must be non-empty"
+        );
+        let expected = crate::sparse::tokenize(query);
+        let captured_set: std::collections::HashSet<u32> = captured.0.iter().copied().collect();
+        let expected_set: std::collections::HashSet<u32> = expected.0.iter().copied().collect();
+        assert_eq!(
+            captured_set, expected_set,
+            "sparse vector must come from the raw query"
+        );
+
+        // Filters carried into the hybrid path.
+        let received = store.received_filters.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            received.get("domain").and_then(|v| v.as_str()),
+            Some("sysadmin"),
+            "filters must be carried into hybrid_search"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_dense_routes_to_plain_search() {
+        let embed = MockEmbedder::ok(vec![0.1, 0.2, 0.3]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let _ = search(
+            &deps,
+            "anything",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &default_opts(), // hybrid: false
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *store.last_call.lock().unwrap(),
+            Some("search"),
+            "hybrid=false must route to the dense-only search"
+        );
+        assert!(
+            store.received_sparse.lock().unwrap().is_none(),
+            "dense-only path must not compute a sparse vector"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_surfaces_store_results() {
+        // Acceptance (mock form): a keyword-only query that dense search alone would
+        // rank poorly. The hybrid arm (RRF over dense+sparse, server-side in Qdrant)
+        // is modeled here by the store returning the correct chunk first; we assert
+        // the hybrid path returns it in position 1.
+        let mut right_chunk = make_search_result(0.95);
+        right_chunk
+            .payload
+            .insert("file_path".into(), serde_json::json!("sysadmin/ares.md"));
+        let store = MockRetrievalStore::with_results(vec![right_chunk, make_search_result(0.40)]);
+        let embed = MockEmbedder::ok(vec![0.1, 0.2, 0.3]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let results = search(
+            &deps,
+            "ares",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &hybrid_opts(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].payload.get("file_path").and_then(|v| v.as_str()),
+            Some("sysadmin/ares.md"),
+            "hybrid result should surface the keyword chunk first"
+        );
     }
 
     // ------------------------------------------------------------------

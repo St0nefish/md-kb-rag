@@ -479,6 +479,8 @@ impl KbSearchServer {
         let opts = SearchOptions {
             limit,
             min_score: None,
+            hybrid: self.config.search.hybrid,
+            rrf_candidates: self.config.search.rrf_candidates as u64,
             explain: false,
             modified_after: None,
             modified_before: None,
@@ -1479,6 +1481,7 @@ mod tests {
             mcp: crate::config::McpConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             write: crate::config::WriteConfig::default(),
+            search: crate::config::SearchConfig::default(),
         })
     }
 
@@ -1850,6 +1853,7 @@ mod tests {
             mcp: crate::config::McpConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             write: crate::config::WriteConfig::default(),
+            search: crate::config::SearchConfig::default(),
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
@@ -1998,6 +2002,7 @@ mod tests {
                 commit_author_name: "md-kb-rag".to_string(),
                 commit_author_email: "md-kb-rag@localhost".to_string(),
             },
+            search: crate::config::SearchConfig::default(),
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
