@@ -7,7 +7,7 @@ use tracing::{error, info};
 
 /// Maximum time to wait for a git subprocess (clone) before treating it as
 /// hung and returning an error.
-const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Inject a token into an HTTPS URL for authenticated git operations.
 /// SSH URLs are returned unchanged.
@@ -145,9 +145,9 @@ pub async fn commit_and_sync(
     };
 
     // --- git add -- <rel_path> ---
-    let add_out = git_cmd(&["add", "--", rel_path])
-        .output()
+    let add_out = timeout(GIT_TIMEOUT, git_cmd(&["add", "--", rel_path]).output())
         .await
+        .map_err(|_| anyhow::anyhow!("git add timed out after {:?}", GIT_TIMEOUT))?
         .context("Failed to spawn git add")?;
     if !add_out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&add_out.stderr));
@@ -158,22 +158,26 @@ pub async fn commit_and_sync(
     // Set the author identity inline so the command is self-contained even in
     // environments without a global git user configured. Both author and committer
     // derive from user.* when not otherwise specified.
-    let commit_out = Command::new("git")
-        .args([
-            "-c",
-            &format!("safe.directory={}", data_path),
-            "-c",
-            &format!("user.name={}", author_name),
-            "-c",
-            &format!("user.email={}", author_email),
-            "commit",
-            "-m",
-            message,
-        ])
-        .current_dir(data_path)
-        .output()
-        .await
-        .context("Failed to spawn git commit")?;
+    let commit_out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args([
+                "-c",
+                &format!("safe.directory={}", data_path),
+                "commit",
+                "-m",
+                message,
+            ])
+            .env("GIT_AUTHOR_NAME", author_name)
+            .env("GIT_AUTHOR_EMAIL", author_email)
+            .env("GIT_COMMITTER_NAME", author_name)
+            .env("GIT_COMMITTER_EMAIL", author_email)
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git commit timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git commit")?;
     if !commit_out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&commit_out.stderr));
         anyhow::bail!("git commit failed: {}", stderr);
@@ -191,19 +195,22 @@ pub async fn commit_and_sync(
             redact_url(&auth_url),
             branch
         );
-        let fetch_out = git_cmd(&["fetch", "--no-tags", &auth_url, branch])
-            .output()
-            .await
-            .context("Failed to spawn git fetch")?;
+        let fetch_out = timeout(
+            GIT_TIMEOUT,
+            git_cmd(&["fetch", "--no-tags", &auth_url, branch]).output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("git fetch timed out after {:?}", GIT_TIMEOUT))?
+        .context("Failed to spawn git fetch")?;
         if !fetch_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&fetch_out.stderr));
             anyhow::bail!("git fetch failed: {}", stderr);
         }
 
         // --- git rebase FETCH_HEAD ---
-        let rebase_out = git_cmd(&["rebase", "FETCH_HEAD"])
-            .output()
+        let rebase_out = timeout(GIT_TIMEOUT, git_cmd(&["rebase", "FETCH_HEAD"]).output())
             .await
+            .map_err(|_| anyhow::anyhow!("git rebase timed out after {:?}", GIT_TIMEOUT))?
             .context("Failed to spawn git rebase")?;
         if !rebase_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&rebase_out.stderr));
@@ -219,10 +226,13 @@ pub async fn commit_and_sync(
         // --- git push <auth_url> HEAD:<branch> ---
         info!("Pushing to {} branch {}", redact_url(&auth_url), branch);
         let push_refspec = format!("HEAD:{}", branch);
-        let push_out = git_cmd(&["push", &auth_url, &push_refspec])
-            .output()
-            .await
-            .context("Failed to spawn git push")?;
+        let push_out = timeout(
+            GIT_TIMEOUT,
+            git_cmd(&["push", &auth_url, &push_refspec]).output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("git push timed out after {:?}", GIT_TIMEOUT))?
+        .context("Failed to spawn git push")?;
         if !push_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&push_out.stderr));
             anyhow::bail!("git push failed: {}", stderr);
@@ -230,9 +240,9 @@ pub async fn commit_and_sync(
     }
 
     // --- git rev-parse HEAD ---
-    let rev_out = git_cmd(&["rev-parse", "HEAD"])
-        .output()
+    let rev_out = timeout(GIT_TIMEOUT, git_cmd(&["rev-parse", "HEAD"]).output())
         .await
+        .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
         .context("Failed to spawn git rev-parse")?;
     if !rev_out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&rev_out.stderr));

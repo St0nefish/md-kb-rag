@@ -33,10 +33,15 @@ fn split_sections(body: &str) -> Vec<Section> {
     let mut section_start: usize = 1;
     let mut last_line_num: usize = 0;
 
+    let mut in_fence = false;
     for (i, line) in body.lines().enumerate() {
         let line_num = i + 1; // 1-based
         last_line_num = line_num;
-        if line.starts_with('#') && !current.trim().is_empty() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && line.starts_with('#') && !current.trim().is_empty() {
             let line_end = line_num - 1;
             sections.push(Section {
                 text: current,

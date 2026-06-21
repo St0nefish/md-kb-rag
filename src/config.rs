@@ -304,6 +304,8 @@ fn default_metadata_refresh_secs() -> u64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default = "default_rate_limit_per_second")]
     pub per_second: u64,
     #[serde(default = "default_rate_limit_burst_size")]
@@ -313,6 +315,7 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             per_second: default_rate_limit_per_second(),
             burst_size: default_rate_limit_burst_size(),
         }
@@ -320,11 +323,11 @@ impl Default for RateLimitConfig {
 }
 
 fn default_rate_limit_per_second() -> u64 {
-    2
+    20
 }
 
 fn default_rate_limit_burst_size() -> u32 {
-    10
+    50
 }
 
 fn default_mcp_port() -> u16 {
@@ -358,7 +361,7 @@ fn default_dedup_enabled() -> bool {
 }
 
 fn default_dedup_threshold() -> f32 {
-    0.85
+    0.80
 }
 
 fn default_commit_author_name() -> String {
@@ -513,6 +516,12 @@ impl Config {
         }
         if self.rate_limit.burst_size == 0 {
             anyhow::bail!("rate_limit.burst_size must be >= 1");
+        }
+        if !(0.0..=1.0).contains(&self.write.dedup_threshold) {
+            anyhow::bail!("write.dedup_threshold must be between 0.0 and 1.0");
+        }
+        if self.search.rrf_candidates == 0 {
+            anyhow::bail!("search.rrf_candidates must be >= 1");
         }
         if self.mcp.metadata_refresh_secs < 10 {
             anyhow::bail!("mcp.metadata_refresh_secs must be >= 10");
@@ -740,8 +749,8 @@ mcp:
         assert_eq!(cfg.qdrant.collection, "knowledge-base");
         assert!(cfg.validation.enabled);
         assert_eq!(cfg.mcp.port, 8001);
-        assert_eq!(cfg.rate_limit.per_second, 2);
-        assert_eq!(cfg.rate_limit.burst_size, 10);
+        assert_eq!(cfg.rate_limit.per_second, 20);
+        assert_eq!(cfg.rate_limit.burst_size, 50);
     }
 
     #[test]

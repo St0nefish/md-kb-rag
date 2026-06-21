@@ -36,7 +36,10 @@ impl EmbedClient {
 
         Self {
             client,
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("static reqwest client config"),
             model: config.model.clone(),
             batch_size: config.batch_size,
             api_key: config.api_key.clone(),
@@ -139,7 +142,12 @@ fn embed_backoff() -> ExponentialBackoff {
 fn is_retryable(err: &async_openai::error::OpenAIError) -> bool {
     use async_openai::error::OpenAIError;
     match err {
-        OpenAIError::Reqwest(e) => e.is_connect() || e.is_timeout(),
+        OpenAIError::Reqwest(e) => {
+            e.is_connect()
+                || e.is_timeout()
+                || e.status()
+                    .is_some_and(|s| s.as_u16() == 429 || s.as_u16() >= 500)
+        }
         OpenAIError::ApiError(api_err) => {
             let code = api_err.code.as_deref().unwrap_or("");
             let err_type = api_err.r#type.as_deref().unwrap_or("");

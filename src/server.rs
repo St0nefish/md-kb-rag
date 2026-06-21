@@ -461,9 +461,13 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     });
 
     // Build router
-    let mcp_router = Router::new().nest_service("/mcp", mcp_service).route_layer(
-        middleware::from_fn_with_state(auth_state.clone(), bearer_auth),
-    );
+    let mcp_router = Router::new()
+        .nest_service("/mcp", mcp_service)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            bearer_auth,
+        ));
 
     let health_state = HealthState {
         qdrant: Arc::clone(&qdrant),
@@ -499,7 +503,11 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         );
     }
 
-    let app = app.layer(GovernorLayer::new(Arc::clone(&governor_conf)));
+    let app = if config.rate_limit.enabled {
+        app.layer(GovernorLayer::new(Arc::clone(&governor_conf)))
+    } else {
+        app
+    };
 
     let mcp_port = config.mcp.port;
     let bind_addr = format!("0.0.0.0:{}", mcp_port);
@@ -531,6 +539,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         }
         info!("Shutting down server");
         ct.cancel();
+        let _guard = crate::webhook::REINDEX_LOCK.lock().await;
     })
     .await
     .context("Server error")?;

@@ -99,9 +99,28 @@ pub async fn validate_content(
             .or_insert_with(|| Value::String(default_val.clone()));
     }
 
+    if !validation.enabled {
+        let result = ValidationResult {
+            file_path: file_path.clone(),
+            valid: true,
+            errors: vec![],
+            field_errors: vec![],
+        };
+        return Ok((
+            result,
+            Some(ValidatedFile {
+                frontmatter,
+                body: parsed.content,
+            }),
+        ));
+    }
+
     // Check required fields
     for field in &config.required {
-        if !frontmatter.contains_key(field) {
+        let missing = !frontmatter.contains_key(field)
+            || matches!(frontmatter.get(field), Some(Value::Null))
+            || frontmatter.get(field).and_then(|v| v.as_str()) == Some("");
+        if missing {
             field_errors.push(FieldError {
                 field: field.clone(),
                 rule: "required".into(),
@@ -152,7 +171,12 @@ pub async fn validate_content(
                     }
                 }
                 // Non-string, non-array values: skip enforcement (not a closed-set scenario)
-                _ => {}
+                _ => {
+                    tracing::warn!(
+                        field = %field,
+                        "allowed check: skipping enforcement on non-string/non-array value"
+                    );
+                }
             }
         }
         // Field absent: no error — presence is governed by `required`, not `allowed`
@@ -235,7 +259,7 @@ pub async fn validate_all(
                     let msg = format!("Failed to read or parse file: {}", e);
                     let fe = FieldError {
                         field: "<io>".into(),
-                        rule: "lint".into(),
+                        rule: "io".into(),
                         message: msg.clone(),
                         got: None,
                         expected: None,
