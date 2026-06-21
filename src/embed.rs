@@ -146,7 +146,7 @@ fn is_retryable(err: &async_openai::error::OpenAIError) -> bool {
             e.is_connect()
                 || e.is_timeout()
                 || e.status()
-                    .map_or(false, |s| s.as_u16() == 429 || s.as_u16() >= 500)
+                    .is_some_and(|s| s.as_u16() == 429 || s.as_u16() >= 500)
         }
         OpenAIError::ApiError(api_err) => {
             let code = api_err.code.as_deref().unwrap_or("");

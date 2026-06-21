@@ -756,11 +756,11 @@ impl KbSearchServer {
             let body_for_dedup = {
                 let s = new_content.trim_start();
                 if s.starts_with("---") {
-                    let after_open = s.splitn(2, '\n').nth(1).unwrap_or("");
+                    let after_open = s.split_once('\n').map(|x| x.1).unwrap_or("");
                     if let Some(close_idx) = after_open.find("\n---") {
                         after_open[close_idx + 4..]
-                            .splitn(2, '\n')
-                            .nth(1)
+                            .split_once('\n')
+                            .map(|x| x.1)
                             .unwrap_or("")
                             .trim_start()
                     } else {
