@@ -5,6 +5,7 @@ mod git;
 mod ingest;
 mod mcp;
 mod qdrant;
+mod rerank;
 mod retrieval;
 mod server;
 mod sparse;

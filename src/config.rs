@@ -31,6 +31,8 @@ pub struct Config {
     pub write: WriteConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub reranking: RerankingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,6 +193,43 @@ fn default_vector_size() -> u64 {
 
 fn default_batch_size() -> usize {
     32
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    #[serde(default = "default_reranking_candidate_limit")]
+    pub candidate_limit: usize,
+}
+
+impl Default for RerankingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: None,
+            model: None,
+            api_key: None,
+            candidate_limit: default_reranking_candidate_limit(),
+        }
+    }
+}
+
+fn default_reranking_candidate_limit() -> usize {
+    50
+}
+
+/// Resolved reranking config — only present when reranking is enabled and all required fields are set.
+#[derive(Debug, Clone)]
+pub struct ResolvedRerankingConfig {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub candidate_limit: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -447,6 +486,7 @@ pub struct ResolvedConfig {
     pub rate_limit: RateLimitConfig,
     pub write: WriteConfig,
     pub search: SearchConfig,
+    pub reranking: Option<ResolvedRerankingConfig>,
 }
 
 impl Config {
@@ -488,6 +528,24 @@ impl Config {
         }
         if let Ok(val) = std::env::var("QDRANT_URL") {
             self.qdrant.url = Some(val);
+        }
+
+        if let Ok(val) = std::env::var("RERANKING_ENABLED") {
+            self.reranking.enabled = matches!(val.trim(), "true" | "1");
+        }
+        if let Ok(val) = std::env::var("RERANKING_BASE_URL") {
+            self.reranking.base_url = Some(val);
+        }
+        if let Ok(val) = std::env::var("RERANKING_MODEL") {
+            self.reranking.model = Some(val);
+        }
+        if let Ok(val) = std::env::var("RERANKING_API_KEY") {
+            self.reranking.api_key = Some(val);
+        }
+        if let Ok(val) = std::env::var("RERANKING_CANDIDATE_LIMIT") {
+            self.reranking.candidate_limit = val.parse().map_err(|_| {
+                anyhow::anyhow!("RERANKING_CANDIDATE_LIMIT must be a valid integer")
+            })?;
         }
 
         // Validate chunk size config
@@ -539,6 +597,16 @@ impl Config {
         if self.qdrant.url.is_none() {
             missing.push("qdrant.url (set QDRANT_URL or config qdrant.url)");
         }
+        if self.reranking.enabled {
+            if self.reranking.base_url.is_none() {
+                missing.push(
+                    "reranking.base_url (set RERANKING_BASE_URL or config reranking.base_url)",
+                );
+            }
+            if self.reranking.model.is_none() {
+                missing.push("reranking.model (set RERANKING_MODEL or config reranking.model)");
+            }
+        }
         if !missing.is_empty() {
             anyhow::bail!(
                 "Missing required configuration:\n  - {}",
@@ -588,6 +656,16 @@ impl Config {
             rate_limit: self.rate_limit,
             write: self.write,
             search: self.search,
+            reranking: if self.reranking.enabled {
+                Some(ResolvedRerankingConfig {
+                    base_url: self.reranking.base_url.unwrap(),
+                    model: self.reranking.model.unwrap(),
+                    api_key: self.reranking.api_key.clone(),
+                    candidate_limit: self.reranking.candidate_limit,
+                })
+            } else {
+                None
+            },
         })
     }
 }
@@ -983,6 +1061,7 @@ chunking:
             rate_limit: RateLimitConfig::default(),
             write: WriteConfig::default(),
             search: SearchConfig::default(),
+            reranking: None,
         };
 
         // All fields are directly accessible — no unwrap, no panic path.
@@ -1592,5 +1671,45 @@ qdrant:
         unsafe {
             std::env::remove_var("EMBEDDING_API_KEY");
         }
+    }
+
+    #[test]
+    fn reranking_config_defaults() {
+        let cfg = Config::from_str_raw("{}").unwrap();
+        assert!(!cfg.reranking.enabled);
+        assert_eq!(cfg.reranking.candidate_limit, 50);
+        assert!(cfg.reranking.base_url.is_none());
+        assert!(cfg.reranking.model.is_none());
+    }
+
+    #[test]
+    fn reranking_config_full() {
+        let yaml = r#"
+reranking:
+  enabled: true
+  base_url: "http://reranker:8081/v1"
+  model: "reranker"
+  api_key: "sk-rerank"
+  candidate_limit: 100
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert!(cfg.reranking.enabled);
+        assert_eq!(
+            cfg.reranking.base_url.as_deref(),
+            Some("http://reranker:8081/v1")
+        );
+        assert_eq!(cfg.reranking.model.as_deref(), Some("reranker"));
+        assert_eq!(cfg.reranking.api_key.as_deref(), Some("sk-rerank"));
+        assert_eq!(cfg.reranking.candidate_limit, 100);
+    }
+
+    #[test]
+    fn resolved_reranking_is_none_when_disabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("RERANKING_ENABLED");
+        }
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert!(cfg.reranking.is_none());
     }
 }
