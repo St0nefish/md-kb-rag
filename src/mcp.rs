@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -27,6 +26,7 @@ const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
 const MAX_TAG_COUNT: usize = 20;
 const MAX_TAG_LEN: usize = 256;
+const MAX_CONTENT_LEN: usize = 512 * 1024; // 512 KB
 
 /// Maximum number of characters from the new document's content used to build
 /// the dedup query text. Keeps the embedding request within typical token limits
@@ -522,9 +522,9 @@ impl KbSearchServer {
                     .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let chars: Vec<char> = full_text.chars().take(401).collect();
-                if chars.len() > 400 {
-                    (chars[..400].iter().collect::<String>(), true)
+                let chars: Vec<char> = full_text.chars().take(801).collect();
+                if chars.len() > 800 {
+                    (chars[..800].iter().collect::<String>(), true)
                 } else {
                     (chars.into_iter().collect::<String>(), false)
                 }
@@ -708,6 +708,17 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         let config = &self.config;
 
+        if new_content.len() > MAX_CONTENT_LEN {
+            return Err(McpError::invalid_params(
+                format!(
+                    "content is too large ({} bytes); maximum is {} bytes",
+                    new_content.len(),
+                    MAX_CONTENT_LEN
+                ),
+                None,
+            ));
+        }
+
         // 1. Validate new_content before writing (catches frontmatter errors in
         //    both full-replace and surgical edits before touching the filesystem).
         let (validation_result, _) = validate::validate_content(
@@ -742,60 +753,74 @@ impl KbSearchServer {
         if is_create && self.config.write.dedup_enabled && !matches!(force_new, Some(true)) {
             // Build query text truncated to DEDUP_QUERY_CHAR_LIMIT chars to stay
             // within embedding model token limits.
-            let query_text: String = new_content.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect();
+            let body_for_dedup = {
+                let s = new_content.trim_start();
+                if s.starts_with("---") {
+                    let after_open = s.splitn(2, '\n').nth(1).unwrap_or("");
+                    if let Some(close_idx) = after_open.find("\n---") {
+                        after_open[close_idx + 4..]
+                            .splitn(2, '\n')
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim_start()
+                    } else {
+                        s
+                    }
+                } else {
+                    s
+                }
+            };
+            let query_text: String = body_for_dedup
+                .chars()
+                .take(DEDUP_QUERY_CHAR_LIMIT)
+                .collect();
 
-            match self.embed_client.embed_query(&query_text).await {
-                Ok(vector) => {
-                    match self
-                        .qdrant
-                        .search(&self.collection, vector, HashMap::new(), 1)
-                        .await
-                    {
-                        Ok(results) => {
-                            let top = results.into_iter().next().map(|r| {
-                                let path = r
-                                    .payload
-                                    .get("file_path")
-                                    .and_then(|v| v.as_str())
-                                    .map(|p| {
-                                        retrieval::relative_to_data(p, &self.canonical_data_path)
-                                    })
-                                    .unwrap_or_default();
-                                (path, r.score)
-                            });
-                            if let Some(hit) = dedup_verdict(top, self.config.write.dedup_threshold)
-                            {
-                                let threshold = self.config.write.dedup_threshold;
-                                return Err(McpError::invalid_params(
-                                    format!(
-                                        "A similar document already exists: '{}' \
-                                         (similarity {:.2} ≥ threshold {:.2}). \
-                                         Edit it with edit_document, or pass \
-                                         force_new=true to create a new document anyway.",
-                                        hit.file_path, hit.score, threshold
-                                    ),
-                                    Some(serde_json::json!({
-                                        "duplicate_of": hit.file_path,
-                                        "similarity": hit.score,
-                                        "threshold": threshold,
-                                    })),
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            // Fail-open: infrastructure failures must not block writes.
-                            // The dedup gate is a guardrail, not a correctness gate.
-                            warn!(
-                                "Dedup search failed for '{}' (proceeding with write): {:#}",
-                                rel_path, e
-                            );
-                        }
+            let dedup_opts = SearchOptions {
+                limit: 1,
+                min_score: None,
+                hybrid: self.config.search.hybrid,
+                rrf_candidates: self.config.search.rrf_candidates as u64,
+                explain: false,
+                modified_after: None,
+                modified_before: None,
+            };
+            let empty_filters = SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            };
+            match retrieval::search(&self.deps(), &query_text, &empty_filters, &dedup_opts).await {
+                Ok(results) => {
+                    let top = results.into_iter().next().map(|r| {
+                        let path = r
+                            .payload
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .map(|p| retrieval::relative_to_data(p, &self.canonical_data_path))
+                            .unwrap_or_default();
+                        (path, r.score)
+                    });
+                    if let Some(hit) = dedup_verdict(top, self.config.write.dedup_threshold) {
+                        let threshold = self.config.write.dedup_threshold;
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "A similar document already exists: '{}' \
+                                 (similarity {:.2} ≥ threshold {:.2}). \
+                                 Edit it with edit_document, or pass \
+                                 force_new=true to create a new document anyway.",
+                                hit.file_path, hit.score, threshold
+                            ),
+                            Some(serde_json::json!({
+                                "duplicate_of": hit.file_path,
+                                "similarity": hit.score,
+                                "threshold": threshold,
+                            })),
+                        ));
                     }
                 }
                 Err(e) => {
-                    // Fail-open: same rationale — embedder down should not block writes.
                     warn!(
-                        "Dedup embedding failed for '{}' (proceeding with write): {:#}",
+                        "Dedup search failed for '{}' (proceeding with write): {:#?}",
                         rel_path, e
                     );
                 }
@@ -817,14 +842,58 @@ impl KbSearchServer {
             })?;
         }
 
-        tokio::fs::write(abs_path, new_content.as_bytes())
-            .await
-            .map_err(|e| {
+        if is_create {
+            use tokio::io::AsyncWriteExt as _;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(abs_path)
+                .await
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        McpError::invalid_params(
+                            format!(
+                                "File '{}' already exists; use edit_document to modify it",
+                                abs_path.display()
+                            ),
+                            None,
+                        )
+                    } else {
+                        error!("Failed to create file '{}': {}", abs_path.display(), e);
+                        McpError::internal_error(format!("Failed to create file: {}", e), None)
+                    }
+                })?;
+            file.write_all(new_content.as_bytes()).await.map_err(|e| {
                 error!("Failed to write file '{}': {}", abs_path.display(), e);
                 McpError::internal_error(format!("Failed to write file: {}", e), None)
             })?;
+        } else {
+            tokio::fs::write(abs_path, new_content.as_bytes())
+                .await
+                .map_err(|e| {
+                    error!("Failed to write file '{}': {}", abs_path.display(), e);
+                    McpError::internal_error(format!("Failed to write file: {}", e), None)
+                })?;
+        }
 
         // 4. Build commit message with git trailers
+        if let Some(msg) = message {
+            if msg.contains('\n') {
+                return Err(McpError::invalid_params(
+                    "commit message must not contain newlines".to_string(),
+                    None,
+                ));
+            }
+            if msg.len() > 1000 {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "commit message too long ({} chars); maximum is 1000",
+                        msg.len()
+                    ),
+                    None,
+                ));
+            }
+        }
         let commit_message = build_commit_message(
             message,
             &format!("docs: {} {}", default_verb, rel_path),
@@ -840,7 +909,7 @@ impl KbSearchServer {
         let commit_sha = git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
-            config.data_path(),
+            self.canonical_data_path.to_str().unwrap_or_default(),
             token.as_deref(),
             rel_path,
             &commit_message,
@@ -889,10 +958,8 @@ impl KbSearchServer {
         &self,
         Parameters(params): Parameters<CreateDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
-        let config = &self.config;
-
         // Resolve path: must be relative, no traversal, not already existing.
-        let data_root = std::path::PathBuf::from(config.data_path());
+        let data_root = self.canonical_data_path.clone();
         let abs_path = resolve_safe_write_path(&data_root, &params.path)
             .map_err(|e| McpError::invalid_params(e, None))?;
 
@@ -1111,6 +1178,23 @@ impl KbSearchServer {
         })?;
 
         // 4. Commit + push the deletion.
+        if let Some(msg) = params.message.as_deref() {
+            if msg.contains('\n') {
+                return Err(McpError::invalid_params(
+                    "commit message must not contain newlines".to_string(),
+                    None,
+                ));
+            }
+            if msg.len() > 1000 {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "commit message too long ({} chars); maximum is 1000",
+                        msg.len()
+                    ),
+                    None,
+                ));
+            }
+        }
         let commit_message = build_commit_message(
             params.message.as_deref(),
             &format!("docs: delete {}", rel_path),
@@ -1124,7 +1208,7 @@ impl KbSearchServer {
         let commit_sha = git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
-            config.data_path(),
+            self.canonical_data_path.to_str().unwrap_or_default(),
             token.as_deref(),
             &rel_path,
             &commit_message,
@@ -1133,8 +1217,18 @@ impl KbSearchServer {
         )
         .await
         .map_err(|e| {
-            error!("commit_and_sync failed for '{}': {:#}", rel_path, e);
-            McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
+            error!(
+                "commit_and_sync failed for '{}' after file was removed from disk: {:#}",
+                rel_path, e
+            );
+            McpError::internal_error(
+                format!(
+                    "File was removed from disk but git commit/sync failed: {}. \
+                     The file is gone locally but the git repo may be out of sync.",
+                    e
+                ),
+                None,
+            )
         })?;
 
         // 5 & 6. Purge from Qdrant and state DB under REINDEX_LOCK.
@@ -1309,17 +1403,17 @@ mod tests {
 
     #[test]
     fn ellipsis_uses_char_count_not_byte_len() {
-        // 400 chars of a 2-byte character = 800 bytes
-        let text: String = "é".repeat(401);
-        assert!(text.len() > 400, "byte len should exceed 400");
-        assert!(text.chars().count() > 400, "char count should exceed 400");
-        // If we used .len() on a 400-char string it would wrongly trigger ellipsis
-        let short: String = "é".repeat(400);
+        // 800 chars of a 2-byte character = 1600 bytes
+        let text: String = "é".repeat(801);
+        assert!(text.len() > 800, "byte len should exceed 800");
+        assert!(text.chars().count() > 800, "char count should exceed 800");
+        // If we used .len() on a 800-char string it would wrongly trigger ellipsis
+        let short: String = "é".repeat(800);
         assert!(
-            short.len() > 400,
-            "byte len of 400 2-byte chars exceeds 400"
+            short.len() > 800,
+            "byte len of 800 2-byte chars exceeds 800"
         );
-        assert_eq!(short.chars().count(), 400, "char count is exactly 400");
+        assert_eq!(short.chars().count(), 800, "char count is exactly 800");
     }
 
     #[test]

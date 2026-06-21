@@ -286,9 +286,9 @@ write:
 
   # Cosine similarity score at or above which a candidate is treated as a
   # duplicate and the create is refused. Range: 0.0–1.0 (1.0 = identical).
-  # 0.85 works well for most embedding models; lower it to 0.75–0.80 for
+  # 0.80 works well for most embedding models; lower it to 0.75–0.80 for
   # shorter or more domain-specific documents.
-  dedup_threshold: 0.85
+  dedup_threshold: 0.80
 
   # Git author identity used for commits made by the write tools (create_document,
   # edit_document). Setting these to a bot identity makes tool-authored commits
@@ -308,13 +308,16 @@ write:
 #   x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-after, retry-after
 rate_limit:
 
+  # Set to false to disable rate limiting entirely (e.g. in trusted internal deployments).
+  enabled: true
+
   # Token replenishment rate: one token is added every 1/per_second seconds.
-  per_second: 2
+  per_second: 20
 
   # Maximum burst size: how many requests can be made before rate limiting
   # kicks in. After the burst is exhausted, requests are limited to the
   # per_second rate.
-  burst_size: 10
+  burst_size: 50
 
 
 # ----------------------------------------------------------------------------

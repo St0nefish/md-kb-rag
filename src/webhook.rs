@@ -1,5 +1,4 @@
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -17,14 +16,11 @@ use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
 use crate::config::{ResolvedConfig, WebhookProvider};
+use crate::git::GIT_TIMEOUT;
 use crate::git::{inject_token_into_url, redact_url};
 use crate::ingest;
 
 type HmacSha256 = Hmac<Sha256>;
-
-/// Maximum time to wait for a git subprocess (fetch, merge) before treating it
-/// as hung and returning an error.
-const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Prevents concurrent reindex tasks from interleaving Qdrant/SQLite operations.
 /// Wrapped in Arc so we can acquire OwnedMutexGuard and move it into tokio::spawn;

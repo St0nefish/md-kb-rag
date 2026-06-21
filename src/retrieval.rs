@@ -228,18 +228,27 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
     let search_start = std::time::Instant::now();
     let mut results = if opts.hybrid {
         // Tokenize the raw query into a sparse vector and fuse with the dense arm.
+        // Fall back to dense-only if the query produces an empty sparse vector
+        // (e.g. all-punctuation queries) to avoid sending an empty vector to Qdrant.
         let sparse = crate::sparse::tokenize(query);
-        deps.qdrant
-            .hybrid_search(
-                deps.collection,
-                vector,
-                sparse,
-                filter_map,
-                opts.limit,
-                opts.rrf_candidates,
-            )
-            .await
-            .map_err(SearchError::Search)?
+        if sparse.0.is_empty() {
+            deps.qdrant
+                .search(deps.collection, vector, filter_map, opts.limit)
+                .await
+                .map_err(SearchError::Search)?
+        } else {
+            deps.qdrant
+                .hybrid_search(
+                    deps.collection,
+                    vector,
+                    sparse,
+                    filter_map,
+                    opts.limit,
+                    opts.rrf_candidates,
+                )
+                .await
+                .map_err(SearchError::Search)?
+        }
     } else {
         deps.qdrant
             .search(deps.collection, vector, filter_map, opts.limit)
@@ -303,6 +312,12 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore>(
             warn!("Failed to fetch file_path facet for fuzzy lookup: {e:#}");
             Vec::new()
         });
+    if all_paths.len() as u64 == MAX_INDEXED_PATHS_FOR_FUZZY {
+        warn!(
+            cap = MAX_INDEXED_PATHS_FOR_FUZZY,
+            "fuzzy path resolver hit the cap; some paths may be missing from suggestions"
+        );
+    }
 
     let basename = Path::new(raw)
         .file_name()
