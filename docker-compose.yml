@@ -21,10 +21,19 @@ services:
     restart: unless-stopped
     volumes:
       - ${MODEL_PATH:-./data/models}:/models:ro
+    # nomic-embed-text-v2-moe supports 8192-token context but the GGUF metadata
+    # incorrectly reports 512. The --override-kv flag corrects this so the full
+    # context window is usable, enabling larger markdown chunks per embedding.
+    # The --ctx-size, --batch-size, and --ubatch-size flags are set to match.
+    # If you switch to a different model, adjust or remove these overrides.
     command: >
       --model /models/${MODEL_FILE:-model.gguf}
       --host 0.0.0.0 --port 8080
       --embeddings
+      --ctx-size 8192
+      --batch-size 8192
+      --ubatch-size 8192
+      --override-kv nomic-bert-moe.context_length=int:8192
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
@@ -44,6 +53,10 @@ services:
     #   --model /models/${MODEL_FILE:-model.gguf}
     #   --host 0.0.0.0 --port 8080
     #   --embeddings -ngl 999
+    #   --ctx-size 8192
+    #   --batch-size 8192
+    #   --ubatch-size 8192
+    #   --override-kv nomic-bert-moe.context_length=int:8192
     # deploy:
     #   resources:
     #     reservations:
@@ -58,6 +71,10 @@ services:
     #   --model /models/${MODEL_FILE:-model.gguf}
     #   --host 0.0.0.0 --port 8080
     #   --embeddings -ngl 999
+    #   --ctx-size 8192
+    #   --batch-size 8192
+    #   --ubatch-size 8192
+    #   --override-kv nomic-bert-moe.context_length=int:8192
     # devices:
     #   - /dev/kfd:/dev/kfd
     #   - /dev/dri:/dev/dri
@@ -68,6 +85,10 @@ services:
     #   --model /models/${MODEL_FILE:-model.gguf}
     #   --host 0.0.0.0 --port 8080
     #   --embeddings -ngl 999
+    #   --ctx-size 8192
+    #   --batch-size 8192
+    #   --ubatch-size 8192
+    #   --override-kv nomic-bert-moe.context_length=int:8192
     # devices:
     #   - /dev/dri:/dev/dri
 

@@ -153,21 +153,46 @@ Or in `config.yaml` (env vars take priority if both are set).
 
 The dev `docker-compose.yml` defaults to **CPU mode** which works on any hardware. For production deployment, pick a hardware-specific template from `deploy/templates/`.
 
+### Context Window Override
+
+nomic-embed-text-v2-moe natively supports 8192-token context windows, but the GGUF file metadata incorrectly reports a 512-token limit. The `docker-compose.yml` command includes `--override-kv nomic-bert-moe.context_length=int:8192` to correct this, along with matching `--ctx-size`, `--batch-size`, and `--ubatch-size` flags. This allows embedding larger markdown chunks in a single pass. If you switch to a different model, adjust or remove these overrides accordingly.
+
 ### CPU (default)
 
 Works everywhere with no special drivers. Good for small knowledge bases or initial testing. The compose file uses `ghcr.io/ggml-org/llama.cpp:server`.
 
 ### NVIDIA CUDA
 
-Most common GPU backend. Requires [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed on the host. Uses `server-cuda12` image with `deploy.resources.reservations.devices` for GPU access.
+Most common GPU backend. Requires [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed on the host. In `docker-compose.yml`, uncomment the `## --- NVIDIA CUDA ---` block (which uses `server-cuda12` with `deploy.resources.reservations.devices` for GPU access), or use the `deploy/templates/compose-nvidia.yml` template.
 
 ### AMD ROCm
 
-Best performance on AMD GPUs. Requires ROCm userspace drivers on the host. Uses `server-rocm` image with `/dev/kfd` and `/dev/dri` device access.
+Best performance on AMD GPUs. Requires ROCm userspace drivers on the host. In `docker-compose.yml`, uncomment the `## --- AMD ROCm ---` block (which uses `server-rocm` with `/dev/kfd` and `/dev/dri` device access), or use the `deploy/templates/compose-rocm.yml` template.
+
+For fine-grained control (e.g. targeting a specific GPU render node or setting `HSA_OVERRIDE_GFX_VERSION`), use a `docker-compose.override.yml`:
+
+```yaml
+services:
+  embeddings:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri/cardN:/dev/dri/cardN       # replace N with your GPU card number
+      - /dev/dri/renderDN:/dev/dri/renderDN  # replace N with your GPU render node
+    group_add:
+      - "video"
+      - "render"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=12.0.1  # 11.0.0 for RDNA 3 (RX 7000), 12.0.1 for RDNA 4 (RX 9000)
+      - HIP_VISIBLE_DEVICES=0
+```
+
+Find your device nodes with `ls /dev/dri/` and match card/render numbers to your target GPU. Check `getent group video render` for the correct GIDs on your system.
 
 ### AMD Vulkan
 
-Simpler driver setup than ROCm — works with standard Mesa Vulkan drivers. Uses `server-vulkan` image with `/dev/dri` device access. Supports multi-GPU setups.
+Simpler driver setup than ROCm — works with standard Mesa Vulkan drivers. In `docker-compose.yml`, uncomment the `## --- AMD Vulkan ---` block (which uses `server-vulkan` with `/dev/dri` device access), or use the `deploy/templates/compose-vulkan.yml` template. Supports multi-GPU setups.
 
 ### Apple Silicon (Metal)
 
