@@ -13,10 +13,10 @@ mod state;
 mod validate;
 mod webhook;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tracing::info;
 
 fn print_component(name: &str, c: &server::ComponentHealth) {
@@ -36,6 +36,48 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Args)]
+struct SearchArgs {
+    /// Natural-language search query
+    query: String,
+    /// Number of results to return
+    #[arg(short, long, default_value_t = 5)]
+    limit: u64,
+    /// Show per-result score breakdown (pre-rerank score when applicable)
+    #[arg(long)]
+    explain: bool,
+    /// Drop results below this relevance floor (0.0–1.0 for dense; ~0.01–0.03 for RRF)
+    #[arg(long)]
+    min_score: Option<f32>,
+    /// Exclude documents with mtime before this date (YYYY-MM-DD or RFC 3339)
+    #[arg(long)]
+    modified_after: Option<String>,
+    /// Exclude documents with mtime after this date (YYYY-MM-DD or RFC 3339)
+    #[arg(long)]
+    modified_before: Option<String>,
+    /// Filter to a specific domain
+    #[arg(long)]
+    domain: Option<String>,
+    /// Filter by document type
+    #[arg(long, name = "type")]
+    doc_type: Option<String>,
+    /// Filter by tags (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    tags: Option<Vec<String>>,
+    /// Output results as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct GetArgs {
+    /// Document path (relative to KB root, basename, or absolute)
+    path: String,
+    /// Output as JSON with path and content fields
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -62,6 +104,10 @@ enum Commands {
         #[arg(short, long)]
         port: Option<u16>,
     },
+    /// Search the knowledge base from the CLI
+    Search(SearchArgs),
+    /// Retrieve a document by path from the CLI
+    Get(GetArgs),
 }
 
 #[tokio::main]
@@ -185,7 +231,185 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Search(args) => {
+            let modified_after = args
+                .modified_after
+                .as_deref()
+                .map(mcp::parse_date_to_timestamp)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let modified_before = args
+                .modified_before
+                .as_deref()
+                .map(mcp::parse_date_to_timestamp)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let embed_client = embed::EmbedClient::new(&cfg.embedding);
+            let qdrant = qdrant::QdrantStore::new(&cfg.qdrant)?;
+            let reranker: Option<rerank::RerankClient> =
+                cfg.reranking.as_ref().map(rerank::RerankClient::new);
+            let data_path = PathBuf::from(cfg.data_path());
+
+            // Build a permissive include GlobSet for CLI search
+            let (gs_builder, _) = ingest::parse_globs(&cfg.indexing.include);
+            let include_patterns = gs_builder.build().unwrap_or_else(|_| {
+                let mut b = globset::GlobSetBuilder::new();
+                b.add(globset::Glob::new("**/*.md").unwrap());
+                b.build().unwrap()
+            });
+
+            let deps = retrieval::RetrievalDeps {
+                embed_client: &embed_client,
+                qdrant: &qdrant,
+                collection: &cfg.qdrant.collection,
+                data_path: &data_path,
+                include_patterns: &include_patterns,
+                reranker: reranker
+                    .as_ref()
+                    .map(|r| r as &(dyn rerank::Reranker + Send + Sync)),
+            };
+
+            let filters = retrieval::SearchFilters {
+                domain: args.domain.clone(),
+                r#type: args.doc_type.clone(),
+                tags: args.tags.clone(),
+            };
+            let opts = retrieval::SearchOptions {
+                limit: args.limit,
+                min_score: args.min_score.or(cfg.search.min_score),
+                hybrid: cfg.search.hybrid,
+                rrf_candidates: cfg.search.rrf_candidates as u64,
+                explain: args.explain,
+                modified_after,
+                modified_before,
+                rerank_candidate_limit: cfg.reranking.as_ref().map(|r| r.candidate_limit as u64),
+            };
+
+            let results = retrieval::search(&deps, &args.query, &filters, &opts)
+                .await
+                .map_err(|e| match e {
+                    retrieval::SearchError::Embed(err) => {
+                        anyhow::anyhow!("embedding failed: {err:#}")
+                    }
+                    retrieval::SearchError::Search(err) => {
+                        anyhow::anyhow!("search failed: {err:#}")
+                    }
+                })?;
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                print_search_results(&results, args.explain, cfg.search.hybrid);
+            }
+        }
+        Commands::Get(args) => {
+            let embed_client = embed::EmbedClient::new(&cfg.embedding);
+            let qdrant = qdrant::QdrantStore::new(&cfg.qdrant)?;
+            let data_path = PathBuf::from(cfg.data_path());
+
+            let (gs_builder, _) = ingest::parse_globs(&cfg.indexing.include);
+            let include_patterns = gs_builder.build().unwrap_or_else(|_| {
+                let mut b = globset::GlobSetBuilder::new();
+                b.add(globset::Glob::new("**/*.md").unwrap());
+                b.build().unwrap()
+            });
+
+            let deps = retrieval::RetrievalDeps {
+                embed_client: &embed_client,
+                qdrant: &qdrant,
+                collection: &cfg.qdrant.collection,
+                data_path: &data_path,
+                include_patterns: &include_patterns,
+                reranker: None,
+            };
+
+            let doc = retrieval::get_document(&deps, &args.path)
+                .await
+                .map_err(|e| match e {
+                    retrieval::GetDocumentError::Outside => {
+                        anyhow::anyhow!("path is outside the data directory")
+                    }
+                    retrieval::GetDocumentError::NotPermitted => {
+                        anyhow::anyhow!("file type not permitted by include patterns")
+                    }
+                    retrieval::GetDocumentError::NotFound { suggestions } => {
+                        if suggestions.is_empty() {
+                            anyhow::anyhow!("document not found: '{}'", args.path)
+                        } else {
+                            anyhow::anyhow!(
+                                "document not found: '{}'. Did you mean: {}",
+                                args.path,
+                                suggestions.join(", ")
+                            )
+                        }
+                    }
+                    retrieval::GetDocumentError::Ambiguous { matches } => {
+                        anyhow::anyhow!(
+                            "ambiguous path '{}' — matches: {}",
+                            args.path,
+                            matches.join(", ")
+                        )
+                    }
+                    retrieval::GetDocumentError::Io(msg) => {
+                        anyhow::anyhow!("I/O error: {}", msg)
+                    }
+                })?;
+
+            if args.json {
+                let json = serde_json::json!({
+                    "path": doc.path.to_string_lossy(),
+                    "content": doc.content,
+                });
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            } else {
+                print!("{}", doc.content);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid: bool) {
+    if results.is_empty() {
+        println!("No results found.");
+        return;
+    }
+    for (i, r) in results.iter().enumerate() {
+        let title = r
+            .payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(untitled)");
+        let file_path = r
+            .payload
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        println!("--- Result {} ---", i + 1);
+        println!("Title: {title}");
+        println!("Score: {:.4}", r.score);
+        println!("File:  {file_path}");
+        if explain {
+            let mode = if hybrid { "hybrid RRF" } else { "dense cosine" };
+            let score_line = if let Some(pre) = r.pre_rerank_score {
+                format!("mode={mode}, rerank={:.4}, pre-rerank={:.4}", r.score, pre)
+            } else {
+                format!("mode={mode}, score={:.4}", r.score)
+            };
+            let arm_scores = match (r.dense_score, r.sparse_score) {
+                (Some(d), Some(s)) => format!(", dense={d:.4}, sparse={s:.4}"),
+                (Some(d), None) => format!(", dense={d:.4}"),
+                _ => String::new(),
+            };
+            println!("Explain: {score_line}{arm_scores}");
+        }
+        if let Some(text) = r.payload.get("text").and_then(|v| v.as_str()) {
+            let snippet: String = text.chars().take(300).collect();
+            println!();
+            println!("{snippet}");
+        }
+        println!();
+    }
 }

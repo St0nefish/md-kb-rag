@@ -43,14 +43,11 @@ pub struct SearchOptions {
     /// Candidates fetched from each arm before RRF fusion. Sourced from
     /// `search.rrf_candidates`. Only consulted when `hybrid` is true.
     pub rrf_candidates: u64,
-    /// Plumbing for later phases — carried, not yet read.
-    #[allow(dead_code)] // wired in Phase 3
+    /// When true, surface per-result score breakdown metadata (pre-rerank score when applicable).
     pub explain: bool,
-    /// Plumbing for later phases — carried, not yet read.
-    #[allow(dead_code)] // wired in Phase 3
+    /// Exclude documents with `mtime` payload below this Unix timestamp.
     pub modified_after: Option<i64>,
-    /// Plumbing for later phases — carried, not yet read.
-    #[allow(dead_code)] // wired in Phase 3
+    /// Exclude documents with `mtime` payload above this Unix timestamp.
     pub modified_before: Option<i64>,
     /// When reranking is enabled, the number of candidates to fetch before reranking.
     /// Ignored when `reranker` is None on RetrievalDeps.
@@ -59,7 +56,6 @@ pub struct SearchOptions {
 
 /// A successfully retrieved document.
 pub struct Document {
-    #[allow(dead_code)] // exposed for callers; path will be used in future phases
     pub path: PathBuf,
     pub content: String,
 }
@@ -230,6 +226,18 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
         filter_map.insert("tags".to_string(), serde_json::Value::Array(tag_values));
     }
 
+    // mtime range filter — documents indexed before mtime was stored may have
+    // mtime=0 or no mtime field and will be excluded silently by this filter.
+    if opts.modified_after.is_some() || opts.modified_before.is_some() {
+        debug!("mtime filter active — documents without mtime in payload will be excluded");
+    }
+    if let Some(after) = opts.modified_after {
+        filter_map.insert("mtime__gte".to_string(), serde_json::json!(after));
+    }
+    if let Some(before) = opts.modified_before {
+        filter_map.insert("mtime__lte".to_string(), serde_json::json!(before));
+    }
+
     let fetch_limit = if deps.reranker.is_some() {
         opts.rerank_candidate_limit.unwrap_or(opts.limit)
     } else {
@@ -243,6 +251,11 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
         // (e.g. all-punctuation queries) to avoid sending an empty vector to Qdrant.
         let sparse = crate::sparse::tokenize(query);
         if sparse.0.is_empty() {
+            if opts.explain {
+                debug!(
+                    "hybrid sparse-fallback: empty sparse vector, explain scores reflect dense-only"
+                );
+            }
             deps.qdrant
                 .search(deps.collection, vector, filter_map, fetch_limit)
                 .await
@@ -256,6 +269,7 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
                     filter_map,
                     fetch_limit,
                     opts.rrf_candidates,
+                    opts.explain,
                 )
                 .await
                 .map_err(SearchError::Search)?
@@ -275,6 +289,14 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
     }
 
     if let Some(reranker) = deps.reranker {
+        // When explain is requested, snapshot pre-rerank scores keyed by index
+        // so we can attach them to each result after reranking updates the score.
+        let pre_rerank_scores: Option<Vec<f32>> = if opts.explain {
+            Some(results.iter().map(|r| r.score).collect())
+        } else {
+            None
+        };
+
         let docs_with_indices: Vec<(usize, &str)> = results
             .iter()
             .enumerate()
@@ -300,6 +322,10 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
                     .filter_map(|(orig_i, score)| {
                         results.get(orig_i).map(|r| {
                             let mut hit = r.clone();
+                            hit.pre_rerank_score = pre_rerank_scores
+                                .as_ref()
+                                .and_then(|v| v.get(orig_i))
+                                .copied();
                             hit.score = score;
                             hit
                         })
@@ -617,6 +643,9 @@ mod tests {
     fn make_search_result(score: f32) -> SearchResult {
         SearchResult {
             score,
+            pre_rerank_score: None,
+            dense_score: None,
+            sparse_score: None,
             payload: HashMap::new(),
         }
     }
@@ -794,6 +823,7 @@ mod tests {
             filters: HashMap<String, serde_json::Value>,
             _limit: u64,
             _rrf_candidates: u64,
+            _explain: bool,
         ) -> anyhow::Result<Vec<SearchResult>> {
             *self.last_call.lock().unwrap() = Some("hybrid_search");
             *self.received_filters.lock().unwrap() = Some(filters);
@@ -1472,5 +1502,140 @@ mod tests {
             Some("doc A"),
             "on reranker failure, should return fused order"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3 feature tests: mtime filter + explain
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn search_modified_after_adds_mtime_gte_filter() {
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            modified_after: Some(1_000_000),
+            ..default_opts()
+        };
+        let _ = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        let received = store.received_filters.lock().unwrap().clone().unwrap();
+        assert!(
+            received.contains_key("mtime__gte"),
+            "modified_after should produce a mtime__gte key in the filter map"
+        );
+        assert_eq!(
+            received.get("mtime__gte").and_then(|v| v.as_i64()),
+            Some(1_000_000),
+            "mtime__gte value should match modified_after"
+        );
+        assert!(
+            !received.contains_key("mtime__lte"),
+            "mtime__lte should not appear when only modified_after is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_modified_before_adds_mtime_lte_filter() {
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            modified_before: Some(2_000_000),
+            ..default_opts()
+        };
+        let _ = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        let received = store.received_filters.lock().unwrap().clone().unwrap();
+        assert!(
+            received.contains_key("mtime__lte"),
+            "modified_before should produce a mtime__lte key in the filter map"
+        );
+        assert_eq!(
+            received.get("mtime__lte").and_then(|v| v.as_i64()),
+            Some(2_000_000),
+            "mtime__lte value should match modified_before"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_explain_populates_pre_rerank_score() {
+        let mut r0 = make_search_result(0.9);
+        r0.payload
+            .insert("content".into(), serde_json::json!("doc A"));
+        let mut r1 = make_search_result(0.8);
+        r1.payload
+            .insert("content".into(), serde_json::json!("doc B"));
+
+        let store = MockRetrievalStore::with_results(vec![r0, r1]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            explain: true,
+            rerank_candidate_limit: Some(10),
+            ..default_opts()
+        };
+        let results = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "should return results when explain is active"
+        );
+        for r in &results {
+            assert!(
+                r.pre_rerank_score.is_some(),
+                "explain=true + reranker active should set pre_rerank_score on every result"
+            );
+        }
     }
 }

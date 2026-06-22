@@ -5,7 +5,7 @@ use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
     Distance, FacetCountsBuilder, FacetHit, FieldCondition, FieldType, Filter, Fusion, Match,
-    Modifier, NamedVectors, PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder,
+    Modifier, NamedVectors, PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder, Range,
     SearchPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
     UpsertPointsBuilder, Value as QdrantValue, Vector, VectorInput, VectorParamsBuilder,
     VectorsConfigBuilder, facet_value, value::Kind,
@@ -28,9 +28,13 @@ pub trait RetrievalStore: Send + Sync {
         filters: std::collections::HashMap<String, serde_json::Value>,
         limit: u64,
     ) -> Result<Vec<SearchResult>>;
-    /// Hybrid sparse+dense retrieval: run a dense and a sparse prefetch arm and
-    /// fuse them server-side with Reciprocal Rank Fusion. `filters` are applied to
-    /// both arms; each arm fetches `rrf_candidates` candidates before fusion.
+    /// Hybrid sparse+dense retrieval with Reciprocal Rank Fusion.
+    ///
+    /// When `explain=false` (default): fuses server-side via Qdrant's built-in RRF;
+    /// `dense_score`/`sparse_score` on results are `None`.
+    /// When `explain=true`: runs separate dense and sparse queries, fuses client-side
+    /// (k=60), and populates `dense_score`/`sparse_score` on each result.
+    #[allow(clippy::too_many_arguments)]
     async fn hybrid_search(
         &self,
         collection: &str,
@@ -39,6 +43,7 @@ pub trait RetrievalStore: Send + Sync {
         filters: std::collections::HashMap<String, serde_json::Value>,
         limit: u64,
         rrf_candidates: u64,
+        explain: bool,
     ) -> Result<Vec<SearchResult>>;
     async fn fetch_facet_values(
         &self,
@@ -62,9 +67,16 @@ pub struct QdrantPoint {
     pub payload: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub score: f32,
+    /// Retrieval score before cross-encoder reranking, when reranking was active.
+    pub pre_rerank_score: Option<f32>,
+    /// Dense cosine score for this result. Always `Some` for dense-only queries;
+    /// `Some` for hybrid queries when `explain=true` (client-side RRF); `None` otherwise.
+    pub dense_score: Option<f32>,
+    /// Sparse BM25 score for this result. `Some` only for hybrid queries when `explain=true`.
+    pub sparse_score: Option<f32>,
     pub payload: HashMap<String, serde_json::Value>,
 }
 
@@ -145,10 +157,32 @@ fn qdrant_payload_to_json(
 ///
 /// Supports: String (keyword match), Integer (exact match),
 /// Bool (boolean match), Array of strings (match_any).
+/// Special keys `mtime__gte` and `mtime__lte` (integer values) are combined
+/// into a single range condition on the `mtime` payload field.
 /// Returns an error for float values, null, object, or other unsupported types.
 fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<Condition>> {
     let mut conditions = Vec::new();
+    let mut mtime_gte: Option<f64> = None;
+    let mut mtime_lte: Option<f64> = None;
+
     for (key, value) in filters {
+        // Special-case: mtime range sentinels inserted by retrieval.rs
+        match key.as_str() {
+            "mtime__gte" => {
+                if let Some(i) = value.as_i64() {
+                    mtime_gte = Some(i as f64);
+                }
+                continue;
+            }
+            "mtime__lte" => {
+                if let Some(i) = value.as_i64() {
+                    mtime_lte = Some(i as f64);
+                }
+                continue;
+            }
+            _ => {}
+        }
+
         let condition = match value {
             serde_json::Value::Array(arr) => {
                 let mut string_values: Vec<String> = Vec::with_capacity(arr.len());
@@ -193,6 +227,19 @@ fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<
         };
         conditions.push(condition);
     }
+
+    if mtime_gte.is_some() || mtime_lte.is_some() {
+        conditions.push(Condition::from(FieldCondition {
+            key: "mtime".to_string(),
+            range: Some(Range {
+                gte: mtime_gte,
+                lte: mtime_lte,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
     Ok(conditions)
 }
 
@@ -417,6 +464,7 @@ impl RetrievalStore for QdrantStore {
         filters: std::collections::HashMap<String, serde_json::Value>,
         limit: u64,
         rrf_candidates: u64,
+        explain: bool,
     ) -> Result<Vec<SearchResult>> {
         QdrantStore::hybrid_search(
             self,
@@ -426,6 +474,7 @@ impl RetrievalStore for QdrantStore {
             filters,
             limit,
             rrf_candidates,
+            explain,
         )
         .await
     }
@@ -482,6 +531,9 @@ impl QdrantStore {
             .into_iter()
             .map(|scored| SearchResult {
                 score: scored.score,
+                pre_rerank_score: None,
+                dense_score: Some(scored.score),
+                sparse_score: None,
                 payload: qdrant_payload_to_json(&scored.payload),
             })
             .collect();
@@ -494,6 +546,7 @@ impl QdrantStore {
     /// Runs two prefetch arms — dense (named `dense`) and sparse (named `sparse`) —
     /// each fetching `rrf_candidates` candidates with `filters` applied, then fuses
     /// them server-side with Reciprocal Rank Fusion and returns the top `limit`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search(
         &self,
         collection: &str,
@@ -502,9 +555,23 @@ impl QdrantStore {
         filters: HashMap<String, serde_json::Value>,
         limit: u64,
         rrf_candidates: u64,
+        explain: bool,
     ) -> Result<Vec<SearchResult>> {
         let conditions = build_conditions(&filters)?;
         let (sparse_indices, sparse_values) = sparse;
+
+        if explain {
+            return self
+                .hybrid_search_explain(
+                    collection,
+                    dense,
+                    (sparse_indices, sparse_values),
+                    conditions,
+                    limit,
+                    rrf_candidates,
+                )
+                .await;
+        }
 
         let mut dense_arm = PrefetchQueryBuilder::default()
             .using("dense")
@@ -542,11 +609,131 @@ impl QdrantStore {
             .into_iter()
             .map(|scored| SearchResult {
                 score: scored.score,
+                pre_rerank_score: None,
+                dense_score: None,
+                sparse_score: None,
                 payload: qdrant_payload_to_json(&scored.payload),
             })
             .collect();
 
         Ok(results)
+    }
+
+    /// Hybrid search with client-side RRF (k=60). Used when `explain=true` to
+    /// surface per-arm dense/sparse scores alongside the fused score.
+    async fn hybrid_search_explain(
+        &self,
+        collection: &str,
+        dense: Vec<f32>,
+        sparse: (Vec<u32>, Vec<f32>),
+        conditions: Vec<Condition>,
+        limit: u64,
+        rrf_candidates: u64,
+    ) -> Result<Vec<SearchResult>> {
+        let (sparse_indices, sparse_values) = sparse;
+
+        // Dense arm
+        let mut dense_builder = SearchPointsBuilder::new(collection, dense, rrf_candidates)
+            .vector_name("dense")
+            .with_payload(true);
+        if !conditions.is_empty() {
+            dense_builder = dense_builder.filter(Filter::must(conditions.clone()));
+        }
+        let dense_resp = self
+            .client
+            .search_points(dense_builder)
+            .await
+            .context("Failed to run dense arm for explain")?;
+
+        // Sparse arm via QueryPoints (supports sparse named vectors)
+        let mut sparse_builder = QueryPointsBuilder::new(collection)
+            .query(Query::new_nearest(VectorInput::new_sparse(
+                sparse_indices,
+                sparse_values,
+            )))
+            .using("sparse")
+            .limit(rrf_candidates)
+            .with_payload(true);
+        if !conditions.is_empty() {
+            sparse_builder = sparse_builder.filter(Filter::must(conditions));
+        }
+        let sparse_resp = self
+            .client
+            .query(sparse_builder)
+            .await
+            .context("Failed to run sparse arm for explain")?;
+
+        // Client-side RRF — key by file_path::chunk_index from payload
+        struct RrfAccum {
+            rrf_score: f32,
+            dense_score: Option<f32>,
+            sparse_score: Option<f32>,
+            payload: HashMap<String, serde_json::Value>,
+        }
+
+        // Key by file_path::chunk_index — both fields are always present in the
+        // indexed schema; missing fields collapse to ""::0 (logged at debug level).
+        fn payload_key(payload: &HashMap<String, serde_json::Value>) -> String {
+            let fp = payload
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ci = payload
+                .get("chunk_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("{fp}::{ci}")
+        }
+
+        let k = 60.0_f32;
+        let mut accum: HashMap<String, RrfAccum> = HashMap::new();
+
+        for (rank, scored) in dense_resp.result.iter().enumerate() {
+            let payload = qdrant_payload_to_json(&scored.payload);
+            let key = payload_key(&payload);
+            let rrf = 1.0 / (k + rank as f32 + 1.0);
+            let entry = accum.entry(key).or_insert(RrfAccum {
+                rrf_score: 0.0,
+                dense_score: None,
+                sparse_score: None,
+                payload,
+            });
+            entry.rrf_score += rrf;
+            entry.dense_score = Some(scored.score);
+        }
+
+        for (rank, scored) in sparse_resp.result.iter().enumerate() {
+            let payload = qdrant_payload_to_json(&scored.payload);
+            let key = payload_key(&payload);
+            let rrf = 1.0 / (k + rank as f32 + 1.0);
+            let entry = accum.entry(key).or_insert(RrfAccum {
+                rrf_score: 0.0,
+                dense_score: None,
+                sparse_score: None,
+                payload,
+            });
+            entry.rrf_score += rrf;
+            entry.sparse_score = Some(scored.score);
+        }
+
+        let mut ranked: Vec<RrfAccum> = accum.into_values().collect();
+        ranked.sort_by(|a, b| {
+            b.rrf_score
+                .partial_cmp(&a.rrf_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ranked.truncate(limit as usize);
+
+        Ok(ranked
+            .into_iter()
+            .map(|a| SearchResult {
+                score: a.rrf_score,
+                pre_rerank_score: None,
+                dense_score: a.dense_score,
+                sparse_score: a.sparse_score,
+                payload: a.payload,
+            })
+            .collect())
     }
 
     pub async fn health_check(&self) -> Result<()> {

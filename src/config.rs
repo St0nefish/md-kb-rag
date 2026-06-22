@@ -439,6 +439,11 @@ pub struct SearchConfig {
     /// Higher values improve recall at the cost of latency.
     #[serde(default = "default_rrf_candidates")]
     pub rrf_candidates: usize,
+    /// Global minimum relevance score floor. Results below this threshold are
+    /// dropped before returning. `None` (the default) disables the floor.
+    /// Note: RRF scores are ~0.01–0.03 — set accordingly when hybrid is true.
+    #[serde(default)]
+    pub min_score: Option<f32>,
 }
 
 impl Default for SearchConfig {
@@ -446,6 +451,7 @@ impl Default for SearchConfig {
         Self {
             hybrid: true,
             rrf_candidates: default_rrf_candidates(),
+            min_score: None,
         }
     }
 }
