@@ -309,6 +309,10 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
             .collect();
         let docs: Vec<&str> = docs_with_indices.iter().map(|(_, s)| *s).collect();
         let top_k = opts.limit as usize;
+        if docs.is_empty() {
+            results.truncate(top_k);
+            return Ok(results);
+        }
         match reranker.rerank(query, &docs).await {
             Ok(ranked) => {
                 let mut indexed: Vec<(usize, f32)> = ranked
