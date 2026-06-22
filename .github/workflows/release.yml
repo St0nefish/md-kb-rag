@@ -50,3 +50,12 @@ jobs:
           docker buildx imagetools create \
             --tag ${{ steps.image.outputs.name }}:latest \
             "$IMAGE"
+
+      - name: Trigger Watchtower
+        if: github.ref == 'refs/heads/master'
+        run: |
+          curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ secrets.WATCHTOWER_URL }}/v1/update" | \
+          grep -q "^2" && echo "Watchtower triggered" || echo "Watchtower trigger failed (non-fatal)"
