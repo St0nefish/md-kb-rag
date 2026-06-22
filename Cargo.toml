@@ -69,6 +69,9 @@ tokio-util = "0.7"
 # Text diffing (unified diff output for write tool results)
 similar = "2"
 
+# Date/time parsing for mtime range filters and CLI date flags
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 tempfile = "3"
 tower = "0.5"

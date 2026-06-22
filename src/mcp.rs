@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use chrono::{DateTime, NaiveDate};
+
 use anyhow::Context as _;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
@@ -58,6 +60,30 @@ pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<Dupli
 
 fn resolve_limit(requested: Option<u64>) -> u64 {
     requested.unwrap_or(10).min(MAX_SEARCH_LIMIT)
+}
+
+/// Parse an ISO 8601 date/datetime string to a Unix timestamp (seconds).
+///
+/// Accepts RFC 3339 datetimes (e.g. `2024-01-15T12:00:00Z`) and date-only
+/// strings (e.g. `2024-01-15`, interpreted as midnight UTC).
+pub(crate) fn parse_date_to_timestamp(s: &str) -> Result<i64, String> {
+    // Try RFC 3339 / ISO 8601 datetime first
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.timestamp());
+    }
+    // Fall back to date-only YYYY-MM-DD (treated as start of day UTC)
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid")
+            .and_utc();
+        return Ok(dt.timestamp());
+    }
+    Err(format!(
+        "invalid date '{}': expected RFC 3339 (e.g. 2024-01-15T00:00:00Z) \
+         or date-only (e.g. 2024-01-15)",
+        s
+    ))
 }
 
 fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
@@ -191,20 +217,42 @@ pub struct SearchParams {
     pub query: String,
 
     /// Optional: filter results to a specific domain.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
 
     /// Optional: filter results by document type.
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
 
     /// Optional: filter results to documents that have any of these tags.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 
     /// Maximum number of results to return (default: 10, max: 50).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+
+    /// Minimum relevance score floor (0.0–1.0 for dense; ~0.01–0.03 for hybrid
+    /// RRF scores). Results below this threshold are dropped. Overrides the
+    /// global `search.min_score` config when provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<f32>,
+
+    /// When true, include a score-breakdown line per result showing retrieval
+    /// mode and, when reranking was active, the pre-rerank score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<bool>,
+
+    /// Exclude documents whose `mtime` is before this date. Accepts RFC 3339
+    /// datetimes (e.g. `2024-01-15T00:00:00Z`) or date-only (e.g. `2024-01-15`).
+    /// Documents indexed before mtime tracking was introduced may be excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_after: Option<String>,
+
+    /// Exclude documents whose `mtime` is after this date. Accepts the same
+    /// formats as `modified_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_before: Option<String>,
 }
 
 /// Parameters for the `create_document` tool.
@@ -459,8 +507,21 @@ impl KbSearchServer {
 
     #[tool(
         description = "Search the knowledge base using a natural-language query. \
-        Returns ranked document chunks with title, relevance score, text snippet, and metadata. \
-        Optionally filter by domain, type, or tags."
+        Returns ranked document chunks with title, relevance score, text snippet, and metadata.\n\
+        \n\
+        Filters: domain, type, tags — narrow results to matching documents.\n\
+        \n\
+        Quality controls:\n\
+        - min_score: drop results below a relevance floor (float). Hybrid RRF scores are \
+          ~0.01–0.03; dense cosine scores are 0.0–1.0. Set accordingly.\n\
+        - explain: add a per-result score-breakdown line showing retrieval mode and, when \
+          reranking was active, the pre-rerank score.\n\
+        \n\
+        Recency filters (ISO 8601 date or datetime, e.g. \"2024-01-15\" or \
+        \"2024-01-15T00:00:00Z\"):\n\
+        - modified_after: exclude documents with mtime before this date.\n\
+        - modified_before: exclude documents with mtime after this date.\n\
+        Note: documents indexed before mtime tracking was introduced may be excluded."
     )]
     async fn search(
         &self,
@@ -485,14 +546,28 @@ impl KbSearchServer {
             tags: params.tags,
         };
 
+        let modified_after = params
+            .modified_after
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let modified_before = params
+            .modified_before
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let explain = params.explain.unwrap_or(false);
         let opts = SearchOptions {
             limit,
-            min_score: None,
+            min_score: params.min_score.or(self.config.search.min_score),
             hybrid: self.config.search.hybrid,
             rrf_candidates: self.config.search.rrf_candidates as u64,
-            explain: false,
-            modified_after: None,
-            modified_before: None,
+            explain,
+            modified_after,
+            modified_before,
             rerank_candidate_limit: self
                 .config
                 .reranking
@@ -594,6 +669,33 @@ impl KbSearchServer {
                 file_path = file_path,
                 lines = lines,
             ));
+
+            if explain {
+                let mode = if self.config.search.hybrid {
+                    "hybrid RRF"
+                } else {
+                    "dense cosine"
+                };
+                let mut breakdown = if let Some(pre) = result.pre_rerank_score {
+                    format!(
+                        "**Score breakdown**: mode={mode}, rerank={:.4}, pre-rerank={:.4}",
+                        result.score, pre,
+                    )
+                } else {
+                    format!(
+                        "**Score breakdown**: mode={mode}, score={:.4}",
+                        result.score,
+                    )
+                };
+                if let Some(d) = result.dense_score {
+                    breakdown.push_str(&format!(", dense={d:.4}"));
+                }
+                if let Some(s) = result.sparse_score {
+                    breakdown.push_str(&format!(", sparse={s:.4}"));
+                }
+                breakdown.push('\n');
+                output.push_str(&breakdown);
+            }
 
             if !domain.is_empty() {
                 output.push_str(&format!("**Domain**: {domain}\n"));
@@ -1478,6 +1580,10 @@ mod tests {
             r#type: None,
             tags: None,
             limit: None,
+            min_score: None,
+            explain: None,
+            modified_after: None,
+            modified_before: None,
         }
     }
 
@@ -2633,5 +2739,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // parse_date_to_timestamp tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_date_rfc3339_returns_unix_timestamp() {
+        // 2024-01-15T00:00:00Z is a known timestamp
+        let ts = parse_date_to_timestamp("2024-01-15T00:00:00Z").unwrap();
+        assert_eq!(
+            ts, 1_705_276_800,
+            "RFC 3339 midnight UTC should parse correctly"
+        );
+    }
+
+    #[test]
+    fn parse_date_date_only_treated_as_midnight_utc() {
+        let ts = parse_date_to_timestamp("2024-01-15").unwrap();
+        assert_eq!(
+            ts, 1_705_276_800,
+            "date-only should be treated as midnight UTC"
+        );
+    }
+
+    #[test]
+    fn parse_date_invalid_string_returns_err() {
+        let result = parse_date_to_timestamp("not-a-date");
+        assert!(
+            result.is_err(),
+            "invalid date string should return an error"
+        );
+    }
+
+    #[test]
+    fn parse_date_rfc3339_with_offset_returns_utc_equivalent() {
+        // 2024-01-15T01:00:00+01:00 == 2024-01-15T00:00:00Z
+        let ts = parse_date_to_timestamp("2024-01-15T01:00:00+01:00").unwrap();
+        assert_eq!(ts, 1_705_276_800, "offset datetime should convert to UTC");
     }
 }
