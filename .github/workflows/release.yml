@@ -50,3 +50,17 @@ jobs:
           docker buildx imagetools create \
             --tag ${{ steps.image.outputs.name }}:latest \
             "$IMAGE"
+
+      - name: Trigger Watchtower
+        if: github.ref == 'refs/heads/master'
+        run: |
+          response=$(curl -fsSL -X POST \
+            -H "Authorization: Bearer ${{ secrets.WATCHTOWER_ATLAS_TOKEN }}" \
+            "${{ vars.WATCHTOWER_ATLAS_URL }}?image=${{ steps.image.outputs.name }}:latest") || true
+          echo "${response}"
+          updated=$(printf '%s' "${response}" | jq -r '.summary.updated // 0')
+          if [ "${updated}" -gt 0 ]; then
+            echo "Watchtower updated ${updated} container(s)"
+          else
+            echo "Warning: Watchtower returned updated=0 (container may already be current)"
+          fi
