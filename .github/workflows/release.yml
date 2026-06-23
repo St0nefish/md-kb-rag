@@ -39,20 +39,23 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Tag as latest
+        id: retag
         run: |
           IMAGE="${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}"
           # CI only builds/pushes the sha image when code changed (see ci.yml path filter).
           # Docs-only merges (e.g. .gitignore) produce no image, so there is nothing to retag.
           if ! docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
             echo "No image $IMAGE for this push (docs-only change?) — skipping latest retag."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           docker buildx imagetools create \
             --tag ${{ steps.image.outputs.name }}:latest \
             "$IMAGE"
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
 
       - name: Trigger Watchtower
-        if: github.ref == 'refs/heads/master'
+        if: steps.retag.outputs.skipped != 'true'
         run: |
           response=$(curl -fsSL -X POST \
             -H "Authorization: Bearer ${{ secrets.WATCHTOWER_ATLAS_TOKEN }}" \
