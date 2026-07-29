@@ -322,6 +322,15 @@ pub struct McpConfig {
     /// How often (in seconds) to refresh discovered metadata from Qdrant.
     #[serde(default = "default_metadata_refresh_secs")]
     pub metadata_refresh_secs: u64,
+    /// Hostnames accepted in the inbound `Host` header, guarding against DNS
+    /// rebinding (RUSTSEC-2026-0189). Entries may include a port, e.g.
+    /// `["kb.example.com", "kb.example.com:8001"]`.
+    ///
+    /// Empty (the default) disables the check and accepts any `Host`. Behind a
+    /// reverse proxy this must list the public hostname clients use, not the
+    /// container's address — the proxy forwards the original `Host`.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for McpConfig {
@@ -332,6 +341,7 @@ impl Default for McpConfig {
             allow_unauthenticated: false,
             instructions: None,
             metadata_refresh_secs: default_metadata_refresh_secs(),
+            allowed_hosts: Vec::new(),
         }
     }
 }
