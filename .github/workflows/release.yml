@@ -57,13 +57,27 @@ jobs:
       - name: Trigger Watchtower
         if: steps.retag.outputs.skipped != 'true'
         run: |
+          # Pull the retagged image onto the host daemon first so Watchtower's
+          # local digest comparison sees the new :latest immediately, rather
+          # than racing registry propagation. Mirrors the devbox deploy job.
+          docker pull "${{ steps.image.outputs.name }}:latest"
+          # Do not swallow transport errors — a failed trigger must fail the job.
           response=$(curl -fsSL -X POST \
             -H "Authorization: Bearer ${{ secrets.WATCHTOWER_ATLAS_TOKEN }}" \
-            "${{ vars.WATCHTOWER_ATLAS_URL }}?image=${{ steps.image.outputs.name }}:latest") || true
+            "${{ vars.WATCHTOWER_ATLAS_URL }}?image=${{ steps.image.outputs.name }}:latest")
           echo "${response}"
           updated=$(printf '%s' "${response}" | jq -r '.summary.updated // 0')
           if [ "${updated}" -gt 0 ]; then
             echo "Watchtower updated ${updated} container(s)"
-          else
-            echo "Warning: Watchtower returned updated=0 (container may already be current)"
+            exit 0
           fi
+          # We just retagged :latest to a new digest, so an update is expected.
+          # updated=0 means Watchtower saw the request but changed nothing —
+          # historically because the container lacked the opt-in label while
+          # Watchtower runs with WATCHTOWER_LABEL_ENABLE=true, so the deploy
+          # silently no-opped for weeks. Fail loudly instead.
+          echo "::error::Watchtower reported updated=0 after retagging :latest."
+          echo "Check that the target container carries the opt-in label:"
+          echo "  com.centurylinklabs.watchtower.enable=true"
+          echo "and that Watchtower can pull ${{ steps.image.outputs.name }}:latest."
+          exit 1

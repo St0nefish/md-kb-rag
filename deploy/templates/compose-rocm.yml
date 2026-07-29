@@ -37,6 +37,11 @@ services:
   kb-rag:
     image: ghcr.io/st0nefish/md-kb-rag:latest
     restart: unless-stopped
+    labels:
+      # Opt in to Watchtower auto-updates. Required when Watchtower runs with
+      # WATCHTOWER_LABEL_ENABLE=true, which only touches labelled containers —
+      # without this the update request succeeds but changes nothing.
+      - "com.centurylinklabs.watchtower.enable=true"
     volumes:
       # Option A: bind-mount a pre-cloned repo (classic workflow)
       # - ${KB_PATH:-./data/repo}:/data:rw
