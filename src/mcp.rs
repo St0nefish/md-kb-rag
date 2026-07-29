@@ -7,8 +7,8 @@ use chrono::{DateTime, NaiveDate};
 use anyhow::Context as _;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
-    ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
-    handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
+    ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*, schemars,
+    tool, tool_handler, tool_router,
 };
 use tracing::{debug, error, warn};
 
@@ -434,7 +434,6 @@ pub struct KbSearchServer {
     /// Resolved config, needed by write tools (create_document, etc.).
     config: Arc<ResolvedConfig>,
     rerank_client: Option<Arc<RerankClient>>,
-    tool_router: ToolRouter<KbSearchServer>,
 }
 
 /// Build an include `GlobSet` for MCP path filtering, with a `**/*.md` fallback
@@ -486,7 +485,6 @@ impl KbSearchServer {
             instructions,
             config,
             rerank_client,
-            tool_router: Self::tool_router(),
         })
     }
 

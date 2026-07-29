@@ -257,6 +257,17 @@ mcp:
   # authentication is handled by an upstream proxy or is genuinely not needed.
   allow_unauthenticated: false
 
+  # Hostnames accepted in the inbound Host header, guarding against DNS
+  # rebinding attacks. Empty (the default) accepts any Host and logs a warning
+  # at startup.
+  #
+  # Behind a reverse proxy, list the PUBLIC hostname clients connect to — the
+  # proxy forwards the original Host header, not the container's address.
+  # Include a port only if clients send one.
+  #
+  # allowed_hosts:
+  #   - "kb.example.com"
+
   # Custom narrative for MCP server instructions. Tells agents what this
   # knowledge base covers. If omitted, a generic read+write description is used.
   # The server automatically appends discovered filter values (domains, types,

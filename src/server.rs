@@ -187,14 +187,27 @@ async fn bearer_auth(
 /// `json_response` skips SSE framing for the single response and returns
 /// `application/json` directly, permitted by the 2025-06-18 Streamable HTTP spec.
 ///
+/// `allowed_hosts` guards the inbound `Host` header against DNS rebinding
+/// (RUSTSEC-2026-0189). rmcp defaults it to loopback only, which would reject
+/// every request to a reverse-proxied public hostname, so an empty list from
+/// config disables the check rather than silently breaking the deployment.
+/// Configure `mcp.allowed_hosts` to turn it on — `run_server` warns when it is unset.
+///
 /// Shared with the transport tests so they exercise the real production settings
 /// rather than a copy that could drift.
-fn mcp_transport_config(cancellation_token: CancellationToken) -> StreamableHttpServerConfig {
-    StreamableHttpServerConfig {
-        stateful_mode: false,
-        json_response: true,
-        cancellation_token,
-        ..Default::default()
+fn mcp_transport_config(
+    cancellation_token: CancellationToken,
+    allowed_hosts: &[String],
+) -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_json_response(true)
+        .with_cancellation_token(cancellation_token);
+
+    if allowed_hosts.is_empty() {
+        config.disable_allowed_hosts()
+    } else {
+        config.with_allowed_hosts(allowed_hosts)
     }
 }
 
@@ -441,10 +454,19 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         rerank_for_mcp,
     )?;
 
+    if config.mcp.allowed_hosts.is_empty() {
+        warn!(
+            "mcp.allowed_hosts is unset — any Host header is accepted. Set it to the \
+             public hostname clients use (e.g. kb.example.com) to guard against DNS rebinding."
+        );
+    } else {
+        info!(allowed_hosts = ?config.mcp.allowed_hosts, "MCP Host validation enabled");
+    }
+
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp_handler.clone()),
         LocalSessionManager::default().into(),
-        mcp_transport_config(ct.child_token()),
+        mcp_transport_config(ct.child_token(), &config.mcp.allowed_hosts),
     );
 
     // Bearer token for MCP auth
@@ -829,6 +851,10 @@ mod tests {
     // client into permanent 404s.
 
     fn test_mcp_router() -> Router {
+        test_mcp_router_with_hosts(&[])
+    }
+
+    fn test_mcp_router_with_hosts(allowed_hosts: &[String]) -> Router {
         let tmp = tempfile::tempdir().unwrap();
         let instructions = Arc::new(RwLock::new("test instructions".to_string()));
 
@@ -865,7 +891,7 @@ mod tests {
         let mcp_service = StreamableHttpService::new(
             move || Ok(handler.clone()),
             LocalSessionManager::default().into(),
-            mcp_transport_config(CancellationToken::new()),
+            mcp_transport_config(CancellationToken::new(), allowed_hosts),
         );
 
         Router::new().nest_service("/mcp", mcp_service)
@@ -901,6 +927,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/mcp")
+            .header("host", "kb.example.com")
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
             .body(Body::from(initialize_request_body()))
@@ -929,6 +956,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("/mcp")
+            .header("host", "kb.example.com")
             .header("accept", "text/event-stream")
             .body(Body::empty())
             .unwrap();
@@ -943,6 +971,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/mcp")
+            .header("host", "kb.example.com")
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
             .body(Body::from(tools_list_request_body()))
@@ -983,6 +1012,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/mcp")
+            .header("host", "kb.example.com")
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
             .header("mcp-session-id", "bogus-dead-session-id")
@@ -991,6 +1021,40 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_allowed_host_is_accepted() {
+        let app = test_mcp_router_with_hosts(&["kb.example.com".to_string()]);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "kb.example.com")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(initialize_request_body()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn host_outside_allowed_list_is_rejected() {
+        // DNS rebinding guard (RUSTSEC-2026-0189): once `mcp.allowed_hosts` is
+        // configured, a request arriving under any other Host is refused.
+        let app = test_mcp_router_with_hosts(&["kb.example.com".to_string()]);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "attacker.example.com")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(initialize_request_body()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // --- build_authoring_section tests ---
