@@ -168,6 +168,36 @@ async fn bearer_auth(
     }
 }
 
+/// Streamable HTTP transport settings for the MCP service.
+///
+/// Stateless deliberately: every POST is self-contained, so there is no server-side
+/// session to lose and no long-lived SSE stream to drop. This matters for clients
+/// that reach us through the `mcp-remote` stdio bridge (Claude Desktop). In stateful
+/// mode a dropped SSE stream — laptop sleep, network change, or a container restart
+/// wiping the in-memory `LocalSessionManager` — left the bridge POSTing a dead
+/// session ID and getting 404s forever, because mcp-remote gives up permanently
+/// after `maxRetries: 2`. That surfaced as tool calls hanging until the client's
+/// timeout, once for five days (#68).
+///
+/// Safe here because this server never pushes to the client: no notifications,
+/// progress, sampling, or logging — every tool is pure request/response. GET and
+/// DELETE consequently return 405, which the MCP spec allows and both clients
+/// handle cleanly.
+///
+/// `json_response` skips SSE framing for the single response and returns
+/// `application/json` directly, permitted by the 2025-06-18 Streamable HTTP spec.
+///
+/// Shared with the transport tests so they exercise the real production settings
+/// rather than a copy that could drift.
+fn mcp_transport_config(cancellation_token: CancellationToken) -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig {
+        stateful_mode: false,
+        json_response: true,
+        cancellation_token,
+        ..Default::default()
+    }
+}
+
 /// Sanitize a single facet value before embedding it into MCP instructions.
 ///
 /// - Replaces control characters (including newlines and tabs) with a single space.
@@ -396,25 +426,25 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         .as_ref()
         .map(|r| Arc::new(RerankClient::new(r)));
 
+    // Build the handler once and clone it per request. In stateless mode the factory
+    // runs on every POST rather than once per session, and `KbSearchServer::new`
+    // canonicalizes the data path (a syscall), compiles the include globset, and
+    // builds the tool router with its generated schemas. Cloning is Arc bumps instead.
+    let mcp_handler = KbSearchServer::new(
+        embed_for_mcp,
+        qdrant_for_mcp,
+        collection,
+        data_path,
+        &include_patterns,
+        Arc::clone(&shared_instructions),
+        config_for_mcp,
+        rerank_for_mcp,
+    )?;
+
     let mcp_service = StreamableHttpService::new(
-        move || {
-            KbSearchServer::new(
-                Arc::clone(&embed_for_mcp),
-                Arc::clone(&qdrant_for_mcp),
-                collection.clone(),
-                data_path.clone(),
-                &include_patterns,
-                Arc::clone(&shared_instructions),
-                Arc::clone(&config_for_mcp),
-                rerank_for_mcp.clone(),
-            )
-            .map_err(std::io::Error::other)
-        },
+        move || Ok(mcp_handler.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig {
-            cancellation_token: ct.child_token(),
-            ..Default::default()
-        },
+        mcp_transport_config(ct.child_token()),
     );
 
     // Bearer token for MCP auth
@@ -788,6 +818,178 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- stateless MCP transport tests ---
+    //
+    // Regression coverage for the stateless Streamable HTTP config (see the
+    // comment on `stateful_mode: false` above): no `Mcp-Session-Id` is ever
+    // issued or required, so a dropped/expired session can never wedge a
+    // client into permanent 404s.
+
+    fn test_mcp_router() -> Router {
+        let tmp = tempfile::tempdir().unwrap();
+        let instructions = Arc::new(RwLock::new("test instructions".to_string()));
+
+        let qdrant_config = crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        };
+        let qdrant = Arc::new(QdrantStore::new(&qdrant_config).unwrap());
+        let embed_config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            api_key: None,
+            vector_size: 768,
+            batch_size: 32,
+        };
+        let embed = Arc::new(EmbedClient::new(&embed_config));
+
+        let handler = KbSearchServer::new(
+            embed,
+            qdrant,
+            "test".into(),
+            tmp.path().to_path_buf(),
+            &["**/*.md".to_string()],
+            instructions,
+            mcp::make_test_resolved_config(tmp.path()),
+            None,
+        )
+        .unwrap();
+
+        // Uses the same `mcp_transport_config` as production, so flipping the
+        // transport back to stateful fails these tests. Deliberately does not
+        // mount auth/rate-limit layers — those have their own tests and are
+        // orthogonal to session behavior.
+        let mcp_service = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            LocalSessionManager::default().into(),
+            mcp_transport_config(CancellationToken::new()),
+        );
+
+        Router::new().nest_service("/mcp", mcp_service)
+    }
+
+    fn initialize_request_body() -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "1.0.0" }
+            }
+        })
+        .to_string()
+    }
+
+    fn tools_list_request_body() -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_json_without_session_header() {
+        let app = test_mcp_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(initialize_request_body()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert!(
+            content_type.starts_with("application/json"),
+            "stateless json_response mode should return application/json, got {content_type}"
+        );
+        assert!(
+            resp.headers().get("mcp-session-id").is_none(),
+            "stateless mode must not issue Mcp-Session-Id"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_mcp_is_method_not_allowed_in_stateless_mode() {
+        let app = test_mcp_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn tools_list_without_session_header_succeeds() {
+        let app = test_mcp_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(tools_list_request_body()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = json["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should contain a tools array")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "search",
+            "get_document",
+            "create_document",
+            "edit_document",
+            "delete_document",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "expected tool '{expected}' in {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_with_bogus_session_header_succeeds() {
+        // This is the exact regression that broke Claude Desktop: a client
+        // replaying a session ID from a dropped SSE stream must not get a
+        // 404, since stateless mode has no sessions to be missing.
+        let app = test_mcp_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", "bogus-dead-session-id")
+            .body(Body::from(tools_list_request_body()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

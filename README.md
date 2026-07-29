@@ -38,6 +38,35 @@ claude mcp add --transport http kb-search \
   --header "Authorization: Bearer $TOKEN"
 ```
 
+### Claude Desktop
+
+Claude Desktop has no native remote-MCP transport for bearer-token servers, so it
+connects through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) stdio
+bridge. Add this to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "kb-search": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "https://your-host:8001/mcp",
+        "--header", "Authorization:${KB_AUTH}"
+      ],
+      "env": { "KB_AUTH": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+Note the `Authorization:${KB_AUTH}` form — no space after the colon. Claude Desktop
+mangles arguments containing spaces, so the token is passed via the `env` block and
+substituted by `mcp-remote`.
+
+The server runs its Streamable HTTP transport in stateless mode, which matters most
+for this path: there is no session for a dropped connection to invalidate, so the
+bridge recovers on its own after a laptop sleep or a server restart.
+
 The recommended setup uses a **named Docker volume** for the knowledge base. The container clones the repo on first start and pulls updates via webhook — no host-side git operations needed. See [deploy/USAGE.md](deploy/USAGE.md#knowledge-base-storage) for details on this approach vs. bind-mounting.
 
 See [deploy/config.example.yaml](deploy/config.example.yaml) for all available options and their defaults.

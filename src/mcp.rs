@@ -1422,6 +1422,42 @@ impl ServerHandler for KbSearchServer {
     }
 }
 
+/// Builds a minimal `ResolvedConfig` for tests. Shared with `server.rs`'s test
+/// module, which needs the same handler-construction pattern for the MCP
+/// service without pulling in a real config file.
+#[cfg(test)]
+pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<ResolvedConfig> {
+    Arc::new(ResolvedConfig {
+        source: crate::config::SourceConfig {
+            git_url: None,
+            branch: "master".into(),
+            data_path: Some(data_path.to_string_lossy().into_owned()),
+            git_token_env: "GIT_PULL_TOKEN".into(),
+        },
+        indexing: crate::config::IndexingConfig::default(),
+        frontmatter: crate::config::FrontmatterConfig::default(),
+        chunking: crate::config::ChunkingConfig::default(),
+        embedding: crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            api_key: None,
+            vector_size: 768,
+            batch_size: 32,
+        },
+        qdrant: crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        },
+        validation: crate::config::ValidationConfig::default(),
+        webhook: crate::config::WebhookConfig::default(),
+        mcp: crate::config::McpConfig::default(),
+        rate_limit: crate::config::RateLimitConfig::default(),
+        write: crate::config::WriteConfig::default(),
+        search: crate::config::SearchConfig::default(),
+        reranking: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1667,38 +1703,6 @@ mod tests {
             err.contains("File not found"),
             "expected 'File not found', got: {err}"
         );
-    }
-
-    fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<ResolvedConfig> {
-        Arc::new(ResolvedConfig {
-            source: crate::config::SourceConfig {
-                git_url: None,
-                branch: "master".into(),
-                data_path: Some(data_path.to_string_lossy().into_owned()),
-                git_token_env: "GIT_PULL_TOKEN".into(),
-            },
-            indexing: crate::config::IndexingConfig::default(),
-            frontmatter: crate::config::FrontmatterConfig::default(),
-            chunking: crate::config::ChunkingConfig::default(),
-            embedding: crate::config::ResolvedEmbeddingConfig {
-                base_url: "http://localhost:8080/v1".into(),
-                model: "test".into(),
-                api_key: None,
-                vector_size: 768,
-                batch_size: 32,
-            },
-            qdrant: crate::config::ResolvedQdrantConfig {
-                url: "http://localhost:6334".into(),
-                collection: "test".into(),
-            },
-            validation: crate::config::ValidationConfig::default(),
-            webhook: crate::config::WebhookConfig::default(),
-            mcp: crate::config::McpConfig::default(),
-            rate_limit: crate::config::RateLimitConfig::default(),
-            write: crate::config::WriteConfig::default(),
-            search: crate::config::SearchConfig::default(),
-            reranking: None,
-        })
     }
 
     #[test]
