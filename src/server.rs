@@ -454,13 +454,19 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         rerank_for_mcp,
     )?;
 
-    if config.mcp.allowed_hosts.is_empty() {
+    if !config.mcp.allowed_hosts.is_empty() {
+        info!(allowed_hosts = ?config.mcp.allowed_hosts, "MCP Host validation enabled");
+    } else if config.mcp.allow_unauthenticated {
+        // Only worth flagging when nothing else is checking the caller. With a
+        // bearer token required, a DNS-rebinding attempt is refused at auth
+        // regardless of Host, so an unset allowed_hosts is not a finding.
         warn!(
-            "mcp.allowed_hosts is unset — any Host header is accepted. Set it to the \
-             public hostname clients use (e.g. kb.example.com) to guard against DNS rebinding."
+            "mcp.allowed_hosts is unset and authentication is disabled — any origin that \
+             can reach this port can call the MCP tools. Set mcp.allowed_hosts to the \
+             hostname clients use, or enable bearer auth."
         );
     } else {
-        info!(allowed_hosts = ?config.mcp.allowed_hosts, "MCP Host validation enabled");
+        debug!("mcp.allowed_hosts is unset; Host validation disabled (bearer auth required)");
     }
 
     let mcp_service = StreamableHttpService::new(

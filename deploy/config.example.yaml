@@ -257,9 +257,10 @@ mcp:
   # authentication is handled by an upstream proxy or is genuinely not needed.
   allow_unauthenticated: false
 
-  # Hostnames accepted in the inbound Host header, guarding against DNS
-  # rebinding attacks. Empty (the default) accepts any Host and logs a warning
-  # at startup.
+  # Hostnames accepted in the inbound Host header. Empty (the default) accepts
+  # any Host, which is fine for most deployments: the check guards against DNS
+  # rebinding, and a bearer-authenticated server already refuses those requests
+  # at auth. Worth setting mainly when allow_unauthenticated is true.
   #
   # Behind a reverse proxy, list the PUBLIC hostname clients connect to — the
   # proxy forwards the original Host header, not the container's address.

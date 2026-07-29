@@ -322,13 +322,17 @@ pub struct McpConfig {
     /// How often (in seconds) to refresh discovered metadata from Qdrant.
     #[serde(default = "default_metadata_refresh_secs")]
     pub metadata_refresh_secs: u64,
-    /// Hostnames accepted in the inbound `Host` header, guarding against DNS
-    /// rebinding (RUSTSEC-2026-0189). Entries may include a port, e.g.
-    /// `["kb.example.com", "kb.example.com:8001"]`.
+    /// Hostnames accepted in the inbound `Host` header. Entries may include a
+    /// port, e.g. `["kb.example.com", "kb.example.com:8001"]`.
     ///
-    /// Empty (the default) disables the check and accepts any `Host`. Behind a
-    /// reverse proxy this must list the public hostname clients use, not the
-    /// container's address — the proxy forwards the original `Host`.
+    /// Empty (the default) disables the check and accepts any `Host`. Most
+    /// deployments want that: the check guards against DNS rebinding, where a
+    /// browser is tricked into treating this server as same-origin, and a
+    /// bearer-authenticated server already refuses those requests at auth. It
+    /// earns its keep mainly when `allow_unauthenticated` is set.
+    ///
+    /// Behind a reverse proxy, list the public hostname clients use rather than
+    /// the container's address — the proxy forwards the original `Host`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
 }
