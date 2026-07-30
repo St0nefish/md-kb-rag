@@ -95,7 +95,7 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
             warn!("qdrant health check failed: {e:#}");
             ComponentHealth {
                 status: ComponentStatus::Unavailable,
-                error: None,
+                error: Some(format!("{e:#}")),
             }
         }
     };
@@ -109,7 +109,7 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
             warn!("embeddings health check failed: {e:#}");
             ComponentHealth {
                 status: ComponentStatus::Unavailable,
-                error: None,
+                error: Some(format!("{e:#}")),
             }
         }
     };
@@ -730,6 +730,53 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- health_handler tests ---
+
+    /// A failing component must report *why* it failed, not just "unavailable".
+    /// The `error` field is the only channel for that — `/health` and the
+    /// `md-kb-rag health` CLI (see `print_component` in main.rs) surface nothing
+    /// else, so leaving it `None` forces operators to grep container logs.
+    #[tokio::test]
+    async fn health_handler_reports_component_errors() {
+        // Port 1 is closed on loopback, so both checks fail fast with
+        // ECONNREFUSED rather than waiting out a connect timeout.
+        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            collection: "test".to_string(),
+        })
+        .expect("client construction is lazy and must not require a live server");
+
+        let embed = EmbedClient::new(&crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key: None,
+            vector_size: 8,
+            batch_size: 1,
+        });
+
+        let state = HealthState {
+            qdrant: Arc::new(qdrant),
+            embed: Arc::new(embed),
+        };
+
+        let (code, Json(body)) = health_handler(State(state)).await;
+
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(body.status, OverallStatus::Degraded));
+
+        for (name, component) in [("qdrant", &body.qdrant), ("embeddings", &body.embeddings)] {
+            assert!(
+                matches!(component.status, ComponentStatus::Unavailable),
+                "{name} should be unavailable against a closed port"
+            );
+            let err = component
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must report a cause, got None"));
+            assert!(!err.is_empty(), "{name} cause must not be empty");
+        }
     }
 
     fn rate_limited_app(burst_size: u32) -> Router {
