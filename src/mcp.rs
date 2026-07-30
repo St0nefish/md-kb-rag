@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate};
 
@@ -476,7 +477,49 @@ pub struct KbSearchServer {
     /// Resolved config, needed by write tools (create_document, etc.).
     config: Arc<ResolvedConfig>,
     rerank_client: Option<Arc<RerankClient>>,
+    /// How long write tools wait for `REINDEX_LOCK` before skipping the index update.
+    /// Always [`crate::webhook::REINDEX_LOCK_TIMEOUT`] in production; tests shorten it so
+    /// they can exercise the timeout path without a 30-second sleep.
+    reindex_lock_timeout: Duration,
 }
+
+/// Acquire the shared reindex lock, giving up after `wait`.
+///
+/// Returns `None` if the lock could not be acquired in time. A webhook-triggered reindex
+/// can hold [`crate::webhook::REINDEX_LOCK`] for minutes, and the write tools only reach
+/// this point *after* the document has already been committed and pushed — so giving up
+/// and reporting a skipped index update beats blocking the tool call indefinitely.
+///
+/// `wait` is a parameter rather than being read from `REINDEX_LOCK_TIMEOUT` directly so
+/// tests can exercise the timeout path without a 30-second sleep.
+async fn acquire_reindex_lock(wait: Duration) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    tokio::time::timeout(wait, Arc::clone(&crate::webhook::REINDEX_LOCK).lock_owned())
+        .await
+        .ok()
+}
+
+/// Warning appended to a write tool's *successful* output when the index update was skipped
+/// because [`acquire_reindex_lock`] timed out.
+///
+/// `consequence` spells out what the stale index means for this specific operation — it
+/// differs materially between a write (not yet searchable) and a delete (still searchable).
+fn reindex_skipped_warning(wait: Duration, consequence: &str) -> String {
+    format!(
+        "⚠️  Search index update was SKIPPED: a reindex is already in progress \
+         (waited {:?} for it to finish). The change is committed to git, so nothing is \
+         lost, but {} until the next reindex runs — another write, a webhook push, or a \
+         manual `index` run. This project has no periodic reindex timer.",
+        wait, consequence
+    )
+}
+
+/// `consequence` text for `create_document` / `edit_document`.
+const REINDEX_SKIPPED_WRITE: &str = "this document will not be searchable";
+
+/// `consequence` text for `delete_document`. The inverse of the write case: the purge did
+/// not happen, so the removed document's content is still live in the index.
+const REINDEX_SKIPPED_DELETE: &str = "the deleted document's content REMAINS in the search index and can still be \
+     returned by `search`";
 
 /// Build an include `GlobSet` for MCP path filtering, with a `**/*.md` fallback
 /// when no patterns are valid. Per-pattern parsing uses [`crate::ingest::parse_globs`]
@@ -527,7 +570,16 @@ impl KbSearchServer {
             instructions,
             config,
             rerank_client,
+            reindex_lock_timeout: crate::webhook::REINDEX_LOCK_TIMEOUT,
         })
+    }
+
+    /// Shorten the reindex-lock wait. Test-only: the timeout path is otherwise a
+    /// 30-second wall-clock wait, which would dominate the suite's runtime.
+    #[cfg(test)]
+    fn with_reindex_lock_timeout(mut self, wait: Duration) -> Self {
+        self.reindex_lock_timeout = wait;
+        self
     }
 
     /// Build a `RetrievalDeps` bundle from this server's fields.
@@ -1087,27 +1139,44 @@ impl KbSearchServer {
             McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
         })?;
 
-        // 7. Trigger incremental reindex (serialized against webhook reindexes)
-        {
-            let _guard = crate::webhook::REINDEX_LOCK.lock().await;
-            ingest::run_index(config, false).await.map_err(|e| {
-                error!(
-                    "Reindex after write_document failed for '{}': {:#}",
-                    rel_path, e
+        // 7. Trigger incremental reindex (serialized against webhook reindexes).
+        //    The commit above already landed on the remote, so a reindex we cannot start
+        //    is a stale index, not a lost document — warn rather than fail the call.
+        let warning = match acquire_reindex_lock(self.reindex_lock_timeout).await {
+            Some(_guard) => {
+                ingest::run_index(config, false).await.map_err(|e| {
+                    error!(
+                        "Reindex after write_document failed for '{}': {:#}",
+                        rel_path, e
+                    );
+                    McpError::internal_error(format!("Reindex failed: {}", e), None)
+                })?;
+                None
+            }
+            None => {
+                warn!(
+                    "Reindex after write_document skipped for '{}': REINDEX_LOCK still held \
+                     after {:?}",
+                    rel_path, self.reindex_lock_timeout
                 );
-                McpError::internal_error(format!("Reindex failed: {}", e), None)
-            })?;
-        }
+                Some(reindex_skipped_warning(
+                    self.reindex_lock_timeout,
+                    REINDEX_SKIPPED_WRITE,
+                ))
+            }
+        };
 
         // 8. Build unified diff and return success
         let action = if is_create { "Created" } else { "Edited" };
         let summary = format!("{} '{}' (commit {})", action, rel_path, commit_sha);
         let diff = render_unified_diff(old_content, new_content, rel_path);
-        let result_text = if diff.is_empty() {
-            summary
-        } else {
-            format!("{}\n\n{}", summary, diff)
-        };
+        let mut result_text = summary;
+        if let Some(warning) = warning {
+            result_text = format!("{}\n\n{}", result_text, warning);
+        }
+        if !diff.is_empty() {
+            result_text = format!("{}\n\n{}", result_text, diff);
+        }
         Ok(CallToolResult::success(vec![Content::text(result_text)]))
     }
 
@@ -1397,9 +1466,9 @@ impl KbSearchServer {
         })?;
 
         // 5 & 6. Purge from Qdrant and state DB under REINDEX_LOCK.
-        {
-            let _guard = crate::webhook::REINDEX_LOCK.lock().await;
-
+        //    As in write_document, the deletion is already committed and pushed, so a lock
+        //    we cannot take means a stale index, not a failed delete — warn, do not fail.
+        let warning = if let Some(_guard) = acquire_reindex_lock(self.reindex_lock_timeout).await {
             // Purge vectors from Qdrant.
             self.qdrant
                 .delete_by_files(&self.collection, &[rel_path.as_str()])
@@ -1431,16 +1500,28 @@ impl KbSearchServer {
                     );
                 }
             }
-        }
+            None
+        } else {
+            warn!(
+                "Index purge for deleted '{}' skipped: REINDEX_LOCK still held after {:?}",
+                rel_path, self.reindex_lock_timeout
+            );
+            Some(reindex_skipped_warning(
+                self.reindex_lock_timeout,
+                REINDEX_SKIPPED_DELETE,
+            ))
+        };
 
         // 7. Return success with summary + diff of removed content.
         let summary = format!("Deleted '{}' (commit {})", rel_path, commit_sha);
         let diff = render_unified_diff(&old_content, "", &rel_path);
-        let result_text = if diff.is_empty() {
-            summary
-        } else {
-            format!("{}\n\n{}", summary, diff)
-        };
+        let mut result_text = summary;
+        if let Some(warning) = warning {
+            result_text = format!("{}\n\n{}", result_text, warning);
+        }
+        if !diff.is_empty() {
+            result_text = format!("{}\n\n{}", result_text, diff);
+        }
         Ok(CallToolResult::success(vec![Content::text(result_text)]))
     }
 }
@@ -2926,5 +3007,168 @@ mod tests {
         // 2024-01-15T01:00:00+01:00 == 2024-01-15T00:00:00Z
         let ts = parse_date_to_timestamp("2024-01-15T01:00:00+01:00").unwrap();
         assert_eq!(ts, 1_705_276_800, "offset datetime should convert to UTC");
+    }
+
+    // --- REINDEX_LOCK timeout tests (issue #64) ---
+    //
+    // These hold a process-global static lock while `cargo test` runs tests in parallel,
+    // so every hold is kept to tens of milliseconds to avoid starving other tests.
+
+    /// Short wait used to drive the timeout path without a real 30-second sleep.
+    const TEST_LOCK_WAIT: Duration = Duration::from_millis(50);
+
+    #[tokio::test]
+    async fn acquire_reindex_lock_returns_guard_when_free() {
+        let guard = acquire_reindex_lock(Duration::from_secs(5)).await;
+        assert!(
+            guard.is_some(),
+            "should acquire the lock when nothing else holds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_reindex_lock_gives_up_when_held() {
+        let held = Arc::clone(&crate::webhook::REINDEX_LOCK).lock_owned().await;
+
+        let start = std::time::Instant::now();
+        let guard = acquire_reindex_lock(TEST_LOCK_WAIT).await;
+        let elapsed = start.elapsed();
+
+        drop(held);
+
+        assert!(
+            guard.is_none(),
+            "should give up rather than block while the lock is held"
+        );
+        // The point of the fix: bounded, not indefinite. A generous ceiling keeps this
+        // from flaking on a loaded CI runner while still catching a missing timeout.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should return promptly after the wait expires, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn reindex_skipped_warning_states_commit_landed_and_consequence() {
+        let write = reindex_skipped_warning(Duration::from_secs(30), REINDEX_SKIPPED_WRITE);
+        assert!(
+            write.contains("committed to git"),
+            "must reassure the caller the write landed: {write}"
+        );
+        assert!(
+            write.contains("30s"),
+            "must state how long it waited: {write}"
+        );
+        assert!(
+            write.contains("not be searchable"),
+            "write variant must say the document is not yet searchable: {write}"
+        );
+
+        let delete = reindex_skipped_warning(Duration::from_secs(30), REINDEX_SKIPPED_DELETE);
+        assert!(
+            delete.contains("REMAINS in the search index"),
+            "delete variant must warn the content is still live in the index: {delete}"
+        );
+    }
+
+    /// Build a `KbSearchServer` backed by a real git working clone, so write tools get
+    /// past `commit_and_sync` and actually reach the reindex step.
+    fn make_git_backed_server(
+        work: &tempfile::TempDir,
+    ) -> (KbSearchServer, Arc<crate::config::ResolvedConfig>) {
+        let mut config = make_test_resolved_config(work.path());
+        // Bypass the dedup gate: it would otherwise call out to a (nonexistent)
+        // embedding service before we ever reach the lock.
+        Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+        let server = make_write_test_server(work, &["**/*.md".to_string()], Arc::clone(&config))
+            .with_reindex_lock_timeout(TEST_LOCK_WAIT);
+        (server, config)
+    }
+
+    #[tokio::test]
+    async fn create_document_returns_warning_when_reindex_lock_held() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let held = Arc::clone(&crate::webhook::REINDEX_LOCK).lock_owned().await;
+
+        let result = server
+            .create_document(Parameters(CreateDocumentParams {
+                path: "docs/locked.md".to_string(),
+                content:
+                    "---\ntitle: Locked\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
+                        .to_string(),
+                message: None,
+                force_new: Some(true),
+            }))
+            .await;
+
+        drop(held);
+
+        let result = result.expect("write succeeded, so the tool must not report failure");
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("Created 'docs/locked.md'"),
+            "must still report the successful create: {text}"
+        );
+        assert!(
+            text.contains("SKIPPED"),
+            "must warn that the index update was skipped: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_returns_warning_when_reindex_lock_held() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("doomed.md"),
+            "---\ntitle: D\n---\n\n# Body\n",
+        )
+        .unwrap();
+        // delete_document git-adds the removed path, so the file must already be tracked.
+        std::process::Command::new("git")
+            .args(["add", "doomed.md"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add doomed.md",
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        let (server, _config) = make_git_backed_server(&work);
+
+        let held = Arc::clone(&crate::webhook::REINDEX_LOCK).lock_owned().await;
+
+        let result = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "doomed.md".to_string(),
+                message: None,
+            }))
+            .await;
+
+        drop(held);
+
+        let result = result.expect("delete succeeded, so the tool must not report failure");
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("Deleted 'doomed.md'"),
+            "must still report the successful delete: {text}"
+        );
+        assert!(
+            text.contains("REMAINS in the search index"),
+            "must warn the deleted content is still searchable: {text}"
+        );
     }
 }

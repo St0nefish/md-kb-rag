@@ -1,4 +1,5 @@
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -27,6 +28,12 @@ type HmacSha256 = Hmac<Sha256>;
 /// `pub(crate)` so the MCP write tools can share the same single-flight lock.
 pub(crate) static REINDEX_LOCK: LazyLock<Arc<Mutex<()>>> =
     LazyLock::new(|| Arc::new(Mutex::new(())));
+
+/// How long an MCP write tool waits for REINDEX_LOCK before giving up and skipping its
+/// index update. A webhook-triggered reindex can hold the lock for minutes, so waiting
+/// unbounded means the tool call never returns. Kept under typical MCP client timeouts so
+/// the caller sees our explanation rather than a client-side timeout.
+pub(crate) const REINDEX_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct WebhookState {
