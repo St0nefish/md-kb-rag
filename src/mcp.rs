@@ -58,6 +58,48 @@ pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<Dupli
     }
 }
 
+/// Build the dedup query text on the same textual basis the indexer uses, then
+/// truncate it to `DEDUP_QUERY_CHAR_LIMIT`.
+///
+/// This must stay aligned with `chunk::chunk_markdown`: every indexed chunk is
+/// prefixed with its document's own `description` when
+/// `chunking.prepend_description` is set, so a dedup query built without that
+/// prefix would be compared against a different textual basis than the
+/// candidates it is scored against.
+pub(crate) fn build_dedup_query(
+    body: &str,
+    description: Option<&str>,
+    prepend_description: bool,
+) -> String {
+    let assembled = match (prepend_description, description) {
+        (true, Some(desc)) => format!("{}\n\n{}", desc, body),
+        _ => body.to_string(),
+    };
+    assembled.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect()
+}
+
+/// Search options for the dedup gate.
+///
+/// Deliberately pinned to dense-only rather than inheriting `search.hybrid`, so
+/// the returned score is a cosine similarity comparable to
+/// `write.dedup_threshold`. Hybrid RRF scores top out around 0.03 — against a
+/// cosine threshold like the 0.80 default the gate could never fire — and a
+/// cross-encoder relevance score is not a similarity at all, so reranking is
+/// also kept out of this path (see the `reranker: None` at the call site).
+pub(crate) fn dedup_search_opts() -> SearchOptions {
+    SearchOptions {
+        limit: 1,
+        min_score: None,
+        hybrid: false,
+        // Unused in the dense-only path, which performs no RRF fusion.
+        rrf_candidates: 0,
+        explain: false,
+        modified_after: None,
+        modified_before: None,
+        rerank_candidate_limit: None,
+    }
+}
+
 fn resolve_limit(requested: Option<u64>) -> u64 {
     requested.unwrap_or(10).min(MAX_SEARCH_LIMIT)
 }
@@ -835,7 +877,7 @@ impl KbSearchServer {
 
         // 1. Validate new_content before writing (catches frontmatter errors in
         //    both full-replace and surgical edits before touching the filesystem).
-        let (validation_result, _) = validate::validate_content(
+        let (validation_result, validated) = validate::validate_content(
             std::path::Path::new(rel_path),
             new_content,
             &config.frontmatter,
@@ -865,79 +907,87 @@ impl KbSearchServer {
         //    Gate runs only when: this is a create (not edit), dedup is enabled in
         //    config, and the caller has not set force_new = true.
         if is_create && self.config.write.dedup_enabled && !matches!(force_new, Some(true)) {
-            // Build query text truncated to DEDUP_QUERY_CHAR_LIMIT chars to stay
-            // within embedding model token limits.
-            let body_for_dedup = {
-                let s = new_content.trim_start();
-                if s.starts_with("---") {
-                    let after_open = s.split_once('\n').map(|x| x.1).unwrap_or("");
-                    if let Some(close_idx) = after_open.find("\n---") {
-                        after_open[close_idx + 4..]
-                            .split_once('\n')
-                            .map(|x| x.1)
-                            .unwrap_or("")
-                            .trim_start()
-                    } else {
-                        s
-                    }
-                } else {
-                    s
-                }
-            };
-            let query_text: String = body_for_dedup
-                .chars()
-                .take(DEDUP_QUERY_CHAR_LIMIT)
-                .collect();
+            // Reuse the body already parsed during validation above rather than
+            // re-deriving it here: that keeps the dedup query on exactly the
+            // frontmatter-stripped basis the indexer embeds.
+            let query_text = validated
+                .as_ref()
+                .map(|v| {
+                    let description = v.frontmatter.get("description").and_then(|d| d.as_str());
+                    build_dedup_query(
+                        &v.body,
+                        description,
+                        self.config.chunking.prepend_description,
+                    )
+                })
+                .unwrap_or_default();
 
-            let dedup_opts = SearchOptions {
-                limit: 1,
-                min_score: None,
-                hybrid: self.config.search.hybrid,
-                rrf_candidates: self.config.search.rrf_candidates as u64,
-                explain: false,
-                modified_after: None,
-                modified_before: None,
-                rerank_candidate_limit: None,
-            };
-            let empty_filters = SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            };
-            match retrieval::search(&self.deps(), &query_text, &empty_filters, &dedup_opts).await {
-                Ok(results) => {
-                    let top = results.into_iter().next().map(|r| {
-                        let path = r
-                            .payload
-                            .get("file_path")
-                            .and_then(|v| v.as_str())
-                            .map(|p| retrieval::relative_to_data(p, &self.canonical_data_path))
-                            .unwrap_or_default();
-                        (path, r.score)
-                    });
-                    if let Some(hit) = dedup_verdict(top, self.config.write.dedup_threshold) {
-                        let threshold = self.config.write.dedup_threshold;
-                        return Err(McpError::invalid_params(
-                            format!(
-                                "A similar document already exists: '{}' \
-                                 (similarity {:.2} ≥ threshold {:.2}). \
-                                 Edit it with edit_document, or pass \
-                                 force_new=true to create a new document anyway.",
-                                hit.file_path, hit.score, threshold
-                            ),
-                            Some(serde_json::json!({
-                                "duplicate_of": hit.file_path,
-                                "similarity": hit.score,
-                                "threshold": threshold,
-                            })),
-                        ));
+            if query_text.trim().is_empty() {
+                warn!(
+                    "Dedup gate skipped for '{}': no body text to compare",
+                    rel_path
+                );
+            } else {
+                let empty_filters = SearchFilters {
+                    domain: None,
+                    r#type: None,
+                    tags: None,
+                };
+                // Detach the reranker: `dedup_threshold` is a cosine similarity,
+                // and a cross-encoder relevance score is not comparable to it.
+                let dedup_deps = RetrievalDeps {
+                    reranker: None,
+                    ..self.deps()
+                };
+                match retrieval::search(
+                    &dedup_deps,
+                    &query_text,
+                    &empty_filters,
+                    &dedup_search_opts(),
+                )
+                .await
+                {
+                    Ok(results) => {
+                        let top = results.into_iter().next().map(|r| {
+                            let path = r
+                                .payload
+                                .get("file_path")
+                                .and_then(|v| v.as_str())
+                                .map(|p| retrieval::relative_to_data(p, &self.canonical_data_path))
+                                .unwrap_or_default();
+                            (path, r.score)
+                        });
+                        if let Some((path, score)) = top.as_ref() {
+                            debug!(
+                                "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} \
+                                 (threshold {:.2})",
+                                rel_path, path, score, self.config.write.dedup_threshold
+                            );
+                        }
+                        if let Some(hit) = dedup_verdict(top, self.config.write.dedup_threshold) {
+                            let threshold = self.config.write.dedup_threshold;
+                            return Err(McpError::invalid_params(
+                                format!(
+                                    "A similar document already exists: '{}' \
+                                     (similarity {:.2} ≥ threshold {:.2}). \
+                                     Edit it with edit_document, or pass \
+                                     force_new=true to create a new document anyway.",
+                                    hit.file_path, hit.score, threshold
+                                ),
+                                Some(serde_json::json!({
+                                    "duplicate_of": hit.file_path,
+                                    "similarity": hit.score,
+                                    "threshold": threshold,
+                                })),
+                            ));
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!(
-                        "Dedup search failed for '{}' (proceeding with write): {:#?}",
-                        rel_path, e
-                    );
+                    Err(e) => {
+                        warn!(
+                            "Dedup search failed for '{}' (proceeding with write): {:#?}",
+                            rel_path, e
+                        );
+                    }
                 }
             }
         }
@@ -2181,6 +2231,102 @@ mod tests {
             .expect("should be a hit");
         assert_eq!(hit.file_path, "sysadmin/networking/dns.md");
         assert!((hit.score - 0.95).abs() < 1e-6, "score should be preserved");
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup query construction + search options — pure, no live services
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_dedup_query_prepends_description() {
+        let q = build_dedup_query("Body text here.", Some("A short summary."), true);
+        assert_eq!(q, "A short summary.\n\nBody text here.");
+    }
+
+    #[test]
+    fn build_dedup_query_omits_description_when_disabled() {
+        let q = build_dedup_query("Body text here.", Some("A short summary."), false);
+        assert_eq!(
+            q, "Body text here.",
+            "prepend_description=false must match the indexer, which also omits it"
+        );
+    }
+
+    #[test]
+    fn build_dedup_query_omits_description_when_absent() {
+        let q = build_dedup_query("Body text here.", None, true);
+        assert_eq!(q, "Body text here.");
+    }
+
+    #[test]
+    fn build_dedup_query_truncates_to_limit() {
+        let long_body = "x".repeat(DEDUP_QUERY_CHAR_LIMIT * 2);
+        let q = build_dedup_query(&long_body, None, false);
+        assert_eq!(q.chars().count(), DEDUP_QUERY_CHAR_LIMIT);
+    }
+
+    #[test]
+    fn build_dedup_query_truncation_counts_chars_not_bytes() {
+        // Multi-byte input must not panic or split a character.
+        let long_body = "é".repeat(DEDUP_QUERY_CHAR_LIMIT * 2);
+        let q = build_dedup_query(&long_body, None, false);
+        assert_eq!(q.chars().count(), DEDUP_QUERY_CHAR_LIMIT);
+    }
+
+    /// The dedup query must be built on the same textual basis the indexer
+    /// embeds, otherwise the gate scores a query against candidates that were
+    /// assembled differently. Pin the two together so they cannot drift.
+    #[test]
+    fn build_dedup_query_matches_chunk_prepend_format() {
+        let body = "## Heading\n\nSome body content.";
+        let description = "A short summary.";
+        let chunking = crate::config::ChunkingConfig::default();
+        assert!(
+            chunking.prepend_description,
+            "this test assumes the indexer default prepends description"
+        );
+
+        let chunks = crate::chunk::chunk_markdown(body, Some(description), &chunking);
+        let first_chunk = &chunks.first().expect("body should produce a chunk").text;
+        let query = build_dedup_query(body, Some(description), chunking.prepend_description);
+
+        assert!(
+            first_chunk.starts_with(&format!("{}\n\n", description)),
+            "indexed chunk should carry the description prefix, got: {:?}",
+            first_chunk
+        );
+        assert_eq!(
+            query, *first_chunk,
+            "dedup query and indexed chunk text must share one textual basis"
+        );
+    }
+
+    /// Regression guard for issue #67: `write.dedup_threshold` is a cosine
+    /// similarity, so the dedup search must never inherit `search.hybrid`
+    /// (RRF scores top out near 0.03 and would make the gate unable to fire).
+    #[test]
+    fn dedup_search_opts_is_dense_only() {
+        let opts = dedup_search_opts();
+        assert!(
+            !opts.hybrid,
+            "dedup must be dense-only so its score is a cosine similarity"
+        );
+        assert!(
+            crate::config::SearchConfig::default().hybrid,
+            "search.hybrid defaults to true — this is exactly what dedup must not inherit"
+        );
+        assert_eq!(opts.limit, 1, "dedup only needs the nearest neighbour");
+        assert!(
+            opts.min_score.is_none(),
+            "thresholding is dedup_verdict's job, not the search floor's"
+        );
+    }
+
+    /// A cross-encoder relevance score is not a cosine similarity, so the gate
+    /// must not request rerank candidate expansion either.
+    #[test]
+    fn dedup_search_opts_requests_no_rerank_expansion() {
+        assert!(dedup_search_opts().rerank_candidate_limit.is_none());
     }
 
     /// Test that the gating booleans (`dedup_enabled`, `must_already_exist`, `force_new`)

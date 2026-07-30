@@ -298,6 +298,9 @@ write:
 
   # Cosine similarity score at or above which a candidate is treated as a
   # duplicate and the create is refused. Range: 0.0–1.0 (1.0 = identical).
+  # Always a dense cosine score: the dedup search is pinned to dense-only with
+  # reranking detached, so this threshold is unaffected by `search.hybrid`
+  # (whose RRF scores are ~0.01–0.03) and by `reranking.enabled`.
   # 0.80 works well for most embedding models; lower it to 0.75–0.80 for
   # shorter or more domain-specific documents.
   dedup_threshold: 0.80
