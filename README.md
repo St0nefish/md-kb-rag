@@ -260,7 +260,7 @@ The server exposes a full read/write surface over MCP. Read tools (`search`, `ge
 
 All three write tools share the same pipeline: **path-safety guard** (no `..`, no symlink escapes, must match `indexing.include`) → **frontmatter validation** → **filesystem write** → **git commit with provenance trailers** (`Tool: md-kb-rag`, `Operation: <tool>`) → **push to the remote** → **incremental reindex** (serialized against webhook reindexes via an internal lock). Each returns a summary line with the commit SHA plus a unified diff. Commits are authored under the `write.commit_author_*` identity so tool edits are easy to spot in `git log`.
 
-**`create_document`** — create a new file. Validates that the document doesn't already exist, then runs a **near-duplicate check**: it embeds the content and, if an existing document scores above `write.dedup_threshold`, refuses the write and names the match (pass `force_new: true` to override).
+**`create_document`** — create a new file. Validates that the document doesn't already exist, then runs a **near-duplicate check**: it embeds the content and, if an existing document scores above `write.dedup_threshold`, refuses the write and names the match (pass `force_new: true` to override). That score is always a dense cosine similarity — the check is pinned to dense-only retrieval with reranking detached, so it is unaffected by `search.hybrid` and `reranking.enabled`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|

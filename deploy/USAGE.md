@@ -151,7 +151,7 @@ Each tool returns a one-line summary with the commit SHA plus a unified diff of 
 
 ### The tools
 
-- **`create_document`** — new file only (errors if it already exists). Before writing, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations). The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
+- **`create_document`** — new file only (errors if it already exists). Before writing, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. The score is always a **dense cosine similarity** — this check is pinned to dense-only retrieval with reranking detached, regardless of `search.hybrid` and `reranking.enabled`, because hybrid RRF scores (~0.01–0.03) and cross-encoder relevance scores are not on the same scale as the threshold. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations). The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
 - **`edit_document`** — existing file only. **Surgical mode** (`old_string` + `new_string`) replaces a single unique occurrence; **full-replace mode** (`content`) swaps the whole file and re-validates its frontmatter. The two modes are mutually exclusive.
 - **`delete_document`** — removes the file, commits and pushes the deletion, then purges the document's vectors from Qdrant and its row from the state DB directly (no full reindex needed).
 
@@ -162,7 +162,7 @@ The `write` section of `config.yaml` (see [config.example.yaml](config.example.y
 ```yaml
 write:
   dedup_enabled: true            # near-duplicate check on create_document
-  dedup_threshold: 0.85          # cosine similarity at/above which a create is refused
+  dedup_threshold: 0.80          # dense cosine similarity at/above which a create is refused
   commit_author_name: "md-kb-rag"
   commit_author_email: "md-kb-rag@localhost"
 ```
