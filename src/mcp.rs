@@ -1187,7 +1187,10 @@ impl KbSearchServer {
         Required frontmatter fields and any fixed allowed values (e.g. for type/status) are \
         listed in this server's instructions. \
         If a very similar document already exists, the create is refused and the close match is \
-        reported — edit that document instead, or set force_new=true to create a new one anyway.")]
+        reported — edit that document instead, or set force_new=true to create a new one anyway. \
+        SCOPE: only for durable, long-lived reference knowledge. NEVER create a document to hold \
+        session notes, intermediate analysis, task/TODO state, or scratch output — every write is \
+        committed, pushed, and permanently indexed. Write transient content to a local file instead.")]
     async fn create_document(
         &self,
         Parameters(params): Parameters<CreateDocumentParams>,
@@ -1250,7 +1253,10 @@ impl KbSearchServer {
         \n\
         In both modes the result is validated, committed, and an incremental reindex is \
         triggered. The path is resolved like get_document: relative to the KB root, a unique \
-        basename, or absolute. The document must already exist — use create_document for new files.")]
+        basename, or absolute. The document must already exist — use create_document for new files.\n\
+        \n\
+        SCOPE: this knowledge base holds durable reference knowledge only. NEVER append session \
+        notes, task state, or other transient content to a document.")]
     async fn edit_document(
         &self,
         Parameters(params): Parameters<EditDocumentParams>,
@@ -1942,6 +1948,39 @@ mod tests {
                 .to_lowercase()
                 .contains("knowledge base")
         );
+    }
+
+    #[test]
+    fn write_tool_descriptions_assert_scope() {
+        let tools = KbSearchServer::tool_router().list_all();
+
+        // The write tools are the ones an agent can use to park transient content
+        // in the KB, so each must carry the scope boundary. Their descriptions are
+        // compiled in, unlike the server instructions, which a deployment overrides
+        // via `mcp.instructions`.
+        for name in ["create_document", "edit_document"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("tool '{name}' not registered"));
+            let description = tool
+                .description
+                .as_deref()
+                .unwrap_or_else(|| panic!("tool '{name}' has no description"));
+
+            assert!(
+                description.contains("SCOPE"),
+                "'{name}' description should carry a scope assertion: {description}"
+            );
+            assert!(
+                description.contains("NEVER"),
+                "'{name}' scope assertion should be emphatic: {description}"
+            );
+            assert!(
+                description.contains("session notes"),
+                "'{name}' should name the transient-content anti-pattern: {description}"
+            );
+        }
     }
 
     #[test]

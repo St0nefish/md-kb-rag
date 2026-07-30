@@ -177,6 +177,8 @@ The server advertises **dynamic instructions** to MCP clients on connect (and re
 2. The distinct filter values (domains, types, tags) discovered in the live index, so the agent knows what's already in use.
 3. A write-authoring section listing the required frontmatter fields and any fixed `allowed` values.
 
+Independently of this, the `create_document` and `edit_document` tool descriptions state that the knowledge base is for durable, long-lived reference knowledge and must not be used as a scratchpad for session notes, intermediate analysis, or task state. That wording is compiled in and always reaches the client. If you want the same boundary stated in the server instructions — worth doing, since a client reads those before it reads any tool description — add it to your `mcp.instructions` narrative yourself; the narrative is yours to write, so nothing is prepended to it.
+
 Keep `mcp.instructions` short — the dynamic sections supply the detail. Example:
 
 ```yaml
