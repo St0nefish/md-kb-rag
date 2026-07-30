@@ -254,7 +254,7 @@ pub async fn commit_and_sync(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // --- inject_token_into_url tests ---
@@ -333,7 +333,8 @@ mod tests {
     }
 
     /// Helper: create a local bare git repo with one commit on the given branch.
-    fn create_bare_repo(branch: &str) -> tempfile::TempDir {
+    /// `pub(crate)` so `mcp.rs`'s write-tool tests can build a real repo fixture.
+    pub(crate) fn create_bare_repo(branch: &str) -> tempfile::TempDir {
         let bare_dir = tempfile::TempDir::new().unwrap();
         let bare_path = bare_dir.path();
 
@@ -569,7 +570,8 @@ mod tests {
     // --- commit_and_sync tests ---
 
     /// Helper: create a local working clone of a bare repo.
-    fn clone_bare_repo(bare_path: &std::path::Path, branch: &str) -> tempfile::TempDir {
+    /// `pub(crate)` so `mcp.rs`'s write-tool tests can build a real repo fixture.
+    pub(crate) fn clone_bare_repo(bare_path: &std::path::Path, branch: &str) -> tempfile::TempDir {
         let work_dir = tempfile::TempDir::new().unwrap();
         std::process::Command::new("git")
             .args(["clone", bare_path.to_str().unwrap(), "."])
