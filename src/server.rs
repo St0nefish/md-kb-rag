@@ -142,16 +142,36 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
 // Status + metrics
 // ---------------------------------------------------------------------------
 
-/// Fields with more distinct values than this are omitted from the breakdown — a
-/// histogram over `title` is noise, one over `status` is information.
-const MAX_DISTINCT_FOR_BREAKDOWN: i64 = 50;
+/// Fields with more distinct values than this are omitted from the breakdown.
+///
+/// Set well above [`MAX_VALUES_PER_BREAKDOWN`] so a broad vocabulary like `tags` still
+/// qualifies — on a real knowledge base that runs to a few hundred values, and its most
+/// common ones are the most useful histogram there is. Such a field is reported as its
+/// top values plus a `truncated` flag rather than dropped.
+const MAX_DISTINCT_FOR_BREAKDOWN: i64 = 500;
 /// Cap on how many fields get broken down, so a schema with hundreds of declared
 /// fields cannot turn one scrape into hundreds of queries.
 const MAX_BREAKDOWN_FIELDS: usize = 20;
 /// Cap on values reported per field.
 const MAX_VALUES_PER_BREAKDOWN: i64 = 50;
-/// Never break these down: they are free text, unique per document by design.
-const BREAKDOWN_EXCLUDED: [&str; 3] = ["title", "description", "file_path"];
+/// Fields never broken down.
+///
+/// - `title`/`description` are free text, unique per document by design (and promoted
+///   to columns, so they never reach `document_fields` anyway).
+/// - `domain` is *derived* from the top-level folder, making it identical to the
+///   synthetic `area` breakdown by construction — reporting both prints the same
+///   histogram twice.
+/// - `timestamp`/`date` are instants. Grouping documents by exact instant produces a
+///   near-unique list that crowds out real vocabularies; recency is a range query, not
+///   a category.
+const BREAKDOWN_EXCLUDED: [&str; 6] = [
+    "title",
+    "description",
+    "file_path",
+    "domain",
+    "timestamp",
+    "date",
+];
 /// Cap on a single reported value's length. Frontmatter values are uncapped at ingest.
 const MAX_VALUE_LEN: usize = 200;
 /// How long a collected status is reused. Short enough that `/status` still reads as
@@ -159,7 +179,7 @@ const MAX_VALUE_LEN: usize = 200;
 const STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
-struct StatusState {
+pub struct StatusState {
     config: Arc<ResolvedConfig>,
     qdrant: Arc<QdrantStore>,
     /// Opened on first use rather than at boot, matching how the MCP handler reaches
@@ -170,6 +190,20 @@ struct StatusState {
 }
 
 impl StatusState {
+    /// Build a status collector outside the server, for the `status` subcommand.
+    ///
+    /// Sharing the collector is what keeps `md-kb-rag status --json` and the `/status`
+    /// endpoint from drifting apart. The `indexing` half will always report idle here:
+    /// run state is per-process, and the CLI is not the process doing the indexing.
+    pub fn for_cli(config: Arc<ResolvedConfig>) -> anyhow::Result<Self> {
+        Ok(Self {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant)?),
+            config,
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
     async fn state_db(&self) -> anyhow::Result<&crate::state::StateDb> {
         self.state_db
             .get_or_try_init(|| async {
@@ -238,7 +272,7 @@ fn store_error(prefix: &str, e: &anyhow::Error) -> String {
 
 /// Gather everything the status views need. Never fails: unreachable stores are
 /// reported as errors inside the response rather than as a failed request.
-async fn collect_status(state: &StatusState) -> StatusResponse {
+pub async fn collect_status(state: &StatusState) -> StatusResponse {
     let mut store = StoreCounts::default();
     let mut breakdown: Vec<FieldBreakdown> = Vec::new();
 
@@ -272,15 +306,15 @@ async fn collect_status(state: &StatusState) -> StatusResponse {
                 store.documents_missing_metadata = Some(missing);
             }
 
-            match db.field_cardinality().await {
-                Err(e) => store.errors.push(store_error("field cardinality", &e)),
+            // Fetch a few extra rows so an excluded field cannot eat a slot that a
+            // reportable one would have used.
+            let fetch = (MAX_BREAKDOWN_FIELDS + BREAKDOWN_EXCLUDED.len()) as i64;
+            match db.breakdown_fields(MAX_DISTINCT_FOR_BREAKDOWN, fetch).await {
+                Err(e) => store.errors.push(store_error("breakdown fields", &e)),
                 Ok(fields) => {
                     let selected: Vec<(String, i64)> = fields
                         .into_iter()
-                        .filter(|(name, distinct)| {
-                            *distinct <= MAX_DISTINCT_FOR_BREAKDOWN
-                                && !BREAKDOWN_EXCLUDED.contains(&name.as_str())
-                        })
+                        .filter(|(name, _)| !BREAKDOWN_EXCLUDED.contains(&name.as_str()))
                         .take(MAX_BREAKDOWN_FIELDS)
                         .collect();
 
@@ -1598,6 +1632,48 @@ mod tests {
         assert_eq!(status.store.documents_with_metadata, Some(0));
         assert_eq!(status.store.documents_missing_metadata, Some(3));
         assert!(render_prometheus(&status).contains("kb_documents_missing_metadata 3"));
+    }
+
+    #[tokio::test]
+    async fn breakdown_omits_derived_and_date_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+        let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+
+        let fm: std::collections::HashMap<String, serde_json::Value> = match serde_json::json!({
+            "title": "T",
+            "type": "guide",
+            // Derived from the top-level folder, so identical to `area`.
+            "domain": "food",
+            // An instant: grouping documents by exact timestamp is near-unique noise.
+            "timestamp": "2026-07-31T12:00:00Z",
+        }) {
+            serde_json::Value::Object(m) => m.into_iter().collect(),
+            _ => unreachable!(),
+        };
+        db.upsert_document_metadata("food/a.md", &fm, 1700, "h", 1)
+            .await
+            .unwrap();
+
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config,
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let status = collect_status(&state).await;
+        let fields: Vec<&str> = status.breakdown.iter().map(|b| b.field.as_str()).collect();
+
+        assert!(fields.contains(&"type"), "{fields:?}");
+        assert!(fields.contains(&"area"), "{fields:?}");
+        assert!(
+            !fields.contains(&"domain"),
+            "domain duplicates area by construction: {fields:?}"
+        );
+        assert!(!fields.contains(&"timestamp"), "{fields:?}");
     }
 
     #[tokio::test]

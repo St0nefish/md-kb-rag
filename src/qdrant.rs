@@ -285,6 +285,11 @@ fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<
 impl QdrantStore {
     pub fn new(config: &ResolvedQdrantConfig) -> Result<Self> {
         let client = Qdrant::from_url(&config.url)
+            // The client's compatibility probe prints to *stdout*, not the tracing
+            // subscriber — which corrupts `status --json` and any other machine-readable
+            // output. The server/client versions are pinned together in compose, so the
+            // check buys nothing here.
+            .skip_compatibility_check()
             .build()
             .context("Failed to connect to Qdrant")?;
         info!("Connected to Qdrant at {}", config.url);

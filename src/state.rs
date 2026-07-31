@@ -712,20 +712,36 @@ impl StateDb {
         Ok(row.0)
     }
 
-    /// Every projected field with how many distinct values it takes, most varied first.
+    /// Fields worth breaking down, with how many distinct values each takes,
+    /// widest document coverage first.
     ///
-    /// Used to decide which fields are worth breaking down in a status report: a field
-    /// with three values (`status`) is a useful histogram, one with several hundred
-    /// (`title`) is noise.
-    pub async fn field_cardinality(&self) -> Result<Vec<(String, i64)>> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT field, COUNT(DISTINCT value_text) FROM document_fields \
-             GROUP BY field ORDER BY COUNT(DISTINCT value_text) DESC, field ASC",
+    /// Two decisions matter here, and both are in SQL because a caller filtering
+    /// afterwards would get the wrong rows:
+    ///
+    /// - `max_distinct` bounds *value* cardinality. A field with three values
+    ///   (`status`) is a useful histogram; one with several hundred is noise.
+    /// - Ordering is by how many documents carry the field, not by how many values it
+    ///   takes. A scoped schema can declare twenty fields that apply to one folder;
+    ///   ordering by value count floats all of them above `type` and `status`, and the
+    ///   fields that describe the whole knowledge base fall off the end of `limit`.
+    pub async fn breakdown_fields(
+        &self,
+        max_distinct: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        // SQLite reads a negative LIMIT as "no limit".
+        let limit = limit.max(0);
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT field, COUNT(DISTINCT value_text) AS n, COUNT(DISTINCT file_path) AS docs \
+             FROM document_fields GROUP BY field HAVING n <= ? \
+             ORDER BY docs DESC, n DESC, field ASC LIMIT ?",
         )
+        .bind(max_distinct)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows)
+        Ok(rows.into_iter().map(|(f, n, _docs)| (f, n)).collect())
     }
 
     /// Document counts per value of `field`, most common first.
@@ -1260,12 +1276,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn field_cardinality_reports_distinct_value_counts() {
+    async fn breakdown_fields_reports_distinct_value_counts() {
         let (db, _dir) = test_db().await;
         seed_breakdown_corpus(&db).await;
 
-        let cards: HashMap<String, i64> =
-            db.field_cardinality().await.unwrap().into_iter().collect();
+        let cards: HashMap<String, i64> = db
+            .breakdown_fields(50, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(cards.get("type"), Some(&3));
         // dinner, quick, docker
         assert_eq!(cards.get("tags"), Some(&3));
@@ -1274,6 +1294,104 @@ mod tests {
         // cannot reach a breakdown at all.
         assert_eq!(cards.get("title"), None);
         assert_eq!(cards.get("description"), None);
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_excludes_high_cardinality_fields_in_sql() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+
+        // `type` and `tags` each take 3 distinct values. With the ceiling at 2, both
+        // drop — the filter is applied in SQL, not by the caller.
+        let fields: Vec<String> = db
+            .breakdown_fields(2, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(!fields.contains(&"type".to_string()), "{fields:?}");
+        assert!(!fields.contains(&"tags".to_string()), "{fields:?}");
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_limit_keeps_usable_fields_not_the_widest() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+        // A field far too wide to be a useful histogram.
+        for i in 0..40 {
+            let fm: HashMap<String, Value> = match serde_json::json!({
+                "title": "T", "type": "guide", "serial": format!("sn-{i}")
+            }) {
+                Value::Object(m) => m.into_iter().collect(),
+                _ => unreachable!(),
+            };
+            db.upsert_document_metadata(&format!("wide/{i}.md"), &fm, 1700, "h", 1)
+                .await
+                .unwrap();
+        }
+
+        // Rows come back richest-first, so an unfiltered `ORDER BY n DESC LIMIT 1`
+        // would return `serial` — and every reportable field would be lost to the cap.
+        let fields: Vec<String> = db
+            .breakdown_fields(10, 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert_eq!(fields.len(), 1);
+        assert!(
+            !fields.contains(&"serial".to_string()),
+            "the 40-value field must not consume the only slot: {fields:?}"
+        );
+        // `tags` and `type` both take 3 values and tie; either is a usable histogram.
+        assert!(
+            fields[0] == "tags" || fields[0] == "type",
+            "expected a low-cardinality field, got {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_orders_by_document_coverage_not_value_count() {
+        let (db, _dir) = test_db().await;
+        // `type` covers every document with few values; a scoped field covers a handful
+        // of documents with many. Ordering by value count would float the scoped field
+        // above the one that describes the whole corpus.
+        for i in 0..30 {
+            let mut fm: HashMap<String, Value> = match serde_json::json!({"title": "T", "type": "guide"})
+            {
+                Value::Object(m) => m.into_iter().collect(),
+                _ => unreachable!(),
+            };
+            if i < 5 {
+                fm.insert("scoped".into(), Value::String(format!("v{i}")));
+            }
+            db.upsert_document_metadata(&format!("d{i}.md"), &fm, 1700, "h", 1)
+                .await
+                .unwrap();
+        }
+
+        let fields: Vec<String> = db
+            .breakdown_fields(500, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert_eq!(
+            fields.first().map(String::as_str),
+            Some("type"),
+            "the field covering every document must lead: {fields:?}"
+        );
+        assert!(fields.contains(&"scoped".to_string()), "{fields:?}");
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_clamps_a_negative_limit() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+        assert!(db.breakdown_fields(50, -1).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1296,7 +1414,7 @@ mod tests {
     #[tokio::test]
     async fn aggregates_are_empty_on_a_fresh_database() {
         let (db, _dir) = test_db().await;
-        assert!(db.field_cardinality().await.unwrap().is_empty());
+        assert!(db.breakdown_fields(50, 50).await.unwrap().is_empty());
         assert!(db.area_counts().await.unwrap().is_empty());
         assert!(db.count_by_field("type", 50).await.unwrap().is_empty());
     }

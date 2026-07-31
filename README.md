@@ -88,7 +88,9 @@ md-kb-rag serve              # Start server (MCP + webhook endpoints)
 md-kb-rag index              # Incremental index (only changed files)
 md-kb-rag index --full       # Full re-index (clear state, re-embed everything)
 md-kb-rag validate           # Validate all markdown files without indexing
-md-kb-rag status             # Print collection stats + state DB info
+md-kb-rag status             # Aggregate counts + metadata breakdown
+md-kb-rag status --json      # Same data as the server's /status endpoint
+md-kb-rag status --files     # List every indexed file instead
 md-kb-rag health             # Check if server is healthy
 md-kb-rag reproject-fields   # Rebuild document_fields from stored frontmatter (no re-embed)
 ```
@@ -423,7 +425,7 @@ Both report:
 - **Indexing state** — whether a run is in flight right now, its phase (`discovering` → `scanning` → `embedding` → `backfilling` → `removing_orphans`), how far through it is, what triggered it (`cli`, `startup`, `webhook`, `write_tool`), and how long it has been going.
 - **Last run** — outcome, duration, error message on failure, and the full per-outcome tallies (`discovered`, `indexed`, `skipped`, `invalid`, `empty`, `read_errors`, `metadata_backfilled`, `frozen_by_broken_schema`, `broken_schemas`, `orphans_removed`).
 - **Store counts** — `indexed_files` (state DB), `documents` (metadata index), and `qdrant_points`. `documents_missing_metadata` is the divergence between the first two; non-zero means the metadata index is behind and the next run will backfill it.
-- **Metadata breakdown** — document counts per value for every low-cardinality indexed field, plus a synthetic `area` field grouping by top-level directory.
+- **Metadata breakdown** — document counts per value for each indexed field, widest document coverage first, plus a synthetic `area` field grouping by top-level directory. Fields are ordered by how many documents carry them rather than how many values they take, so a scoped schema's twenty recipe fields can't crowd out `type` and `status`. Broad vocabularies like `tags` report their most common values with `truncated: true`. `domain` is omitted (it is derived from the top-level folder, so it duplicates `area`), as are date and timestamp fields.
 - **Payload index health** — which Qdrant payload indexes are in place and which failed. Failures are non-fatal by design, so this is the only lasting signal that a filter may be slow or incomplete.
 
 `kb_index_last_success_timestamp_seconds` is the metric worth alerting on: its age answers "is the index actually keeping up", which neither `/health` nor a bare error count can. It is absent until a run succeeds, so an alert on timestamp age will not fire spuriously against a freshly started process.

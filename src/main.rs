@@ -108,7 +108,14 @@ enum Commands {
         strict: bool,
     },
     /// Print collection stats and state DB info
-    Status,
+    Status {
+        /// Emit the same JSON the server's /status endpoint returns
+        #[arg(long)]
+        json: bool,
+        /// List every indexed file instead of aggregate counts
+        #[arg(long)]
+        files: bool,
+    },
     /// Check if the server is healthy
     Health {
         /// Port to check (defaults to config mcp.port)
@@ -131,6 +138,11 @@ async fn main() -> anyhow::Result<()> {
     status::init_process_start();
 
     tracing_subscriber::fmt()
+        // Logs to stderr, data to stdout. `fmt()` defaults to stdout, which corrupted
+        // every `--json` mode — a single startup log line ahead of the payload is
+        // enough to make the output unparseable. Docker captures both streams, so
+        // `docker logs` is unaffected.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|e| {
                 if std::env::var_os("RUST_LOG").is_some() {
@@ -229,46 +241,34 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
             }
         }
-        Commands::Status => {
-            // State DB stats
-            let state = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
-            let count = state.count().await?;
-            let doc_count = state.document_count().await?;
-            let files = state.list_all().await?;
-            println!("State DB: {} indexed files", count);
-            println!("Document metadata: {} documents", doc_count);
-            if doc_count < count {
-                println!(
-                    "  ({} file(s) missing metadata — the next index run will backfill them)",
-                    count - doc_count
-                );
-            }
-            for f in &files {
-                println!(
-                    "  {} (chunks: {}, hash: {}..., at: {})",
-                    f.file_path,
-                    f.chunk_count,
-                    &f.content_hash[..12.min(f.content_hash.len())],
-                    f.indexed_at
-                );
+        Commands::Status { json, files } => {
+            if files {
+                // The pre-aggregation behavior, now opt-in: one line per document is
+                // unreadable past a few dozen files, which is most knowledge bases.
+                let state = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
+                for f in state.list_all().await? {
+                    println!(
+                        "{} (chunks: {}, hash: {}..., at: {})",
+                        f.file_path,
+                        f.chunk_count,
+                        &f.content_hash[..12.min(f.content_hash.len())],
+                        f.indexed_at
+                    );
+                }
+                return Ok(());
             }
 
-            // Qdrant stats
-            let store = qdrant::QdrantStore::new(&cfg.qdrant)?;
-            match store.collection_info(&cfg.qdrant.collection).await? {
-                Some(points) => {
-                    println!(
-                        "Qdrant collection '{}': {} points",
-                        cfg.qdrant.collection, points
-                    );
-                }
-                None => {
-                    println!(
-                        "Qdrant collection '{}': does not exist",
-                        cfg.qdrant.collection
-                    );
-                }
+            // Same collector the /status endpoint uses, so the two cannot drift.
+            let status =
+                server::collect_status(&server::StatusState::for_cli(std::sync::Arc::new(cfg))?)
+                    .await;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
             }
+
+            print_status(&status);
         }
         Commands::ReprojectFields => {
             // No lock: this runs in its own process, so an in-process mutex would be
@@ -444,6 +444,76 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Human-readable rendering of a status snapshot.
+///
+/// Aggregates rather than enumerating. The in-flight indexing section is deliberately
+/// absent: run state lives in the process doing the work, so a CLI invocation would
+/// always report idle regardless of what the server is doing. `/status` on the running
+/// server is the place to ask that.
+fn print_status(status: &server::StatusResponse) {
+    println!("Collection:  {}", status.collection);
+    println!("Data path:   {}", status.data_path);
+    println!();
+
+    let fmt = |n: Option<i64>| n.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+    println!("Indexed files:  {}", fmt(status.store.indexed_files));
+    println!(
+        "Documents:      {}",
+        fmt(status.store.documents_with_metadata)
+    );
+    println!(
+        "Qdrant points:  {}",
+        status
+            .store
+            .qdrant_points
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into())
+    );
+
+    match status.store.documents_missing_metadata {
+        Some(n) if n > 0 => {
+            println!("\n{n} file(s) missing metadata — the next index run will backfill them")
+        }
+        Some(n) if n < 0 => println!(
+            "\nWARNING: {} more document(s) than the state DB tracks",
+            -n
+        ),
+        _ => {}
+    }
+
+    for b in &status.breakdown {
+        println!("\nBy {}:", b.field);
+        let width = b
+            .values
+            .iter()
+            .map(|v| v.value.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(40);
+        for v in &b.values {
+            let label = if v.value.is_empty() {
+                "(root)"
+            } else {
+                &v.value
+            };
+            println!("  {label:<width$}  {}", v.documents);
+        }
+        if b.truncated {
+            println!(
+                "  … {} more value(s) not shown",
+                b.distinct_values - b.values.len() as i64
+            );
+        }
+    }
+
+    if !status.store.errors.is_empty() {
+        println!("\nErrors:");
+        for e in &status.store.errors {
+            println!("  {e}");
+        }
+    }
 }
 
 fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid: bool) {
