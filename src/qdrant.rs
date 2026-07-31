@@ -389,8 +389,10 @@ impl QdrantStore {
                     );
                     // An error! that scrolls out of the log buffer leaves a silently
                     // degraded filter behind; /status keeps it visible until it is fixed.
-                    crate::status::INDEX_STATUS
-                        .record_payload_index(&indexed.name, Some(format!("{e:#}")));
+                    crate::status::INDEX_STATUS.record_payload_index(
+                        &indexed.name,
+                        Some(crate::status::redact_error(&format!("{e:#}"))),
+                    );
                 }
             }
         }
@@ -416,7 +418,10 @@ impl QdrantStore {
                      Recency filters may be slow until this is resolved.",
                     collection, e
                 );
-                crate::status::INDEX_STATUS.record_payload_index("mtime", Some(format!("{e:#}")));
+                crate::status::INDEX_STATUS.record_payload_index(
+                    "mtime",
+                    Some(crate::status::redact_error(&format!("{e:#}"))),
+                );
             }
         }
 

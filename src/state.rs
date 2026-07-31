@@ -734,6 +734,9 @@ impl StateDb {
     /// store one row per value, so a `COUNT(*)` here would be counting projections
     /// rather than documents the moment a field ever repeats within one document.
     pub async fn count_by_field(&self, field: &str, limit: i64) -> Result<Vec<(String, i64)>> {
+        // SQLite reads a negative LIMIT as "no limit", so a caller passing one through
+        // from arithmetic would silently get the whole vocabulary instead of a page.
+        let limit = limit.max(0);
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT value_text, COUNT(DISTINCT file_path) AS n FROM document_fields \
              WHERE field = ? GROUP BY value_text ORDER BY n DESC, value_text ASC LIMIT ?",
@@ -1237,6 +1240,16 @@ mod tests {
         assert_eq!(limited.len(), 2);
         // The most common values survive truncation.
         assert_eq!(limited[0].1, 2);
+    }
+
+    #[tokio::test]
+    async fn count_by_field_clamps_a_negative_limit() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+        // SQLite reads a negative LIMIT as "unbounded", so an unclamped negative would
+        // silently return the whole vocabulary instead of nothing.
+        assert!(db.count_by_field("type", -1).await.unwrap().is_empty());
+        assert!(db.count_by_field("type", 0).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -692,17 +692,17 @@ async fn backfill_document_metadata(
 /// Run the indexing pipeline, recording start/finish in [`INDEX_STATUS`].
 ///
 /// The body lives in `run_index_inner` so that every exit path — including the `?`
-/// early returns scattered through it — funnels through exactly one `finish` call.
-/// Without that, a run that failed partway would stay marked in-flight forever, and
-/// "is it indexing?" would answer yes until the process restarted.
+/// early returns scattered through it — funnels through one `finish` call. The
+/// [`RunGuard`] covers the paths that skip even that: a panic (which `tokio::spawn`
+/// catches at the task boundary, leaving the process alive) or a cancelled future.
 pub async fn run_index(config: &ResolvedConfig, full: bool, trigger: Trigger) -> Result<()> {
     let mode = RunMode::from_full(full);
-    INDEX_STATUS.begin(mode, trigger);
+    let run = INDEX_STATUS.begin(mode, trigger);
 
     let result = run_index_inner(config, full, trigger).await;
 
     match &result {
-        Ok(()) => INDEX_STATUS.finish(None),
+        Ok(()) => run.finish(None),
         Err(e) => {
             // The failure path needs a terminal log line of its own. A run that simply
             // stops emitting is indistinguishable from one still working, which is the
@@ -713,7 +713,7 @@ pub async fn run_index(config: &ResolvedConfig, full: bool, trigger: Trigger) ->
                 "Indexing run failed: {:#}",
                 e
             );
-            INDEX_STATUS.finish(Some(format!("{e:#}")));
+            run.finish(Some(format!("{e:#}")));
         }
     }
 

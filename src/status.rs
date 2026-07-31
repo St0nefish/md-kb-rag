@@ -46,6 +46,9 @@ pub enum RunMode {
 }
 
 impl RunMode {
+    /// Every variant, so state-set metrics can emit a 0 for the inactive ones.
+    pub const ALL: [Self; 2] = [Self::Full, Self::Incremental];
+
     pub fn from_full(full: bool) -> Self {
         if full { Self::Full } else { Self::Incremental }
     }
@@ -74,6 +77,9 @@ pub enum Trigger {
 }
 
 impl Trigger {
+    /// Every variant, so state-set metrics can emit a 0 for the inactive ones.
+    pub const ALL: [Self; 4] = [Self::Cli, Self::Startup, Self::Webhook, Self::WriteTool];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cli => "cli",
@@ -103,6 +109,16 @@ pub enum Phase {
 }
 
 impl Phase {
+    /// Every variant, so state-set metrics can emit a 0 for the inactive ones.
+    pub const ALL: [Self; 6] = [
+        Self::Starting,
+        Self::Discovering,
+        Self::Scanning,
+        Self::Embedding,
+        Self::Backfilling,
+        Self::RemovingOrphans,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Starting => "starting",
@@ -220,6 +236,9 @@ pub struct StatusSnapshot {
 
 #[derive(Debug)]
 struct Current {
+    /// Monotonic run identity. A guard only retires the run it was issued for, so a
+    /// stale guard dropping late cannot cancel the run that superseded it.
+    generation: u64,
     mode: RunMode,
     trigger: Trigger,
     phase: Phase,
@@ -236,6 +255,8 @@ struct Current {
 struct Inner {
     current: Option<Current>,
     last: Option<LastRun>,
+    /// Incremented by every `begin`, so each run has a distinct identity.
+    generation: u64,
     runs_total: u64,
     runs_failed: u64,
     last_success_unix: Option<i64>,
@@ -269,9 +290,20 @@ impl IndexStatus {
     }
 
     /// Mark a run as started, discarding any stale in-flight record.
-    pub fn begin(&self, mode: RunMode, trigger: Trigger) {
-        self.with(|inner| {
+    ///
+    /// Returns a guard that retires the run when dropped. Holding the guard is what
+    /// makes "in flight" honest: a run that panics or whose future is cancelled skips
+    /// every explicit `finish` call in its path, and would otherwise stay marked
+    /// in-flight until the process restarted — reporting "still working" for a run that
+    /// died is worse than reporting nothing.
+    #[must_use = "the returned guard retires the run when dropped; binding it to `_` \
+                  ends the run immediately"]
+    pub fn begin(&self, mode: RunMode, trigger: Trigger) -> RunGuard<'_> {
+        let generation = self.with(|inner| {
+            inner.generation = inner.generation.wrapping_add(1);
+            let generation = inner.generation;
             inner.current = Some(Current {
+                generation,
                 mode,
                 trigger,
                 phase: Phase::Starting,
@@ -283,7 +315,14 @@ impl IndexStatus {
                 chunks_total: 0,
                 counters: RunCounters::default(),
             });
+            generation
         });
+
+        RunGuard {
+            status: self,
+            generation,
+            armed: true,
+        }
     }
 
     pub fn set_phase(&self, phase: Phase) {
@@ -337,13 +376,17 @@ impl IndexStatus {
         });
     }
 
-    /// Retire the in-flight run into `last_run`.
+    /// Retire the in-flight run into `last_run`, if it is still the run identified by
+    /// `generation`.
     ///
-    /// `error` is `None` for success. Called from exactly one place — the wrapper around
-    /// `run_index`'s body — so no early return can leave a run looking eternally
-    /// in-flight, which would be a worse lie than reporting nothing at all.
-    pub fn finish(&self, error: Option<String>) {
+    /// `error` is `None` for success. Reached only through [`RunGuard`]. Idempotent, and
+    /// generation-checked: a guard whose run was already superseded by a later `begin`
+    /// does nothing, so a late drop cannot retire someone else's run.
+    fn finish_run(&self, generation: u64, error: Option<String>) {
         self.with(|inner| {
+            if inner.current.as_ref().map(|c| c.generation) != Some(generation) {
+                return;
+            }
             let Some(cur) = inner.current.take() else {
                 return;
             };
@@ -408,6 +451,99 @@ impl IndexStatus {
     }
 }
 
+/// Query-string keys whose values are scrubbed by [`redact_error`].
+const SECRET_QUERY_KEYS: [&str; 6] = ["api-key", "api_key", "apikey", "key", "token", "password"];
+
+/// Scrub credentials out of an error message before it is served over HTTP.
+///
+/// Error text reaching `/status` comes from `anyhow`-wrapped Qdrant and sqlx failures,
+/// and the Qdrant client renders its full connection URL on a transport error. There is
+/// no separate `qdrant.api_key` setting, so the only way to authenticate against a
+/// secured Qdrant is to embed the credential in `QDRANT_URL` — which put it one failed
+/// connection away from the response body. Worse, a payload-index failure is recorded
+/// once and served on every request for the life of the process, turning a momentary
+/// blip into a standing leak.
+///
+/// [`crate::git::redact_url`] handles `scheme://token@host` userinfo, which is why git
+/// errors were already safe; this additionally scrubs `?api-key=` style query
+/// parameters, the form Qdrant Cloud uses.
+pub fn redact_error(msg: &str) -> String {
+    let mut out = crate::git::redact_url(msg);
+
+    // Scrub `key=value` pairs wherever they appear, not only after a `?` — error text
+    // wraps and reformats URLs, so anchoring on URL structure would miss cases.
+    let lower = out.to_lowercase();
+    let mut replacements: Vec<(usize, usize)> = Vec::new();
+    for key in SECRET_QUERY_KEYS {
+        let needle = format!("{key}=");
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(&needle) {
+            let start = from + pos;
+            // Require a delimiter before the key so `monkey=` does not match `key=`.
+            let preceded_ok = start == 0
+                || !lower.as_bytes()[start - 1].is_ascii_alphanumeric()
+                    && lower.as_bytes()[start - 1] != b'_'
+                    && lower.as_bytes()[start - 1] != b'-';
+            let value_start = start + needle.len();
+            if preceded_ok && value_start < out.len() {
+                let value_end = out[value_start..]
+                    .find(|c: char| c == '&' || c == '"' || c == '\'' || c.is_whitespace())
+                    .map(|i| value_start + i)
+                    .unwrap_or(out.len());
+                if value_end > value_start {
+                    replacements.push((value_start, value_end));
+                }
+            }
+            from = value_start.min(lower.len());
+        }
+    }
+
+    // Apply right-to-left so earlier offsets stay valid.
+    replacements.sort_unstable_by_key(|(start, _)| std::cmp::Reverse(*start));
+    for (start, end) in replacements {
+        if out.is_char_boundary(start) && out.is_char_boundary(end) {
+            out.replace_range(start..end, "***");
+        }
+    }
+
+    out
+}
+
+/// Reason recorded when a run's guard drops without an explicit outcome.
+pub const ABORTED_REASON: &str =
+    "run ended without reporting an outcome (panicked, or its future was cancelled)";
+
+/// Keeps a run marked in-flight for exactly as long as it is running.
+///
+/// Every path out of an indexing run — normal return, `?`, panic-unwind, future
+/// cancellation — drops this guard, so the "indexing" flag cannot survive the work it
+/// describes. `tokio::spawn` catches panics at the task boundary, which means a panicked
+/// reindex leaves the process alive; without this guard it would also leave `/status`
+/// claiming a run was still going, with `elapsed_secs` climbing forever.
+#[must_use = "dropping the guard immediately ends the run it represents"]
+pub struct RunGuard<'a> {
+    status: &'a IndexStatus,
+    generation: u64,
+    armed: bool,
+}
+
+impl RunGuard<'_> {
+    /// Retire the run with a known outcome. `None` means success.
+    pub fn finish(mut self, error: Option<String>) {
+        self.armed = false;
+        self.status.finish_run(self.generation, error);
+    }
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.status
+                .finish_run(self.generation, Some(ABORTED_REASON.to_string()));
+        }
+    }
+}
+
 /// Process-wide indexing status. See the module docs for why this is global.
 pub static INDEX_STATUS: LazyLock<IndexStatus> = LazyLock::new(IndexStatus::new);
 
@@ -435,7 +571,7 @@ mod tests {
         let s = IndexStatus::new();
         assert!(!s.snapshot().indexing);
 
-        s.begin(RunMode::Incremental, Trigger::Webhook);
+        let run = s.begin(RunMode::Incremental, Trigger::Webhook);
         assert!(s.snapshot().indexing);
         let snap = s.snapshot();
         assert!(snap.indexing);
@@ -444,7 +580,7 @@ mod tests {
         assert_eq!(cur.trigger, Trigger::Webhook);
         assert_eq!(cur.phase, Phase::Starting);
 
-        s.finish(None);
+        run.finish(None);
         assert!(!s.snapshot().indexing);
         let snap = s.snapshot();
         assert!(snap.current.is_none());
@@ -456,8 +592,8 @@ mod tests {
     #[test]
     fn failed_run_records_error_and_increments_failure_count() {
         let s = IndexStatus::new();
-        s.begin(RunMode::Full, Trigger::Cli);
-        s.finish(Some("qdrant unreachable".into()));
+        let run = s.begin(RunMode::Full, Trigger::Cli);
+        run.finish(Some("qdrant unreachable".into()));
 
         let snap = s.snapshot();
         assert_eq!(snap.runs_total, 1);
@@ -471,7 +607,7 @@ mod tests {
     #[test]
     fn progress_updates_are_visible_mid_run() {
         let s = IndexStatus::new();
-        s.begin(RunMode::Incremental, Trigger::Startup);
+        let _run = s.begin(RunMode::Incremental, Trigger::Startup);
         s.set_phase(Phase::Discovering);
         s.set_files_total(329);
         s.set_phase(Phase::Scanning);
@@ -495,7 +631,7 @@ mod tests {
     #[test]
     fn set_chunks_total_resets_embedded_progress() {
         let s = IndexStatus::new();
-        s.begin(RunMode::Incremental, Trigger::Cli);
+        let _run = s.begin(RunMode::Incremental, Trigger::Cli);
         s.set_chunks_total(10);
         s.add_chunks_embedded(10);
         // A second embedding pass within the same run must not report 20/10.
@@ -517,18 +653,29 @@ mod tests {
     }
 
     #[test]
-    fn finish_without_begin_is_a_noop() {
+    fn a_superseded_guard_cannot_retire_the_live_run() {
         let s = IndexStatus::new();
-        s.finish(Some("stray".into()));
+        let stale = s.begin(RunMode::Full, Trigger::Cli);
+        let live = s.begin(RunMode::Incremental, Trigger::Webhook);
+
+        // The stale guard reports its own run as aborted...
+        stale.finish(Some("this should be ignored".into()));
+        assert!(
+            s.snapshot().indexing,
+            "the live run must survive a superseded guard finishing"
+        );
+        assert_eq!(s.snapshot().runs_total, 0, "no run has actually retired");
+
+        live.finish(None);
         let snap = s.snapshot();
-        assert_eq!(snap.runs_total, 0);
-        assert!(snap.last_run.is_none());
+        assert_eq!(snap.runs_total, 1);
+        assert!(snap.last_run.expect("last run").success);
     }
 
     #[test]
     fn counters_survive_into_last_run() {
         let s = IndexStatus::new();
-        s.begin(RunMode::Incremental, Trigger::Webhook);
+        let run = s.begin(RunMode::Incremental, Trigger::Webhook);
         s.set_counters(RunCounters {
             discovered: 329,
             indexed: 12,
@@ -537,7 +684,7 @@ mod tests {
             orphans_removed: 4,
             ..Default::default()
         });
-        s.finish(None);
+        run.finish(None);
 
         let last = s.snapshot().last_run.expect("last run");
         assert_eq!(last.counters.discovered, 329);
@@ -550,14 +697,19 @@ mod tests {
     #[test]
     fn a_new_run_replaces_stale_in_flight_state() {
         let s = IndexStatus::new();
-        s.begin(RunMode::Full, Trigger::Cli);
+        let stale = s.begin(RunMode::Full, Trigger::Cli);
         s.set_files_total(10);
         // No finish() — simulate a run whose process-level bookkeeping was skipped.
-        s.begin(RunMode::Incremental, Trigger::Webhook);
+        let _fresh = s.begin(RunMode::Incremental, Trigger::Webhook);
+        // The superseded guard drops after its replacement already exists. Generation
+        // checking is what stops its Drop from retiring the run that replaced it —
+        // otherwise a late drop would report the live run as aborted.
+        drop(stale);
 
         let cur = s.snapshot().current.expect("current run");
         assert_eq!(cur.mode, RunMode::Incremental);
         assert_eq!(cur.files_total, 0);
+        assert!(s.snapshot().indexing);
     }
 
     #[test]
@@ -609,14 +761,53 @@ mod tests {
     }
 
     #[test]
+    fn dropping_the_guard_retires_the_run_as_aborted() {
+        let s = IndexStatus::new();
+        {
+            let _run = s.begin(RunMode::Incremental, Trigger::Webhook);
+            s.set_files_total(329);
+            assert!(s.snapshot().indexing);
+            // Guard dropped here without finish() — the shape of a panicked or
+            // cancelled run. tokio::spawn catches the panic, so the process survives
+            // and nothing else would ever clear the flag.
+        }
+
+        let snap = s.snapshot();
+        assert!(
+            !snap.indexing,
+            "a run that died must not keep reporting as in flight"
+        );
+        let last = snap.last_run.expect("last run");
+        assert!(!last.success);
+        assert_eq!(last.error.as_deref(), Some(ABORTED_REASON));
+        assert_eq!(snap.runs_failed, 1);
+        // Work discovered before the abort is still reported.
+        assert_eq!(last.counters.discovered, 329);
+    }
+
+    #[test]
+    fn explicit_finish_wins_over_the_guard_drop() {
+        let s = IndexStatus::new();
+        {
+            let run = s.begin(RunMode::Full, Trigger::Cli);
+            run.finish(None);
+        }
+        // The guard's Drop must not turn a completed run into an aborted one, nor
+        // double-count it.
+        let snap = s.snapshot();
+        assert_eq!(snap.runs_total, 1);
+        assert_eq!(snap.runs_failed, 0);
+        assert!(snap.last_run.expect("last run").success);
+    }
+
+    #[test]
     fn last_success_survives_a_later_failure() {
         let s = IndexStatus::new();
-        s.begin(RunMode::Incremental, Trigger::Webhook);
-        s.finish(None);
+        s.begin(RunMode::Incremental, Trigger::Webhook).finish(None);
         let after_success = s.snapshot().last_success_unix.expect("success timestamp");
 
-        s.begin(RunMode::Incremental, Trigger::Webhook);
-        s.finish(Some("embeddings unreachable".into()));
+        s.begin(RunMode::Incremental, Trigger::Webhook)
+            .finish(Some("embeddings unreachable".into()));
 
         let snap = s.snapshot();
         // The failed run becomes last_run, but the success timestamp must not be
@@ -631,9 +822,60 @@ mod tests {
     fn last_success_is_absent_until_a_run_succeeds() {
         let s = IndexStatus::new();
         assert!(s.snapshot().last_success_unix.is_none());
-        s.begin(RunMode::Full, Trigger::Cli);
-        s.finish(Some("boom".into()));
+        s.begin(RunMode::Full, Trigger::Cli)
+            .finish(Some("boom".into()));
         assert!(s.snapshot().last_success_unix.is_none());
+    }
+
+    #[test]
+    fn redact_error_strips_url_userinfo() {
+        let msg = "Failed to connect to http://apikey:secrettoken@127.0.0.1:6334/: transport error";
+        let out = redact_error(msg);
+        assert!(!out.contains("secrettoken"), "{out}");
+        assert!(!out.contains("apikey:"), "{out}");
+        assert!(out.contains("127.0.0.1:6334"), "host must survive: {out}");
+    }
+
+    #[test]
+    fn redact_error_strips_api_key_query_parameters() {
+        // The Qdrant Cloud auth pattern: there is no separate api_key config field, so
+        // the credential can only live in QDRANT_URL.
+        let msg = "error contacting https://xyz.cloud.qdrant.io:6334/?api-key=abc123def&foo=bar";
+        let out = redact_error(msg);
+        assert!(!out.contains("abc123def"), "{out}");
+        assert!(out.contains("api-key=***"), "{out}");
+        assert!(out.contains("foo=bar"), "unrelated params survive: {out}");
+    }
+
+    #[test]
+    fn redact_error_covers_the_common_secret_key_spellings() {
+        for key in ["api_key", "apikey", "token", "password", "key"] {
+            let out = redact_error(&format!("boom {key}=s3cret trailing"));
+            assert!(!out.contains("s3cret"), "{key} not redacted: {out}");
+            assert!(out.contains("trailing"), "{key} over-consumed: {out}");
+        }
+    }
+
+    #[test]
+    fn redact_error_does_not_match_a_key_suffix() {
+        // `monkey=` ends in `key=` but is not a credential.
+        let out = redact_error("monkey=banana");
+        assert_eq!(out, "monkey=banana");
+    }
+
+    #[test]
+    fn redact_error_leaves_ordinary_messages_alone() {
+        let msg = "no such table: documents";
+        assert_eq!(redact_error(msg), msg);
+    }
+
+    #[test]
+    fn redact_error_handles_multibyte_input() {
+        // Byte offsets are computed on a lowercased copy; a value containing multi-byte
+        // characters must not panic on a non-boundary slice.
+        let out = redact_error("token=café&x=1 — naïve");
+        assert!(!out.contains("café"), "{out}");
+        assert!(out.contains("naïve"), "{out}");
     }
 
     #[test]

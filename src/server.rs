@@ -152,6 +152,11 @@ const MAX_BREAKDOWN_FIELDS: usize = 20;
 const MAX_VALUES_PER_BREAKDOWN: i64 = 50;
 /// Never break these down: they are free text, unique per document by design.
 const BREAKDOWN_EXCLUDED: [&str; 3] = ["title", "description", "file_path"];
+/// Cap on a single reported value's length. Frontmatter values are uncapped at ingest.
+const MAX_VALUE_LEN: usize = 200;
+/// How long a collected status is reused. Short enough that `/status` still reads as
+/// live, long enough that a scrape storm cannot turn into a query storm.
+const STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct StatusState {
@@ -160,6 +165,8 @@ struct StatusState {
     /// Opened on first use rather than at boot, matching how the MCP handler reaches
     /// the state DB — a status request must not be the thing that creates the file.
     state_db: Arc<tokio::sync::OnceCell<crate::state::StateDb>>,
+    /// Last collected response and when, for [`STATUS_CACHE_TTL`] reuse.
+    cache: Arc<tokio::sync::Mutex<Option<(std::time::Instant, StatusResponse)>>>,
 }
 
 impl StatusState {
@@ -222,6 +229,13 @@ pub struct StatusResponse {
     pub breakdown: Vec<FieldBreakdown>,
 }
 
+/// Errors are scrubbed before they reach the wire: the Qdrant client renders its full
+/// connection URL on a transport failure, and with no separate `qdrant.api_key` setting
+/// the only way to authenticate is to embed the credential in `QDRANT_URL`.
+fn store_error(prefix: &str, e: &anyhow::Error) -> String {
+    crate::status::redact_error(&format!("{prefix}: {e:#}"))
+}
+
 /// Gather everything the status views need. Never fails: unreachable stores are
 /// reported as errors inside the response rather than as a failed request.
 async fn collect_status(state: &StatusState) -> StatusResponse {
@@ -229,23 +243,37 @@ async fn collect_status(state: &StatusState) -> StatusResponse {
     let mut breakdown: Vec<FieldBreakdown> = Vec::new();
 
     match state.state_db().await {
-        Err(e) => store.errors.push(format!("state db: {e:#}")),
+        Err(e) => store.errors.push(store_error("state db", &e)),
         Ok(db) => {
             match db.count().await {
                 Ok(n) => store.indexed_files = Some(n),
-                Err(e) => store.errors.push(format!("indexed_files: {e:#}")),
+                Err(e) => store.errors.push(store_error("indexed_files", &e)),
             }
             match db.document_count().await {
                 Ok(n) => store.documents_with_metadata = Some(n),
-                Err(e) => store.errors.push(format!("documents: {e:#}")),
+                Err(e) => store.errors.push(store_error("documents", &e)),
             }
             if let (Some(files), Some(docs)) = (store.indexed_files, store.documents_with_metadata)
             {
-                store.documents_missing_metadata = Some((files - docs).max(0));
+                let missing = files - docs;
+                // Orphan removal always deletes metadata before bookkeeping, so within
+                // one process `documents <= indexed_files` holds by construction. A
+                // negative value means something violated that — most plausibly a CLI
+                // `index` run interleaving with the server's, since REINDEX_LOCK only
+                // serializes within a process. Clamping it to zero would report perfect
+                // health for exactly the corruption this field exists to catch.
+                if missing < 0 {
+                    store.errors.push(format!(
+                        "metadata index has {} more document(s) than the state DB tracks; \
+                         a concurrent CLI index run may have interleaved with the server",
+                        -missing
+                    ));
+                }
+                store.documents_missing_metadata = Some(missing);
             }
 
             match db.field_cardinality().await {
-                Err(e) => store.errors.push(format!("field cardinality: {e:#}")),
+                Err(e) => store.errors.push(store_error("field cardinality", &e)),
                 Ok(fields) => {
                     let selected: Vec<(String, i64)> = fields
                         .into_iter()
@@ -259,16 +287,24 @@ async fn collect_status(state: &StatusState) -> StatusResponse {
                     for (field, distinct) in selected {
                         match db.count_by_field(&field, MAX_VALUES_PER_BREAKDOWN).await {
                             Ok(values) => breakdown.push(FieldBreakdown {
-                                truncated: values.len() as i64 >= MAX_VALUES_PER_BREAKDOWN
-                                    && distinct > MAX_VALUES_PER_BREAKDOWN,
+                                // Compare against what actually came back rather than
+                                // the cap: the two constants happen to be equal, so a
+                                // cap-based test would be dead code that always reads
+                                // false.
+                                truncated: distinct > values.len() as i64,
                                 field,
                                 distinct_values: distinct,
                                 values: values
                                     .into_iter()
-                                    .map(|(value, documents)| ValueCount { value, documents })
+                                    .map(|(value, documents)| ValueCount {
+                                        value: truncate_value(&value),
+                                        documents,
+                                    })
                                     .collect(),
                             }),
-                            Err(e) => store.errors.push(format!("breakdown {field}: {e:#}")),
+                            Err(e) => store
+                                .errors
+                                .push(store_error(&format!("breakdown {field}"), &e)),
                         }
                     }
                 }
@@ -283,11 +319,14 @@ async fn collect_status(state: &StatusState) -> StatusResponse {
                     field: "area".to_string(),
                     values: areas
                         .into_iter()
-                        .map(|(value, documents)| ValueCount { value, documents })
+                        .map(|(value, documents)| ValueCount {
+                            value: truncate_value(&value),
+                            documents,
+                        })
                         .collect(),
                 }),
                 Ok(_) => {}
-                Err(e) => store.errors.push(format!("areas: {e:#}")),
+                Err(e) => store.errors.push(store_error("areas", &e)),
             }
         }
     }
@@ -302,7 +341,7 @@ async fn collect_status(state: &StatusState) -> StatusResponse {
             "collection '{}' does not exist",
             state.config.qdrant.collection
         )),
-        Err(e) => store.errors.push(format!("qdrant: {e:#}")),
+        Err(e) => store.errors.push(store_error("qdrant", &e)),
     }
 
     StatusResponse {
@@ -315,12 +354,46 @@ async fn collect_status(state: &StatusState) -> StatusResponse {
     }
 }
 
+/// Bound a single breakdown value's length.
+///
+/// Nothing caps the length of a frontmatter value at ingest — only the row count is
+/// capped — so one enormous tag would otherwise inflate every subsequent response.
+fn truncate_value(value: &str) -> String {
+    if value.len() <= MAX_VALUE_LEN {
+        return value.to_string();
+    }
+    let mut end = MAX_VALUE_LEN;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
+/// Collect the status, reusing a recent result if one is fresh enough.
+///
+/// One request costs up to ~24 sequential SQLite queries plus a Qdrant round trip, and
+/// nothing about the answer changes meaningfully within a second. The `Mutex` also makes
+/// this single-flight, so a burst collapses into one refresh instead of N concurrent
+/// fan-outs. Prometheus scrapes every 15-60s, so this is free for the intended use.
+async fn cached_status(state: &StatusState) -> StatusResponse {
+    let mut cache = state.cache.lock().await;
+    if let Some((fetched_at, ref cached)) = *cache
+        && fetched_at.elapsed() < STATUS_CACHE_TTL
+    {
+        return cached.clone();
+    }
+
+    let fresh = collect_status(state).await;
+    *cache = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
+}
+
 async fn status_handler(State(state): State<StatusState>) -> Json<StatusResponse> {
-    Json(collect_status(&state).await)
+    Json(cached_status(&state).await)
 }
 
 async fn metrics_handler(State(state): State<StatusState>) -> Response {
-    let status = collect_status(&state).await;
+    let status = cached_status(&state).await;
     let body = render_prometheus(&status);
 
     axum::response::IntoResponse::into_response((
@@ -331,6 +404,25 @@ async fn metrics_handler(State(state): State<StatusState>) -> Response {
         )],
         body,
     ))
+}
+
+/// Build a state-set metric: one sample per possible value, 1 for the active one.
+///
+/// Grafana state timelines and `sum by (label)` queries expect every member of the set
+/// to be present every scrape; emitting only the active one leaves gaps where a zero
+/// belongs.
+fn state_set<'a>(
+    all: impl Iterator<Item = &'a str>,
+    label: &str,
+    active: &str,
+) -> Vec<(String, f64)> {
+    all.map(|value| {
+        (
+            format!("{{{label}=\"{}\"}}", escape_label(value)),
+            if value == active { 1.0 } else { 0.0 },
+        )
+    })
+    .collect()
 }
 
 /// Escape a Prometheus label value: backslash, double quote and newline.
@@ -433,14 +525,18 @@ pub fn render_prometheus(status: &StatusResponse) -> String {
             "gauge",
             &plain(cur.chunks_embedded as f64),
         );
+        // State-set convention: emit every variant each scrape, 1 for the active one and
+        // 0 for the rest. Emitting only the active label leaves the others absent, which
+        // shows up as gaps rather than zeroes in a Grafana state timeline.
         metric(
             "kb_index_current_phase",
-            "1 for the phase the in-flight run is in.",
+            "1 for the phase the in-flight run is in, 0 for every other phase.",
             "gauge",
-            &[(
-                format!("{{phase=\"{}\"}}", escape_label(cur.phase.as_str())),
-                1.0,
-            )],
+            &state_set(
+                crate::status::Phase::ALL.iter().map(|p| p.as_str()),
+                "phase",
+                cur.phase.as_str(),
+            ),
         );
     }
 
@@ -465,21 +561,23 @@ pub fn render_prometheus(status: &StatusResponse) -> String {
         );
         metric(
             "kb_index_last_run_mode",
-            "1 for the mode of the last indexing run.",
+            "1 for the mode of the last indexing run, 0 for every other mode.",
             "gauge",
-            &[(
-                format!("{{mode=\"{}\"}}", escape_label(last.mode.as_str())),
-                1.0,
-            )],
+            &state_set(
+                crate::status::RunMode::ALL.iter().map(|m| m.as_str()),
+                "mode",
+                last.mode.as_str(),
+            ),
         );
         metric(
             "kb_index_last_run_trigger",
-            "1 for what triggered the last indexing run.",
+            "1 for what triggered the last indexing run, 0 for every other trigger.",
             "gauge",
-            &[(
-                format!("{{trigger=\"{}\"}}", escape_label(last.trigger.as_str())),
-                1.0,
-            )],
+            &state_set(
+                crate::status::Trigger::ALL.iter().map(|t| t.as_str()),
+                "trigger",
+                last.trigger.as_str(),
+            ),
         );
         let counter_lines: Vec<(String, f64)> = last
             .counters
@@ -1051,9 +1149,10 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
                 );
             }
             warn!(
-                "SECURITY: bearer token env var '{}' is not set — the MCP endpoint (/mcp) is \
-                 reachable WITHOUT authentication and will serve full document content to any \
-                 caller. Set the env var or restrict network access. \
+                "SECURITY: bearer token env var '{}' is not set — /mcp, /status and /metrics are \
+                 all reachable WITHOUT authentication. /mcp will serve full document content to \
+                 any caller; /status and /metrics expose tag vocabularies, area names and \
+                 document counts. Set the env var or restrict network access. \
                  (allow_unauthenticated is enabled in config)",
                 config.mcp.bearer_token_env
             );
@@ -1109,6 +1208,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         config: Arc::clone(&config),
         qdrant: Arc::clone(&qdrant),
         state_db: Arc::new(tokio::sync::OnceCell::new()),
+        cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let status_router = Router::new()
         .route("/status", axum::routing::get(status_handler))
@@ -1210,17 +1310,18 @@ mod tests {
         s.record_payload_index("tags", None);
         s.record_payload_index("planning.effort", Some("wrong index type".into()));
 
-        s.begin(RunMode::Incremental, Trigger::Webhook);
+        let first = s.begin(RunMode::Incremental, Trigger::Webhook);
         s.set_counters(RunCounters {
             discovered: 329,
             indexed: 12,
             skipped: 317,
             ..Default::default()
         });
-        s.finish(None);
+        first.finish(None);
 
         // A second run, still going, so both halves of the snapshot are exercised.
-        s.begin(RunMode::Full, Trigger::Cli);
+        // The guard stays alive until after the snapshot is taken.
+        let _second = s.begin(RunMode::Full, Trigger::Cli);
         s.set_phase(Phase::Embedding);
         s.set_files_total(329);
         s.set_files_done(329);
@@ -1319,6 +1420,49 @@ mod tests {
     }
 
     #[test]
+    fn state_set_metrics_emit_a_zero_for_inactive_values() {
+        let out = render_prometheus(&sample_status());
+
+        // Every phase present every scrape, so a Grafana state timeline shows an
+        // explicit 0 rather than a gap for the phases that are not running.
+        for phase in crate::status::Phase::ALL {
+            let expected = if phase == crate::status::Phase::Embedding {
+                1.0
+            } else {
+                0.0
+            };
+            assert!(
+                out.contains(&format!(
+                    "kb_index_current_phase{{phase=\"{}\"}} {expected}",
+                    phase.as_str()
+                )),
+                "missing phase {}: {out}",
+                phase.as_str()
+            );
+        }
+        assert!(out.contains(r#"kb_index_last_run_trigger{trigger="cli"} 0"#));
+        assert!(out.contains(r#"kb_index_last_run_trigger{trigger="webhook"} 1"#));
+        assert!(out.contains(r#"kb_index_last_run_mode{mode="full"} 0"#));
+        assert!(out.contains(r#"kb_index_last_run_mode{mode="incremental"} 1"#));
+    }
+
+    #[test]
+    fn breakdown_values_are_length_capped() {
+        let long = "x".repeat(MAX_VALUE_LEN * 3);
+        let out = truncate_value(&long);
+        assert!(out.chars().count() <= MAX_VALUE_LEN + 1, "{}", out.len());
+        assert!(out.ends_with('…'));
+
+        // Short values pass through untouched.
+        assert_eq!(truncate_value("recipe"), "recipe");
+
+        // Truncation must land on a character boundary, not split a multi-byte char.
+        let multibyte = "é".repeat(MAX_VALUE_LEN);
+        let out = truncate_value(&multibyte);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
     fn label_values_are_escaped() {
         assert_eq!(escape_label(r#"a"b"#), r#"a\"b"#);
         assert_eq!(escape_label(r"a\b"), r"a\\b");
@@ -1396,6 +1540,7 @@ mod tests {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
             config,
             state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let status = collect_status(&state).await;
@@ -1445,6 +1590,7 @@ mod tests {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
             config,
             state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let status = collect_status(&state).await;
@@ -1452,6 +1598,79 @@ mod tests {
         assert_eq!(status.store.documents_with_metadata, Some(0));
         assert_eq!(status.store.documents_missing_metadata, Some(3));
         assert!(render_prometheus(&status).contains("kb_documents_missing_metadata 3"));
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_a_metadata_count_inversion_instead_of_clamping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+
+        // More metadata rows than bookkeeping rows. Can only happen if something
+        // violated the ordering guarantee — e.g. a CLI index run interleaving with the
+        // server's, since REINDEX_LOCK only serializes within one process.
+        let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        let fm: std::collections::HashMap<String, serde_json::Value> = match serde_json::json!({"title": "T", "type": "guide"})
+        {
+            serde_json::Value::Object(m) => m.into_iter().collect(),
+            _ => unreachable!(),
+        };
+        for path in ["a.md", "b.md"] {
+            db.upsert_document_metadata(path, &fm, 1700, "h", 1)
+                .await
+                .unwrap();
+        }
+
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config,
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let status = collect_status(&state).await;
+        assert_eq!(status.store.documents_missing_metadata, Some(-2));
+        assert!(
+            status
+                .store
+                .errors
+                .iter()
+                .any(|e| e.contains("more document(s) than the state DB tracks")),
+            "clamping to zero would report perfect health for real corruption: {:?}",
+            status.store.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn status_is_cached_briefly() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+        let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        db.upsert("a.md", "h", 1, "sh").await.unwrap();
+
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config,
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let first = cached_status(&state).await;
+        assert_eq!(first.store.indexed_files, Some(1));
+
+        // A change the cache must not yet reflect: one request costs ~24 queries plus a
+        // Qdrant round trip, so a scrape burst has to collapse into one refresh.
+        db.upsert("b.md", "h", 1, "sh").await.unwrap();
+        let second = cached_status(&state).await;
+        assert_eq!(second.store.indexed_files, Some(1), "served from cache");
+
+        // Expiring the entry brings the new count through.
+        *state.cache.lock().await = None;
+        let third = cached_status(&state).await;
+        assert_eq!(third.store.indexed_files, Some(2));
     }
 
     #[tokio::test]

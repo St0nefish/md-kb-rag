@@ -428,7 +428,11 @@ Both report:
 
 `kb_index_last_success_timestamp_seconds` is the metric worth alerting on: its age answers "is the index actually keeping up", which neither `/health` nor a bare error count can. It is absent until a run succeeds, so an alert on timestamp age will not fire spuriously against a freshly started process.
 
-If a backing store is unreachable, `/status` still answers — the failure is reported in `store.errors` (and counted by `kb_status_errors`) rather than failing the request, so "is it indexing?" stays answerable while Qdrant is down.
+If a backing store is unreachable, `/status` still answers — the failure is reported in `store.errors` (and counted by `kb_status_errors`) rather than failing the request, so "is it indexing?" stays answerable while Qdrant is down. Those error strings are scrubbed of credentials first: the Qdrant client renders its full connection URL on a transport failure, and since there is no separate `qdrant.api_key` setting, an authenticated Qdrant can only be reached by embedding the credential in `QDRANT_URL`.
+
+Responses are cached for 5 seconds and collected single-flight. One request costs roughly two dozen SQLite queries plus a Qdrant round trip, and nothing about the answer changes meaningfully within that window — a scrape burst collapses into one refresh instead of a query storm.
+
+`documents_missing_metadata` can legitimately read negative, and is reported that way rather than clamped. It means the metadata index holds more documents than the state DB tracks, which orphan removal cannot produce on its own — the likely cause is a CLI `index` run interleaving with the server's, since the reindex lock only serializes within one process.
 
 ### Logging
 
