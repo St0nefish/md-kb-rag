@@ -1128,6 +1128,46 @@ mod tests {
         }
     }
 
+    /// The one test that drives the process-global `INDEX_STATUS`.
+    ///
+    /// Every other status test uses a local `IndexStatus`, so nothing here races. If a
+    /// second global-touching test is ever added, both need serializing — `cargo test`
+    /// runs tests in parallel threads within one process.
+    #[tokio::test]
+    async fn run_index_records_a_failed_run_in_the_global_status() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        // Port 1 refuses immediately, so `ensure_collection` fails before discovery and
+        // the run ends in an error without needing any live service.
+        config.qdrant.url = "http://127.0.0.1:1".into();
+
+        let result = run_index(&config, false, Trigger::Cli).await;
+        assert!(result.is_err(), "expected the run to fail");
+
+        // Without this assertion, swapping the Ok/Err arms in `run_index` — reporting a
+        // failed run as a success — passes the entire suite. That would defeat the
+        // point of the feature: `/status` would claim the index is healthy while every
+        // run is failing, and `kb_index_last_success_timestamp_seconds` would keep
+        // advancing so no age-based alert would ever fire.
+        let snap = crate::status::INDEX_STATUS.snapshot();
+        assert!(!snap.indexing, "the run must not still be marked in flight");
+
+        let last = snap.last_run.expect("the failed run must be recorded");
+        assert!(!last.success, "a failed run must not report success");
+        assert_eq!(last.mode, RunMode::Incremental);
+        assert_eq!(last.trigger, Trigger::Cli);
+        assert!(
+            last.error.is_some_and(|e| !e.is_empty()),
+            "the failure needs a reason attached"
+        );
+        assert!(snap.runs_failed >= 1);
+        assert!(
+            snap.last_success_unix.is_none(),
+            "a failing run must not stamp a success timestamp"
+        );
+    }
+
     // -- domain derivation ---------------------------------------------------
 
     #[test]

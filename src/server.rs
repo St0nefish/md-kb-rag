@@ -1648,6 +1648,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_degrades_when_the_state_db_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        // A plain file where a directory component must be, so opening the DB fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let config = status_config(&blocker.join("nested"));
+
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config,
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        // Must degrade, not panic or 500: if this branch regresses into an unwrap,
+        // /status dies on every request the moment the DB path is unwritable — exactly
+        // when you most need it to answer.
+        let status = collect_status(&state).await;
+        assert!(status.store.indexed_files.is_none());
+        assert!(status.breakdown.is_empty());
+        assert!(
+            status.store.errors.iter().any(|e| e.contains("state db")),
+            "the unreachable store must be named: {:?}",
+            status.store.errors
+        );
+        // And it still renders as valid exposition output.
+        assert!(render_prometheus(&status).contains("kb_status_errors"));
+    }
+
+    #[tokio::test]
     async fn breakdown_omits_derived_and_date_fields() {
         let dir = tempfile::tempdir().unwrap();
         let config = status_config(dir.path());

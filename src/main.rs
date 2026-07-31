@@ -453,38 +453,52 @@ async fn main() -> anyhow::Result<()> {
 /// always report idle regardless of what the server is doing. `/status` on the running
 /// server is the place to ask that.
 fn print_status(status: &server::StatusResponse) {
-    println!("Collection:  {}", status.collection);
-    println!("Data path:   {}", status.data_path);
-    println!();
+    let mut out = std::io::stdout().lock();
+    // A write to stdout failing (closed pipe, e.g. `| head`) is not worth an error.
+    let _ = write_status(&mut out, status);
+}
+
+/// Render into any writer, so the branches below are assertable in tests.
+fn write_status(
+    w: &mut impl std::io::Write,
+    status: &server::StatusResponse,
+) -> std::io::Result<()> {
+    writeln!(w, "Collection:  {}", status.collection)?;
+    writeln!(w, "Data path:   {}", status.data_path)?;
+    writeln!(w)?;
 
     let fmt = |n: Option<i64>| n.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
-    println!("Indexed files:  {}", fmt(status.store.indexed_files));
-    println!(
+    writeln!(w, "Indexed files:  {}", fmt(status.store.indexed_files))?;
+    writeln!(
+        w,
         "Documents:      {}",
         fmt(status.store.documents_with_metadata)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "Qdrant points:  {}",
         status
             .store
             .qdrant_points
             .map(|v| v.to_string())
             .unwrap_or_else(|| "?".into())
-    );
+    )?;
 
     match status.store.documents_missing_metadata {
-        Some(n) if n > 0 => {
-            println!("\n{n} file(s) missing metadata — the next index run will backfill them")
-        }
-        Some(n) if n < 0 => println!(
+        Some(n) if n > 0 => writeln!(
+            w,
+            "\n{n} file(s) missing metadata — the next index run will backfill them"
+        )?,
+        Some(n) if n < 0 => writeln!(
+            w,
             "\nWARNING: {} more document(s) than the state DB tracks",
             -n
-        ),
+        )?,
         _ => {}
     }
 
     for b in &status.breakdown {
-        println!("\nBy {}:", b.field);
+        writeln!(w, "\nBy {}:", b.field)?;
         let width = b
             .values
             .iter()
@@ -498,22 +512,25 @@ fn print_status(status: &server::StatusResponse) {
             } else {
                 &v.value
             };
-            println!("  {label:<width$}  {}", v.documents);
+            writeln!(w, "  {label:<width$}  {}", v.documents)?;
         }
         if b.truncated {
-            println!(
+            writeln!(
+                w,
                 "  … {} more value(s) not shown",
                 b.distinct_values - b.values.len() as i64
-            );
+            )?;
         }
     }
 
     if !status.store.errors.is_empty() {
-        println!("\nErrors:");
+        writeln!(w, "\nErrors:")?;
         for e in &status.store.errors {
-            println!("  {e}");
+            writeln!(w, "  {e}")?;
         }
     }
+
+    Ok(())
 }
 
 fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid: bool) {
@@ -556,5 +573,139 @@ fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid:
             println!("{snippet}");
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use server::{FieldBreakdown, StatusResponse, StoreCounts, ValueCount};
+
+    fn render(status: &StatusResponse) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        write_status(&mut buf, status).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn base_status() -> StatusResponse {
+        StatusResponse {
+            uptime_secs: 1.0,
+            collection: "knowledge-base".into(),
+            data_path: "/data".into(),
+            indexing: status::IndexStatus::new().snapshot(),
+            store: StoreCounts {
+                indexed_files: Some(330),
+                documents_with_metadata: Some(330),
+                documents_missing_metadata: Some(0),
+                qdrant_points: Some(2481),
+                errors: vec![],
+            },
+            breakdown: vec![],
+        }
+    }
+
+    #[test]
+    fn status_renders_the_three_store_counts() {
+        let out = render(&base_status());
+        assert!(out.contains("Indexed files:  330"), "{out}");
+        assert!(out.contains("Documents:      330"), "{out}");
+        assert!(out.contains("Qdrant points:  2481"), "{out}");
+        // In sync, so neither divergence line appears.
+        assert!(!out.contains("missing metadata"), "{out}");
+        assert!(!out.contains("WARNING"), "{out}");
+    }
+
+    #[test]
+    fn status_renders_unavailable_counts_as_question_marks() {
+        let mut s = base_status();
+        s.store.qdrant_points = None;
+        s.store.indexed_files = None;
+        let out = render(&s);
+        assert!(out.contains("Indexed files:  ?"), "{out}");
+        assert!(out.contains("Qdrant points:  ?"), "{out}");
+    }
+
+    #[test]
+    fn status_reports_a_metadata_backlog() {
+        let mut s = base_status();
+        s.store.documents_missing_metadata = Some(5);
+        let out = render(&s);
+        assert!(out.contains("5 file(s) missing metadata"), "{out}");
+        assert!(!out.contains("WARNING"), "{out}");
+    }
+
+    #[test]
+    fn status_warns_on_a_metadata_count_inversion() {
+        // Negative means more metadata rows than bookkeeping rows — the direction
+        // orphan removal cannot produce — so it has to read as a warning rather than
+        // as a backlog that will resolve itself on the next run.
+        let mut s = base_status();
+        s.store.documents_missing_metadata = Some(-2);
+        let out = render(&s);
+        assert!(
+            out.contains("WARNING: 2 more document(s) than the state DB tracks"),
+            "{out}"
+        );
+        assert!(!out.contains("missing metadata"), "{out}");
+    }
+
+    #[test]
+    fn status_renders_a_truncated_breakdown_with_a_remainder_line() {
+        let mut s = base_status();
+        s.breakdown = vec![FieldBreakdown {
+            field: "tags".into(),
+            distinct_values: 274,
+            truncated: true,
+            values: (0..50)
+                .map(|i| ValueCount {
+                    value: format!("tag{i}"),
+                    documents: 60 - i,
+                })
+                .collect(),
+        }];
+        let out = render(&s);
+        assert!(out.contains("By tags:"), "{out}");
+        assert!(out.contains("tag0"), "{out}");
+        assert!(
+            out.contains("… 224 more value(s) not shown"),
+            "the remainder must be 274 - 50, so a truncated list is never mistaken \
+             for the whole vocabulary: {out}"
+        );
+    }
+
+    #[test]
+    fn status_labels_the_root_area_rather_than_printing_an_empty_name() {
+        let mut s = base_status();
+        s.breakdown = vec![FieldBreakdown {
+            field: "area".into(),
+            distinct_values: 2,
+            truncated: false,
+            values: vec![
+                ValueCount {
+                    value: "food".into(),
+                    documents: 36,
+                },
+                // Documents at the KB root have no area.
+                ValueCount {
+                    value: String::new(),
+                    documents: 4,
+                },
+            ],
+        }];
+        assert!(render(&s).contains("(root)"));
+    }
+
+    #[test]
+    fn status_lists_backing_store_errors() {
+        let mut s = base_status();
+        s.store.errors = vec!["qdrant: connection refused".into()];
+        let out = render(&s);
+        assert!(out.contains("Errors:"), "{out}");
+        assert!(out.contains("qdrant: connection refused"), "{out}");
+    }
+
+    #[test]
+    fn status_omits_the_error_section_when_everything_is_reachable() {
+        assert!(!render(&base_status()).contains("Errors:"));
     }
 }
