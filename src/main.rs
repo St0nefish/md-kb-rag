@@ -1,5 +1,6 @@
 mod chunk;
 mod config;
+mod document_fields;
 mod embed;
 mod git;
 mod ingest;
@@ -7,6 +8,7 @@ mod mcp;
 mod qdrant;
 mod rerank;
 mod retrieval;
+mod schema;
 mod server;
 mod sparse;
 mod state;
@@ -108,6 +110,11 @@ enum Commands {
     Search(SearchArgs),
     /// Retrieve a document by path from the CLI
     Get(GetArgs),
+    /// Rebuild the document field index from stored frontmatter
+    ///
+    /// Use after changing how frontmatter projects into filterable fields. Reads only
+    /// the state DB — no markdown is re-read, nothing is re-embedded, Qdrant is untouched.
+    ReprojectFields,
 }
 
 #[tokio::main]
@@ -142,7 +149,41 @@ async fn main() -> anyhow::Result<()> {
             let files = ingest::discover_files(data_path, &cfg.indexing)?;
             info!("Validating {} files", files.len());
 
-            let results = validate::validate_all(&files, &cfg.frontmatter, &cfg.validation).await;
+            let schemas = schema::SchemaCache::build(data_path, &cfg.frontmatter);
+            let broken: Vec<_> = schemas.broken_scopes().collect();
+            if !broken.is_empty() {
+                eprintln!("SCHEMA ERRORS ({}):", broken.len());
+                for (scope, reason) in &broken {
+                    eprintln!(
+                        "  {}/{}: {}",
+                        scope.display(),
+                        schema::SCHEMA_FILE_NAME,
+                        reason
+                    );
+                    eprintln!("    -> documents in this scope are frozen and will not be indexed");
+                }
+                eprintln!();
+            }
+
+            // Documents under a broken schema are frozen: the indexer will not touch
+            // them, so validating against the parent's rules would report a reassuring
+            // result for files that are not actually being indexed.
+            let (frozen, live): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
+                let rel = f.strip_prefix(data_path).unwrap_or(f);
+                schemas.is_frozen(rel).is_some()
+            });
+            if !frozen.is_empty() {
+                eprintln!(
+                    "FROZEN ({}): under an invalid schema, not indexed, not validated",
+                    frozen.len()
+                );
+                for f in &frozen {
+                    eprintln!("  {}", f.strip_prefix(data_path).unwrap_or(f).display());
+                }
+                eprintln!();
+            }
+
+            let results = validate::validate_all(&live, data_path, &schemas, &cfg.validation).await;
 
             let mut valid_count = 0;
             let mut invalid_count = 0;
@@ -166,6 +207,11 @@ async fn main() -> anyhow::Result<()> {
             );
 
             let strict = cfg.validation.strict || strict;
+            if strict && !broken.is_empty() {
+                // A broken schema silently loosens validation for a whole subtree,
+                // which is worse than any single invalid document.
+                anyhow::bail!("{} schema file(s) failed to parse", broken.len());
+            }
             if invalid_count > 0 && strict {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
             }
@@ -174,8 +220,16 @@ async fn main() -> anyhow::Result<()> {
             // State DB stats
             let state = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
             let count = state.count().await?;
+            let doc_count = state.document_count().await?;
             let files = state.list_all().await?;
             println!("State DB: {} indexed files", count);
+            println!("Document metadata: {} documents", doc_count);
+            if doc_count < count {
+                println!(
+                    "  ({} file(s) missing metadata — the next index run will backfill them)",
+                    count - doc_count
+                );
+            }
             for f in &files {
                 println!(
                     "  {} (chunks: {}, hash: {}..., at: {})",
@@ -202,6 +256,14 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+        }
+        Commands::ReprojectFields => {
+            // No lock: this runs in its own process, so an in-process mutex would be
+            // uncontended and meaningless. Safety comes from `reproject_all_fields`
+            // re-reading each document inside the transaction that rewrites it.
+            let state = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
+            let count = state.reproject_all_fields().await?;
+            println!("Reprojected filterable fields for {} document(s)", count);
         }
         Commands::Health { port } => {
             let port = port.unwrap_or(cfg.mcp.port);

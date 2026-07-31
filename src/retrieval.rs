@@ -8,6 +8,7 @@ use crate::{
     embed::QueryEmbedder,
     qdrant::{RetrievalStore, SearchResult},
     rerank::Reranker,
+    state::{DocumentIndex, DocumentQuery, DocumentQueryResult},
 };
 
 /// Upper bound on the number of indexed file paths to fetch for fuzzy
@@ -17,6 +18,26 @@ pub const MAX_INDEXED_PATHS_FOR_FUZZY: u64 = 10_000;
 pub const FUZZY_SUGGESTION_COUNT: usize = 3;
 
 /// Dependencies needed by the shared retrieval functions.
+/// Dependencies for document listing.
+///
+/// Deliberately separate from [`RetrievalDeps`] rather than a third generic parameter
+/// on it: `search` and `get_document` never touch the metadata index, and widening
+/// their deps struct would ripple through every construction site and mock.
+pub struct DocumentIndexDeps<'a, D: DocumentIndex> {
+    pub index: &'a D,
+}
+
+/// List documents by metadata, with no embedding call and no vector search.
+///
+/// Unlike [`search`], this is exhaustive and deterministic: the result carries the
+/// total number of matches so a caller can always detect truncation.
+pub async fn list_documents<D: DocumentIndex>(
+    deps: &DocumentIndexDeps<'_, D>,
+    query: &DocumentQuery,
+) -> anyhow::Result<DocumentQueryResult> {
+    deps.index.query_documents(query).await
+}
+
 pub struct RetrievalDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub embed_client: &'a E,
     pub qdrant: &'a Q,
@@ -143,6 +164,11 @@ pub(crate) enum ResolveErr {
     Other(String),
 }
 
+/// Strip a leading separator so a caller can address the knowledge-base root as `/`.
+pub(crate) fn kb_root_relative(raw: &str) -> &str {
+    raw.trim_start_matches('/')
+}
+
 /// Resolve a user-supplied path against the data directory, applying the
 /// path-traversal and file-type security checks.
 pub(crate) fn resolve_within_data(
@@ -152,7 +178,15 @@ pub(crate) fn resolve_within_data(
 ) -> Result<PathBuf, ResolveErr> {
     let requested = PathBuf::from(raw);
     let resolved = if requested.is_absolute() {
-        requested
+        // A leading `/` is ambiguous: it could be a real filesystem path (accepted
+        // historically) or the caller treating the knowledge-base root as `/`, which is
+        // the natural reading since callers cannot know where the KB lives inside the
+        // container. Try the literal path first, then fall back to KB-root-relative.
+        if requested.exists() {
+            requested
+        } else {
+            data_path.join(kb_root_relative(raw))
+        }
     } else {
         data_path.join(&requested)
     };

@@ -7,7 +7,8 @@ use gray_matter::engine::YAML;
 use gray_matter::{Matter, Pod};
 use serde_json::Value;
 
-use crate::config::{FrontmatterConfig, ValidationConfig};
+use crate::config::ValidationConfig;
+use crate::schema::{self, ResolvedSchema, SchemaCache};
 
 /// A structured, machine-readable description of a single validation failure.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -64,40 +65,186 @@ fn pod_to_value(pod: Pod) -> Value {
 
 pub async fn validate_file(
     path: &Path,
-    config: &FrontmatterConfig,
+    schema: &ResolvedSchema,
     validation: &ValidationConfig,
 ) -> anyhow::Result<(ValidationResult, Option<ValidatedFile>)> {
     let content = tokio::fs::read_to_string(path).await?;
-    validate_content(path, &content, config, validation).await
+    validate_content(path, &content, schema, validation).await
 }
 
-pub async fn validate_content(
-    path: &Path,
-    content: &str,
-    config: &FrontmatterConfig,
-    validation: &ValidationConfig,
-) -> anyhow::Result<(ValidationResult, Option<ValidatedFile>)> {
-    let file_path = path.to_string_lossy().to_string();
-    let mut field_errors: Vec<FieldError> = Vec::new();
+/// Render a value compactly for an error message, without dumping a whole document.
+fn compact_value(value: &Value) -> String {
+    const MAX: usize = 80;
+    let rendered = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if rendered.chars().count() > MAX {
+        let truncated: String = rendered.chars().take(MAX).collect();
+        format!("{truncated}…")
+    } else {
+        rendered
+    }
+}
 
+/// Parse frontmatter and body, applying schema defaults, without validating.
+///
+/// Split out from [`validate_content`] because that function deliberately returns no
+/// frontmatter when validation fails — metadata backfill needs the parsed fields for
+/// documents that were indexed under whatever rules applied at the time, regardless of
+/// whether they satisfy today's rules.
+pub(crate) fn parse_frontmatter(
+    content: &str,
+    schema: &ResolvedSchema,
+) -> (HashMap<String, Value>, String) {
+    let (mut frontmatter, body) = parse_frontmatter_raw(content);
+    apply_defaults(&mut frontmatter, schema);
+    (frontmatter, body)
+}
+
+/// Parse frontmatter and body with no schema involvement at all.
+pub(crate) fn parse_frontmatter_raw(content: &str) -> (HashMap<String, Value>, String) {
     let matter = Matter::<YAML>::new();
     let parsed = matter.parse(content);
 
-    // Parse frontmatter fields
     let mut frontmatter: HashMap<String, Value> = HashMap::new();
-
     if let Some(Pod::Hash(map)) = parsed.data {
         for (k, v) in map {
             frontmatter.insert(k, pod_to_value(v));
         }
     }
 
-    // Apply defaults for missing fields
-    for (key, default_val) in &config.defaults {
-        frontmatter
-            .entry(key.clone())
-            .or_insert_with(|| Value::String(default_val.clone()));
+    (frontmatter, parsed.content)
+}
+
+/// Fill in schema-declared defaults for fields the document omitted.
+pub(crate) fn apply_defaults(frontmatter: &mut HashMap<String, Value>, schema: &ResolvedSchema) {
+    for (path, def) in &schema.fields {
+        let Some(default) = &def.default else {
+            continue;
+        };
+        if schema::get_by_dotpath(frontmatter, path).is_none() {
+            schema::set_by_dotpath(frontmatter, path, default.clone());
+        }
     }
+}
+
+/// Check parsed frontmatter against a resolved schema.
+///
+/// Separate from [`validate_content`] so a schema change can be dry-run against the
+/// frontmatter already stored in the metadata index, without re-reading any documents.
+pub fn validate_frontmatter(
+    frontmatter: &HashMap<String, Value>,
+    schema: &ResolvedSchema,
+) -> Vec<FieldError> {
+    let mut field_errors: Vec<FieldError> = Vec::new();
+
+    // One pass over the resolved schema, dispatching per field definition. Field paths
+    // may be nested (`planning.prep_minutes`), so lookups go through dot-path access.
+    for (field, def) in &schema.fields {
+        let value = schema::get_by_dotpath(frontmatter, field);
+
+        // An empty string satisfies "present" for lookup purposes but not for the
+        // required check — matching the pre-cascade behavior exactly.
+        let empty_string = value.and_then(Value::as_str) == Some("");
+        let absent = matches!(value, None | Some(Value::Null));
+
+        if absent || empty_string {
+            if def.required {
+                field_errors.push(FieldError {
+                    field: field.clone(),
+                    rule: "required".into(),
+                    message: format!("Missing required frontmatter field: '{}'", field),
+                    got: None,
+                    expected: None,
+                });
+            }
+            if absent {
+                // A genuinely absent field has nothing to type- or value-check.
+                continue;
+            }
+            // An empty string that IS present still gets checked below: the old
+            // validator ran it against the allowed set and reported a value error,
+            // and skipping that here would silently accept documents it rejected.
+        }
+
+        let Some(value) = value else {
+            continue;
+        };
+
+        if let Some(ty) = def.ty {
+            if let Err(reason) = schema::check_type(ty, value) {
+                field_errors.push(FieldError {
+                    field: field.clone(),
+                    rule: "type_mismatch".into(),
+                    message: format!("field '{}': {}", field, reason),
+                    got: Some(compact_value(value)),
+                    expected: None,
+                });
+                // A wrong-typed value cannot be meaningfully checked against a value
+                // set or an object's key list.
+                continue;
+            }
+
+            if ty == schema::FieldType::Object
+                && !def.open
+                && let Some(map) = value.as_object()
+            {
+                for key in map.keys() {
+                    let child = format!("{}.{}", field, key);
+                    if !schema.fields.contains_key(&child) {
+                        field_errors.push(FieldError {
+                            field: child.clone(),
+                            rule: "closed_object".into(),
+                            message: format!(
+                                "field '{}' is not declared, and '{}' does not allow undeclared keys",
+                                child, field
+                            ),
+                            got: None,
+                            expected: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // A field whose type was never declared keeps the pre-cascade value-checking
+        // semantics: only strings and string array elements are checked, everything
+        // else is exempt. Explicitly declared enum/list fields get the strict check.
+        let value_check = match def.ty {
+            None => schema::check_values_lenient(value, def.values.as_deref()),
+            Some(_) => def
+                .values
+                .as_ref()
+                .map_or(Ok(()), |permitted| schema::check_values(value, permitted)),
+        };
+
+        if let Some(permitted) = &def.values
+            && let Err(reason) = value_check
+        {
+            field_errors.push(FieldError {
+                field: field.clone(),
+                rule: "allowed_value".into(),
+                message: format!("field '{}': {}", field, reason),
+                got: Some(compact_value(value)),
+                expected: Some(permitted.clone()),
+            });
+        }
+    }
+
+    field_errors
+}
+
+pub async fn validate_content(
+    path: &Path,
+    content: &str,
+    schema: &ResolvedSchema,
+    validation: &ValidationConfig,
+) -> anyhow::Result<(ValidationResult, Option<ValidatedFile>)> {
+    let file_path = path.to_string_lossy().to_string();
+    let mut field_errors: Vec<FieldError> = Vec::new();
+
+    let (frontmatter, body) = parse_frontmatter(content, schema);
 
     if !validation.enabled {
         let result = ValidationResult {
@@ -106,81 +253,10 @@ pub async fn validate_content(
             errors: vec![],
             field_errors: vec![],
         };
-        return Ok((
-            result,
-            Some(ValidatedFile {
-                frontmatter,
-                body: parsed.content,
-            }),
-        ));
+        return Ok((result, Some(ValidatedFile { frontmatter, body })));
     }
 
-    // Check required fields
-    for field in &config.required {
-        let missing = !frontmatter.contains_key(field)
-            || matches!(frontmatter.get(field), Some(Value::Null))
-            || frontmatter.get(field).and_then(|v| v.as_str()) == Some("");
-        if missing {
-            field_errors.push(FieldError {
-                field: field.clone(),
-                rule: "required".into(),
-                message: format!("Missing required frontmatter field: '{}'", field),
-                got: None,
-                expected: None,
-            });
-        }
-    }
-
-    // Check allowed values for fields that are present
-    for (field, allowed_values) in &config.allowed {
-        if let Some(value) = frontmatter.get(field) {
-            match value {
-                Value::String(s) => {
-                    if !allowed_values.contains(s) {
-                        let expected_list = allowed_values.join(", ");
-                        field_errors.push(FieldError {
-                            field: field.clone(),
-                            rule: "allowed_value".into(),
-                            message: format!(
-                                "field '{}' has value '{}', expected one of: {}",
-                                field, s, expected_list
-                            ),
-                            got: Some(s.clone()),
-                            expected: Some(allowed_values.clone()),
-                        });
-                    }
-                }
-                Value::Array(arr) => {
-                    // For list-valued fields, check each element against the allowed set
-                    for elem in arr {
-                        if let Value::String(s) = elem
-                            && !allowed_values.contains(s)
-                        {
-                            let expected_list = allowed_values.join(", ");
-                            field_errors.push(FieldError {
-                                field: field.clone(),
-                                rule: "allowed_value".into(),
-                                message: format!(
-                                    "field '{}' has value '{}', expected one of: {}",
-                                    field, s, expected_list
-                                ),
-                                got: Some(s.clone()),
-                                expected: Some(allowed_values.clone()),
-                            });
-                        }
-                    }
-                }
-                // Non-string, non-array values: skip enforcement (not a closed-set scenario)
-                _ => {
-                    tracing::warn!(
-                        field = %field,
-                        "allowed check: skipping enforcement on non-string/non-array value"
-                    );
-                }
-            }
-        }
-        // Field absent: no error — presence is governed by `required`, not `allowed`
-    }
+    field_errors.extend(validate_frontmatter(&frontmatter, schema));
 
     // Run lint command if configured
     if let Some(lint_cmd) = &validation.lint_command
@@ -230,10 +306,7 @@ pub async fn validate_content(
     };
 
     let validated_file = if valid {
-        Some(ValidatedFile {
-            frontmatter,
-            body: parsed.content,
-        })
+        Some(ValidatedFile { frontmatter, body })
     } else {
         None
     };
@@ -243,17 +316,20 @@ pub async fn validate_content(
 
 pub async fn validate_all(
     files: &[PathBuf],
-    config: &FrontmatterConfig,
+    data_path: &Path,
+    schemas: &SchemaCache,
     validation: &ValidationConfig,
 ) -> Vec<(ValidationResult, Option<ValidatedFile>)> {
     let mut set = JoinSet::new();
 
     for (i, file) in files.iter().enumerate() {
         let file = file.clone();
-        let config = config.clone();
+        // Each file validates against the schema governing its own directory.
+        let rel = file.strip_prefix(data_path).unwrap_or(&file).to_path_buf();
+        let schema = schemas.resolve_for(&rel).clone();
         let validation = validation.clone();
         set.spawn(async move {
-            let pair = match validate_file(&file, &config, &validation).await {
+            let pair = match validate_file(&file, &schema, &validation).await {
                 Ok(pair) => pair,
                 Err(e) => {
                     let msg = format!("Failed to read or parse file: {}", e);
@@ -292,6 +368,17 @@ pub async fn validate_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::FrontmatterConfig;
+    use crate::schema::SchemaFile;
+
+    /// Route a legacy `FrontmatterConfig` fixture through the backward-compat adapter.
+    ///
+    /// Every pre-cascade test below runs against the adapted schema rather than the
+    /// config directly, which makes the whole existing suite a golden master proving
+    /// a deployment with no `.kb-schema.yaml` behaves exactly as it did.
+    fn as_schema(config: &FrontmatterConfig) -> ResolvedSchema {
+        ResolvedSchema::from_config(config)
+    }
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -323,10 +410,13 @@ mod tests {
     async fn valid_frontmatter() {
         let content = "---\ntitle: Test\ntype: guide\n---\n# Hello\nBody text";
         let f = write_temp(content);
-        let (result, validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config())
-                .await
-                .unwrap();
+        let (result, validated) = validate_file(
+            f.path(),
+            &as_schema(&default_fm_config()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         assert!(result.valid);
         assert!(result.errors.is_empty());
         let vf = validated.unwrap();
@@ -345,10 +435,13 @@ mod tests {
     async fn missing_required_field() {
         let content = "---\ntitle: Test\n---\nBody";
         let f = write_temp(content);
-        let (result, validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config())
-                .await
-                .unwrap();
+        let (result, validated) = validate_file(
+            f.path(),
+            &as_schema(&default_fm_config()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         assert!(!result.valid);
         assert!(result.errors.iter().any(|e| e.contains("type")));
         assert!(validated.is_none());
@@ -358,9 +451,13 @@ mod tests {
     async fn no_frontmatter() {
         let content = "# Just markdown\nNo frontmatter here";
         let f = write_temp(content);
-        let (result, _) = validate_file(f.path(), &default_fm_config(), &default_val_config())
-            .await
-            .unwrap();
+        let (result, _) = validate_file(
+            f.path(),
+            &as_schema(&default_fm_config()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         assert!(!result.valid);
         assert_eq!(result.errors.len(), 2); // missing title and type
     }
@@ -369,9 +466,13 @@ mod tests {
     async fn defaults_applied() {
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
-        let (_, validated) = validate_file(f.path(), &default_fm_config(), &default_val_config())
-            .await
-            .unwrap();
+        let (_, validated) = validate_file(
+            f.path(),
+            &as_schema(&default_fm_config()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         let vf = validated.unwrap();
         assert_eq!(
             vf.frontmatter.get("status").unwrap().as_str().unwrap(),
@@ -383,14 +484,17 @@ mod tests {
     async fn validate_content_matches_validate_file() {
         let content = "---\ntitle: Test\ntype: guide\n---\n# Hello\nBody text";
         let f = write_temp(content);
-        let (file_result, file_validated) =
-            validate_file(f.path(), &default_fm_config(), &default_val_config())
-                .await
-                .unwrap();
+        let (file_result, file_validated) = validate_file(
+            f.path(),
+            &as_schema(&default_fm_config()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         let (content_result, content_validated) = validate_content(
             f.path(),
             content,
-            &default_fm_config(),
+            &as_schema(&default_fm_config()),
             &default_val_config(),
         )
         .await
@@ -410,7 +514,7 @@ mod tests {
         let (result, validated) = validate_content(
             f.path(),
             content,
-            &default_fm_config(),
+            &as_schema(&default_fm_config()),
             &default_val_config(),
         )
         .await
@@ -427,7 +531,7 @@ mod tests {
         let (_, validated) = validate_content(
             f.path(),
             content,
-            &default_fm_config(),
+            &as_schema(&default_fm_config()),
             &default_val_config(),
         )
         .await
@@ -440,11 +544,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_defaults_create_their_parent_object() {
+        let schema: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  planning:\n    type: object\n    fields:\n      effort:\n        default: medium\n",
+        )
+        .unwrap();
+        let resolved = ResolvedSchema::default().merged_with_for_test(&schema, "s");
+
+        let (fm, _body) = parse_frontmatter("---\ntitle: X\n---\nBody", &resolved);
+
+        assert_eq!(
+            fm["planning"]["effort"],
+            serde_json::json!("medium"),
+            "a dot-path default must create the intermediate object"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_objects_reject_undeclared_keys() {
+        let schema: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  planning:\n    type: object\n    open: false\n    fields:\n      effort:\n        type: text\n",
+        )
+        .unwrap();
+        let resolved = ResolvedSchema::default().merged_with_for_test(&schema, "s");
+
+        let (result, _) = validate_content(
+            Path::new("d.md"),
+            "---\nplanning:\n  effort: low\n  typo_key: x\n---\nBody",
+            &resolved,
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.valid);
+        let err = result
+            .field_errors
+            .iter()
+            .find(|e| e.rule == "closed_object")
+            .expect("undeclared key inside a closed object must be reported");
+        assert_eq!(err.field, "planning.typo_key");
+    }
+
+    #[tokio::test]
+    async fn open_objects_permit_undeclared_keys() {
+        let schema: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  planning:\n    type: object\n    fields:\n      effort:\n        type: text\n",
+        )
+        .unwrap();
+        let resolved = ResolvedSchema::default().merged_with_for_test(&schema, "s");
+
+        let (result, _) = validate_content(
+            Path::new("d.md"),
+            "---\nplanning:\n  effort: low\n  extra: x\n---\nBody",
+            &resolved,
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.valid, "containers are open by default");
+    }
+
+    #[tokio::test]
+    async fn an_empty_string_counts_as_missing_for_required() {
+        let (result, _) = validate_content(
+            Path::new("d.md"),
+            "---\ntitle: \"\"\ntype: guide\n---\nBody",
+            &as_schema(&default_fm_config()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.valid);
+        assert!(
+            result
+                .field_errors
+                .iter()
+                .any(|e| e.field == "title" && e.rule == "required")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_string_is_still_checked_against_a_closed_set() {
+        // The pre-cascade validator reported an allowed_value error here; treating an
+        // empty string purely as "missing" would silently accept it on a non-required
+        // field, which is a behavior regression for config-only deployments.
+        let (result, _) = validate_content(
+            Path::new("d.md"),
+            "---\ntitle: T\ntype: guide\nstatus: \"\"\n---\nBody",
+            &as_schema(&fm_config_with_allowed()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result
+                .field_errors
+                .iter()
+                .any(|e| e.field == "status" && e.rule == "allowed_value"),
+            "expected an allowed_value error, got: {:?}",
+            result.field_errors
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_allowed_fields_still_exempt_non_strings() {
+        // The old validator only checked strings and string array elements; numbers and
+        // booleans passed untouched. A config-only deployment must not start failing.
+        let (result, _) = validate_content(
+            Path::new("d.md"),
+            "---\ntitle: T\ntype: guide\nstatus: 42\n---\nBody",
+            &as_schema(&fm_config_with_allowed()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !result.field_errors.iter().any(|e| e.field == "status"),
+            "a numeric value in an `allowed` field was exempt before and must stay exempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_all_reports_unreadable_files_rather_than_dropping_them() {
+        // A file deleted between discovery and validation must surface as an explicit
+        // failure, not silently vanish from the report.
+        let good = write_temp("---\ntitle: Good\ntype: guide\n---\nBody");
+        let files = vec![
+            good.path().to_path_buf(),
+            std::path::PathBuf::from("/nonexistent/gone.md"),
+        ];
+        let schemas = SchemaCache::from_config_only(&default_fm_config());
+
+        let results = validate_all(&files, Path::new("/"), &schemas, &default_val_config()).await;
+
+        assert_eq!(results.len(), 2, "every input yields a result");
+        let failed = results
+            .iter()
+            .find(|(r, _)| !r.valid)
+            .expect("the unreadable file must be reported");
+        assert!(
+            failed.0.field_errors.iter().any(|e| e.rule == "io"),
+            "expected an io rule, got: {:?}",
+            failed.0.field_errors
+        );
+    }
+
+    #[tokio::test]
     async fn validate_all_mixed() {
         let good = write_temp("---\ntitle: Good\ntype: guide\n---\nBody");
         let bad = write_temp("---\ntitle: Bad\n---\nMissing type");
         let files = vec![good.path().to_path_buf(), bad.path().to_path_buf()];
-        let results = validate_all(&files, &default_fm_config(), &default_val_config()).await;
+        let schemas = SchemaCache::from_config_only(&default_fm_config());
+        let results = validate_all(&files, Path::new("/"), &schemas, &default_val_config()).await;
         assert_eq!(results.len(), 2);
         assert!(results[0].0.valid);
         assert!(!results[1].0.valid);
@@ -459,7 +715,7 @@ mod tests {
             strict: false,
             lint_command: Some(vec!["true".into()]),
         };
-        let (result, _) = validate_file(f.path(), &default_fm_config(), &val_config)
+        let (result, _) = validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
             .await
             .unwrap();
         assert!(result.valid);
@@ -475,9 +731,10 @@ mod tests {
             strict: false,
             lint_command: Some(vec!["false".into()]),
         };
-        let (result, validated) = validate_file(f.path(), &default_fm_config(), &val_config)
-            .await
-            .unwrap();
+        let (result, validated) =
+            validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
+                .await
+                .unwrap();
         assert!(!result.valid);
         assert!(
             result
@@ -504,7 +761,7 @@ mod tests {
                 "--".into(),
             ]),
         };
-        let (result, _) = validate_file(f.path(), &default_fm_config(), &val_config)
+        let (result, _) = validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
             .await
             .unwrap();
         assert!(result.valid, "errors: {:?}", result.errors);
@@ -519,7 +776,7 @@ mod tests {
             strict: false,
             lint_command: Some(vec![]),
         };
-        let (result, _) = validate_file(f.path(), &default_fm_config(), &val_config)
+        let (result, _) = validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
             .await
             .unwrap();
         assert!(result.valid);
@@ -562,10 +819,13 @@ mod tests {
         // "type" present but value not in the allowed set
         let content = "---\ntitle: Test\ntype: invalid-type\n---\nBody";
         let f = write_temp(content);
-        let (result, validated) =
-            validate_file(f.path(), &fm_config_with_allowed(), &default_val_config())
-                .await
-                .unwrap();
+        let (result, validated) = validate_file(
+            f.path(),
+            &as_schema(&fm_config_with_allowed()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         assert!(!result.valid);
         assert!(validated.is_none());
 
@@ -586,10 +846,13 @@ mod tests {
     async fn allowed_value_valid_passes() {
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
-        let (result, validated) =
-            validate_file(f.path(), &fm_config_with_allowed(), &default_val_config())
-                .await
-                .unwrap();
+        let (result, validated) = validate_file(
+            f.path(),
+            &as_schema(&fm_config_with_allowed()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         assert!(result.valid, "errors: {:?}", result.errors);
         assert!(validated.is_some());
         assert!(result.field_errors.is_empty());
@@ -601,9 +864,13 @@ mod tests {
         // No defaults configured in this fixture either, so it is simply absent.
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
-        let (result, _) = validate_file(f.path(), &fm_config_with_allowed(), &default_val_config())
-            .await
-            .unwrap();
+        let (result, _) = validate_file(
+            f.path(),
+            &as_schema(&fm_config_with_allowed()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         assert!(
             result.field_errors.iter().all(|e| e.field != "status"),
             "absent allowed-field 'status' should not produce an error"
@@ -616,9 +883,13 @@ mod tests {
         // A required-field violation should appear in both errors and field_errors
         let content = "---\ntitle: Test\n---\nBody"; // missing 'type'
         let f = write_temp(content);
-        let (result, _) = validate_file(f.path(), &fm_config_with_allowed(), &default_val_config())
-            .await
-            .unwrap();
+        let (result, _) = validate_file(
+            f.path(),
+            &as_schema(&fm_config_with_allowed()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
         assert!(!result.valid);
 
         // Every field_error message must appear verbatim in errors

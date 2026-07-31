@@ -2,7 +2,6 @@
 title: Deploying with Docker Compose
 description: Step-by-step guide to deploying services with Docker Compose on a Linux host.
 type: guide
-domain: infrastructure
 tags:
   - docker
   - deployment
