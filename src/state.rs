@@ -711,6 +711,79 @@ impl StateDb {
 
         Ok(row.0)
     }
+
+    /// Fields worth breaking down, with how many distinct values each takes,
+    /// widest document coverage first.
+    ///
+    /// Two decisions matter here, and both are in SQL because a caller filtering
+    /// afterwards would get the wrong rows:
+    ///
+    /// - `max_distinct` bounds *value* cardinality. A field with three values
+    ///   (`status`) is a useful histogram; one with several hundred is noise.
+    /// - Ordering is by how many documents carry the field, not by how many values it
+    ///   takes. A scoped schema can declare twenty fields that apply to one folder;
+    ///   ordering by value count floats all of them above `type` and `status`, and the
+    ///   fields that describe the whole knowledge base fall off the end of `limit`.
+    pub async fn breakdown_fields(
+        &self,
+        max_distinct: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        // SQLite reads a negative LIMIT as "no limit".
+        let limit = limit.max(0);
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT field, COUNT(DISTINCT value_text) AS n, COUNT(DISTINCT file_path) AS docs \
+             FROM document_fields GROUP BY field HAVING n <= ? \
+             ORDER BY docs DESC, n DESC, field ASC LIMIT ?",
+        )
+        .bind(max_distinct)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(f, n, _docs)| (f, n)).collect())
+    }
+
+    /// Document counts per value of `field`, most common first.
+    ///
+    /// Counts distinct documents rather than rows: multi-valued fields such as `tags`
+    /// store one row per value, so a `COUNT(*)` here would be counting projections
+    /// rather than documents the moment a field ever repeats within one document.
+    pub async fn count_by_field(&self, field: &str, limit: i64) -> Result<Vec<(String, i64)>> {
+        // SQLite reads a negative LIMIT as "no limit", so a caller passing one through
+        // from arithmetic would silently get the whole vocabulary instead of a page.
+        let limit = limit.max(0);
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT value_text, COUNT(DISTINCT file_path) AS n FROM document_fields \
+             WHERE field = ? GROUP BY value_text ORDER BY n DESC, value_text ASC LIMIT ?",
+        )
+        .bind(field)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Document counts per top-level directory, derived from stored paths.
+    ///
+    /// Deliberately sourced from the metadata index rather than a directory walk: this
+    /// answers "what has actually been indexed", which is the question a status report
+    /// is for. A directory present on disk but absent here is precisely the discrepancy
+    /// worth seeing.
+    pub async fn area_counts(&self) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT CASE WHEN instr(file_path, '/') > 0 \
+                         THEN substr(file_path, 1, instr(file_path, '/') - 1) \
+                         ELSE '' END AS area, \
+                    COUNT(*) AS n \
+             FROM documents GROUP BY area ORDER BY n DESC, area ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
 }
 
 /// The `documents` column backing a promoted field, if it is one.
@@ -1121,6 +1194,247 @@ mod tests {
         .fetch_all(&db.pool)
         .await
         .unwrap()
+    }
+
+    /// Frontmatter with a chosen type, area-agnostic, plus two tags.
+    fn doc_frontmatter(doc_type: &str, tags: &[&str]) -> HashMap<String, Value> {
+        let json = serde_json::json!({
+            "title": "T",
+            "type": doc_type,
+            "tags": tags,
+        });
+        match json {
+            Value::Object(map) => map.into_iter().collect(),
+            _ => unreachable!(),
+        }
+    }
+
+    async fn seed_breakdown_corpus(db: &StateDb) {
+        for (path, ty, tags) in [
+            ("food/recipes/a.md", "recipe", vec!["dinner", "quick"]),
+            ("food/recipes/b.md", "recipe", vec!["dinner"]),
+            ("food/plans/c.md", "project", vec!["quick"]),
+            ("sysadmin/d.md", "guide", vec!["docker"]),
+            ("top-level.md", "guide", vec![]),
+        ] {
+            db.upsert_document_metadata(path, &doc_frontmatter(ty, &tags), 1700, "h", 1)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn count_by_field_counts_documents_per_value() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+
+        let by_type = db.count_by_field("type", 50).await.unwrap();
+        assert_eq!(
+            by_type,
+            vec![
+                ("guide".to_string(), 2),
+                ("recipe".to_string(), 2),
+                ("project".to_string(), 1),
+            ],
+            "ordered by count desc, then value asc for a stable report"
+        );
+
+        // `tags` stores one row per value, so this is the case where counting rows
+        // instead of distinct documents would go wrong.
+        let by_tag = db.count_by_field("tags", 50).await.unwrap();
+        assert_eq!(by_tag.iter().find(|(v, _)| v == "dinner").unwrap().1, 2);
+        assert_eq!(by_tag.iter().find(|(v, _)| v == "quick").unwrap().1, 2);
+        assert_eq!(by_tag.iter().find(|(v, _)| v == "docker").unwrap().1, 1);
+    }
+
+    #[tokio::test]
+    async fn count_by_field_respects_the_limit() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+
+        let limited = db.count_by_field("type", 2).await.unwrap();
+        assert_eq!(limited.len(), 2);
+        // The most common values survive truncation.
+        assert_eq!(limited[0].1, 2);
+    }
+
+    #[tokio::test]
+    async fn count_by_field_clamps_a_negative_limit() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+        // SQLite reads a negative LIMIT as "unbounded", so an unclamped negative would
+        // silently return the whole vocabulary instead of nothing.
+        assert!(db.count_by_field("type", -1).await.unwrap().is_empty());
+        assert!(db.count_by_field("type", 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn count_by_field_is_empty_for_an_unknown_field() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+        assert!(db.count_by_field("nope", 50).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_reports_distinct_value_counts() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+
+        let cards: HashMap<String, i64> = db
+            .breakdown_fields(50, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(cards.get("type"), Some(&3));
+        // dinner, quick, docker
+        assert_eq!(cards.get("tags"), Some(&3));
+        // `title`/`description` are promoted to columns on `documents` and never
+        // projected into `document_fields`, so the highest-cardinality free-text fields
+        // cannot reach a breakdown at all.
+        assert_eq!(cards.get("title"), None);
+        assert_eq!(cards.get("description"), None);
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_excludes_high_cardinality_fields_in_sql() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+
+        // `type` and `tags` each take 3 distinct values. With the ceiling at 2, both
+        // drop — the filter is applied in SQL, not by the caller.
+        let fields: Vec<String> = db
+            .breakdown_fields(2, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(!fields.contains(&"type".to_string()), "{fields:?}");
+        assert!(!fields.contains(&"tags".to_string()), "{fields:?}");
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_limit_keeps_usable_fields_not_the_widest() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+        // A field far too wide to be a useful histogram.
+        for i in 0..40 {
+            let fm: HashMap<String, Value> = match serde_json::json!({
+                "title": "T", "type": "guide", "serial": format!("sn-{i}")
+            }) {
+                Value::Object(m) => m.into_iter().collect(),
+                _ => unreachable!(),
+            };
+            db.upsert_document_metadata(&format!("wide/{i}.md"), &fm, 1700, "h", 1)
+                .await
+                .unwrap();
+        }
+
+        // Rows come back richest-first, so an unfiltered `ORDER BY n DESC LIMIT 1`
+        // would return `serial` — and every reportable field would be lost to the cap.
+        let fields: Vec<String> = db
+            .breakdown_fields(10, 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert_eq!(fields.len(), 1);
+        assert!(
+            !fields.contains(&"serial".to_string()),
+            "the 40-value field must not consume the only slot: {fields:?}"
+        );
+        // `tags` and `type` both take 3 values and tie; either is a usable histogram.
+        assert!(
+            fields[0] == "tags" || fields[0] == "type",
+            "expected a low-cardinality field, got {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_orders_by_document_coverage_not_value_count() {
+        let (db, _dir) = test_db().await;
+        // `type` covers every document with few values; a scoped field covers a handful
+        // of documents with many. Ordering by value count would float the scoped field
+        // above the one that describes the whole corpus.
+        for i in 0..30 {
+            let mut fm: HashMap<String, Value> = match serde_json::json!({"title": "T", "type": "guide"})
+            {
+                Value::Object(m) => m.into_iter().collect(),
+                _ => unreachable!(),
+            };
+            if i < 5 {
+                fm.insert("scoped".into(), Value::String(format!("v{i}")));
+            }
+            db.upsert_document_metadata(&format!("d{i}.md"), &fm, 1700, "h", 1)
+                .await
+                .unwrap();
+        }
+
+        let fields: Vec<String> = db
+            .breakdown_fields(500, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert_eq!(
+            fields.first().map(String::as_str),
+            Some("type"),
+            "the field covering every document must lead: {fields:?}"
+        );
+        assert!(fields.contains(&"scoped".to_string()), "{fields:?}");
+    }
+
+    #[tokio::test]
+    async fn breakdown_fields_clamps_a_negative_limit() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+        assert!(db.breakdown_fields(50, -1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn area_counts_group_by_top_level_directory() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+
+        let areas = db.area_counts().await.unwrap();
+        assert_eq!(
+            areas,
+            vec![
+                ("food".to_string(), 3),
+                ("".to_string(), 1),
+                ("sysadmin".to_string(), 1),
+            ],
+            "a document at the KB root has no area and must not be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregates_are_empty_on_a_fresh_database() {
+        let (db, _dir) = test_db().await;
+        assert!(db.breakdown_fields(50, 50).await.unwrap().is_empty());
+        assert!(db.area_counts().await.unwrap().is_empty());
+        assert!(db.count_by_field("type", 50).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregates_follow_document_deletion() {
+        let (db, _dir) = test_db().await;
+        seed_breakdown_corpus(&db).await;
+        db.delete_document("food/recipes/a.md").await.unwrap();
+
+        let by_type: HashMap<String, i64> = db
+            .count_by_field("type", 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(by_type.get("recipe"), Some(&1));
+
+        let areas: HashMap<String, i64> = db.area_counts().await.unwrap().into_iter().collect();
+        assert_eq!(areas.get("food"), Some(&2));
     }
 
     #[tokio::test]

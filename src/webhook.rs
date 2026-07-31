@@ -244,7 +244,9 @@ pub async fn handle_webhook(
             let task = tokio::spawn(async move {
                 let _guard = guard; // hold for the duration of the reindex
                 info!("Webhook triggered incremental reindex");
-                if let Err(e) = ingest::run_index(&config, false).await {
+                if let Err(e) =
+                    ingest::run_index(&config, false, crate::status::Trigger::Webhook).await
+                {
                     error!("Reindex failed: {:#}", e);
                 }
             });

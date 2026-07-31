@@ -12,6 +12,7 @@ mod schema;
 mod server;
 mod sparse;
 mod state;
+mod status;
 mod validate;
 mod webhook;
 
@@ -20,6 +21,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tracing::info;
+
+/// Default tracing filter when `RUST_LOG` is unset.
+///
+/// `rmcp` logs three INFO lines per MCP request — session initialized, stream
+/// terminated, serve finished — which on an actively used server buries the indexing
+/// pipeline's own output entirely. Its warnings and errors (including tool-call
+/// failures) still come through at `warn`.
+const DEFAULT_LOG_FILTER: &str = "info,rmcp=warn";
 
 fn print_component(name: &str, c: &server::ComponentHealth) {
     if let Some(ref err) = c.error {
@@ -99,7 +108,17 @@ enum Commands {
         strict: bool,
     },
     /// Print collection stats and state DB info
-    Status,
+    Status {
+        /// Emit the same JSON the server's /status endpoint returns
+        ///
+        /// Conflicts with --files rather than silently losing to it: the two ask for
+        /// different things, and quietly ignoring one is worse than refusing both.
+        #[arg(long, conflicts_with = "files")]
+        json: bool,
+        /// List every indexed file instead of aggregate counts
+        #[arg(long)]
+        files: bool,
+    },
     /// Check if the server is healthy
     Health {
         /// Port to check (defaults to config mcp.port)
@@ -119,11 +138,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    status::init_process_start();
+
     tracing_subscriber::fmt()
+        // Logs to stderr, data to stdout. `fmt()` defaults to stdout, which corrupted
+        // every `--json` mode — a single startup log line ahead of the payload is
+        // enough to make the output unparseable. Docker captures both streams, so
+        // `docker logs` is unaffected.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|e| {
-                eprintln!("Warning: invalid RUST_LOG value ({e}); defaulting to info");
-                "info".into()
+                if std::env::var_os("RUST_LOG").is_some() {
+                    eprintln!("Warning: invalid RUST_LOG value ({e}); using the default filter");
+                }
+                DEFAULT_LOG_FILTER.into()
             }),
         )
         .init();
@@ -142,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(parent)
                     .context("Failed to create directory for state DB")?;
             }
-            ingest::run_index(&cfg, full).await?;
+            ingest::run_index(&cfg, full, status::Trigger::Cli).await?;
         }
         Commands::Validate { strict } => {
             let data_path = Path::new(cfg.data_path());
@@ -216,46 +244,34 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{} file(s) failed validation in strict mode", invalid_count);
             }
         }
-        Commands::Status => {
-            // State DB stats
-            let state = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
-            let count = state.count().await?;
-            let doc_count = state.document_count().await?;
-            let files = state.list_all().await?;
-            println!("State DB: {} indexed files", count);
-            println!("Document metadata: {} documents", doc_count);
-            if doc_count < count {
-                println!(
-                    "  ({} file(s) missing metadata — the next index run will backfill them)",
-                    count - doc_count
-                );
-            }
-            for f in &files {
-                println!(
-                    "  {} (chunks: {}, hash: {}..., at: {})",
-                    f.file_path,
-                    f.chunk_count,
-                    &f.content_hash[..12.min(f.content_hash.len())],
-                    f.indexed_at
-                );
+        Commands::Status { json, files } => {
+            if files {
+                // The pre-aggregation behavior, now opt-in: one line per document is
+                // unreadable past a few dozen files, which is most knowledge bases.
+                let state = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
+                for f in state.list_all().await? {
+                    println!(
+                        "{} (chunks: {}, hash: {}..., at: {})",
+                        f.file_path,
+                        f.chunk_count,
+                        &f.content_hash[..12.min(f.content_hash.len())],
+                        f.indexed_at
+                    );
+                }
+                return Ok(());
             }
 
-            // Qdrant stats
-            let store = qdrant::QdrantStore::new(&cfg.qdrant)?;
-            match store.collection_info(&cfg.qdrant.collection).await? {
-                Some(points) => {
-                    println!(
-                        "Qdrant collection '{}': {} points",
-                        cfg.qdrant.collection, points
-                    );
-                }
-                None => {
-                    println!(
-                        "Qdrant collection '{}': does not exist",
-                        cfg.qdrant.collection
-                    );
-                }
+            // Same collector the /status endpoint uses, so the two cannot drift.
+            let status =
+                server::collect_status(&server::StatusState::for_cli(std::sync::Arc::new(cfg))?)
+                    .await;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
             }
+
+            print_status(&status);
         }
         Commands::ReprojectFields => {
             // No lock: this runs in its own process, so an in-process mutex would be
@@ -433,6 +449,93 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Human-readable rendering of a status snapshot.
+///
+/// Aggregates rather than enumerating. The in-flight indexing section is deliberately
+/// absent: run state lives in the process doing the work, so a CLI invocation would
+/// always report idle regardless of what the server is doing. `/status` on the running
+/// server is the place to ask that.
+fn print_status(status: &server::StatusResponse) {
+    let mut out = std::io::stdout().lock();
+    // A write to stdout failing (closed pipe, e.g. `| head`) is not worth an error.
+    let _ = write_status(&mut out, status);
+}
+
+/// Render into any writer, so the branches below are assertable in tests.
+fn write_status(
+    w: &mut impl std::io::Write,
+    status: &server::StatusResponse,
+) -> std::io::Result<()> {
+    writeln!(w, "Collection:  {}", status.collection)?;
+    writeln!(w, "Data path:   {}", status.data_path)?;
+    writeln!(w)?;
+
+    let fmt = |n: Option<i64>| n.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+    writeln!(w, "Indexed files:  {}", fmt(status.store.indexed_files))?;
+    writeln!(
+        w,
+        "Documents:      {}",
+        fmt(status.store.documents_with_metadata)
+    )?;
+    writeln!(
+        w,
+        "Qdrant points:  {}",
+        status
+            .store
+            .qdrant_points
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into())
+    )?;
+
+    match status.store.documents_missing_metadata {
+        Some(n) if n > 0 => writeln!(
+            w,
+            "\n{n} file(s) missing metadata — the next index run will backfill them"
+        )?,
+        Some(n) if n < 0 => writeln!(
+            w,
+            "\nWARNING: {} more document(s) than the state DB tracks",
+            -n
+        )?,
+        _ => {}
+    }
+
+    for b in &status.breakdown {
+        writeln!(w, "\nBy {}:", b.field)?;
+        let width = b
+            .values
+            .iter()
+            .map(|v| v.value.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(40);
+        for v in &b.values {
+            let label = if v.value.is_empty() {
+                "(root)"
+            } else {
+                &v.value
+            };
+            writeln!(w, "  {label:<width$}  {}", v.documents)?;
+        }
+        if b.truncated {
+            writeln!(
+                w,
+                "  … {} more value(s) not shown",
+                b.distinct_values - b.values.len() as i64
+            )?;
+        }
+    }
+
+    if !status.store.errors.is_empty() {
+        writeln!(w, "\nErrors:")?;
+        for e in &status.store.errors {
+            writeln!(w, "  {e}")?;
+        }
+    }
+
+    Ok(())
+}
+
 fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid: bool) {
     if results.is_empty() {
         println!("No results found.");
@@ -473,5 +576,139 @@ fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid:
             println!("{snippet}");
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use server::{FieldBreakdown, StatusResponse, StoreCounts, ValueCount};
+
+    fn render(status: &StatusResponse) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        write_status(&mut buf, status).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn base_status() -> StatusResponse {
+        StatusResponse {
+            uptime_secs: 1.0,
+            collection: "knowledge-base".into(),
+            data_path: "/data".into(),
+            indexing: status::IndexStatus::new().snapshot(),
+            store: StoreCounts {
+                indexed_files: Some(330),
+                documents_with_metadata: Some(330),
+                documents_missing_metadata: Some(0),
+                qdrant_points: Some(2481),
+                errors: vec![],
+            },
+            breakdown: vec![],
+        }
+    }
+
+    #[test]
+    fn status_renders_the_three_store_counts() {
+        let out = render(&base_status());
+        assert!(out.contains("Indexed files:  330"), "{out}");
+        assert!(out.contains("Documents:      330"), "{out}");
+        assert!(out.contains("Qdrant points:  2481"), "{out}");
+        // In sync, so neither divergence line appears.
+        assert!(!out.contains("missing metadata"), "{out}");
+        assert!(!out.contains("WARNING"), "{out}");
+    }
+
+    #[test]
+    fn status_renders_unavailable_counts_as_question_marks() {
+        let mut s = base_status();
+        s.store.qdrant_points = None;
+        s.store.indexed_files = None;
+        let out = render(&s);
+        assert!(out.contains("Indexed files:  ?"), "{out}");
+        assert!(out.contains("Qdrant points:  ?"), "{out}");
+    }
+
+    #[test]
+    fn status_reports_a_metadata_backlog() {
+        let mut s = base_status();
+        s.store.documents_missing_metadata = Some(5);
+        let out = render(&s);
+        assert!(out.contains("5 file(s) missing metadata"), "{out}");
+        assert!(!out.contains("WARNING"), "{out}");
+    }
+
+    #[test]
+    fn status_warns_on_a_metadata_count_inversion() {
+        // Negative means more metadata rows than bookkeeping rows — the direction
+        // orphan removal cannot produce — so it has to read as a warning rather than
+        // as a backlog that will resolve itself on the next run.
+        let mut s = base_status();
+        s.store.documents_missing_metadata = Some(-2);
+        let out = render(&s);
+        assert!(
+            out.contains("WARNING: 2 more document(s) than the state DB tracks"),
+            "{out}"
+        );
+        assert!(!out.contains("missing metadata"), "{out}");
+    }
+
+    #[test]
+    fn status_renders_a_truncated_breakdown_with_a_remainder_line() {
+        let mut s = base_status();
+        s.breakdown = vec![FieldBreakdown {
+            field: "tags".into(),
+            distinct_values: 274,
+            truncated: true,
+            values: (0..50)
+                .map(|i| ValueCount {
+                    value: format!("tag{i}"),
+                    documents: 60 - i,
+                })
+                .collect(),
+        }];
+        let out = render(&s);
+        assert!(out.contains("By tags:"), "{out}");
+        assert!(out.contains("tag0"), "{out}");
+        assert!(
+            out.contains("… 224 more value(s) not shown"),
+            "the remainder must be 274 - 50, so a truncated list is never mistaken \
+             for the whole vocabulary: {out}"
+        );
+    }
+
+    #[test]
+    fn status_labels_the_root_area_rather_than_printing_an_empty_name() {
+        let mut s = base_status();
+        s.breakdown = vec![FieldBreakdown {
+            field: "area".into(),
+            distinct_values: 2,
+            truncated: false,
+            values: vec![
+                ValueCount {
+                    value: "food".into(),
+                    documents: 36,
+                },
+                // Documents at the KB root have no area.
+                ValueCount {
+                    value: String::new(),
+                    documents: 4,
+                },
+            ],
+        }];
+        assert!(render(&s).contains("(root)"));
+    }
+
+    #[test]
+    fn status_lists_backing_store_errors() {
+        let mut s = base_status();
+        s.store.errors = vec!["qdrant: connection refused".into()];
+        let out = render(&s);
+        assert!(out.contains("Errors:"), "{out}");
+        assert!(out.contains("qdrant: connection refused"), "{out}");
+    }
+
+    #[test]
+    fn status_omits_the_error_section_when_everything_is_reachable() {
+        assert!(!render(&base_status()).contains("Errors:"));
     }
 }

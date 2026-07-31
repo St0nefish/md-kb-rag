@@ -1204,7 +1204,9 @@ impl KbSearchServer {
         // a reindex we cannot start means a stale index, not lost content.
         match acquire_reindex_lock(self.reindex_lock_timeout).await {
             Some(_guard) => {
-                if let Err(e) = ingest::run_index(config, false).await {
+                if let Err(e) =
+                    ingest::run_index(config, false, crate::status::Trigger::WriteTool).await
+                {
                     error!("Reindex after schema update failed: {:#}", e);
                 }
             }
@@ -2274,13 +2276,15 @@ impl KbSearchServer {
         //    is a stale index, not a lost document — warn rather than fail the call.
         let warning = match acquire_reindex_lock(self.reindex_lock_timeout).await {
             Some(_guard) => {
-                ingest::run_index(config, false).await.map_err(|e| {
-                    error!(
-                        "Reindex after write_document failed for '{}': {:#}",
-                        rel_path, e
-                    );
-                    McpError::internal_error(format!("Reindex failed: {}", e), None)
-                })?;
+                ingest::run_index(config, false, crate::status::Trigger::WriteTool)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Reindex after write_document failed for '{}': {:#}",
+                            rel_path, e
+                        );
+                        McpError::internal_error(format!("Reindex failed: {}", e), None)
+                    })?;
                 None
             }
             None => {

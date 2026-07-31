@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use crate::config::ResolvedEmbeddingConfig;
 
+/// How often `embed_texts` logs progress through a long batch sequence.
+const EMBED_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+
 pub trait EmbedStore: Send + Sync {
     async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
@@ -46,39 +49,73 @@ impl EmbedClient {
         }
     }
 
+    /// Embed one batch, retrying transient failures. Carries no progress reporting —
+    /// see [`Self::embed_texts`] for why that distinction matters.
+    async fn embed_batch(&self, batch: &[String], batch_index: usize) -> Result<Vec<Vec<f32>>> {
+        let response = backoff::future::retry(embed_backoff(), || async {
+            let request = CreateEmbeddingRequestArgs::default()
+                .model(&self.model)
+                .input(EmbeddingInput::StringArray(batch.to_vec()))
+                .build()
+                .map_err(backoff::Error::permanent)?;
+
+            self.client.embeddings().create(request).await.map_err(|e| {
+                if is_retryable(&e) {
+                    tracing::warn!(
+                        batch = batch_index,
+                        texts = batch.len(),
+                        "Transient embedding error, retrying: {e}"
+                    );
+                    backoff::Error::transient(e)
+                } else {
+                    backoff::Error::permanent(e)
+                }
+            })
+        })
+        .await?;
+
+        tracing::debug!(batch = batch_index, texts = batch.len(), "Embedded batch");
+
+        let mut data = response.data;
+        data.sort_by_key(|e| e.index);
+        Ok(data.into_iter().map(|e| e.embedding).collect())
+    }
+
+    /// Embed a corpus, reporting progress as each batch lands.
+    ///
+    /// Indexing calls this and nothing else does. Embedding a whole knowledge base is
+    /// one `await` that can run for minutes, so per-batch reporting is what turns it
+    /// from indistinguishable-from-hung into observable progress.
+    ///
+    /// Query embedding deliberately does **not** route through here: `search` is not
+    /// gated by `REINDEX_LOCK`, so a query served during a reindex would add itself to
+    /// that run's chunk tally and push reported progress past 100%.
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
+        let total = texts.len();
+        let mut last_progress = std::time::Instant::now();
+
         for (batch_index, batch) in texts.chunks(self.batch_size).enumerate() {
-            let response = backoff::future::retry(embed_backoff(), || async {
-                let request = CreateEmbeddingRequestArgs::default()
-                    .model(&self.model)
-                    .input(EmbeddingInput::StringArray(batch.to_vec()))
-                    .build()
-                    .map_err(backoff::Error::permanent)?;
+            all_embeddings.extend(self.embed_batch(batch, batch_index).await?);
 
-                self.client.embeddings().create(request).await.map_err(|e| {
-                    if is_retryable(&e) {
-                        tracing::warn!(
-                            batch = batch_index,
-                            texts = batch.len(),
-                            "Transient embedding error, retrying: {e}"
-                        );
-                        backoff::Error::transient(e)
-                    } else {
-                        backoff::Error::permanent(e)
-                    }
-                })
-            })
-            .await?;
+            // No-op unless an indexing run is in flight.
+            crate::status::INDEX_STATUS.add_chunks_embedded(batch.len() as u64);
 
-            tracing::debug!(batch = batch_index, texts = batch.len(), "Embedded batch");
-
-            let mut data = response.data;
-            data.sort_by_key(|e| e.index);
-
-            for embedding in data {
-                all_embeddings.push(embedding.embedding);
+            let done = all_embeddings.len();
+            if last_progress.elapsed() >= EMBED_PROGRESS_INTERVAL && done < total {
+                let pct = if total > 0 {
+                    (done as f64 / total as f64) * 100.0
+                } else {
+                    100.0
+                };
+                tracing::info!(
+                    embedded = done,
+                    total,
+                    percent = format_args!("{pct:.1}"),
+                    "Embedding progress"
+                );
+                last_progress = std::time::Instant::now();
             }
         }
 
@@ -122,7 +159,10 @@ impl EmbedClient {
     }
 
     pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let results = self.embed_texts(&[query.to_string()]).await?;
+        // Goes straight to `embed_batch`, bypassing `embed_texts`' progress reporting:
+        // searches run concurrently with indexing and must not be counted as indexing
+        // work. See the note on `embed_texts`.
+        let results = self.embed_batch(&[query.to_string()], 0).await?;
         results
             .into_iter()
             .next()
