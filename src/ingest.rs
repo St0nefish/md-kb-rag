@@ -14,8 +14,16 @@ use crate::{
     qdrant::{IndexedField, QdrantPoint, QdrantStore, VectorStore},
     schema::{ResolvedSchema, SchemaCache},
     state::{IndexedFile, StateDb},
+    status::{INDEX_STATUS, Phase, RunMode, Trigger},
     validate,
 };
+
+/// How often a long-running phase emits a progress line.
+///
+/// Time-based rather than every-N-files: what matters is that the log never goes quiet
+/// for long enough that a healthy run looks hung, and file counts say nothing about how
+/// long each one takes.
+const PROGRESS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // File discovery
@@ -375,6 +383,11 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
         file_boundaries.push((start, pf.chunks.len()));
     }
 
+    // Publish the denominator before the call blocks. `embed_texts` reports each batch
+    // as it completes, so `/status` can show real progress through what is by far the
+    // longest phase of a run — on a full re-embed this single await can take minutes.
+    INDEX_STATUS.set_chunks_total(all_texts.len() as u64);
+
     let all_embeddings = embedder
         .embed_texts(&all_texts)
         .await
@@ -494,7 +507,10 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
             continue;
         }
 
-        info!("Indexed {} chunk(s) from: {}", count, pf.file_path);
+        // Per-file at debug: on a full reindex this fires once per document, which
+        // drowns the progress and summary lines that actually answer "is it working?".
+        // The aggregate below carries the same information for a whole batch.
+        debug!(file = %pf.file_path, chunks = *count, "Indexed file");
     }
 
     if bookkeeping_failures > 0 {
@@ -505,9 +521,10 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     }
 
     info!(
-        "Upserted {} total points across {} files",
-        all_texts.len(),
-        pending.len()
+        points = all_texts.len(),
+        files = pending.len(),
+        bookkeeping_failures,
+        "Upserted points"
     );
 
     Ok(())
@@ -672,10 +689,42 @@ async fn backfill_document_metadata(
     filled
 }
 
-pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
+/// Run the indexing pipeline, recording start/finish in [`INDEX_STATUS`].
+///
+/// The body lives in `run_index_inner` so that every exit path — including the `?`
+/// early returns scattered through it — funnels through exactly one `finish` call.
+/// Without that, a run that failed partway would stay marked in-flight forever, and
+/// "is it indexing?" would answer yes until the process restarted.
+pub async fn run_index(config: &ResolvedConfig, full: bool, trigger: Trigger) -> Result<()> {
+    let mode = RunMode::from_full(full);
+    INDEX_STATUS.begin(mode, trigger);
+
+    let result = run_index_inner(config, full, trigger).await;
+
+    match &result {
+        Ok(()) => INDEX_STATUS.finish(None),
+        Err(e) => {
+            // The failure path needs a terminal log line of its own. A run that simply
+            // stops emitting is indistinguishable from one still working, which is the
+            // ambiguity this whole module exists to remove.
+            error!(
+                mode = mode.as_str(),
+                trigger = trigger.as_str(),
+                "Indexing run failed: {:#}",
+                e
+            );
+            INDEX_STATUS.finish(Some(format!("{e:#}")));
+        }
+    }
+
+    result
+}
+
+async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) -> Result<()> {
     let run_start = std::time::Instant::now();
     info!(
         mode = if full { "full" } else { "incremental" },
+        trigger = trigger.as_str(),
         data_path = config.data_path(),
         collection = %config.qdrant.collection,
         "Starting indexing run"
@@ -788,6 +837,7 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
 
     // Offload the synchronous directory walk to a blocking thread so we don't
     // stall the tokio executor on large knowledge bases.
+    INDEX_STATUS.set_phase(Phase::Discovering);
     let indexing_config = config.indexing.clone();
     let walk_path = data_path.clone();
     let discovered =
@@ -796,6 +846,7 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
             .context("File-discovery task panicked")??;
 
     info!("Discovered {} files", discovered.len());
+    INDEX_STATUS.set_files_total(discovered.len() as u64);
 
     // ── Determine which previously-indexed files no longer exist ─────────────
     let all_indexed = state.list_all().await.context("Failed to list state DB")?;
@@ -840,7 +891,24 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
     let mut read_errors = 0usize;
     let mut frozen = 0usize;
 
+    INDEX_STATUS.set_phase(Phase::Scanning);
+    let mut scanned = 0usize;
+    let mut last_progress = std::time::Instant::now();
+
     for path in &discovered {
+        // Counted at the top so the `continue` arms below still advance progress —
+        // a scan that stalls on unreadable files should look like it is moving.
+        scanned += 1;
+        INDEX_STATUS.set_files_done(scanned as u64);
+        if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+            info!(
+                scanned,
+                total = discovered.len(),
+                "Scanning files for changes…"
+            );
+            last_progress = std::time::Instant::now();
+        }
+
         let rel_key = match path.strip_prefix(&data_path) {
             Ok(rel) => rel.to_string_lossy().to_string(),
             Err(_) => {
@@ -906,6 +974,7 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
     // ── Batch embedding & upsert ────────────────────────────────────────────
     let pending_count = pending.len();
     if !pending.is_empty() {
+        INDEX_STATUS.set_phase(Phase::Embedding);
         info!("Embedding chunks for {} changed file(s)…", pending_count);
         upsert_pending(&pending, &embedder, &store, &state, collection).await?;
     }
@@ -914,6 +983,7 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
     let backfilled = if backfill_queue.is_empty() {
         0
     } else {
+        INDEX_STATUS.set_phase(Phase::Backfilling);
         info!(
             "Backfilling document metadata for {} unchanged file(s)",
             backfill_queue.len()
@@ -923,22 +993,37 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
 
     // ── Handle orphaned (deleted) files ──────────────────────────────────────
     if !orphaned.is_empty() {
+        INDEX_STATUS.set_phase(Phase::RemovingOrphans);
         info!("Removing {} orphaned file(s) from index", orphaned.len());
         remove_orphans(&orphaned, &store, &state, collection).await?;
     }
 
     // ── Summary ──────────────────────────────────────────────────────────────
+    let counters = crate::status::RunCounters {
+        discovered: discovered.len() as u64,
+        indexed: pending_count as u64,
+        skipped: skipped as u64,
+        invalid: invalid as u64,
+        empty: empty as u64,
+        read_errors: read_errors as u64,
+        metadata_backfilled: backfilled as u64,
+        frozen_by_broken_schema: frozen as u64,
+        broken_schemas: schemas.broken_scopes().count() as u64,
+        orphans_removed: orphaned.len() as u64,
+    };
+    INDEX_STATUS.set_counters(counters.clone());
+
     info!(
-        discovered = discovered.len(),
-        indexed = pending_count,
-        skipped,
-        invalid,
-        empty,
-        read_errors,
-        metadata_backfilled = backfilled,
-        frozen_by_broken_schema = frozen,
-        broken_schemas = schemas.broken_scopes().count(),
-        orphans_removed = orphaned.len(),
+        discovered = counters.discovered,
+        indexed = counters.indexed,
+        skipped = counters.skipped,
+        invalid = counters.invalid,
+        empty = counters.empty,
+        read_errors = counters.read_errors,
+        metadata_backfilled = counters.metadata_backfilled,
+        frozen_by_broken_schema = counters.frozen_by_broken_schema,
+        broken_schemas = counters.broken_schemas,
+        orphans_removed = counters.orphans_removed,
         elapsed_secs = run_start.elapsed().as_secs_f64(),
         "Indexing run complete"
     );

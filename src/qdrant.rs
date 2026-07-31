@@ -366,23 +366,32 @@ impl QdrantStore {
                 ))
                 .await;
 
-            if let Err(e) = result {
-                // Creating an index that already exists with the same type is a no-op,
-                // so a failure here usually means the declared type changed and Qdrant
-                // is holding an index of the old kind. Dropping and recreating it would
-                // be destructive on a live collection, and failing the whole run because
-                // of one field is worse than proceeding — so warn precisely and carry on.
-                // Deliberate: failing the whole run — and therefore server startup — over
-                // one field is worse than proceeding without its index, and dropping a
-                // live index to recreate it is destructive. But a filter on this field
-                // may now be slow or incomplete, so this is an error, not a warning.
-                error!(
-                    "Could not ensure {:?} index on '{}' in collection '{}': {:#}. \
-                     Filters on this field may be slow or return incomplete results. \
-                     If its declared type changed, delete the payload index in Qdrant \
-                     and reindex.",
-                    kind, indexed.name, collection, e
-                );
+            match result {
+                // Recorded on success too, so a field that recovers on a later run
+                // clears its previous failure instead of looking broken forever.
+                Ok(_) => crate::status::INDEX_STATUS.record_payload_index(&indexed.name, None),
+                Err(e) => {
+                    // Creating an index that already exists with the same type is a no-op,
+                    // so a failure here usually means the declared type changed and Qdrant
+                    // is holding an index of the old kind. Dropping and recreating it would
+                    // be destructive on a live collection, and failing the whole run because
+                    // of one field is worse than proceeding — so warn precisely and carry on.
+                    // Deliberate: failing the whole run — and therefore server startup — over
+                    // one field is worse than proceeding without its index, and dropping a
+                    // live index to recreate it is destructive. But a filter on this field
+                    // may now be slow or incomplete, so this is an error, not a warning.
+                    error!(
+                        "Could not ensure {:?} index on '{}' in collection '{}': {:#}. \
+                         Filters on this field may be slow or return incomplete results. \
+                         If its declared type changed, delete the payload index in Qdrant \
+                         and reindex.",
+                        kind, indexed.name, collection, e
+                    );
+                    // An error! that scrolls out of the log buffer leaves a silently
+                    // degraded filter behind; /status keeps it visible until it is fixed.
+                    crate::status::INDEX_STATUS
+                        .record_payload_index(&indexed.name, Some(format!("{e:#}")));
+                }
             }
         }
 
@@ -391,7 +400,7 @@ impl QdrantStore {
         // Non-fatal for the same reason as the schema-declared indexes above: Qdrant
         // filters correctly without a payload index, just more slowly, so failing
         // startup over one index is worse than proceeding loudly without it.
-        if let Err(e) = self
+        match self
             .client
             .create_field_index(CreateFieldIndexCollectionBuilder::new(
                 collection,
@@ -400,11 +409,15 @@ impl QdrantStore {
             ))
             .await
         {
-            error!(
-                "Could not ensure the integer index on 'mtime' in collection '{}': {:#}. \
-                 Recency filters may be slow until this is resolved.",
-                collection, e
-            );
+            Ok(_) => crate::status::INDEX_STATUS.record_payload_index("mtime", None),
+            Err(e) => {
+                error!(
+                    "Could not ensure the integer index on 'mtime' in collection '{}': {:#}. \
+                     Recency filters may be slow until this is resolved.",
+                    collection, e
+                );
+                crate::status::INDEX_STATUS.record_payload_index("mtime", Some(format!("{e:#}")));
+            }
         }
 
         info!(

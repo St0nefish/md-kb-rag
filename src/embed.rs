@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use crate::config::ResolvedEmbeddingConfig;
 
+/// How often `embed_texts` logs progress through a long batch sequence.
+const EMBED_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+
 pub trait EmbedStore: Send + Sync {
     async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
@@ -49,6 +52,12 @@ impl EmbedClient {
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
+        // Embedding a whole knowledge base is one `await` that can run for minutes.
+        // Reporting per batch is what turns that from indistinguishable-from-hung into
+        // observable progress, both in the logs and on `/status`.
+        let total = texts.len();
+        let mut last_progress = std::time::Instant::now();
+
         for (batch_index, batch) in texts.chunks(self.batch_size).enumerate() {
             let response = backoff::future::retry(embed_backoff(), || async {
                 let request = CreateEmbeddingRequestArgs::default()
@@ -79,6 +88,26 @@ impl EmbedClient {
 
             for embedding in data {
                 all_embeddings.push(embedding.embedding);
+            }
+
+            // No-op unless an indexing run is in flight, so CLI and test callers of
+            // `embed_texts` are unaffected.
+            crate::status::INDEX_STATUS.add_chunks_embedded(batch.len() as u64);
+
+            let done = all_embeddings.len();
+            if last_progress.elapsed() >= EMBED_PROGRESS_INTERVAL && done < total {
+                let pct = if total > 0 {
+                    (done as f64 / total as f64) * 100.0
+                } else {
+                    100.0
+                };
+                tracing::info!(
+                    embedded = done,
+                    total,
+                    percent = format_args!("{pct:.1}"),
+                    "Embedding progress"
+                );
+                last_progress = std::time::Instant::now();
             }
         }
 

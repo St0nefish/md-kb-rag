@@ -12,6 +12,7 @@ mod schema;
 mod server;
 mod sparse;
 mod state;
+mod status;
 mod validate;
 mod webhook;
 
@@ -20,6 +21,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tracing::info;
+
+/// Default tracing filter when `RUST_LOG` is unset.
+///
+/// `rmcp` logs three INFO lines per MCP request — session initialized, stream
+/// terminated, serve finished — which on an actively used server buries the indexing
+/// pipeline's own output entirely. Its warnings and errors (including tool-call
+/// failures) still come through at `warn`.
+const DEFAULT_LOG_FILTER: &str = "info,rmcp=warn";
 
 fn print_component(name: &str, c: &server::ComponentHealth) {
     if let Some(ref err) = c.error {
@@ -119,11 +128,15 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    status::init_process_start();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|e| {
-                eprintln!("Warning: invalid RUST_LOG value ({e}); defaulting to info");
-                "info".into()
+                if std::env::var_os("RUST_LOG").is_some() {
+                    eprintln!("Warning: invalid RUST_LOG value ({e}); using the default filter");
+                }
+                DEFAULT_LOG_FILTER.into()
             }),
         )
         .init();
@@ -142,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(parent)
                     .context("Failed to create directory for state DB")?;
             }
-            ingest::run_index(&cfg, full).await?;
+            ingest::run_index(&cfg, full, status::Trigger::Cli).await?;
         }
         Commands::Validate { strict } => {
             let data_path = Path::new(cfg.data_path());

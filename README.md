@@ -396,6 +396,46 @@ That same first-run revalidation is also when every document's `domain` gets (re
 
 Declared fields get typed Qdrant payload indexes — integer/number/boolean fields get Integer/Float/Bool indexes (enabling range filters) instead of a blanket Keyword index. The same applies to the built-in `mtime` index used by `search`'s recency filters. Index-creation failures are logged as errors but never abort startup or indexing; a filter on an unindexed field still returns correct results, just more slowly. If a field's declared type changed, delete the stale payload index in Qdrant and reindex to pick up the new type.
 
+## Observability
+
+Three HTTP endpoints, with different audiences and different auth:
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `/health` | open | Liveness/readiness. Reports Qdrant and embedding-service reachability only. Returns 503 when either is down. |
+| `/status` | bearer | Full runtime state as JSON. |
+| `/metrics` | bearer | The same data in Prometheus text exposition format. |
+
+`/status` and `/metrics` require the same bearer token as `/mcp` (`MCP_BEARER_TOKEN`), because unlike `/health` they enumerate tag vocabularies, area names and document counts — a readable sketch of the knowledge base's contents. Scrape them with an `authorization` stanza:
+
+```yaml
+scrape_configs:
+  - job_name: md-kb-rag
+    metrics_path: /metrics
+    authorization:
+      credentials: ${MCP_BEARER_TOKEN}
+    static_configs:
+      - targets: ["kb-rag:8001"]
+```
+
+Both report:
+
+- **Indexing state** — whether a run is in flight right now, its phase (`discovering` → `scanning` → `embedding` → `backfilling` → `removing_orphans`), how far through it is, what triggered it (`cli`, `startup`, `webhook`, `write_tool`), and how long it has been going.
+- **Last run** — outcome, duration, error message on failure, and the full per-outcome tallies (`discovered`, `indexed`, `skipped`, `invalid`, `empty`, `read_errors`, `metadata_backfilled`, `frozen_by_broken_schema`, `broken_schemas`, `orphans_removed`).
+- **Store counts** — `indexed_files` (state DB), `documents` (metadata index), and `qdrant_points`. `documents_missing_metadata` is the divergence between the first two; non-zero means the metadata index is behind and the next run will backfill it.
+- **Metadata breakdown** — document counts per value for every low-cardinality indexed field, plus a synthetic `area` field grouping by top-level directory.
+- **Payload index health** — which Qdrant payload indexes are in place and which failed. Failures are non-fatal by design, so this is the only lasting signal that a filter may be slow or incomplete.
+
+`kb_index_last_success_timestamp_seconds` is the metric worth alerting on: its age answers "is the index actually keeping up", which neither `/health` nor a bare error count can. It is absent until a run succeeds, so an alert on timestamp age will not fire spuriously against a freshly started process.
+
+If a backing store is unreachable, `/status` still answers — the failure is reported in `store.errors` (and counted by `kb_status_errors`) rather than failing the request, so "is it indexing?" stays answerable while Qdrant is down.
+
+### Logging
+
+`RUST_LOG` defaults to `info,rmcp=warn`. The `rmcp` demotion matters on an actively used server: the MCP transport logs three INFO lines per request, which otherwise buries the indexing pipeline's output entirely. Its warnings and errors, including tool-call failures, still come through.
+
+Long phases report progress on a 10-second cadence rather than staying silent — a full re-embed is a single API sequence that can run for many minutes, and a run that simply stops logging is indistinguishable from one that is still working. Every run ends with an explicit terminal line on both the success and failure paths.
+
 ## Webhook
 
 POST to `/hooks/reindex` triggers:

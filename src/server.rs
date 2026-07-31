@@ -138,6 +138,471 @@ async fn health_handler(State(state): State<HealthState>) -> (StatusCode, Json<H
     )
 }
 
+// ---------------------------------------------------------------------------
+// Status + metrics
+// ---------------------------------------------------------------------------
+
+/// Fields with more distinct values than this are omitted from the breakdown — a
+/// histogram over `title` is noise, one over `status` is information.
+const MAX_DISTINCT_FOR_BREAKDOWN: i64 = 50;
+/// Cap on how many fields get broken down, so a schema with hundreds of declared
+/// fields cannot turn one scrape into hundreds of queries.
+const MAX_BREAKDOWN_FIELDS: usize = 20;
+/// Cap on values reported per field.
+const MAX_VALUES_PER_BREAKDOWN: i64 = 50;
+/// Never break these down: they are free text, unique per document by design.
+const BREAKDOWN_EXCLUDED: [&str; 3] = ["title", "description", "file_path"];
+
+#[derive(Clone)]
+struct StatusState {
+    config: Arc<ResolvedConfig>,
+    qdrant: Arc<QdrantStore>,
+    /// Opened on first use rather than at boot, matching how the MCP handler reaches
+    /// the state DB — a status request must not be the thing that creates the file.
+    state_db: Arc<tokio::sync::OnceCell<crate::state::StateDb>>,
+}
+
+impl StatusState {
+    async fn state_db(&self) -> anyhow::Result<&crate::state::StateDb> {
+        self.state_db
+            .get_or_try_init(|| async {
+                let path = self.config.state_db_path();
+                crate::state::StateDb::new(Path::new(&path)).await
+            })
+            .await
+    }
+}
+
+/// One value of a field and how many documents carry it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ValueCount {
+    pub value: String,
+    pub documents: i64,
+}
+
+/// Document counts across the values of one field.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FieldBreakdown {
+    pub field: String,
+    pub distinct_values: i64,
+    /// True when `values` was cut short by [`MAX_VALUES_PER_BREAKDOWN`], so a consumer
+    /// never mistakes a truncated list for the whole vocabulary.
+    pub truncated: bool,
+    pub values: Vec<ValueCount>,
+}
+
+/// The three durable counts, which should agree and are worth seeing when they don't.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct StoreCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_files: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents_with_metadata: Option<i64>,
+    /// `indexed_files - documents_with_metadata`. Non-zero means the metadata index is
+    /// behind and the next run will backfill it; this divergence is the single best
+    /// staleness signal the system has, and it used to be reachable only from the CLI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents_missing_metadata: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qdrant_points: Option<u64>,
+    /// Populated when a backing store could not be read. The rest of the response is
+    /// still served: "is it indexing" must stay answerable while Qdrant is down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StatusResponse {
+    pub uptime_secs: f64,
+    pub collection: String,
+    pub data_path: String,
+    pub indexing: crate::status::StatusSnapshot,
+    pub store: StoreCounts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breakdown: Vec<FieldBreakdown>,
+}
+
+/// Gather everything the status views need. Never fails: unreachable stores are
+/// reported as errors inside the response rather than as a failed request.
+async fn collect_status(state: &StatusState) -> StatusResponse {
+    let mut store = StoreCounts::default();
+    let mut breakdown: Vec<FieldBreakdown> = Vec::new();
+
+    match state.state_db().await {
+        Err(e) => store.errors.push(format!("state db: {e:#}")),
+        Ok(db) => {
+            match db.count().await {
+                Ok(n) => store.indexed_files = Some(n),
+                Err(e) => store.errors.push(format!("indexed_files: {e:#}")),
+            }
+            match db.document_count().await {
+                Ok(n) => store.documents_with_metadata = Some(n),
+                Err(e) => store.errors.push(format!("documents: {e:#}")),
+            }
+            if let (Some(files), Some(docs)) = (store.indexed_files, store.documents_with_metadata)
+            {
+                store.documents_missing_metadata = Some((files - docs).max(0));
+            }
+
+            match db.field_cardinality().await {
+                Err(e) => store.errors.push(format!("field cardinality: {e:#}")),
+                Ok(fields) => {
+                    let selected: Vec<(String, i64)> = fields
+                        .into_iter()
+                        .filter(|(name, distinct)| {
+                            *distinct <= MAX_DISTINCT_FOR_BREAKDOWN
+                                && !BREAKDOWN_EXCLUDED.contains(&name.as_str())
+                        })
+                        .take(MAX_BREAKDOWN_FIELDS)
+                        .collect();
+
+                    for (field, distinct) in selected {
+                        match db.count_by_field(&field, MAX_VALUES_PER_BREAKDOWN).await {
+                            Ok(values) => breakdown.push(FieldBreakdown {
+                                truncated: values.len() as i64 >= MAX_VALUES_PER_BREAKDOWN
+                                    && distinct > MAX_VALUES_PER_BREAKDOWN,
+                                field,
+                                distinct_values: distinct,
+                                values: values
+                                    .into_iter()
+                                    .map(|(value, documents)| ValueCount { value, documents })
+                                    .collect(),
+                            }),
+                            Err(e) => store.errors.push(format!("breakdown {field}: {e:#}")),
+                        }
+                    }
+                }
+            }
+
+            // Synthesized rather than projected: `area` is the top-level directory, which
+            // is where `domain` is derived from, so it belongs alongside the real fields.
+            match db.area_counts().await {
+                Ok(areas) if !areas.is_empty() => breakdown.push(FieldBreakdown {
+                    distinct_values: areas.len() as i64,
+                    truncated: false,
+                    field: "area".to_string(),
+                    values: areas
+                        .into_iter()
+                        .map(|(value, documents)| ValueCount { value, documents })
+                        .collect(),
+                }),
+                Ok(_) => {}
+                Err(e) => store.errors.push(format!("areas: {e:#}")),
+            }
+        }
+    }
+
+    match state
+        .qdrant
+        .collection_info(&state.config.qdrant.collection)
+        .await
+    {
+        Ok(Some(points)) => store.qdrant_points = Some(points),
+        Ok(None) => store.errors.push(format!(
+            "collection '{}' does not exist",
+            state.config.qdrant.collection
+        )),
+        Err(e) => store.errors.push(format!("qdrant: {e:#}")),
+    }
+
+    StatusResponse {
+        uptime_secs: crate::status::uptime_secs(),
+        collection: state.config.qdrant.collection.clone(),
+        data_path: state.config.data_path().to_string(),
+        indexing: crate::status::INDEX_STATUS.snapshot(),
+        store,
+        breakdown,
+    }
+}
+
+async fn status_handler(State(state): State<StatusState>) -> Json<StatusResponse> {
+    Json(collect_status(&state).await)
+}
+
+async fn metrics_handler(State(state): State<StatusState>) -> Response {
+    let status = collect_status(&state).await;
+    let body = render_prometheus(&status);
+
+    axum::response::IntoResponse::into_response((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    ))
+}
+
+/// Escape a Prometheus label value: backslash, double quote and newline.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the status snapshot in Prometheus text exposition format (v0.0.4).
+///
+/// Hand-rolled rather than pulling in a metrics crate: every value here is read from
+/// SQLite/Qdrant at scrape time or from an in-memory snapshot, so there is no registry
+/// to maintain and nothing to keep in sync.
+pub fn render_prometheus(status: &StatusResponse) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(4096);
+
+    let mut metric = |name: &str, help: &str, kind: &str, lines: &[(String, f64)]| {
+        let _ = writeln!(s, "# HELP {name} {help}");
+        let _ = writeln!(s, "# TYPE {name} {kind}");
+        for (labels, value) in lines {
+            let _ = writeln!(s, "{name}{labels} {value}");
+        }
+    };
+
+    let plain = |v: f64| vec![(String::new(), v)];
+
+    metric(
+        "kb_uptime_seconds",
+        "Seconds since this process started.",
+        "gauge",
+        &plain(status.uptime_secs),
+    );
+
+    let idx = &status.indexing;
+    metric(
+        "kb_indexing_in_progress",
+        "1 while an indexing run is in flight, 0 otherwise.",
+        "gauge",
+        &plain(if idx.indexing { 1.0 } else { 0.0 }),
+    );
+    metric(
+        "kb_index_runs_total",
+        "Indexing runs completed since process start.",
+        "counter",
+        &plain(idx.runs_total as f64),
+    );
+    metric(
+        "kb_index_runs_failed_total",
+        "Indexing runs that ended in an error since process start.",
+        "counter",
+        &plain(idx.runs_failed as f64),
+    );
+
+    if let Some(ts) = idx.last_success_unix {
+        metric(
+            "kb_index_last_success_timestamp_seconds",
+            "Unix time of the last successful indexing run. Alert on its age.",
+            "gauge",
+            &plain(ts as f64),
+        );
+    }
+
+    if let Some(ref cur) = idx.current {
+        metric(
+            "kb_index_current_elapsed_seconds",
+            "Seconds the in-flight indexing run has been going.",
+            "gauge",
+            &plain(cur.elapsed_secs),
+        );
+        metric(
+            "kb_index_current_files_total",
+            "Files discovered by the in-flight run.",
+            "gauge",
+            &plain(cur.files_total as f64),
+        );
+        metric(
+            "kb_index_current_files_done",
+            "Files scanned so far by the in-flight run.",
+            "gauge",
+            &plain(cur.files_done as f64),
+        );
+        metric(
+            "kb_index_current_chunks_total",
+            "Chunks queued for embedding by the in-flight run.",
+            "gauge",
+            &plain(cur.chunks_total as f64),
+        );
+        metric(
+            "kb_index_current_chunks_embedded",
+            "Chunks embedded so far by the in-flight run.",
+            "gauge",
+            &plain(cur.chunks_embedded as f64),
+        );
+        metric(
+            "kb_index_current_phase",
+            "1 for the phase the in-flight run is in.",
+            "gauge",
+            &[(
+                format!("{{phase=\"{}\"}}", escape_label(cur.phase.as_str())),
+                1.0,
+            )],
+        );
+    }
+
+    if let Some(ref last) = idx.last_run {
+        metric(
+            "kb_index_last_run_timestamp_seconds",
+            "Unix time the last indexing run finished, successful or not.",
+            "gauge",
+            &plain(last.finished_unix as f64),
+        );
+        metric(
+            "kb_index_last_run_duration_seconds",
+            "Wall-clock duration of the last indexing run.",
+            "gauge",
+            &plain(last.duration_secs),
+        );
+        metric(
+            "kb_index_last_run_success",
+            "1 if the last indexing run succeeded, 0 if it failed.",
+            "gauge",
+            &plain(if last.success { 1.0 } else { 0.0 }),
+        );
+        metric(
+            "kb_index_last_run_mode",
+            "1 for the mode of the last indexing run.",
+            "gauge",
+            &[(
+                format!("{{mode=\"{}\"}}", escape_label(last.mode.as_str())),
+                1.0,
+            )],
+        );
+        metric(
+            "kb_index_last_run_trigger",
+            "1 for what triggered the last indexing run.",
+            "gauge",
+            &[(
+                format!("{{trigger=\"{}\"}}", escape_label(last.trigger.as_str())),
+                1.0,
+            )],
+        );
+        let counter_lines: Vec<(String, f64)> = last
+            .counters
+            .as_pairs()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    format!("{{outcome=\"{}\"}}", escape_label(name)),
+                    *value as f64,
+                )
+            })
+            .collect();
+        metric(
+            "kb_index_last_run_files",
+            "Per-outcome file tallies from the last indexing run.",
+            "gauge",
+            &counter_lines,
+        );
+    }
+
+    let failed_indexes = idx
+        .payload_indexes
+        .values()
+        .filter(|v| !matches!(v, crate::status::PayloadIndexState::Ok))
+        .count();
+    metric(
+        "kb_payload_indexes_failed",
+        "Qdrant payload indexes that could not be created. Filters on those fields \
+         may be slow or incomplete.",
+        "gauge",
+        &plain(failed_indexes as f64),
+    );
+    if !idx.payload_indexes.is_empty() {
+        let lines: Vec<(String, f64)> = idx
+            .payload_indexes
+            .iter()
+            .map(|(field, state)| {
+                (
+                    format!("{{field=\"{}\"}}", escape_label(field)),
+                    match state {
+                        crate::status::PayloadIndexState::Ok => 1.0,
+                        crate::status::PayloadIndexState::Failed { .. } => 0.0,
+                    },
+                )
+            })
+            .collect();
+        metric(
+            "kb_payload_index_ok",
+            "1 if the Qdrant payload index for this field is in place, 0 if it failed.",
+            "gauge",
+            &lines,
+        );
+    }
+
+    if let Some(n) = status.store.indexed_files {
+        metric(
+            "kb_indexed_files",
+            "Files tracked in the state DB.",
+            "gauge",
+            &plain(n as f64),
+        );
+    }
+    if let Some(n) = status.store.documents_with_metadata {
+        metric(
+            "kb_documents",
+            "Documents present in the metadata index.",
+            "gauge",
+            &plain(n as f64),
+        );
+    }
+    if let Some(n) = status.store.documents_missing_metadata {
+        metric(
+            "kb_documents_missing_metadata",
+            "Indexed files with no metadata row. Non-zero means the metadata index is \
+             behind and the next run will backfill it.",
+            "gauge",
+            &plain(n as f64),
+        );
+    }
+    if let Some(n) = status.store.qdrant_points {
+        metric(
+            "kb_qdrant_points",
+            "Points (chunks) stored in the Qdrant collection.",
+            "gauge",
+            &plain(n as f64),
+        );
+    }
+    metric(
+        "kb_status_errors",
+        "Backing stores that could not be read while building this response.",
+        "gauge",
+        &plain(status.store.errors.len() as f64),
+    );
+
+    if !status.breakdown.is_empty() {
+        let lines: Vec<(String, f64)> = status
+            .breakdown
+            .iter()
+            .flat_map(|b| {
+                let field = escape_label(&b.field);
+                b.values.iter().map(move |v| {
+                    (
+                        format!(
+                            "{{field=\"{}\",value=\"{}\"}}",
+                            field,
+                            escape_label(&v.value)
+                        ),
+                        v.documents as f64,
+                    )
+                })
+            })
+            .collect();
+        metric(
+            "kb_documents_by_field",
+            "Documents carrying each value of each low-cardinality indexed field.",
+            "gauge",
+            &lines,
+        );
+    }
+
+    s
+}
+
 #[derive(Clone)]
 struct AuthState {
     bearer_token: Option<String>,
@@ -427,7 +892,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         .context("Failed to ensure git repository")?;
         if fresh {
             info!("Fresh clone — running initial full index");
-            ingest::run_index(&config, true)
+            ingest::run_index(&config, true, crate::status::Trigger::Startup)
                 .await
                 .context("Initial index after clone failed")?;
         }
@@ -636,11 +1101,30 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         embed: Arc::clone(&embed_client),
     };
 
+    // `/status` and `/metrics` sit behind the same bearer token as `/mcp`, not open like
+    // `/health`. `/health` answers "is it up" and reveals nothing; these enumerate tag
+    // vocabularies, area names and document counts, which is a readable sketch of the
+    // knowledge base's contents. Prometheus scrapes them with an `authorization` stanza.
+    let status_state = StatusState {
+        config: Arc::clone(&config),
+        qdrant: Arc::clone(&qdrant),
+        state_db: Arc::new(tokio::sync::OnceCell::new()),
+    };
+    let status_router = Router::new()
+        .route("/status", axum::routing::get(status_handler))
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .with_state(status_state)
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            bearer_auth,
+        ));
+
     let mut app = Router::new()
         .route(
             "/health",
             axum::routing::get(health_handler).with_state(health_state),
         )
+        .merge(status_router)
         .merge(mcp_router);
 
     if let Some(secret) = webhook_secret {
@@ -675,6 +1159,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let bind_addr = format!("0.0.0.0:{}", mcp_port);
     info!("Starting server on {}", bind_addr);
     info!("  MCP endpoint: /mcp");
+    info!("  Status endpoints: /status (JSON), /metrics (Prometheus)");
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -714,6 +1199,306 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request, routing::get};
     use tower::ServiceExt;
+
+    // --- status & metrics ---
+
+    /// A status snapshot with a finished run, mid-flight run, and a failed payload index.
+    fn sample_status() -> StatusResponse {
+        use crate::status::{IndexStatus, Phase, RunCounters, RunMode, Trigger};
+
+        let s = IndexStatus::new();
+        s.record_payload_index("tags", None);
+        s.record_payload_index("planning.effort", Some("wrong index type".into()));
+
+        s.begin(RunMode::Incremental, Trigger::Webhook);
+        s.set_counters(RunCounters {
+            discovered: 329,
+            indexed: 12,
+            skipped: 317,
+            ..Default::default()
+        });
+        s.finish(None);
+
+        // A second run, still going, so both halves of the snapshot are exercised.
+        s.begin(RunMode::Full, Trigger::Cli);
+        s.set_phase(Phase::Embedding);
+        s.set_files_total(329);
+        s.set_files_done(329);
+        s.set_chunks_total(2400);
+        s.add_chunks_embedded(600);
+
+        StatusResponse {
+            uptime_secs: 42.0,
+            collection: "knowledge-base".into(),
+            data_path: "/data".into(),
+            indexing: s.snapshot(),
+            store: StoreCounts {
+                indexed_files: Some(329),
+                documents_with_metadata: Some(300),
+                documents_missing_metadata: Some(29),
+                qdrant_points: Some(2481),
+                errors: vec![],
+            },
+            breakdown: vec![FieldBreakdown {
+                field: "type".into(),
+                distinct_values: 2,
+                truncated: false,
+                values: vec![
+                    ValueCount {
+                        value: "reference".into(),
+                        documents: 120,
+                    },
+                    ValueCount {
+                        value: "guide".into(),
+                        documents: 80,
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn prometheus_output_covers_indexing_store_and_breakdown() {
+        let out = render_prometheus(&sample_status());
+
+        // In-flight state — the question that was previously unanswerable.
+        assert!(out.contains("kb_indexing_in_progress 1"));
+        assert!(out.contains("kb_index_current_chunks_embedded 600"));
+        assert!(out.contains("kb_index_current_chunks_total 2400"));
+        assert!(out.contains(r#"kb_index_current_phase{phase="embedding"} 1"#));
+
+        // Last completed run.
+        assert!(out.contains("kb_index_runs_total 1"));
+        assert!(out.contains("kb_index_runs_failed_total 0"));
+        assert!(out.contains("kb_index_last_run_success 1"));
+        assert!(out.contains(r#"kb_index_last_run_trigger{trigger="webhook"} 1"#));
+        assert!(out.contains(r#"kb_index_last_run_files{outcome="discovered"} 329"#));
+        assert!(out.contains(r#"kb_index_last_run_files{outcome="skipped"} 317"#));
+        assert!(out.contains("kb_index_last_success_timestamp_seconds"));
+
+        // Durable counts, including the three-way divergence signal.
+        assert!(out.contains("kb_indexed_files 329"));
+        assert!(out.contains("kb_documents 300"));
+        assert!(out.contains("kb_documents_missing_metadata 29"));
+        assert!(out.contains("kb_qdrant_points 2481"));
+
+        // Payload index health.
+        assert!(out.contains("kb_payload_indexes_failed 1"));
+        assert!(out.contains(r#"kb_payload_index_ok{field="tags"} 1"#));
+        assert!(out.contains(r#"kb_payload_index_ok{field="planning.effort"} 0"#));
+
+        // Metadata breakdown.
+        assert!(out.contains(r#"kb_documents_by_field{field="type",value="reference"} 120"#));
+
+        // Every metric must be declared before use, or Prometheus rejects the scrape.
+        for line in out.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+            let name = line
+                .split(['{', ' '])
+                .next()
+                .expect("metric name")
+                .to_string();
+            assert!(
+                out.contains(&format!("# TYPE {name} ")),
+                "metric {name} emitted without a TYPE declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn prometheus_omits_run_metrics_before_anything_has_run() {
+        let mut status = sample_status();
+        status.indexing = crate::status::IndexStatus::new().snapshot();
+        let out = render_prometheus(&status);
+
+        assert!(out.contains("kb_indexing_in_progress 0"));
+        // No fabricated zero timestamp: absent is different from "succeeded in 1970",
+        // and an alert on timestamp age must not fire on a freshly started process.
+        assert!(!out.contains("kb_index_last_success_timestamp_seconds"));
+        assert!(!out.contains("kb_index_last_run_duration_seconds"));
+        assert!(!out.contains("kb_index_current_phase"));
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        assert_eq!(escape_label(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_label(r"a\b"), r"a\\b");
+        assert_eq!(escape_label("a\nb"), r"a\nb");
+    }
+
+    #[test]
+    fn breakdown_values_with_quotes_stay_parseable() {
+        let mut status = sample_status();
+        status.breakdown[0].values[0].value = "he said \"hi\"\nand left".into();
+        let out = render_prometheus(&status);
+
+        // Tag and type values come from knowledge-base frontmatter, so they are not
+        // guaranteed to be label-safe; an unescaped quote would corrupt the scrape.
+        assert!(out.contains(r#"value="he said \"hi\"\nand left""#));
+        for line in out.lines() {
+            assert!(!line.contains('\n'));
+        }
+    }
+
+    /// A config pointing at a temp state DB and a Qdrant that is not listening.
+    fn status_config(state_dir: &std::path::Path) -> Arc<ResolvedConfig> {
+        Arc::new(ResolvedConfig {
+            source: crate::config::SourceConfig {
+                git_url: None,
+                branch: "master".into(),
+                data_path: Some(state_dir.to_string_lossy().into_owned()),
+                git_token_env: "GIT_PULL_TOKEN".into(),
+            },
+            indexing: Default::default(),
+            frontmatter: Default::default(),
+            chunking: Default::default(),
+            embedding: crate::config::ResolvedEmbeddingConfig {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "test".into(),
+                api_key: None,
+                vector_size: 768,
+                batch_size: 32,
+            },
+            qdrant: crate::config::ResolvedQdrantConfig {
+                // Port 1 refuses immediately rather than hanging the test.
+                url: "http://127.0.0.1:1".into(),
+                collection: "knowledge-base".into(),
+            },
+            validation: Default::default(),
+            webhook: Default::default(),
+            mcp: Default::default(),
+            rate_limit: Default::default(),
+            write: Default::default(),
+            search: Default::default(),
+            reranking: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn status_degrades_rather_than_failing_when_qdrant_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+
+        // Seed the metadata index so the SQLite half has something to report.
+        let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        let fm: std::collections::HashMap<String, serde_json::Value> = match serde_json::json!({"title": "T", "type": "recipe", "tags": ["dinner"]})
+        {
+            serde_json::Value::Object(m) => m.into_iter().collect(),
+            _ => unreachable!(),
+        };
+        db.upsert_document_metadata("food/a.md", &fm, 1700, "h", 1)
+            .await
+            .unwrap();
+        db.upsert("food/a.md", "h", 1, "sh").await.unwrap();
+
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config,
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+        };
+
+        let status = collect_status(&state).await;
+
+        // The whole point: Qdrant being down must not cost us the answer to
+        // "is it indexing?" or the SQLite-side counts.
+        assert_eq!(status.store.indexed_files, Some(1));
+        assert_eq!(status.store.documents_with_metadata, Some(1));
+        assert_eq!(status.store.documents_missing_metadata, Some(0));
+        assert!(status.store.qdrant_points.is_none());
+        assert!(
+            status.store.errors.iter().any(|e| e.contains("qdrant")),
+            "the unreachable store must be named, not silently omitted: {:?}",
+            status.store.errors
+        );
+
+        let types = status
+            .breakdown
+            .iter()
+            .find(|b| b.field == "type")
+            .expect("type breakdown");
+        assert_eq!(types.values[0].value, "recipe");
+        assert!(status.breakdown.iter().any(|b| b.field == "area"));
+
+        // And it still renders as valid exposition output.
+        let out = render_prometheus(&status);
+        assert!(out.contains("kb_indexed_files 1"));
+        assert!(!out.contains("kb_qdrant_points"));
+        assert!(out.contains("kb_status_errors 1"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_missing_metadata_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+
+        // Bookkeeping rows with no matching metadata: exactly the state that made
+        // list_documents return zero while search still worked.
+        let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        for path in ["a.md", "b.md", "c.md"] {
+            db.upsert(path, "h", 1, "sh").await.unwrap();
+        }
+
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config,
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+        };
+
+        let status = collect_status(&state).await;
+        assert_eq!(status.store.indexed_files, Some(3));
+        assert_eq!(status.store.documents_with_metadata, Some(0));
+        assert_eq!(status.store.documents_missing_metadata, Some(3));
+        assert!(render_prometheus(&status).contains("kb_documents_missing_metadata 3"));
+    }
+
+    #[tokio::test]
+    async fn status_and_metrics_require_the_bearer_token() {
+        // Mirrors the production topology: status routes carry the same auth layer as
+        // /mcp, while /health stays open.
+        let auth_state = AuthState {
+            bearer_token: Some("secret".into()),
+        };
+        let protected = Router::new()
+            .route("/status", get(|| async { "status" }))
+            .route("/metrics", get(|| async { "metrics" }))
+            .route_layer(middleware::from_fn_with_state(
+                auth_state.clone(),
+                bearer_auth,
+            ));
+        let app = Router::new()
+            .route("/health", get(|| async { "health" }))
+            .merge(protected);
+
+        for path in ["/status", "/metrics"] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must not be readable without a token — it enumerates the \
+                 knowledge base's tag vocabulary and document counts"
+            );
+
+            let req = Request::builder()
+                .uri(path)
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path} with a valid token");
+        }
+
+        // /health stays open: it is the container's liveness probe.
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 
     // --- top-level areas & indexed field union ---
 

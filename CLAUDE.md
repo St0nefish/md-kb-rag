@@ -36,9 +36,10 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 | `schema.rs` | Directory-cascading `.kb-schema.yaml` support: parse, cascade merge, `SchemaCache` tree resolution, type/value checking, schema fingerprinting |
 | `retrieval.rs` | Shared retrieval core (`search` + `get_document`) used by MCP and (future) CLI |
 | `mcp.rs` | MCP tools (rmcp): `search`, `get_document`, `list_documents`, `get_schema`, `update_schema` (thin handlers delegating to `retrieval`/`state`/`schema`), and write tools `create_document`/`edit_document`/`delete_document` |
+| `status.rs` | Process-global indexing run state (`INDEX_STATUS`) backing `/status` and `/metrics`: in-flight phase/progress, last-run outcome and counters, payload-index health |
 | `webhook.rs` | Webhook handler (owns `REINDEX_LOCK`, shared with write tools) |
 | `git.rs` | Git operations for the KB clone (clone, fetch with timeout, `commit_and_sync`: add→commit→fetch→rebase→push) |
-| `server.rs` | Axum server (MCP + webhook routes) |
+| `server.rs` | Axum server (MCP + webhook + `/health`, `/status`, `/metrics` routes; owns the Prometheus encoder) |
 
 ## Workflow
 
