@@ -81,6 +81,13 @@ indexing:
 # By default, no frontmatter rules are enforced. Files without frontmatter
 # are indexed normally. Configure this section to require specific fields
 # or expose metadata as filterable Qdrant payload fields.
+#
+# This block is now the IMPLICIT ROOT SCHEMA for the knowledge base. A
+# directory can override or extend it by adding a `.kb-schema.yaml` file,
+# which governs that directory and everything beneath it (cascading like
+# CLAUDE.md) — see the README for syntax, cascade/merge rules, and the
+# `get_schema` / `update_schema` MCP tools. With no `.kb-schema.yaml` files
+# anywhere, this block alone governs the whole tree, same as before.
 frontmatter:
 
   # Fields that MUST be present in every file's frontmatter. Files missing
@@ -90,6 +97,9 @@ frontmatter:
 
   # Frontmatter fields to store as Qdrant payload fields, enabling filtered
   # search. These become keyword-indexed payload fields on each point.
+  # `domain` is not author-written frontmatter — it's derived automatically
+  # from each document's top-level folder — but it's still a normal field
+  # here for the purpose of getting a Qdrant payload index.
   # Example: [type, domain, tags, status]
   indexed_fields: []
 
@@ -101,7 +111,9 @@ frontmatter:
   # Closed-set (enum) enforcement. Maps a frontmatter field to its exhaustive
   # list of allowed values. A file whose field value is NOT in the list fails
   # validation. Absent fields are not checked here — use `required` for that.
-  # Open-ended fields (domain, tags) should be omitted from this map.
+  # Open-ended fields (e.g. tags) should be omitted from this map. `domain`
+  # is never author-set at all (it's derived from the folder), so it never
+  # belongs here either.
   allowed:
     type:
       - guide
@@ -200,8 +212,10 @@ qdrant:
 # ----------------------------------------------------------------------------
 validation:
 
-  # Master switch. When false, frontmatter validation is skipped entirely
-  # and all files are indexed regardless of their frontmatter.
+  # Master switch. When false, frontmatter is still parsed and stored
+  # (so Qdrant and the list_documents metadata index stay accurate) but
+  # required/allowed/lint checks are skipped, and all files are indexed
+  # regardless of their frontmatter.
   enabled: true
 
   # Strict mode. When true, files that fail validation are treated as hard

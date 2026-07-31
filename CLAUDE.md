@@ -26,14 +26,16 @@ Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI i
 |---|---|
 | `main.rs` | CLI entrypoint (clap subcommands) |
 | `config.rs` | Config deserialization |
-| `validate.rs` | Frontmatter validation |
+| `validate.rs` | Frontmatter validation against the resolved `.kb-schema.yaml` cascade for each file's path (not the global config directly — `frontmatter` in `config.yaml` is only the implicit root schema) |
 | `ingest.rs` | Indexing pipeline |
 | `chunk.rs` | Markdown chunking |
 | `embed.rs` | Embedding API client |
 | `qdrant.rs` | Qdrant operations |
-| `state.rs` | SQLite state DB |
+| `state.rs` | SQLite state DB: file bookkeeping (`indexed_files`) plus the document metadata index (`documents`, `document_fields`) backing `list_documents` |
+| `document_fields.rs` | Projects frontmatter JSON into filterable `document_fields` rows (dot-path flattening, array/range support) |
+| `schema.rs` | Directory-cascading `.kb-schema.yaml` support: parse, cascade merge, `SchemaCache` tree resolution, type/value checking, schema fingerprinting |
 | `retrieval.rs` | Shared retrieval core (`search` + `get_document`) used by MCP and (future) CLI |
-| `mcp.rs` | MCP tools (rmcp): `search`, `get_document` (thin handlers delegating to `retrieval`), and write tools `create_document`/`edit_document`/`delete_document` |
+| `mcp.rs` | MCP tools (rmcp): `search`, `get_document`, `list_documents`, `get_schema`, `update_schema` (thin handlers delegating to `retrieval`/`state`/`schema`), and write tools `create_document`/`edit_document`/`delete_document` |
 | `webhook.rs` | Webhook handler (owns `REINDEX_LOCK`, shared with write tools) |
 | `git.rs` | Git operations for the KB clone (clone, fetch with timeout, `commit_and_sync`: add→commit→fetch→rebase→push) |
 | `server.rs` | Axum server (MCP + webhook routes) |
@@ -58,4 +60,5 @@ cargo run -- serve          # Start server (MCP + webhook)
 cargo run -- index --full   # Full reindex
 cargo run -- validate       # Validate frontmatter
 cargo run -- status         # Collection stats
+cargo run -- reproject-fields # Rebuild document_fields from stored frontmatter (no re-embed)
 ```

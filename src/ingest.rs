@@ -11,7 +11,8 @@ use crate::{
     chunk,
     config::{IndexingConfig, ResolvedConfig},
     embed::{EmbedClient, EmbedStore},
-    qdrant::{QdrantPoint, QdrantStore, VectorStore},
+    qdrant::{IndexedField, QdrantPoint, QdrantStore, VectorStore},
+    schema::{ResolvedSchema, SchemaCache},
     state::{IndexedFile, StateDb},
     validate,
 };
@@ -161,6 +162,23 @@ pub fn compute_hash_from_bytes(content: &[u8]) -> String {
     hex::encode(digest)
 }
 
+/// Modification time as a Unix timestamp, falling back to 0 with a warning.
+///
+/// `label` is the path as reported to the user, which may differ from `path` (relative
+/// key vs. absolute location).
+async fn file_mtime(path: &Path, label: &str) -> i64 {
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(|| {
+            warn!("Could not read mtime for '{}', defaulting to 0", label);
+            0
+        })
+}
+
 #[cfg(test)]
 pub async fn compute_hash(path: &Path) -> Result<String> {
     let content = tokio::fs::read(path)
@@ -199,17 +217,24 @@ struct PendingFile {
     old_chunk_count: usize,
     /// File modification time as Unix timestamp (seconds). Falls back to 0 on metadata/clock error.
     mtime: i64,
+    /// Fingerprint of the schema this file was validated against.
+    schema_hash: String,
 }
 
 /// Result of processing a single discovered file.
 enum FileOutcome {
-    Skipped,
+    /// Unchanged since the last run. Carries the content hash so `run_index` can tell
+    /// whether the document metadata index is in sync without a per-file query.
+    Skipped {
+        hash: String,
+    },
     Invalid,
     Empty,
     Ready(PendingFile),
 }
 
 /// Process a single file: hash, skip-if-unchanged, validate, chunk.
+#[allow(clippy::too_many_arguments)]
 async fn process_file(
     path: &Path,
     rel_key: &str,
@@ -217,40 +242,34 @@ async fn process_file(
     full: bool,
     state_entry: Option<IndexedFile>,
     config: &ResolvedConfig,
+    schema: &ResolvedSchema,
+    schema_hash: &str,
 ) -> Result<FileOutcome> {
     let file_path = rel_key.to_string();
     let hash = compute_hash_from_bytes(content.as_bytes());
 
     // Capture mtime now — used in PendingFile regardless of validation path.
-    let mtime: i64 = tokio::fs::metadata(path)
-        .await
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_else(|| {
-            warn!("Could not read mtime for '{}', defaulting to 0", file_path);
-            0
-        });
+    let mtime = file_mtime(path, &file_path).await;
 
     let old_chunk_count = state_entry
         .as_ref()
         .map(|e| e.chunk_count as usize)
         .unwrap_or(0);
 
-    // Skip unchanged files in incremental mode
+    // Skip unchanged files in incremental mode. The schema fingerprint is part of the
+    // condition: editing a .kb-schema.yaml changes no document's bytes, so without this
+    // a tightened rule would never be applied to anything already indexed.
     if !full
         && let Some(ref entry) = state_entry
         && entry.content_hash == hash
+        && entry.schema_hash == schema_hash
     {
         debug!("Unchanged, skipping: {}", file_path);
-        return Ok(FileOutcome::Skipped);
+        return Ok(FileOutcome::Skipped { hash });
     }
 
     if config.validation.enabled {
-        match validate::validate_content(path, content, &config.frontmatter, &config.validation)
-            .await
-        {
+        match validate::validate_content(path, content, schema, &config.validation).await {
             Ok((_result, Some(validated))) => {
                 let description = validated
                     .frontmatter
@@ -278,6 +297,7 @@ async fn process_file(
                     hash,
                     old_chunk_count,
                     mtime,
+                    schema_hash: schema_hash.to_string(),
                 }))
             }
             Ok((result, None)) => {
@@ -308,8 +328,16 @@ async fn process_file(
             }
         }
     } else {
-        // Validation disabled — chunk the already-read content
-        let chunks = chunk::chunk_markdown(content, None, &config.chunking);
+        // Validation disabled — still PARSE frontmatter, just don't enforce anything.
+        // The metadata backfill path parses unconditionally, so returning an empty map
+        // here would let Qdrant and SQLite hold different frontmatter for the same
+        // document, and search filters would silently never match it.
+        let (frontmatter, body) = validate::parse_frontmatter(content, schema);
+        let description = frontmatter
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let chunks = chunk::chunk_markdown(&body, description.as_deref(), &config.chunking);
         if chunks.is_empty() {
             warn!("No chunks produced for: {}", file_path);
             return Ok(FileOutcome::Empty);
@@ -317,11 +345,12 @@ async fn process_file(
 
         Ok(FileOutcome::Ready(PendingFile {
             file_path,
-            frontmatter: HashMap::new(),
+            frontmatter,
             chunks,
             hash,
             old_chunk_count,
             mtime,
+            schema_hash: schema_hash.to_string(),
         }))
     }
 }
@@ -365,7 +394,8 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
         let embeddings = &all_embeddings[*start..*start + *count];
 
-        let base_payload = pf.frontmatter.clone();
+        let base_payload = with_derived_domain(&pf.frontmatter, &pf.file_path);
+
         for (chunk, vector) in pf.chunks.iter().zip(embeddings.iter()) {
             let mut payload: HashMap<String, serde_json::Value> = base_payload.clone();
             payload.insert(
@@ -429,13 +459,49 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     }
 
     // Update state DB per file
+    // The points are already in Qdrant at this stage, so a bookkeeping failure for one
+    // file must not abandon the rest of the batch — that would leave later files with
+    // vectors but no state row, and they would be needlessly re-embedded next run.
+    // Record and continue; every failure mode here self-heals on the following run.
+    let mut bookkeeping_failures = 0usize;
     for (pf, (_start, count)) in pending.iter().zip(file_boundaries.iter()) {
-        state
-            .upsert(&pf.file_path, &pf.hash, *count as i64)
+        if let Err(e) = state
+            .upsert(&pf.file_path, &pf.hash, *count as i64, &pf.schema_hash)
             .await
-            .with_context(|| format!("Failed to update state DB for '{}'", pf.file_path))?;
+        {
+            error!("Failed to update state DB for '{}': {:#}", pf.file_path, e);
+            bookkeeping_failures += 1;
+            continue;
+        }
+
+        if let Err(e) = state
+            .upsert_document_metadata(
+                &pf.file_path,
+                &with_derived_domain(&pf.frontmatter, &pf.file_path),
+                pf.mtime,
+                &pf.hash,
+                *count as i64,
+            )
+            .await
+        {
+            // The state row is already written, so this file's metadata is stale until
+            // the next run's backfill notices the hash mismatch and repairs it.
+            error!(
+                "Failed to update document metadata for '{}': {:#}",
+                pf.file_path, e
+            );
+            bookkeeping_failures += 1;
+            continue;
+        }
 
         info!("Indexed {} chunk(s) from: {}", count, pf.file_path);
+    }
+
+    if bookkeeping_failures > 0 {
+        warn!(
+            "{} file(s) had bookkeeping failures; they will be repaired on the next run",
+            bookkeeping_failures
+        );
     }
 
     info!(
@@ -460,15 +526,150 @@ async fn remove_orphans<Q: VectorStore>(
         .await
         .context("Failed to batch-delete orphaned points")?;
 
+    // Vectors for the whole batch are already deleted, so stopping at the first
+    // bookkeeping failure would leave later orphans visible to `list_documents` with no
+    // vectors behind them. Continue; orphan detection is idempotent and retries.
     for file_path in orphaned {
-        state
-            .delete(file_path)
-            .await
-            .with_context(|| format!("Failed to delete state DB entry for '{}'", file_path))?;
+        // Metadata first, bookkeeping second. Orphan detection is driven off
+        // `indexed_files`, so clearing that row first and then failing would drop the
+        // file out of detection permanently and strand its metadata with no sweep able
+        // to find it again. This order leaves it detectable, so the next run retries.
+        if let Err(e) = state.delete_document(file_path).await {
+            error!(
+                "Failed to delete document metadata for '{}': {:#}",
+                file_path, e
+            );
+            continue;
+        }
+        if let Err(e) = state.delete(file_path).await {
+            error!(
+                "Failed to delete state DB entry for '{}': {:#}",
+                file_path, e
+            );
+            continue;
+        }
 
         info!("Removed orphaned file: {}", file_path);
     }
     Ok(())
+}
+
+/// Frontmatter with `domain` set from the document's top-level folder.
+///
+/// Applied identically to the Qdrant payload and the metadata index so a `domain`
+/// filter behaves the same through `search` and `list_documents`. Any `domain:` key an
+/// author wrote in frontmatter is overridden — location is the single source of truth.
+fn with_derived_domain(
+    frontmatter: &HashMap<String, serde_json::Value>,
+    rel_path: &str,
+) -> HashMap<String, serde_json::Value> {
+    let mut out = frontmatter.clone();
+    let authored = frontmatter.get("domain").and_then(|v| v.as_str());
+
+    match derive_domain(rel_path) {
+        Some(domain) => {
+            // Authors migrating from the old convention may still carry a `domain:`
+            // key. Overriding it silently would make `search(domain=…)` stop finding
+            // their document with no indication why, so say so once per index.
+            if let Some(authored) = authored
+                && authored != domain
+            {
+                warn!(
+                    file = rel_path,
+                    "frontmatter says domain '{}' but the folder says '{}'; using the \
+                     folder. Remove the frontmatter key — domain is derived from \
+                     location now.",
+                    authored,
+                    domain
+                );
+            }
+            out.insert("domain".to_string(), serde_json::Value::String(domain));
+        }
+        None => {
+            if authored.is_some() {
+                warn!(
+                    file = rel_path,
+                    "dropping frontmatter 'domain': documents at the knowledge-base \
+                     root belong to no area"
+                );
+            }
+            out.remove("domain");
+        }
+    }
+    out
+}
+
+/// Top-level folder of a KB-relative path, which is what `domain` now means.
+///
+/// Returns `None` for a document sitting directly at the knowledge-base root, which
+/// belongs to no area.
+pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
+    let mut components = Path::new(rel_path).components();
+    let first = components.next()?;
+    // Only a real directory component counts, and only when something follows it.
+    components.next()?;
+    match first {
+        std::path::Component::Normal(name) => name.to_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Payload fields to index, unioning the schema tree with the legacy config list.
+///
+/// `config.effective_indexed_fields()` still contributes `file_path`, which is not a
+/// frontmatter field but is needed for path lookups.
+fn merge_indexed_fields(config: &ResolvedConfig, schemas: &SchemaCache) -> Vec<IndexedField> {
+    let mut fields = schemas.all_indexed_fields();
+    for name in config.effective_indexed_fields() {
+        if !fields.iter().any(|f| f.name == name) {
+            fields.push(IndexedField::keyword(name));
+        }
+    }
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+    fields
+}
+
+/// Fill in document metadata for files the incremental pass skipped.
+///
+/// Runs when a file is unchanged by content hash but its metadata row is missing or
+/// stale — the case an existing deployment hits on its first run after this feature
+/// lands. Parses frontmatter only: no chunking, no embedding, no Qdrant writes, so it
+/// costs nothing beyond a file read. Per-file failures are logged and retried next run
+/// rather than failing the whole index.
+async fn backfill_document_metadata(
+    queue: &[(String, PathBuf)],
+    state: &StateDb,
+    indexed: &HashMap<String, IndexedFile>,
+    schemas: &SchemaCache,
+) -> usize {
+    let mut filled = 0usize;
+
+    for (rel_key, path) in queue {
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(content) => content,
+            Err(e) => {
+                warn!("Metadata backfill: failed to read '{}': {:#}", rel_key, e);
+                continue;
+            }
+        };
+
+        let hash = compute_hash_from_bytes(content.as_bytes());
+        let schema = schemas.resolve_for(Path::new(rel_key));
+        let (frontmatter, _body) = validate::parse_frontmatter(&content, schema);
+        let frontmatter = with_derived_domain(&frontmatter, rel_key);
+        let mtime = file_mtime(path, rel_key).await;
+        let chunk_count = indexed.get(rel_key).map(|e| e.chunk_count).unwrap_or(0);
+
+        match state
+            .upsert_document_metadata(rel_key, &frontmatter, mtime, &hash, chunk_count)
+            .await
+        {
+            Ok(()) => filled += 1,
+            Err(e) => warn!("Metadata backfill failed for '{}': {:#}", rel_key, e),
+        }
+    }
+
+    filled
 }
 
 pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
@@ -506,7 +707,44 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
     let collection = &config.qdrant.collection;
     let vector_size = config.embedding.vector_size;
 
-    let indexed_fields = config.effective_indexed_fields();
+    // Discover and merge every .kb-schema.yaml once. Resolution afterwards is an
+    // in-memory prefix lookup, so this stays O(schema files) rather than O(documents).
+    // The walk root only determines the relative scope keys, so the configured path
+    // works here even though `data_path` is canonicalized further down.
+    let schemas = SchemaCache::build(Path::new(config.data_path()), &config.frontmatter);
+    for (scope, reason) in schemas.broken_scopes() {
+        error!(
+            "Invalid schema at {}/{}: {} — documents in this scope are frozen and will \
+             not be indexed until it is fixed",
+            scope.display(),
+            crate::schema::SCHEMA_FILE_NAME,
+            reason
+        );
+    }
+
+    // Union of every `indexed` dot-path across the whole schema tree. Payload indexes
+    // are collection-wide, so a field declared only in a deep scope still has to be
+    // registered here or filtering on it silently fails.
+    let indexed_fields = merge_indexed_fields(config, &schemas);
+
+    // A full reindex drops the collection and rebuilds it, but frozen documents are
+    // skipped during the rebuild — so their vectors would be deleted and never
+    // restored, leaving them invisible to search while still listed in the metadata
+    // index. Refuse rather than destroy data; incremental indexing is unaffected.
+    if full && schemas.broken_scopes().count() > 0 {
+        let scopes: Vec<String> = schemas
+            .broken_scopes()
+            .map(|(dir, _)| dir.display().to_string())
+            .collect();
+        anyhow::bail!(
+            "Refusing a full reindex while {} schema file(s) are invalid ({}). A full \
+             run rebuilds the collection from scratch and cannot reindex frozen scopes, \
+             so their vectors would be lost. Fix the schema(s), or run an incremental \
+             index instead.",
+            scopes.len(),
+            scopes.join(", ")
+        );
+    }
 
     // ── Full-mode: drop Qdrant collection so it is recreated clean ───────────
     if full {
@@ -586,12 +824,21 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
         .map(|f| (f.file_path.clone(), f))
         .collect();
 
+    // Content hashes already reflected in the document metadata index. Fetched once so
+    // the per-file loop can detect metadata drift without querying per file.
+    let document_hashes = state
+        .list_document_hashes()
+        .await
+        .context("Failed to list document metadata")?;
+
     // ── Per-file processing ──────────────────────────────────────────────────
     let mut pending: Vec<PendingFile> = Vec::new();
+    let mut backfill_queue: Vec<(String, PathBuf)> = Vec::new();
     let mut skipped = 0usize;
     let mut invalid = 0usize;
     let mut empty = 0usize;
     let mut read_errors = 0usize;
+    let mut frozen = 0usize;
 
     for path in &discovered {
         let rel_key = match path.strip_prefix(&data_path) {
@@ -617,8 +864,39 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
 
         let state_entry = indexed_map.get(&rel_key).cloned();
 
-        match process_file(path, &rel_key, &content, full, state_entry, config).await? {
-            FileOutcome::Skipped => skipped += 1,
+        let rel = Path::new(&rel_key);
+        if let Some(reason) = schemas.is_frozen(rel) {
+            // The schema governing this document failed to parse. Applying the parent's
+            // rules instead would silently enforce rules we know are wrong across a
+            // whole subtree, so the scope is frozen: nothing here is indexed or
+            // re-indexed, and whatever is already in the index stays untouched.
+            debug!("Frozen scope, skipping {}: {}", rel_key, reason);
+            frozen += 1;
+            continue;
+        }
+        let schema = schemas.resolve_for(rel);
+        let schema_hash = schema.fingerprint();
+
+        match process_file(
+            path,
+            &rel_key,
+            &content,
+            full,
+            state_entry,
+            config,
+            schema,
+            &schema_hash,
+        )
+        .await?
+        {
+            FileOutcome::Skipped { hash } => {
+                skipped += 1;
+                // Unchanged content, but the metadata index may still be missing or
+                // stale for this file — queue it for a cheap parse-only backfill.
+                if document_hashes.get(&rel_key) != Some(&hash) {
+                    backfill_queue.push((rel_key.clone(), path.clone()));
+                }
+            }
             FileOutcome::Invalid => invalid += 1,
             FileOutcome::Empty => empty += 1,
             FileOutcome::Ready(pf) => pending.push(pf),
@@ -631,6 +909,17 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
         info!("Embedding chunks for {} changed file(s)…", pending_count);
         upsert_pending(&pending, &embedder, &store, &state, collection).await?;
     }
+
+    // ── Backfill metadata for unchanged files ────────────────────────────────
+    let backfilled = if backfill_queue.is_empty() {
+        0
+    } else {
+        info!(
+            "Backfilling document metadata for {} unchanged file(s)",
+            backfill_queue.len()
+        );
+        backfill_document_metadata(&backfill_queue, &state, &indexed_map, &schemas).await
+    };
 
     // ── Handle orphaned (deleted) files ──────────────────────────────────────
     if !orphaned.is_empty() {
@@ -646,6 +935,9 @@ pub async fn run_index(config: &ResolvedConfig, full: bool) -> Result<()> {
         invalid,
         empty,
         read_errors,
+        metadata_backfilled = backfilled,
+        frozen_by_broken_schema = frozen,
+        broken_schemas = schemas.broken_scopes().count(),
         orphans_removed = orphaned.len(),
         elapsed_secs = run_start.elapsed().as_secs_f64(),
         "Indexing run complete"
@@ -751,6 +1043,218 @@ mod tests {
         }
     }
 
+    // -- domain derivation ---------------------------------------------------
+
+    #[test]
+    fn domain_comes_from_the_top_level_folder() {
+        assert_eq!(
+            derive_domain("food/recipes/chili.md").as_deref(),
+            Some("food")
+        );
+        assert_eq!(
+            derive_domain("sysadmin/zfs.md").as_deref(),
+            Some("sysadmin")
+        );
+    }
+
+    #[test]
+    fn documents_at_the_root_have_no_domain() {
+        assert_eq!(derive_domain("README.md"), None);
+        assert_eq!(derive_domain(""), None);
+    }
+
+    #[test]
+    fn derived_domain_overrides_whatever_frontmatter_claimed() {
+        // Location is the single source of truth; a stale `domain:` key must not win.
+        let mut fm: HashMap<String, serde_json::Value> = HashMap::new();
+        fm.insert(
+            "domain".into(),
+            serde_json::Value::String("lifestyle".into()),
+        );
+        let out = with_derived_domain(&fm, "food/recipes/chili.md");
+        assert_eq!(out["domain"], serde_json::json!("food"));
+    }
+
+    #[test]
+    fn root_documents_lose_a_stale_domain_key() {
+        let mut fm: HashMap<String, serde_json::Value> = HashMap::new();
+        fm.insert("domain".into(), serde_json::Value::String("old".into()));
+        let out = with_derived_domain(&fm, "README.md");
+        assert!(
+            !out.contains_key("domain"),
+            "a document in no folder belongs to no domain"
+        );
+    }
+
+    // -- indexed field union -------------------------------------------------
+
+    #[test]
+    fn merge_indexed_fields_unions_schema_and_legacy_config() {
+        use crate::qdrant::IndexKind;
+
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("food/recipes")).unwrap();
+        std::fs::write(
+            dir.path().join("food/recipes/.kb-schema.yaml"),
+            "fields:\n  planning.prep_minutes:\n    type: integer\n    indexed: true\n",
+        )
+        .unwrap();
+
+        let mut config = config_no_validation();
+        config.frontmatter = crate::config::FrontmatterConfig {
+            indexed_fields: vec!["tags".into(), "planning.prep_minutes".into()],
+            ..Default::default()
+        };
+        let schemas = SchemaCache::build(dir.path(), &config.frontmatter);
+
+        let fields = merge_indexed_fields(&config, &schemas);
+        let named = |n: &str| fields.iter().find(|f| f.name == n);
+
+        assert!(named("tags").is_some(), "legacy config field survives");
+        assert!(
+            named("file_path").is_some(),
+            "effective_indexed_fields still contributes file_path"
+        );
+        let nested = named("planning.prep_minutes").expect("deep-scope field must be indexed");
+        assert_eq!(
+            nested.kind,
+            IndexKind::Integer,
+            "the schema's declared type must win over the legacy keyword default"
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|f| f.name == "planning.prep_minutes")
+                .count(),
+            1,
+            "a field named in both sources appears once"
+        );
+    }
+
+    // -- document metadata backfill -----------------------------------------
+
+    /// A cascade with no schema files and no config rules — the shape backfill sees
+    /// when it only needs frontmatter parsed, not validated.
+    /// The schema a test file validates against when the test does not care about
+    /// schema rules — derived from the fixture config, matching production behavior
+    /// for a deployment with no `.kb-schema.yaml`.
+    fn test_schema() -> ResolvedSchema {
+        ResolvedSchema::from_config(&Default::default())
+    }
+
+    fn empty_schemas() -> SchemaCache {
+        SchemaCache::from_config_only(&Default::default())
+    }
+
+    async fn backfill_test_db() -> (StateDb, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::new(&dir.path().join("state.db")).await.unwrap();
+        (db, dir)
+    }
+
+    #[tokio::test]
+    async fn backfill_fills_metadata_for_unchanged_files() {
+        // The upgrade case: indexed_files populated by a previous version, documents
+        // empty. No embedder is constructed at all, which is the point — backfill must
+        // never trigger an embedding call.
+        let (db, db_dir) = backfill_test_db().await;
+        let kb = TempDir::new().unwrap();
+        let path = kb.path().join("recipe.md");
+        std::fs::write(
+            &path,
+            "---\ntitle: Chili\ndescription: One pot\ntags: [recipe, dinner]\nplanning:\n  prep_minutes: 20\n---\n\nBody.",
+        )
+        .unwrap();
+
+        db.upsert("recipe.md", "stale-hash", 3, "").await.unwrap();
+        assert_eq!(db.document_count().await.unwrap(), 0);
+
+        let indexed: HashMap<String, IndexedFile> = db
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.file_path.clone(), f))
+            .collect();
+        let queue = vec![("recipe.md".to_string(), path.clone())];
+
+        let filled = backfill_document_metadata(&queue, &db, &indexed, &empty_schemas()).await;
+
+        assert_eq!(filled, 1);
+        assert_eq!(db.document_count().await.unwrap(), 1);
+
+        let hashes = db.list_document_hashes().await.unwrap();
+        assert!(hashes.contains_key("recipe.md"));
+
+        // chunk_count is carried over from indexed_files rather than recomputed,
+        // since backfill deliberately does not chunk.
+        let (chunk_count,): (i64,) =
+            sqlx::query_as("SELECT chunk_count FROM documents WHERE file_path = ?")
+                .bind("recipe.md")
+                .fetch_one(db.pool_for_test())
+                .await
+                .unwrap();
+        assert_eq!(chunk_count, 3);
+
+        drop(db_dir);
+    }
+
+    #[tokio::test]
+    async fn backfill_projects_nested_frontmatter() {
+        let (db, _db_dir) = backfill_test_db().await;
+        let kb = TempDir::new().unwrap();
+        let path = kb.path().join("recipe.md");
+        std::fs::write(
+            &path,
+            "---\ntitle: Chili\ntags: [recipe]\nplanning:\n  prep_minutes: 20\n  tested: true\n---\n\nBody.",
+        )
+        .unwrap();
+
+        let queue = vec![("recipe.md".to_string(), path)];
+        backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas()).await;
+
+        let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(
+            "SELECT field, value_text, value_num FROM document_fields WHERE file_path = ?",
+        )
+        .bind("recipe.md")
+        .fetch_all(db.pool_for_test())
+        .await
+        .unwrap();
+
+        assert!(rows.contains(&("planning.prep_minutes".into(), "20".into(), Some(20.0))));
+        assert!(rows.contains(&("planning.tested".into(), "true".into(), Some(1.0))));
+    }
+
+    #[tokio::test]
+    async fn backfill_survives_unreadable_files() {
+        // A missing file must not fail the whole index run — it is retried next time.
+        let (db, _db_dir) = backfill_test_db().await;
+        let queue = vec![("gone.md".to_string(), PathBuf::from("/nonexistent/gone.md"))];
+
+        let filled =
+            backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas()).await;
+
+        assert_eq!(filled, 0);
+        assert_eq!(db.document_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn backfill_parses_frontmatter_that_would_fail_validation() {
+        // Documents indexed under older rules must still get metadata, so backfill
+        // uses parse_frontmatter rather than going through validation.
+        let (db, _db_dir) = backfill_test_db().await;
+        let kb = TempDir::new().unwrap();
+        let path = kb.path().join("sparse.md");
+        // No title, no description, no tags — would fail a strict required-fields check.
+        std::fs::write(&path, "---\ntype: reference\n---\n\nBody.").unwrap();
+
+        let queue = vec![("sparse.md".to_string(), path)];
+        let filled =
+            backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas()).await;
+
+        assert_eq!(filled, 1, "metadata must not depend on passing validation");
+    }
+
     #[tokio::test]
     async fn process_file_skips_unchanged_incremental() {
         let dir = TempDir::new().unwrap();
@@ -764,13 +1268,23 @@ mod tests {
             content_hash: hash,
             chunk_count: 1,
             indexed_at: String::new(),
+            schema_hash: String::new(),
         });
 
         let config = config_no_validation();
-        let outcome = process_file(&path, "doc.md", content, false, state_entry, &config)
-            .await
-            .unwrap();
-        assert!(matches!(outcome, FileOutcome::Skipped));
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            state_entry,
+            &config,
+            &test_schema(),
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, FileOutcome::Skipped { .. }));
     }
 
     #[tokio::test]
@@ -785,12 +1299,22 @@ mod tests {
             content_hash: "old-hash".to_string(),
             chunk_count: 1,
             indexed_at: String::new(),
+            schema_hash: String::new(),
         });
 
         let config = config_no_validation();
-        let outcome = process_file(&path, "doc.md", content, false, state_entry, &config)
-            .await
-            .unwrap();
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            state_entry,
+            &config,
+            &test_schema(),
+            "",
+        )
+        .await
+        .unwrap();
         match outcome {
             FileOutcome::Ready(pf) => {
                 assert!(!pf.chunks.is_empty());
@@ -814,12 +1338,22 @@ mod tests {
             content_hash: hash,
             chunk_count: 1,
             indexed_at: String::new(),
+            schema_hash: String::new(),
         });
 
         let config = config_no_validation();
-        let outcome = process_file(&path, "doc.md", content, true, state_entry, &config)
-            .await
-            .unwrap();
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            true,
+            state_entry,
+            &config,
+            &test_schema(),
+            "",
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(outcome, FileOutcome::Ready(_)),
             "Full mode should process even when hash matches"
@@ -834,9 +1368,18 @@ mod tests {
         std::fs::write(&path, content).unwrap();
 
         let config = config_no_validation();
-        let outcome = process_file(&path, "doc.md", content, false, None, &config)
-            .await
-            .unwrap();
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &test_schema(),
+            "",
+        )
+        .await
+        .unwrap();
         match outcome {
             FileOutcome::Ready(pf) => assert_eq!(pf.old_chunk_count, 0),
             other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
@@ -851,9 +1394,18 @@ mod tests {
         std::fs::write(&path, content).unwrap();
 
         let config = config_no_validation();
-        let outcome = process_file(&path, "doc.md", content, false, None, &config)
-            .await
-            .unwrap();
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &test_schema(),
+            "",
+        )
+        .await
+        .unwrap();
         assert!(matches!(outcome, FileOutcome::Empty));
     }
 
@@ -874,9 +1426,18 @@ mod tests {
             c
         };
 
-        let outcome = process_file(&path, "doc.md", content, false, None, &config)
-            .await
-            .unwrap();
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &test_schema(),
+            "",
+        )
+        .await
+        .unwrap();
         match outcome {
             FileOutcome::Ready(pf) => {
                 assert!(pf.frontmatter.contains_key("title"));
@@ -902,9 +1463,18 @@ mod tests {
             c
         };
 
-        let outcome = process_file(&path, "doc.md", content, false, None, &config)
-            .await
-            .unwrap();
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &ResolvedSchema::from_config(&config.frontmatter),
+            "",
+        )
+        .await
+        .unwrap();
         assert!(matches!(outcome, FileOutcome::Invalid));
     }
 
@@ -929,14 +1499,191 @@ mod tests {
             c
         };
 
-        let result = process_file(&path, "doc.md", content, false, None, &config).await;
+        let result = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &ResolvedSchema::from_config(&config.frontmatter),
+            "",
+        )
+        .await;
         assert!(result.is_err(), "Strict mode should propagate as Err");
+    }
+
+    #[tokio::test]
+    async fn unchanged_content_with_unchanged_schema_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let state_entry = Some(IndexedFile {
+            file_path: "doc.md".into(),
+            content_hash: compute_hash_from_bytes(content.as_bytes()),
+            chunk_count: 1,
+            indexed_at: "now".into(),
+            schema_hash: "abc".into(),
+        });
+
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            state_entry,
+            &config_no_validation(),
+            &test_schema(),
+            "abc",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, FileOutcome::Skipped { .. }));
+    }
+
+    #[tokio::test]
+    async fn unchanged_content_with_changed_schema_is_reprocessed() {
+        // The landmine this mechanism exists for: editing a .kb-schema.yaml changes no
+        // document's bytes, so a content-hash-only skip would never revalidate anything.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let state_entry = Some(IndexedFile {
+            file_path: "doc.md".into(),
+            content_hash: compute_hash_from_bytes(content.as_bytes()),
+            chunk_count: 1,
+            indexed_at: "now".into(),
+            schema_hash: "old-fingerprint".into(),
+        });
+
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            state_entry,
+            &config_no_validation(),
+            &test_schema(),
+            "new-fingerprint",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !matches!(outcome, FileOutcome::Skipped { .. }),
+            "a tightened schema must force revalidation of unchanged content"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_reprocesses_every_file_so_qdrant_and_sqlite_agree_on_domain() {
+        // Derived `domain` is written to the Qdrant payload only via the full
+        // reprocess path, while metadata backfill deliberately skips Qdrant. The two
+        // stores would diverge on upgrade if legacy rows were SKIPPED — they are not,
+        // because their empty schema_hash never equals a real fingerprint. This test
+        // pins that reasoning down rather than leaving it as an assumption.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\ndomain: stale\n---\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let legacy_row = Some(IndexedFile {
+            file_path: "food/doc.md".into(),
+            content_hash: compute_hash_from_bytes(content.as_bytes()),
+            chunk_count: 1,
+            indexed_at: "now".into(),
+            schema_hash: String::new(),
+        });
+
+        let outcome = process_file(
+            &path,
+            "food/doc.md",
+            content,
+            false,
+            legacy_row,
+            &config_no_validation(),
+            &test_schema(),
+            &test_schema().fingerprint(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, FileOutcome::Ready(_)),
+            "an unchanged legacy file must still be fully reprocessed on upgrade, which \
+             is what rewrites its Qdrant payload with the derived domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgraded_deployments_revalidate_once() {
+        // Rows written before schema tracking existed carry an empty schema_hash, which
+        // never equals a real fingerprint — so the first run after upgrading reprocesses
+        // every file exactly once.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let state_entry = Some(IndexedFile {
+            file_path: "doc.md".into(),
+            content_hash: compute_hash_from_bytes(content.as_bytes()),
+            chunk_count: 1,
+            indexed_at: "now".into(),
+            schema_hash: String::new(),
+        });
+
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            state_entry,
+            &config_no_validation(),
+            &test_schema(),
+            &test_schema().fingerprint(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!matches!(outcome, FileOutcome::Skipped { .. }));
+    }
+
+    #[tokio::test]
+    async fn ready_files_carry_the_schema_fingerprint_they_were_validated_against() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "---\ntitle: Test\n---\nBody.";
+        std::fs::write(&path, content).unwrap();
+
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config_no_validation(),
+            &test_schema(),
+            "fingerprint-xyz",
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            FileOutcome::Ready(pf) => assert_eq!(pf.schema_hash, "fingerprint-xyz"),
+            other => panic!("expected Ready, got {}", outcome_name(&other)),
+        }
     }
 
     /// Helper for debug output in test assertions.
     fn outcome_name(outcome: &FileOutcome) -> &'static str {
         match outcome {
-            FileOutcome::Skipped => "Skipped",
+            FileOutcome::Skipped { .. } => "Skipped",
             FileOutcome::Invalid => "Invalid",
             FileOutcome::Empty => "Empty",
             FileOutcome::Ready(_) => "Ready",
@@ -1147,6 +1894,7 @@ mod tests {
             })
             .collect();
         PendingFile {
+            schema_hash: String::new(),
             file_path: file_path.to_string(),
             frontmatter: HashMap::new(),
             chunks,
@@ -1187,7 +1935,10 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         // Seed state DB with an entry
-        state.upsert("data/orphan.md", "hash1", 3).await.unwrap();
+        state
+            .upsert("data/orphan.md", "hash1", 3, "")
+            .await
+            .unwrap();
 
         let store = MockVectorStore::with_delete_err("qdrant unavailable");
 
@@ -1204,12 +1955,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_an_orphan_clears_its_metadata_and_projection() {
+        // The existing orphan test only covers the Qdrant-failure branch, so nothing
+        // proved an orphaned document actually loses its metadata — it would otherwise
+        // stay visible to list_documents with no vectors behind it.
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        let mut fm: HashMap<String, serde_json::Value> = HashMap::new();
+        fm.insert("title".into(), serde_json::json!("Orphan"));
+        fm.insert("tags".into(), serde_json::json!(["note", "stale"]));
+
+        state.upsert("gone.md", "h", 1, "").await.unwrap();
+        state
+            .upsert_document_metadata("gone.md", &fm, 1, "h", 1)
+            .await
+            .unwrap();
+        assert_eq!(state.document_count().await.unwrap(), 1);
+
+        let store = MockVectorStore::all_ok();
+        remove_orphans(&["gone.md".to_string()], &store, &state, "test-col")
+            .await
+            .unwrap();
+
+        assert_eq!(state.count().await.unwrap(), 0, "bookkeeping row removed");
+        assert_eq!(
+            state.document_count().await.unwrap(),
+            0,
+            "document metadata removed"
+        );
+
+        let remaining: Vec<(String,)> =
+            sqlx::query_as("SELECT field FROM document_fields WHERE file_path = ?")
+                .bind("gone.md")
+                .fetch_all(state.pool_for_test())
+                .await
+                .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "projection rows must cascade away with the document"
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_failure_preserves_state_for_retry() {
         let dir = TempDir::new().unwrap();
         let state = test_state_db(&dir).await;
 
         // Seed state with a previously-indexed file
-        state.upsert("data/test.md", "old-hash", 2).await.unwrap();
+        state
+            .upsert("data/test.md", "old-hash", 2, "")
+            .await
+            .unwrap();
 
         let pending = vec![make_pending("data/test.md", 2, 2)];
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
@@ -1297,7 +2094,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = test_state_db(&dir).await;
 
-        state.upsert("data/test.md", "old-hash", 2).await.unwrap();
+        state
+            .upsert("data/test.md", "old-hash", 2, "")
+            .await
+            .unwrap();
 
         let pending = vec![make_pending("data/test.md", 2, 2)];
         let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
@@ -1320,7 +2120,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = test_state_db(&dir).await;
 
-        state.upsert("data/shrink.md", "old-hash", 3).await.unwrap();
+        state
+            .upsert("data/shrink.md", "old-hash", 3, "")
+            .await
+            .unwrap();
 
         // File shrinks from 3 chunks to 1
         let mut pf = make_pending("data/shrink.md", 1, 1);
@@ -1356,7 +2159,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = test_state_db(&dir).await;
 
-        state.upsert("data/grow.md", "old-hash", 1).await.unwrap();
+        state
+            .upsert("data/grow.md", "old-hash", 1, "")
+            .await
+            .unwrap();
 
         let mut pf = make_pending("data/grow.md", 2, 1);
         pf.old_chunk_count = 1;

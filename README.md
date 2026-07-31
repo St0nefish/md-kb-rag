@@ -90,6 +90,7 @@ md-kb-rag index --full       # Full re-index (clear state, re-embed everything)
 md-kb-rag validate           # Validate all markdown files without indexing
 md-kb-rag status             # Print collection stats + state DB info
 md-kb-rag health             # Check if server is healthy
+md-kb-rag reproject-fields   # Rebuild document_fields from stored frontmatter (no re-embed)
 ```
 
 ## Configuration
@@ -236,7 +237,9 @@ Skip the bundled embedding service entirely. Point `EMBEDDING_BASE_URL` at any O
 
 ## MCP Tools
 
-The server exposes a full read/write surface over MCP. Read tools (`search`, `get_document`) are always safe; write tools (`create_document`, `edit_document`, `delete_document`) mutate the knowledge base and commit to git.
+The server exposes a full read/write surface over MCP. Read tools (`search`, `get_document`, `list_documents`, `get_schema`) are always safe; write tools (`create_document`, `edit_document`, `delete_document`, `update_schema`) mutate the knowledge base and commit to git.
+
+**Path handling is unified across every tool that takes a `path`.** A leading `/` means the knowledge-base root, not a filesystem path — callers have no way to know where the KB actually lives inside the container, so `/food/recipes/chili.md` and `food/recipes/chili.md` address the same document. Path-escape protections still apply on top of that: `/../x` is rejected the same as `../x`. Partial paths resolve to a best match — `get_document` accepts a bare basename when it's unique across the index, and `get_schema`/`update_schema` accept a partial directory when it matches on trailing segments. A single match resolves silently; multiple matches are refused with the candidates listed rather than guessed at. `update_schema` is the one exception: when a partial directory matches *nothing* existing, it falls back to the literal path instead of erroring, since creating a schema for a directory that doesn't have one yet is the normal way to introduce one.
 
 ### Read
 
@@ -245,16 +248,46 @@ The server exposes a full read/write surface over MCP. Read tools (`search`, `ge
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `query` | string | yes | Natural-language search query |
-| `domain` | string | no | Filter by domain field |
+| `domain` | string | no | Filter by domain — see note below |
 | `type` | string | no | Filter by document type |
 | `tags` | string[] | no | Filter by tags (match any) |
 | `limit` | integer | no | Max results (default: 10, max: 50) |
+
+**`domain` is derived, not authored.** `domain` is computed from each document's top-level folder name (a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`; a file at the KB root has no domain) and written into both the Qdrant payload and the SQLite metadata index — it is not read from a `domain:` frontmatter key. A `domain:` key an author writes anyway is overwritten on the next index run, and the server logs a warning when the two disagree. This changes where the value comes from, not how you filter on it: `domain=...` here, the CLI's `--domain` flag, and `list_documents(filters={"domain": ...})` all still work exactly as before.
 
 **`get_document`** — fetch the full raw markdown (including frontmatter) for one document.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `path` | string | yes | Path relative to the KB root (as returned by `search`), a unique basename, or an absolute path |
+| `path` | string | yes | Path relative to the KB root (as returned by `search`), or a unique basename. A leading `/` also means the KB root — see path handling above |
+
+**`list_documents`** — lists documents by frontmatter, with no relevance ranking and no embedding call. Complements `search`, which returns ranked *chunks* and cannot reliably enumerate a complete set.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `filters` | object | no | Keyed by frontmatter field (dot-paths for nested fields, e.g. `planning.prep_minutes`). A scalar means equality (`{"type": "guide"}`); an array means any-of (`{"tags": ["recipe","dinner"]}`); an object means all-of or a numeric range (`{"tags": {"all_of": ["recipe","dinner"]}}`, `{"planning.prep_minutes": {"lt": 30}}`). Range operators: `gte`, `lte`, `gt`, `lt`. Also `any_of`, `all_of` |
+| `path_prefix` | string | no | Restrict to a folder, e.g. `lifestyle/kitchen/recipes/` |
+| `order_by` | string | no | `path` (default), `title`, `mtime`, `indexed_at` |
+| `descending` | boolean | no | Reverse sort order |
+| `limit` | integer | no | Max results (default: 100, max: 1000) |
+| `offset` | integer | no | Paging offset |
+| `fields` | string[] | no | Frontmatter dot-paths to return per document; omit for all |
+
+Per field, the operators are **mutually exclusive**: use set matching (`any_of`/`all_of`) *or* a numeric range (`gte`/`lte`/`gt`/`lt`), never both on the same field, and never `any_of` together with `all_of`. Mixing them is a validation error, not silently-honor-one-of-them behavior.
+
+`title` and `description` are filterable too — they're matched against dedicated columns rather than the generic dot-path projection every other frontmatter field goes through. Since each holds a single scalar, `all_of` with more than one value on `title` or `description` can never match anything (it returns zero results rather than erroring).
+
+Returns both plain text and MCP `structured_content` with `total`, `returned`, `offset`, `has_more`, and `documents[]` — truncation is never silent.
+
+**`get_schema`** — show the fully merged frontmatter rules governing a path, with per-field provenance (which `.kb-schema.yaml` declared each field). See [`.kb-schema.yaml` Directory Schemas](#kb-schemayaml-directory-schemas) below for how the cascade works.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | no | Directory or document path to resolve rules for; a partial directory resolves if it matches one scope uniquely (multiple matches are refused with the candidates listed); omit for the root |
+| `fields` | string[] | no | Only report these dot-paths; omit for all |
+| `values_only` | boolean | no | Only report fields that declare a closed value set |
+
+Returns plain text plus `structured_content` (`path`, `frozen`, `frozen_reason`, `fields[]`, each field carrying `type`, `required`, `indexed`, `values`, `default`, `open`, and `declared_in`).
 
 ### Write
 
@@ -264,7 +297,7 @@ All three write tools share the same pipeline: **path-safety guard** (no `..`, n
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `path` | string | yes | Relative path of the new document (e.g. `sysadmin/docker/foo.md`) |
+| `path` | string | yes | Path of the new document, relative to the KB root (e.g. `sysadmin/docker/foo.md`); a leading `/` also means the KB root |
 | `content` | string | yes | Full markdown including YAML frontmatter |
 | `message` | string | no | Commit subject (default: `docs: add <path>`) |
 | `force_new` | boolean | no | Skip the duplicate-detection gate (default: `false`) |
@@ -289,9 +322,79 @@ All three write tools share the same pipeline: **path-safety guard** (no `..`, n
 | `path` | string | yes | Resolved like `get_document` |
 | `message` | string | no | Commit subject (default: `docs: delete <path>`) |
 
-When validation fails, write tools return a structured error whose `data.field_errors` array names each offending `field`, the `rule` it broke (`required` / `allowed_value` / `lint`), and — for closed-set fields — the value it `got` and the values it `expected`, so an agent can self-correct.
+### Schema
+
+**`update_schema`** — edit a directory's `.kb-schema.yaml` through constrained operations instead of free-form text. Before writing, the change is validated against every document already under that scope, using the frontmatter stored in the metadata index (no markdown re-read). If any document would fail the new rules, the change is refused and they're listed; `force` applies anyway, `dry_run` reports what would happen without writing. The rendered YAML is re-parsed before writing, so an unparseable schema can never be committed. Like the write tools above, the file is written temp-then-rename, committed and pushed, and triggers a reindex.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | no | Directory whose schema to edit; a partial directory resolves if it uniquely matches an existing scope (multiple matches are refused with the candidates listed, no match falls back to the literal path so a new scope can be introduced); omit for the root |
+| `operation` | string | yes | One of `add_values`, `remove_values`, `set_field`, `remove_field` |
+| `field` | string | yes | Field the operation targets (dot-path for nested fields) |
+| `values` | string[] | conditional | For `add_values` / `remove_values` |
+| `definition` | object | conditional | For `set_field` — accepts the same keys as a `.kb-schema.yaml` entry (`type`, `required`, `indexed`, `values`, `extend`, `default`, `open`) |
+| `dry_run` | boolean | no | Report the effect without writing (default: `false`) |
+| `force` | boolean | no | Apply even if existing documents would fail the new rules (default: `false`) |
+
+When validation fails, write tools return a structured error whose `data.field_errors` array names each offending `field`, the `rule` it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`), and — for closed-set fields — the value it `got` and the values it `expected`, so an agent can self-correct.
 
 The server also advertises **dynamic instructions** to connected clients: the configured `mcp.instructions` narrative, the distinct filter values (domains, types, tags) discovered in the live index, and a write-authoring section listing the required frontmatter fields and any fixed allowed values. See the [`write` and `mcp` sections of the config reference](deploy/config.example.yaml) and [deploy/USAGE.md](deploy/USAGE.md#agent-write-tools) for details.
+
+## `.kb-schema.yaml` Directory Schemas
+
+A file named `.kb-schema.yaml` governs its directory and everything beneath it, cascading like `CLAUDE.md`. Where `frontmatter` in `config.yaml` used to be the one global rule set, per-directory schema files now let different parts of a knowledge base declare their own fields on top of (or instead of) that root.
+
+Top-level folder names are the KB's areas — this is also what `domain` is derived from (see the [`search`](#read) note above). The MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is listed in `frontmatter.indexed_fields`.
+
+### Syntax
+
+```yaml
+fields:
+  planning:
+    type: object
+    open: false          # reject undeclared keys under planning.* (default: true)
+    fields:
+      prep_minutes: { type: integer, indexed: true }
+      effort:       { type: enum, values: [low, medium, high], indexed: true }
+  tags:
+    type: list
+    extend: true          # union values with the inherited definition instead of replacing
+    values: [dinner, quick]
+```
+
+Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are equivalent — nesting is sugar flattened at parse time. Internally, schemas are a flat dot-path map.
+
+**Types:** `text`, `integer`, `number`, `boolean`, `enum`, `list`, `date` (`YYYY-MM-DD`), `timestamp` (RFC 3339), `object`. Declared types are strictly enforced with no coercion — `prep_minutes: "45"` fails against `type: integer`. Undeclared fields are not type-checked and remain legal.
+
+A field can't declare both a scalar `type` and nested `fields:` — it's either a value or a container, not both (`type: object` is the exception, since `object` means "has nested fields"). `update_schema` enforces this the same way a hand-edited `.kb-schema.yaml` does.
+
+### Cascade and merge rules
+
+- The **set** of fields unions across cascade levels. A field redefined at a deeper level **replaces** its inherited definition wholesale.
+- `extend: true` is the opt-out: it unions only `values` with the inherited set. Everything else on the child definition still wins.
+- Resolution is a single tree walk at startup/reindex time, with in-memory longest-prefix lookup per document afterward — not a walk per file.
+
+### Freezing
+
+A malformed `.kb-schema.yaml` **freezes its subtree**: nothing under it is indexed or re-indexed, and existing index entries are left untouched. It never silently falls back to the parent's rules. `md-kb-rag validate` reports broken schema files loudly in a `SCHEMA ERRORS` section, and they count as a failure under strict mode (`validation.strict: true`).
+
+`md-kb-rag index --full` **refuses to run** while any scope is frozen, naming the offending directories — a full run rebuilds the Qdrant collection from scratch and cannot reindex a frozen scope, so its vectors would be lost rather than merely stale. Fix the schema(s) first, or reindex incrementally in the meantime; incremental indexing is unaffected by frozen scopes elsewhere in the tree.
+
+A `.kb-schema.yaml` over 256 KB is refused purely on file size — it's never read or parsed — and freezes its subtree through that same mechanism.
+
+### Backward compatibility
+
+With no `.kb-schema.yaml` files anywhere, the global `frontmatter` block in `config.yaml` acts as the implicit root schema — existing deployments keep working unchanged.
+
+### Schema-change detection
+
+A `schema_hash` fingerprint is stored per file alongside its content hash. The incremental indexer skips a file only when **both** match, so editing a schema revalidates every document under it even though their bytes didn't change. Two consequences: the first index run after upgrading to this feature revalidates every file once (backfilling the fingerprint), and editing a root-level schema revalidates the whole KB.
+
+That same first-run revalidation is also when every document's `domain` gets (re)computed from its folder and written to Qdrant and the state DB. If a document's old, hand-authored `domain:` disagreed with its folder, the effective value changes at that point — update any saved filters that assumed the old value, and remove the now-redundant `domain:` key from frontmatter (it's ignored either way).
+
+### Qdrant payload indexes
+
+Declared fields get typed Qdrant payload indexes — integer/number/boolean fields get Integer/Float/Bool indexes (enabling range filters) instead of a blanket Keyword index. The same applies to the built-in `mtime` index used by `search`'s recency filters. Index-creation failures are logged as errors but never abort startup or indexing; a filter on an unindexed field still returns correct results, just more slowly. If a field's declared type changed, delete the stale payload index in Qdrant and reindex to pick up the new type.
 
 ## Webhook
 

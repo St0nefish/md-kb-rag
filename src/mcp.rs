@@ -15,12 +15,16 @@ use tracing::{debug, error, warn};
 
 use crate::{
     config::ResolvedConfig,
+    document_fields,
     embed::EmbedClient,
     git, ingest,
     qdrant::QdrantStore,
     rerank::RerankClient,
-    retrieval::{self, GetDocumentError, RetrievalDeps, SearchFilters, SearchOptions},
-    state::StateDb,
+    retrieval::{
+        self, DocumentIndexDeps, GetDocumentError, RetrievalDeps, SearchFilters, SearchOptions,
+    },
+    schema::SchemaCache,
+    state::{DocumentIndex, DocumentQuery, FieldFilter, OrderBy, StateDb},
     validate,
 };
 
@@ -129,6 +133,443 @@ pub(crate) fn parse_date_to_timestamp(s: &str) -> Result<i64, String> {
     ))
 }
 
+/// How many invalidated documents to name before summarizing the rest.
+const MAX_REPORTED_CASUALTIES: usize = 20;
+/// Cap on permitted values a single `update_schema` call may add to a field.
+const MAX_SCHEMA_VALUES: usize = 500;
+/// Cap on the serialized size of a `set_field` definition.
+const MAX_SCHEMA_DEFINITION_LEN: usize = 8 * 1024;
+/// Cap on permitted values echoed back per field by `get_schema`.
+const MAX_REPORTED_VALUES: usize = 200;
+/// Cap on fields echoed back per scope by `get_schema`.
+const MAX_REPORTED_FIELDS: usize = 500;
+/// Cap on a caller-supplied commit message.
+const MAX_COMMIT_MESSAGE_LEN: usize = 1000;
+
+/// Normalize a caller-supplied scope path into a safe KB-relative directory.
+///
+/// Rejects absolute paths and any `..` component — a schema written outside the KB
+/// would govern nothing and could clobber unrelated files.
+fn normalize_scope_path(raw: &str) -> Result<std::path::PathBuf, McpError> {
+    use std::path::{Component, PathBuf};
+
+    let trimmed = raw.trim().trim_start_matches("./").trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    if trimmed.len() > MAX_PATH_LEN {
+        return Err(McpError::invalid_params(
+            format!(
+                "path too long: {} chars (max {})",
+                trimmed.len(),
+                MAX_PATH_LEN
+            ),
+            None,
+        ));
+    }
+
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() {
+        return Err(McpError::invalid_params(
+            format!("path must be relative to the knowledge-base root, got '{raw}'"),
+            None,
+        ));
+    }
+    for component in candidate.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(McpError::invalid_params(
+                format!("path must not contain '..' or absolute segments, got '{raw}'"),
+                None,
+            ));
+        }
+    }
+
+    Ok(candidate)
+}
+
+/// Turn tool parameters into a typed schema edit.
+fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::SchemaEdit, McpError> {
+    use crate::schema::SchemaEdit;
+    let invalid = |msg: String| McpError::invalid_params(msg, None);
+
+    // A schema file is committed, pushed, and re-parsed on every cache build, so an
+    // oversized one is a durable cost rather than a transient one. Bound the inputs
+    // here, mirroring the content cap the document write tools enforce.
+    if params.field.len() > MAX_FILTER_STR_LEN {
+        return Err(invalid(format!(
+            "field name too long: {} chars (max {})",
+            params.field.len(),
+            MAX_FILTER_STR_LEN
+        )));
+    }
+    if let Some(values) = &params.values {
+        if values.len() > MAX_SCHEMA_VALUES {
+            return Err(invalid(format!(
+                "too many values: {} (max {})",
+                values.len(),
+                MAX_SCHEMA_VALUES
+            )));
+        }
+        if let Some(long) = values.iter().find(|v| v.len() > MAX_FILTER_STR_LEN) {
+            return Err(invalid(format!(
+                "value too long: {} chars (max {})",
+                long.len(),
+                MAX_FILTER_STR_LEN
+            )));
+        }
+    }
+    if let Some(definition) = &params.definition
+        && definition.to_string().len() > MAX_SCHEMA_DEFINITION_LEN
+    {
+        return Err(invalid(format!(
+            "field definition too large (max {} bytes)",
+            MAX_SCHEMA_DEFINITION_LEN
+        )));
+    }
+
+    let values = || -> Result<Vec<String>, McpError> {
+        params
+            .values
+            .clone()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "'{}' requires a non-empty values list",
+                    params.operation
+                ))
+            })
+    };
+
+    match params.operation.trim().to_ascii_lowercase().as_str() {
+        "add_values" => Ok(SchemaEdit::AddValues {
+            field: params.field.clone(),
+            values: values()?,
+        }),
+        "remove_values" => Ok(SchemaEdit::RemoveValues {
+            field: params.field.clone(),
+            values: values()?,
+        }),
+        "set_field" => {
+            let definition = params
+                .definition
+                .clone()
+                .ok_or_else(|| invalid("'set_field' requires a definition".into()))?;
+            let parsed = serde_json::from_value(definition)
+                .map_err(|e| invalid(format!("invalid field definition: {e}")))?;
+            Ok(SchemaEdit::SetField {
+                field: params.field.clone(),
+                definition: Box::new(parsed),
+            })
+        }
+        "remove_field" => Ok(SchemaEdit::RemoveField {
+            field: params.field.clone(),
+        }),
+        other => Err(invalid(format!(
+            "unknown operation '{other}': expected add_values, remove_values, set_field, \
+             or remove_field"
+        ))),
+    }
+}
+
+/// Resolve a possibly-partial scope reference to exactly one directory.
+///
+/// Mirrors `get_document`'s contract: an exact match wins, several matches are an
+/// explicit ambiguity error rather than a guess, and none is a not-found error naming
+/// what does exist.
+fn resolve_scope_reference(
+    schemas: &SchemaCache,
+    requested: &std::path::Path,
+) -> Result<std::path::PathBuf, McpError> {
+    let matches = schemas.match_scope_dirs(requested);
+    match matches.len() {
+        // No scope declares its own schema here; the path still resolves through the
+        // cascade to whatever ancestor governs it.
+        0 => Ok(requested.to_path_buf()),
+        1 => Ok(matches.into_iter().next().expect("length checked")),
+        _ => Err(McpError::invalid_params(
+            format!(
+                "'{}' matches {} scopes: {}. Use a more specific path.",
+                requested.display(),
+                matches.len(),
+                matches
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None,
+        )),
+    }
+}
+
+/// Reject a caller-supplied commit message that git or the log would mangle.
+fn validate_commit_message(message: Option<&str>) -> Result<(), McpError> {
+    let Some(msg) = message else {
+        return Ok(());
+    };
+    if msg.contains('\n') {
+        return Err(McpError::invalid_params(
+            "commit message must not contain newlines".to_string(),
+            None,
+        ));
+    }
+    if msg.len() > MAX_COMMIT_MESSAGE_LEN {
+        return Err(McpError::invalid_params(
+            format!(
+                "commit message too long ({} chars); maximum is {}",
+                msg.len(),
+                MAX_COMMIT_MESSAGE_LEN
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Strip control characters and cap length anywhere inside a value echoed back to an
+/// agent. Defaults come from schema files in a synced repo, so an array or object
+/// default is just as attacker-controlled as a string one.
+fn sanitize_reflected_value(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(crate::server::sanitize_facet_value(s)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(MAX_REPORTED_VALUES)
+                .map(sanitize_reflected_value)
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .take(MAX_REPORTED_VALUES)
+                .map(|(k, v)| {
+                    (
+                        crate::server::sanitize_facet_value(k),
+                        sanitize_reflected_value(v),
+                    )
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Render a casualty list for a human-readable message.
+fn render_casualties(casualties: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for entry in casualties.iter().take(MAX_REPORTED_CASUALTIES) {
+        out.push_str(&format!(
+            "  - {}: {}\n",
+            entry["path"].as_str().unwrap_or("?"),
+            entry["reason"].as_str().unwrap_or("?")
+        ));
+    }
+    if casualties.len() > MAX_REPORTED_CASUALTIES {
+        out.push_str(&format!(
+            "  … and {} more\n",
+            casualties.len() - MAX_REPORTED_CASUALTIES
+        ));
+    }
+    out
+}
+
+/// Default page size for `list_documents` — well above `search`'s cap, since
+/// enumeration is the point.
+const DEFAULT_LIST_LIMIT: u64 = 100;
+/// Hard cap on a single `list_documents` page.
+const MAX_LIST_LIMIT: u64 = 1000;
+/// Cap on how many filter fields one call may specify.
+const MAX_LIST_FILTERS: usize = 20;
+/// Cap on values within a single field's filter, so one call cannot generate an
+/// unbounded number of bound SQL parameters.
+const MAX_FILTER_VALUES: usize = 500;
+
+/// Translate one JSON filter value into a typed [`FieldFilter`].
+///
+/// Accepts a scalar for equality, an array for any-of, or an object carrying
+/// `any_of` / `all_of` / `gte` / `lte` / `gt` / `lt`.
+fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilter, String> {
+    use serde_json::Value;
+
+    // Scalar values go through the same canonicalization as the write path, so a JSON
+    // `false` matches a stored boolean and `45` matches a stored integer.
+    let canonical = |value: &Value| -> Result<String, String> {
+        document_fields::canonical_text(value).ok_or_else(|| {
+            format!(
+                "filter '{}': expected a string, number, or boolean, got {}",
+                field, value
+            )
+        })
+    };
+
+    // One place enforces the value cap, so no filter form can slip past it. `all_of`
+    // in particular compiles to one correlated subquery per value, so an uncapped list
+    // is a query-complexity attack, not merely a large response.
+    let values_of = |items: &[Value]| -> Result<Vec<String>, String> {
+        if items.len() > MAX_FILTER_VALUES {
+            return Err(format!(
+                "filter '{}': too many values ({}, max {})",
+                field,
+                items.len(),
+                MAX_FILTER_VALUES
+            ));
+        }
+        items.iter().map(&canonical).collect()
+    };
+
+    match raw {
+        Value::String(_) | Value::Number(_) | Value::Bool(_) => {
+            Ok(FieldFilter::AnyOf(vec![canonical(raw)?]))
+        }
+        Value::Array(items) => Ok(FieldFilter::AnyOf(values_of(items)?)),
+        Value::Object(map) => {
+            let number = |key: &str| -> Result<Option<f64>, String> {
+                match map.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::Number(n)) => Ok(n.as_f64()),
+                    Some(other) => Err(format!(
+                        "filter '{}': '{}' must be a number, got {}",
+                        field, key, other
+                    )),
+                }
+            };
+
+            let known = ["any_of", "all_of", "gte", "lte", "gt", "lt"];
+            if let Some(unknown) = map.keys().find(|k| !known.contains(&k.as_str())) {
+                return Err(format!(
+                    "filter '{}': unknown operator '{}'; expected one of {}",
+                    field,
+                    unknown,
+                    known.join(", ")
+                ));
+            }
+
+            // Set matching and range matching are separate modes. Accepting a mix and
+            // honoring only one silently returns a broader result set than the caller
+            // asked for, which is exactly the class of silent-wrong-answer this tool
+            // exists to eliminate — so reject it rather than pick a winner.
+            let has_set = map.contains_key("any_of") || map.contains_key("all_of");
+            let has_range = ["gte", "lte", "gt", "lt"]
+                .iter()
+                .any(|k| map.contains_key(*k));
+            if has_set && has_range {
+                return Err(format!(
+                    "filter '{}': cannot combine set matching (any_of/all_of) with a \
+                     numeric range (gte/lte/gt/lt); use one or the other",
+                    field
+                ));
+            }
+            if map.contains_key("any_of") && map.contains_key("all_of") {
+                return Err(format!(
+                    "filter '{}': specify either any_of or all_of, not both",
+                    field
+                ));
+            }
+
+            if let Some(values) = map.get("all_of") {
+                let items = values
+                    .as_array()
+                    .ok_or_else(|| format!("filter '{}': 'all_of' must be an array", field))?;
+                if items.is_empty() {
+                    return Err(format!("filter '{}': 'all_of' must not be empty", field));
+                }
+                return Ok(FieldFilter::AllOf(values_of(items)?));
+            }
+
+            if let Some(values) = map.get("any_of") {
+                let items = values
+                    .as_array()
+                    .ok_or_else(|| format!("filter '{}': 'any_of' must be an array", field))?;
+                return Ok(FieldFilter::AnyOf(values_of(items)?));
+            }
+
+            let (gte, lte, gt, lt) = (number("gte")?, number("lte")?, number("gt")?, number("lt")?);
+            if gte.is_none() && lte.is_none() && gt.is_none() && lt.is_none() {
+                return Err(format!(
+                    "filter '{}': object filters need at least one of {}",
+                    field,
+                    known.join(", ")
+                ));
+            }
+            Ok(FieldFilter::Range { gte, lte, gt, lt })
+        }
+        Value::Null => Err(format!(
+            "filter '{}': null is not a filter; omit the field instead",
+            field
+        )),
+    }
+}
+
+/// Build a validated [`DocumentQuery`] from tool parameters.
+fn build_document_query(params: &ListDocumentsParams) -> Result<DocumentQuery, McpError> {
+    let invalid = |msg: String| McpError::invalid_params(msg, None);
+
+    let mut filters = Vec::new();
+    if let Some(raw_filters) = &params.filters {
+        if raw_filters.len() > MAX_LIST_FILTERS {
+            return Err(invalid(format!(
+                "too many filters: {} (max {})",
+                raw_filters.len(),
+                MAX_LIST_FILTERS
+            )));
+        }
+        for (field, raw) in raw_filters {
+            if field.len() > MAX_FILTER_STR_LEN {
+                return Err(invalid(format!(
+                    "filter field name too long: {} chars (max {})",
+                    field.len(),
+                    MAX_FILTER_STR_LEN
+                )));
+            }
+            filters.push((
+                field.clone(),
+                parse_field_filter(field, raw).map_err(invalid)?,
+            ));
+        }
+        // Deterministic order keeps generated SQL stable across calls.
+        filters.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    let order_by = match &params.order_by {
+        Some(raw) => OrderBy::parse(raw).map_err(invalid)?,
+        None => OrderBy::default(),
+    };
+
+    if let Some(fields) = &params.fields
+        && fields.len() > MAX_LIST_FILTERS
+    {
+        return Err(invalid(format!(
+            "too many fields requested: {} (max {})",
+            fields.len(),
+            MAX_LIST_FILTERS
+        )));
+    }
+
+    if let Some(prefix) = &params.path_prefix
+        && prefix.len() > MAX_FILTER_STR_LEN
+    {
+        return Err(invalid(format!(
+            "path_prefix too long: {} chars (max {})",
+            prefix.len(),
+            MAX_FILTER_STR_LEN
+        )));
+    }
+
+    Ok(DocumentQuery {
+        filters,
+        path_prefix: params.path_prefix.clone(),
+        order_by,
+        order_desc: params.descending.unwrap_or(false),
+        limit: params
+            .limit
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .clamp(1, MAX_LIST_LIMIT),
+        offset: params.offset.unwrap_or(0),
+        fields: params.fields.clone(),
+    })
+}
+
 fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
     if params.query.len() > MAX_QUERY_LEN {
         return Err(McpError::invalid_params(
@@ -182,7 +623,10 @@ fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
 ///    still `starts_with` the canonical data_root. This catches a symlinked
 ///    ancestor directory that resolves to a location outside data_root.
 pub fn resolve_safe_write_path(data_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
-    // 1. Reject absolute paths.
+    // A leading `/` means "the knowledge-base root", not a filesystem path — callers
+    // have no way to know where the KB lives inside the container, so treating `/x.md`
+    // and `x.md` as the same location is the only reading that makes sense here.
+    let rel_path = crate::retrieval::kb_root_relative(rel_path);
     let requested = Path::new(rel_path);
     if requested.is_absolute() {
         return Err("path must be relative to the knowledge base root".to_string());
@@ -251,6 +695,99 @@ pub struct GetDocumentParams {
     /// the `search` tool), or just a basename when it's unique across the
     /// index. Absolute paths are also accepted for backwards compatibility.
     pub path: String,
+}
+
+/// Parameters for the `list_documents` tool.
+///
+/// Every field is optional: with no arguments at all the tool pages through the whole
+/// knowledge base.
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListDocumentsParams {
+    /// Frontmatter criteria, keyed by field name. Nested fields use dot-paths
+    /// (`planning.prep_minutes`). Values may be:
+    /// a scalar for equality (`{"type": "guide"}`), an array for any-of
+    /// (`{"tags": ["recipe", "dinner"]}`), or an object for all-of and numeric
+    /// comparison (`{"tags": {"all_of": ["recipe", "dinner"]}}`,
+    /// `{"planning.prep_minutes": {"lt": 30}}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// Restrict to documents whose path starts with this prefix, e.g.
+    /// `lifestyle/kitchen/recipes/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+
+    /// Sort key: `path` (default), `title`, `mtime`, or `indexed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<String>,
+
+    /// Sort descending instead of ascending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descending: Option<bool>,
+
+    /// Maximum documents to return (default 100, max 1000). The response always
+    /// reports the full match count, so truncation is never silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+
+    /// Number of documents to skip, for paging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+
+    /// Frontmatter fields to include per document (dot-paths). Omit for all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+}
+
+/// Parameters for the `get_schema` tool.
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetSchemaParams {
+    /// Directory or document path whose governing rules to resolve. Omit for the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
+    /// Only report these fields (dot-paths). Omit for all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+
+    /// Only report fields that declare a closed value set — the vocabulary view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values_only: Option<bool>,
+}
+
+/// Parameters for the `update_schema` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateSchemaParams {
+    /// Directory whose schema to edit, e.g. `lifestyle/kitchen/recipes`. Empty or
+    /// omitted edits the knowledge-base root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
+    /// What to change: `add_values`, `remove_values`, `set_field`, or `remove_field`.
+    pub operation: String,
+
+    /// Field this operation targets. Nested fields use dot-paths.
+    pub field: String,
+
+    /// Values, for `add_values` and `remove_values`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+
+    /// Field definition, for `set_field`. Accepts the same keys as a `.kb-schema.yaml`
+    /// entry: `type`, `required`, `indexed`, `values`, `extend`, `default`, `open`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<serde_json::Value>,
+
+    /// Report what the change would do without writing anything, including which
+    /// existing documents it would invalidate. Never refuses — it always succeeds and
+    /// reports. When false (the default), a change that would invalidate existing
+    /// documents is refused unless `force` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+
+    /// Apply even when existing documents would fail the new rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
 }
 
 /// Parameters for the `search` tool.
@@ -481,6 +1018,13 @@ pub struct KbSearchServer {
     /// Always [`crate::webhook::REINDEX_LOCK_TIMEOUT`] in production; tests shorten it so
     /// they can exercise the timeout path without a 30-second sleep.
     reindex_lock_timeout: Duration,
+    /// Handle to the document metadata index, opened on first use and held for the
+    /// process lifetime. Under WAL this reader coexists with the short-lived writer
+    /// pools that reindexing and delete cleanup open.
+    ///
+    /// Lazy rather than constructor-injected so building a server stays synchronous
+    /// and infallible with respect to SQLite availability.
+    state_db: Arc<tokio::sync::OnceCell<StateDb>>,
 }
 
 /// Acquire the shared reindex lock, giving up after `wait`.
@@ -571,6 +1115,7 @@ impl KbSearchServer {
             config,
             rerank_client,
             reindex_lock_timeout: crate::webhook::REINDEX_LOCK_TIMEOUT,
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -580,6 +1125,183 @@ impl KbSearchServer {
     fn with_reindex_lock_timeout(mut self, wait: Duration) -> Self {
         self.reindex_lock_timeout = wait;
         self
+    }
+
+    /// Write a non-document file into the KB, commit it, and reindex.
+    ///
+    /// Used for `.kb-schema.yaml`, which is versioned and synced like a document but is
+    /// not itself indexed. The write goes to a temp file and is renamed into place, so a
+    /// failure part-way cannot leave a half-written schema that would freeze the scope.
+    async fn write_raw_file(
+        &self,
+        rel_path: &str,
+        content: &str,
+        commit_message: &str,
+    ) -> Result<(), McpError> {
+        let config = &self.config;
+
+        // Same resolver the document write tools use. Joining the data root with a
+        // caller-supplied path is NOT sufficient on its own: the knowledge base is a
+        // synced git repo, and git materializes tracked symlinks on checkout, so a
+        // hostile upstream commit could otherwise redirect this write outside the KB.
+        let abs_path = resolve_safe_write_path(&self.canonical_data_path, rel_path)
+            .map_err(|e| McpError::invalid_params(format!("Invalid schema path: {}", e), None))?;
+
+        if let Some(parent) = abs_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                error!("Failed to create directory '{}': {}", parent.display(), e);
+                McpError::internal_error(format!("Failed to create directory: {}", e), None)
+            })?;
+        }
+
+        // Re-check after creating the directory: `resolve_safe_write_path` can only
+        // canonicalize ancestors that existed at the time, so a newly created path
+        // component is verified here.
+        resolve_safe_write_path(&self.canonical_data_path, rel_path)
+            .map_err(|e| McpError::invalid_params(format!("Invalid schema path: {}", e), None))?;
+
+        // Unique per call, not merely per process: two concurrent requests inside one
+        // server would otherwise share a temp path and silently clobber each other,
+        // with the loser still reporting success.
+        static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_path = abs_path.with_extension(format!("tmp-{}-{}", std::process::id(), seq));
+        tokio::fs::write(&temp_path, content.as_bytes())
+            .await
+            .map_err(|e| {
+                error!("Failed to write '{}': {}", temp_path.display(), e);
+                McpError::internal_error(format!("Failed to write file: {}", e), None)
+            })?;
+        tokio::fs::rename(&temp_path, &abs_path)
+            .await
+            .map_err(|e| {
+                error!("Failed to install '{}': {}", abs_path.display(), e);
+                McpError::internal_error(format!("Failed to write file: {}", e), None)
+            })?;
+
+        let token = std::env::var(&config.source.git_token_env)
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        git::commit_and_sync(
+            config.source.git_url.as_deref(),
+            &config.source.branch,
+            self.canonical_data_path.to_str().unwrap_or_default(),
+            token.as_deref(),
+            rel_path,
+            commit_message,
+            &config.write.commit_author_name,
+            &config.write.commit_author_email,
+        )
+        .await
+        .map_err(|e| {
+            error!("commit_and_sync failed for '{}': {:#}", rel_path, e);
+            McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
+        })?;
+
+        // A schema change revalidates its whole subtree via the schema fingerprint, so
+        // this reindex is doing real work rather than a no-op. As with document writes,
+        // a reindex we cannot start means a stale index, not lost content.
+        match acquire_reindex_lock(self.reindex_lock_timeout).await {
+            Some(_guard) => {
+                if let Err(e) = ingest::run_index(config, false).await {
+                    error!("Reindex after schema update failed: {:#}", e);
+                }
+            }
+            None => warn!(
+                "Reindex after schema update skipped: REINDEX_LOCK still held after {:?}",
+                self.reindex_lock_timeout
+            ),
+        }
+
+        Ok(())
+    }
+
+    /// Documents already under `rel_dir` that a candidate schema would reject.
+    ///
+    /// Answered from the metadata index rather than by re-reading markdown: every
+    /// document's frontmatter is stored as JSON, so this is a query.
+    async fn documents_broken_by(
+        &self,
+        rel_dir: &std::path::Path,
+        schemas: &SchemaCache,
+        candidate_file: &crate::schema::SchemaFile,
+    ) -> Result<Vec<serde_json::Value>, McpError> {
+        let index = self.state_db().await.map_err(|e| {
+            error!("Schema dry-run could not open the metadata index: {:#}", e);
+            McpError::internal_error(
+                format!("Cannot check existing documents: {e}. Index unavailable."),
+                None,
+            )
+        })?;
+
+        let prefix = if rel_dir.as_os_str().is_empty() {
+            None
+        } else {
+            Some(format!("{}/", rel_dir.to_string_lossy()))
+        };
+
+        let query = DocumentQuery {
+            path_prefix: prefix,
+            // The whole point is completeness; a truncated check would report a clean
+            // dry-run for a change that breaks documents beyond the page.
+            limit: u32::MAX as u64,
+            ..Default::default()
+        };
+
+        let listing = index.query_documents(&query).await.map_err(|e| {
+            error!("Schema dry-run query failed: {:#}", e);
+            McpError::internal_error(format!("Cannot check existing documents: {e}"), None)
+        })?;
+
+        let mut casualties = Vec::new();
+        for doc in &listing.documents {
+            let Some(map) = doc.frontmatter.as_object() else {
+                continue;
+            };
+
+            // Resolve each document against ITS OWN effective schema under the proposed
+            // edit, not against the edited directory's. A descendant scope that
+            // redefines the field being changed is unaffected by this edit, and
+            // validating it against the parent's new rule would report a casualty that
+            // does not exist — blocking a legitimate change.
+            let doc_path = std::path::Path::new(&doc.file_path);
+            let effective = schemas.resolve_with_candidate(doc_path, rel_dir, candidate_file);
+            if effective.is_none() {
+                continue;
+            }
+            let effective = effective.expect("checked above");
+
+            let mut frontmatter: std::collections::HashMap<String, serde_json::Value> =
+                map.clone().into_iter().collect();
+            // The real indexing path fills in schema defaults before validating, so
+            // skipping that here reports a required field WITH a default as breaking
+            // every document that omits it — blocking a genuinely safe change and
+            // pushing the operator toward `force`, which also bypasses the real checks.
+            validate::apply_defaults(&mut frontmatter, &effective);
+            let errors = validate::validate_frontmatter(&frontmatter, &effective);
+            if let Some(first) = errors.first() {
+                casualties.push(serde_json::json!({
+                    "path": doc.file_path,
+                    "reason": first.message,
+                    "error_count": errors.len(),
+                }));
+            }
+        }
+
+        Ok(casualties)
+    }
+
+    /// The document metadata index, opened on first use.
+    async fn state_db(&self) -> anyhow::Result<&StateDb> {
+        self.state_db
+            .get_or_try_init(|| async {
+                let path = self.config.state_db_path();
+                StateDb::new(std::path::Path::new(&path))
+                    .await
+                    .with_context(|| format!("Failed to open state DB at {}", path))
+            })
+            .await
     }
 
     /// Build a `RetrievalDeps` bundle from this server's fields.
@@ -811,6 +1533,378 @@ impl KbSearchServer {
     }
 
     #[tool(
+        description = "Show the frontmatter rules governing a path. Schemas cascade by \
+        directory: a .kb-schema.yaml applies to its folder and everything beneath it, \
+        with deeper files refining shallower ones. This returns the fully MERGED result \
+        for the path you ask about, plus which schema file contributed each field.\n\
+        \n\
+        Call this before creating or editing a document — the rules in the server \
+        instructions are root-level only and may not be complete for a given folder.\n\
+        \n\
+        - path: directory or document path; omit for the knowledge-base root\n\
+        - fields: only report these dot-paths\n\
+        - values_only: only report fields with a closed set of permitted values"
+    )]
+    async fn get_schema(
+        &self,
+        Parameters(params): Parameters<GetSchemaParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let raw = params.path.clone().unwrap_or_default();
+        let rel = normalize_scope_path(&raw)?;
+        let schemas = SchemaCache::build(&self.canonical_data_path, &self.config.frontmatter);
+
+        // A document path resolves via its parent; a directory resolves to itself. A
+        // partial directory reference resolves like a partial document path does —
+        // exact match wins, otherwise report the candidates rather than guessing.
+        let rel = if raw.ends_with(".md") || rel.as_os_str().is_empty() {
+            rel
+        } else {
+            resolve_scope_reference(&schemas, &rel)?
+        };
+        let lookup = if raw.ends_with(".md") {
+            rel.clone()
+        } else {
+            rel.join("_")
+        };
+        let schema = schemas.resolve_for(&lookup);
+
+        let values_only = params.values_only.unwrap_or(false);
+        let mut reported: Vec<serde_json::Value> = Vec::new();
+        let mut omitted = 0usize;
+        for (field, def) in &schema.fields {
+            if let Some(wanted) = &params.fields
+                && !wanted.contains(field)
+            {
+                continue;
+            }
+            if values_only && def.values.is_none() {
+                continue;
+            }
+            // Schema files arrive via git sync, so field count is attacker-controlled
+            // and the per-field value cap alone does not bound the response. Counted
+            // after the filters so `omitted` reflects fields the caller actually asked
+            // for, not every remaining field in the schema.
+            if reported.len() >= MAX_REPORTED_FIELDS {
+                omitted += 1;
+                continue;
+            }
+            // Field names, permitted values, and provenance paths all originate in
+            // .kb-schema.yaml files from a synced repo. The instructions actively steer
+            // agents to call this tool before every write, so it is a reliably-triggered
+            // reflection point — strip control characters and cap length on everything
+            // that came from the knowledge base.
+            let clean_values = def.values.as_ref().map(|vs| {
+                vs.iter()
+                    .take(MAX_REPORTED_VALUES)
+                    .map(|v| crate::server::sanitize_facet_value(v))
+                    .collect::<Vec<_>>()
+            });
+            reported.push(serde_json::json!({
+                "field": crate::server::sanitize_facet_value(field),
+                "type": def.ty.map(|t| format!("{t:?}").to_lowercase()),
+                "required": def.required,
+                "indexed": def.indexed,
+                "values": clean_values,
+                "default": def.default.as_ref().map(sanitize_reflected_value),
+                "open": def.open,
+                "declared_in": schema
+                    .origin
+                    .get(field)
+                    .map(|o| crate::server::sanitize_facet_value(o)),
+            }));
+        }
+
+        let frozen = schemas.is_frozen(&lookup);
+        let structured = serde_json::json!({
+            "path": rel.to_string_lossy(),
+            "frozen": frozen.is_some(),
+            "frozen_reason": frozen,
+            "fields": reported,
+            "omitted_fields": omitted,
+        });
+
+        let mut text = format!(
+            "Schema governing '{}' ({} field(s)):\n\n",
+            rel.display(),
+            reported.len()
+        );
+        if let Some(reason) = frozen {
+            text.push_str(&format!(
+                "WARNING: this scope is frozen — its schema file is invalid ({reason}). \
+                 Documents here are not being indexed.\n\n"
+            ));
+        }
+        if omitted > 0 {
+            text.push_str(&format!(
+                "({omitted} further field(s) omitted; narrow with the fields parameter.)\n\n"
+            ));
+        }
+        for entry in &reported {
+            text.push_str(&format!("- {}", entry["field"].as_str().unwrap_or("?")));
+            if let Some(ty) = entry["type"].as_str() {
+                text.push_str(&format!(" ({ty})"));
+            }
+            if entry["required"] == serde_json::json!(true) {
+                text.push_str(" [required]");
+            }
+            if let Some(values) = entry["values"].as_array() {
+                let rendered: Vec<String> = values
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                text.push_str(&format!(" — one of: {}", rendered.join(", ")));
+            }
+            if let Some(origin) = entry["declared_in"].as_str() {
+                text.push_str(&format!("  (from {origin})"));
+            }
+            text.push('\n');
+        }
+
+        let mut result = CallToolResult::success(vec![Content::text(text.trim_end())]);
+        result.structured_content = Some(structured);
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Change the frontmatter rules for a directory, editing its \
+        .kb-schema.yaml. Use this when a new document warrants a new tag or field \
+        rather than working around the rules.\n\
+        \n\
+        Operations: add_values / remove_values (adjust a field's permitted set), \
+        set_field (declare or replace a field definition), remove_field.\n\
+        \n\
+        Every change is checked against the documents that already exist under this \
+        scope BEFORE anything is written. If the change would invalidate any of them, \
+        it is refused and they are listed — pass force to apply anyway. Pass dry_run to \
+        see the effect without writing. The file is committed and pushed like any \
+        document edit."
+    )]
+    async fn update_schema(
+        &self,
+        Parameters(params): Parameters<UpdateSchemaParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let invalid = |msg: String| McpError::invalid_params(msg, None);
+
+        let requested = normalize_scope_path(params.path.as_deref().unwrap_or(""))?;
+        let edit = build_schema_edit(&params)?;
+
+        let schemas = SchemaCache::build(&self.canonical_data_path, &self.config.frontmatter);
+
+        // Resolve a partial reference against existing scopes, but fall back to the
+        // literal path: creating a schema for a directory that has none yet is the
+        // normal way to introduce one, so "no match" is not an error here.
+        let matches = schemas.match_scope_dirs(&requested);
+        let rel_dir = match matches.len() {
+            0 => requested,
+            1 => matches.into_iter().next().expect("length checked"),
+            _ => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "'{}' matches {} scopes: {}. Use a more specific path.",
+                        requested.display(),
+                        matches.len(),
+                        matches
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        let mut file = schemas
+            .raw_file_at(&rel_dir)
+            .map_err(|e| invalid(format!("Existing schema at '{}' is unreadable: {e}. Fix it by hand before editing through this tool.", rel_dir.display())))?;
+        let summary = file.apply(&edit).map_err(invalid)?;
+
+        // A self-contradictory definition parses fine but freezes the whole subtree at
+        // the next index run — after this call has already reported success. Catch it
+        // here, where the caller can still act on it.
+        file.validate_self().map_err(invalid)?;
+
+        let yaml = file.to_yaml().map_err(invalid)?;
+
+        // Re-parse what we are about to write. A schema that does not round-trip would
+        // freeze this whole subtree at the next index run.
+        serde_yaml_ng::from_str::<crate::schema::SchemaFile>(&yaml).map_err(|e| {
+            McpError::internal_error(
+                format!("Refusing to write a schema that does not parse: {e}"),
+                None,
+            )
+        })?;
+
+        // Dry-run the change against documents that already exist under this scope.
+        let casualties = self.documents_broken_by(&rel_dir, &schemas, &file).await?;
+
+        let dry_run = params.dry_run.unwrap_or(false);
+        let force = params.force.unwrap_or(false);
+
+        if !casualties.is_empty() && !force && !dry_run {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Refusing to apply: {} existing document(s) would fail the new rules. \
+                     Fix them first, or pass force to apply anyway.\n{}",
+                    casualties.len(),
+                    render_casualties(&casualties)
+                ),
+                Some(serde_json::json!({ "would_invalidate": casualties })),
+            ));
+        }
+
+        if dry_run {
+            let text = format!(
+                "Dry run — nothing written.\n{}\nWould affect {} existing document(s).{}\n\nResulting {}:\n{}",
+                summary,
+                casualties.len(),
+                if casualties.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", render_casualties(&casualties))
+                },
+                crate::schema::SCHEMA_FILE_NAME,
+                yaml
+            );
+            let mut result = CallToolResult::success(vec![Content::text(text)]);
+            result.structured_content = Some(serde_json::json!({
+                "dry_run": true,
+                "summary": summary,
+                "would_invalidate": casualties,
+                "yaml": yaml,
+            }));
+            return Ok(result);
+        }
+
+        let rel_file = rel_dir.join(crate::schema::SCHEMA_FILE_NAME);
+        let rel_file_str = rel_file.to_string_lossy().to_string();
+        let commit_message = format!("schema: {summary} in {}", rel_dir.display());
+
+        self.write_raw_file(&rel_file_str, &yaml, &commit_message)
+            .await?;
+
+        let mut text = format!("{summary}\nWrote {rel_file_str}.");
+        if !casualties.is_empty() {
+            text.push_str(&format!(
+                "\n\nWARNING: {} existing document(s) now fail validation and will stop \
+                 being re-indexed until fixed:\n{}",
+                casualties.len(),
+                render_casualties(&casualties)
+            ));
+        }
+
+        let mut result = CallToolResult::success(vec![Content::text(text)]);
+        result.structured_content = Some(serde_json::json!({
+            "dry_run": false,
+            "summary": summary,
+            "path": rel_file_str,
+            "invalidated": casualties,
+        }));
+        Ok(result)
+    }
+
+    #[tool(
+        description = "List documents by their frontmatter, without relevance ranking. \
+        Use this instead of `search` whenever you need a COMPLETE set — every recipe, \
+        every config document, all docs of a given type. `search` returns ranked chunks \
+        and several may come from one document, so it cannot enumerate reliably.\n\
+        \n\
+        All parameters are optional; with none, it pages through the whole knowledge base.\n\
+        - filters: frontmatter criteria keyed by field. Nested fields use dot-paths. \
+        A scalar means equality ({\"type\": \"guide\"}), an array means any-of \
+        ({\"tags\": [\"recipe\", \"dinner\"]}), and an object means all-of or a numeric \
+        range ({\"tags\": {\"all_of\": [\"recipe\", \"dinner\"]}}, \
+        {\"planning.prep_minutes\": {\"lt\": 30}}).\n\
+        - path_prefix: restrict to a folder, e.g. 'lifestyle/kitchen/recipes/'.\n\
+        - order_by: path (default), title, mtime, or indexed_at; descending flips it.\n\
+        - limit / offset: page size (default 100, max 1000) and starting position.\n\
+        - fields: which frontmatter fields to return per document; omit for all.\n\
+        \n\
+        The response always reports the total number of matching documents, so \
+        truncation is never silent — if has_more is true, page with offset."
+    )]
+    async fn list_documents(
+        &self,
+        Parameters(params): Parameters<ListDocumentsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let query = build_document_query(&params)?;
+
+        let index = self.state_db().await.map_err(|e| {
+            error!("list_documents could not open the metadata index: {:#}", e);
+            McpError::internal_error(format!("Document index unavailable: {}", e), None)
+        })?;
+
+        let result = retrieval::list_documents(&DocumentIndexDeps { index }, &query)
+            .await
+            .map_err(|e| {
+                error!("list_documents failed: {:#}", e);
+                McpError::internal_error(format!("Failed to list documents: {}", e), None)
+            })?;
+
+        let has_more = result.has_more(query.offset);
+        let returned = result.documents.len();
+
+        let structured = serde_json::json!({
+            "total": result.total,
+            "returned": returned,
+            "offset": query.offset,
+            "has_more": has_more,
+            "documents": result
+                .documents
+                .iter()
+                .map(|d| serde_json::json!({
+                    "file_path": d.file_path,
+                    "title": d.title,
+                    "description": d.description,
+                    "mtime": d.mtime,
+                    "frontmatter": d.frontmatter,
+                }))
+                .collect::<Vec<_>>(),
+        });
+
+        let mut text = if result.total == 0 {
+            "No documents match those criteria.".to_string()
+        } else if returned == 0 {
+            format!(
+                "{} document(s) match, but offset {} is past the end.",
+                result.total, query.offset
+            )
+        } else {
+            format!(
+                "{} document(s) match; showing {}–{}.\n\n",
+                result.total,
+                query.offset + 1,
+                query.offset + returned as u64
+            )
+        };
+
+        for doc in &result.documents {
+            text.push_str(&format!("- {}", doc.file_path));
+            if let Some(title) = &doc.title {
+                text.push_str(&format!(" — {}", title));
+            }
+            text.push('\n');
+            if let Some(description) = &doc.description {
+                text.push_str(&format!("  {}\n", description.trim()));
+            }
+        }
+
+        if has_more {
+            text.push_str(&format!(
+                "\n{} more document(s) match. Page with offset={} to continue.",
+                result.total - query.offset - returned as u64,
+                query.offset + returned as u64
+            ));
+        }
+
+        // Plain text keeps parity with the other tools; the structured half is what a
+        // consuming skill checks to detect truncation without parsing prose.
+        let mut call_result = CallToolResult::success(vec![Content::text(text.trim_end())]);
+        call_result.structured_content = Some(structured);
+        Ok(call_result)
+    }
+
+    #[tool(
         description = "Retrieve the full raw content of a document by file path. \
         Accepts paths relative to the knowledge base root (e.g. \
         'lifestyle/vehicles/foo.md', as returned by the `search` tool) or just \
@@ -894,19 +1988,22 @@ impl KbSearchServer {
     ///
     /// * `old_content` – empty string for create; existing file bytes for edit.
     /// * `new_content` – the content to write (already computed by caller).
-    /// * `abs_path`    – canonical absolute path of the target file.
     /// * `rel_path`    – repo-relative path (used for git add/commit and messages).
     /// * `is_create`   – `true` for create (dedup gate active), `false` for edit.
     /// * `message`     – optional custom commit message.
     /// * `default_verb`– verb for the default commit message, e.g. `"add"` or `"update"`.
     /// * `force_new`   – when `Some(true)`, bypasses the dedup gate on create paths.
     /// * `operation`   – label for the `Operation:` git trailer, e.g. `"create_document"`.
+    ///
+    /// The absolute path is deliberately NOT a parameter: it is re-resolved from
+    /// `rel_path` immediately before each filesystem action, so a path validated by the
+    /// caller cannot go stale across the validation and dedup awaits in between.
+    /// Callers still resolve it themselves for their own existence checks.
     #[allow(clippy::too_many_arguments)]
     async fn write_document(
         &self,
         old_content: &str,
         new_content: &str,
-        abs_path: &Path,
         rel_path: &str,
         is_create: bool,
         message: Option<&str>,
@@ -929,10 +2026,31 @@ impl KbSearchServer {
 
         // 1. Validate new_content before writing (catches frontmatter errors in
         //    both full-replace and surgical edits before touching the filesystem).
+        //
+        // The schema is resolved from the TARGET path's directory, so writing into
+        // `lifestyle/kitchen/recipes/` is governed by that folder's rules regardless of
+        // where the caller has been reading. The cascade is rebuilt per write rather
+        // than cached: writes are infrequent, a tree walk is milliseconds, and a stale
+        // cache here would validate against rules the author just changed.
+        let schemas = SchemaCache::build(&self.canonical_data_path, &config.frontmatter);
+        if let Some(reason) = schemas.is_frozen(std::path::Path::new(rel_path)) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Cannot write '{}': the schema governing this directory is invalid ({}). \
+                     Fix {} before writing here.",
+                    rel_path,
+                    reason,
+                    crate::schema::SCHEMA_FILE_NAME
+                ),
+                None,
+            ));
+        }
+        let schema = schemas.resolve_for(std::path::Path::new(rel_path));
+
         let (validation_result, validated) = validate::validate_content(
             std::path::Path::new(rel_path),
             new_content,
-            &config.frontmatter,
+            schema,
             &config.validation,
         )
         .await
@@ -1045,6 +2163,24 @@ impl KbSearchServer {
         }
 
         // 3. Create parent directories and write the file
+        // Validate the commit message BEFORE touching the filesystem. Rejecting it
+        // afterwards would leave the file written but never committed, and the index
+        // purge that follows a successful commit would never run.
+        validate_commit_message(message)?;
+
+        // Resolve fresh before creating directories too. The caller's resolution
+        // happened before schema validation and a Qdrant dedup query — a wide window in
+        // which a concurrent git sync could swap a component for a symlink, which would
+        // otherwise let create_dir_all materialize real directories outside the KB.
+        let abs_path =
+            &resolve_safe_write_path(&self.canonical_data_path, rel_path).map_err(|e| {
+                error!(
+                    "Path check failed before creating directories for '{}': {}",
+                    rel_path, e
+                );
+                McpError::invalid_params(format!("Invalid path: {}", e), None)
+            })?;
+
         if let Some(parent) = abs_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 error!(
@@ -1058,6 +2194,18 @@ impl KbSearchServer {
                 )
             })?;
         }
+
+        // Re-verify immediately before writing. The initial resolution could only
+        // canonicalize ancestors that existed at the time, and the work between then
+        // and here — schema validation, an embedding call, a Qdrant dedup query — is a
+        // wide window in which a concurrent git sync could swap a path component for a
+        // symlink. Checking afterwards would only report an escape that already
+        // happened; the verified path is what we write to.
+        let abs_path =
+            &resolve_safe_write_path(&self.canonical_data_path, rel_path).map_err(|e| {
+                error!("Path check failed before writing '{}': {}", rel_path, e);
+                McpError::invalid_params(format!("Invalid path: {}", e), None)
+            })?;
 
         if is_create {
             use tokio::io::AsyncWriteExt as _;
@@ -1093,24 +2241,6 @@ impl KbSearchServer {
                 })?;
         }
 
-        // 4. Build commit message with git trailers
-        if let Some(msg) = message {
-            if msg.contains('\n') {
-                return Err(McpError::invalid_params(
-                    "commit message must not contain newlines".to_string(),
-                    None,
-                ));
-            }
-            if msg.len() > 1000 {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "commit message too long ({} chars); maximum is 1000",
-                        msg.len()
-                    ),
-                    None,
-                ));
-            }
-        }
         let commit_message = build_commit_message(
             message,
             &format!("docs: {} {}", default_verb, rel_path),
@@ -1226,7 +2356,6 @@ impl KbSearchServer {
         self.write_document(
             "", // old_content: empty for new files
             &params.content,
-            &abs_path,
             &params.path,
             true, // is_create
             params.message.as_deref(),
@@ -1335,7 +2464,6 @@ impl KbSearchServer {
         self.write_document(
             &old_content,
             &new_content,
-            &canonical,
             &rel_path,
             false, // is_create
             params.message.as_deref(),
@@ -1405,6 +2533,12 @@ impl KbSearchServer {
             .to_string_lossy()
             .into_owned();
 
+        // Validate the commit message BEFORE deleting anything. Rejecting it after the
+        // removal would leave the file gone from disk but never committed, with the
+        // Qdrant and state-DB purge — which only runs after a successful commit —
+        // skipped too, so search would keep returning a document that no longer exists.
+        validate_commit_message(params.message.as_deref())?;
+
         // 2. Read file content before removal (used for diff output).
         let old_content = tokio::fs::read_to_string(&canonical).await.map_err(|e| {
             error!("Failed to read '{}': {}", canonical.display(), e);
@@ -1418,23 +2552,6 @@ impl KbSearchServer {
         })?;
 
         // 4. Commit + push the deletion.
-        if let Some(msg) = params.message.as_deref() {
-            if msg.contains('\n') {
-                return Err(McpError::invalid_params(
-                    "commit message must not contain newlines".to_string(),
-                    None,
-                ));
-            }
-            if msg.len() > 1000 {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "commit message too long ({} chars); maximum is 1000",
-                        msg.len()
-                    ),
-                    None,
-                ));
-            }
-        }
         let commit_message = build_commit_message(
             params.message.as_deref(),
             &format!("docs: delete {}", rel_path),
@@ -1492,10 +2609,24 @@ impl KbSearchServer {
             let db_path = config.state_db_path();
             match StateDb::new(std::path::Path::new(&db_path)).await {
                 Ok(state) => {
-                    if let Err(e) = state.delete(&rel_path).await {
-                        // Non-fatal: stale state DB row causes the next incremental
-                        // reindex to attempt re-processing, which will succeed because
-                        // the file is gone (orphan removal path). Log and continue.
+                    // Metadata first. Orphan detection reads `indexed_files`, so
+                    // clearing that row before the metadata would drop this path out of
+                    // detection permanently and strand the metadata with no sweep able
+                    // to find it again.
+                    // Gated, not merely ordered: clearing the bookkeeping row after a
+                    // failed metadata delete would drop this path out of
+                    // `indexed_files`-driven orphan detection permanently, stranding a
+                    // metadata row that no future sweep can find.
+                    if let Err(e) = state.delete_document(&rel_path).await {
+                        error!(
+                            "Failed to remove document metadata for '{}': {:#} — leaving \
+                             the state row so the next orphan sweep retries",
+                            rel_path, e
+                        );
+                    } else if let Err(e) = state.delete(&rel_path).await {
+                        // Non-fatal: a stale bookkeeping row makes the next incremental
+                        // reindex re-process the path, which succeeds because the file
+                        // is gone (orphan removal path). Log and continue.
                         error!("Failed to remove state DB row for '{}': {:#}", rel_path, e);
                     }
                 }
@@ -1596,6 +2727,942 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- list_documents filter parsing ---
+
+    fn filters_from(json: serde_json::Value) -> ListDocumentsParams {
+        ListDocumentsParams {
+            filters: Some(json.as_object().unwrap().clone()),
+            ..Default::default()
+        }
+    }
+
+    fn parsed_filters(json: serde_json::Value) -> Vec<(String, FieldFilter)> {
+        build_document_query(&filters_from(json)).unwrap().filters
+    }
+
+    #[test]
+    fn scalar_filter_becomes_equality() {
+        let filters = parsed_filters(serde_json::json!({ "type": "guide" }));
+        assert_eq!(
+            filters,
+            vec![("type".to_string(), FieldFilter::AnyOf(vec!["guide".into()]))]
+        );
+    }
+
+    #[test]
+    fn array_filter_becomes_any_of() {
+        let filters = parsed_filters(serde_json::json!({ "tags": ["recipe", "dinner"] }));
+        assert_eq!(
+            filters,
+            vec![(
+                "tags".to_string(),
+                FieldFilter::AnyOf(vec!["recipe".into(), "dinner".into()])
+            )]
+        );
+    }
+
+    #[test]
+    fn all_of_object_becomes_all_of() {
+        let filters =
+            parsed_filters(serde_json::json!({ "tags": { "all_of": ["recipe", "dinner"] } }));
+        assert_eq!(
+            filters,
+            vec![(
+                "tags".to_string(),
+                FieldFilter::AllOf(vec!["recipe".into(), "dinner".into()])
+            )]
+        );
+    }
+
+    #[test]
+    fn numeric_operators_become_a_range() {
+        let filters =
+            parsed_filters(serde_json::json!({ "planning.prep_minutes": { "gte": 10, "lt": 30 } }));
+        assert_eq!(
+            filters,
+            vec![(
+                "planning.prep_minutes".to_string(),
+                FieldFilter::Range {
+                    gte: Some(10.0),
+                    lte: None,
+                    gt: None,
+                    lt: Some(30.0),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn booleans_and_numbers_canonicalize_like_the_write_path() {
+        // The property that makes {"planning.needs_recipe": false} match stored rows.
+        let filters = parsed_filters(
+            serde_json::json!({ "planning.needs_recipe": false, "planning.rating": 5 }),
+        );
+        assert!(filters.contains(&(
+            "planning.needs_recipe".to_string(),
+            FieldFilter::AnyOf(vec!["false".into()])
+        )));
+        assert!(filters.contains(&(
+            "planning.rating".to_string(),
+            FieldFilter::AnyOf(vec!["5".into()])
+        )));
+    }
+
+    #[test]
+    fn unknown_filter_operator_is_rejected_with_guidance() {
+        let err = build_document_query(&filters_from(
+            serde_json::json!({ "planning.prep_minutes": { "lte_": 30 } }),
+        ))
+        .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("unknown operator"), "got: {msg}");
+        assert!(msg.contains("all_of"), "error should list valid operators");
+    }
+
+    #[test]
+    fn empty_object_filter_is_rejected() {
+        assert!(
+            build_document_query(&filters_from(serde_json::json!({ "tags": {} }))).is_err(),
+            "an operator-less object would otherwise match everything"
+        );
+    }
+
+    #[test]
+    fn null_filter_is_rejected() {
+        assert!(build_document_query(&filters_from(serde_json::json!({ "tags": null }))).is_err());
+    }
+
+    #[test]
+    fn non_numeric_range_bound_is_rejected() {
+        let err = build_document_query(&filters_from(
+            serde_json::json!({ "planning.prep_minutes": { "lt": "thirty" } }),
+        ))
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("must be a number"));
+    }
+
+    #[test]
+    fn nested_object_filter_value_is_rejected() {
+        assert!(
+            build_document_query(&filters_from(
+                serde_json::json!({ "tags": [{ "nested": true }] })
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn list_defaults_are_applied_when_nothing_is_supplied() {
+        let query = build_document_query(&ListDocumentsParams::default()).unwrap();
+        assert_eq!(query.limit, DEFAULT_LIST_LIMIT);
+        assert_eq!(query.offset, 0);
+        assert_eq!(query.order_by, OrderBy::Path);
+        assert!(!query.order_desc);
+        assert!(query.filters.is_empty());
+        assert!(query.path_prefix.is_none());
+        assert!(query.fields.is_none());
+    }
+
+    #[test]
+    fn list_limit_is_clamped_to_the_cap() {
+        let query = build_document_query(&ListDocumentsParams {
+            limit: Some(999_999),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(query.limit, MAX_LIST_LIMIT);
+
+        let query = build_document_query(&ListDocumentsParams {
+            limit: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(query.limit, 1, "a zero-size page would return nothing");
+    }
+
+    #[test]
+    fn invalid_order_by_is_rejected() {
+        let err = build_document_query(&ListDocumentsParams {
+            order_by: Some("file_path; DROP TABLE documents".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("unknown order_by"));
+    }
+
+    #[test]
+    fn filters_are_sorted_for_stable_sql() {
+        let query = build_document_query(&filters_from(
+            serde_json::json!({ "zeta": "a", "alpha": "b", "mid": "c" }),
+        ))
+        .unwrap();
+        let names: Vec<&str> = query.filters.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn too_many_filters_is_rejected() {
+        let mut map = serde_json::Map::new();
+        for i in 0..(MAX_LIST_FILTERS + 1) {
+            map.insert(format!("field{i}"), serde_json::json!("x"));
+        }
+        let err = build_document_query(&ListDocumentsParams {
+            filters: Some(map),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("too many filters"));
+    }
+
+    #[test]
+    fn overlong_path_prefix_is_rejected() {
+        let err = build_document_query(&ListDocumentsParams {
+            path_prefix: Some("a".repeat(MAX_FILTER_STR_LEN + 1)),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("path_prefix too long"));
+    }
+
+    // --- schema tool helpers ---
+
+    #[test]
+    fn scope_paths_normalize_to_relative_dirs() {
+        assert_eq!(normalize_scope_path("").unwrap(), std::path::PathBuf::new());
+        assert_eq!(
+            normalize_scope_path("/food/recipes/").unwrap(),
+            std::path::PathBuf::from("food/recipes")
+        );
+        assert_eq!(
+            normalize_scope_path("./food/recipes").unwrap(),
+            std::path::PathBuf::from("food/recipes")
+        );
+    }
+
+    #[test]
+    fn scope_paths_reject_traversal() {
+        // A schema written outside the KB governs nothing and could clobber other files.
+        assert!(normalize_scope_path("../../etc").is_err());
+        assert!(normalize_scope_path("food/../../etc").is_err());
+    }
+
+    #[test]
+    fn scope_paths_reject_overlong_input() {
+        assert!(normalize_scope_path(&"a".repeat(MAX_PATH_LEN + 1)).is_err());
+    }
+
+    fn update_params(operation: &str, field: &str) -> UpdateSchemaParams {
+        UpdateSchemaParams {
+            path: None,
+            operation: operation.into(),
+            field: field.into(),
+            values: None,
+            definition: None,
+            dry_run: None,
+            force: None,
+        }
+    }
+
+    #[test]
+    fn add_values_requires_a_non_empty_list() {
+        let mut params = update_params("add_values", "tags");
+        assert!(build_schema_edit(&params).is_err());
+
+        params.values = Some(vec![]);
+        assert!(build_schema_edit(&params).is_err());
+
+        params.values = Some(vec!["recipe".into()]);
+        assert!(build_schema_edit(&params).is_ok());
+    }
+
+    #[test]
+    fn unknown_operation_lists_the_valid_ones() {
+        let err = build_schema_edit(&update_params("delete_everything", "tags")).unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("unknown operation"));
+        assert!(msg.contains("add_values"));
+    }
+
+    #[test]
+    fn set_field_parses_a_definition() {
+        let mut params = update_params("set_field", "planning.prep_minutes");
+        params.definition = Some(serde_json::json!({ "type": "integer", "indexed": true }));
+
+        match build_schema_edit(&params).unwrap() {
+            crate::schema::SchemaEdit::SetField { field, definition } => {
+                assert_eq!(field, "planning.prep_minutes");
+                assert_eq!(definition.ty, Some(crate::schema::FieldType::Integer));
+                assert!(definition.indexed);
+            }
+            other => panic!("expected SetField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_field_rejects_an_unknown_key() {
+        let mut params = update_params("set_field", "tags");
+        params.definition = Some(serde_json::json!({ "typ": "integer" }));
+        assert!(
+            build_schema_edit(&params).is_err(),
+            "a typo'd key must not be silently dropped"
+        );
+    }
+
+    #[test]
+    fn schema_edits_round_trip_through_yaml() {
+        // The property that matters: whatever update_schema writes must parse back,
+        // because an unparseable schema freezes its whole subtree.
+        let mut file = crate::schema::SchemaFile::default();
+        file.apply(&crate::schema::SchemaEdit::AddValues {
+            field: "tags".into(),
+            values: vec!["recipe".into(), "dinner".into()],
+        })
+        .unwrap();
+        file.apply(&crate::schema::SchemaEdit::SetField {
+            field: "planning.prep_minutes".into(),
+            definition: Box::new(
+                serde_json::from_value(serde_json::json!({ "type": "integer", "indexed": true }))
+                    .unwrap(),
+            ),
+        })
+        .unwrap();
+
+        let yaml = file.to_yaml().unwrap();
+        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+
+        assert_eq!(
+            reparsed.fields["tags"].values,
+            Some(vec!["dinner".to_string(), "recipe".to_string()]),
+            "values are sorted for a stable diff"
+        );
+        assert_eq!(
+            reparsed.fields["planning.prep_minutes"].ty,
+            Some(crate::schema::FieldType::Integer)
+        );
+    }
+
+    #[test]
+    fn adding_an_existing_value_is_reported_as_a_no_op() {
+        let mut file = crate::schema::SchemaFile::default();
+        let edit = crate::schema::SchemaEdit::AddValues {
+            field: "tags".into(),
+            values: vec!["recipe".into()],
+        };
+        file.apply(&edit).unwrap();
+        let summary = file.apply(&edit).unwrap();
+
+        assert!(summary.contains("already permitted"), "got: {summary}");
+        assert_eq!(file.fields["tags"].values, Some(vec!["recipe".to_string()]));
+    }
+
+    #[test]
+    fn removing_an_undeclared_field_is_an_error() {
+        let mut file = crate::schema::SchemaFile::default();
+        assert!(
+            file.apply(&crate::schema::SchemaEdit::RemoveField {
+                field: "nope".into()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn casualty_rendering_summarizes_beyond_the_cap() {
+        let many: Vec<serde_json::Value> = (0..MAX_REPORTED_CASUALTIES + 5)
+            .map(|i| serde_json::json!({ "path": format!("d{i}.md"), "reason": "missing" }))
+            .collect();
+        let rendered = render_casualties(&many);
+
+        assert!(rendered.contains("d0.md"));
+        assert!(rendered.contains("and 5 more"));
+    }
+
+    // --- schema tool handlers (no Qdrant, no embeddings, no git required) ---
+
+    /// A server whose state DB lives under the temp KB, so metadata-backed tools work.
+    fn schema_tool_server(tmp: &tempfile::TempDir) -> KbSearchServer {
+        let config = make_test_resolved_config(tmp.path());
+        make_write_test_server(tmp, &["**/*.md".to_string()], config)
+    }
+
+    async fn seed_document(
+        server: &KbSearchServer,
+        rel_path: &str,
+        frontmatter: serde_json::Value,
+    ) {
+        let map = match frontmatter {
+            serde_json::Value::Object(m) => {
+                m.into_iter().collect::<std::collections::HashMap<_, _>>()
+            }
+            _ => panic!("frontmatter fixture must be an object"),
+        };
+        server
+            .state_db()
+            .await
+            .unwrap()
+            .upsert_document_metadata(rel_path, &map, 100, "hash", 1)
+            .await
+            .unwrap();
+    }
+
+    fn write_schema_file(tmp: &tempfile::TempDir, dir: &str, yaml: &str) {
+        let target = tmp.path().join(dir);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(crate::schema::SCHEMA_FILE_NAME), yaml).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_schema_reports_merged_fields_with_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", "fields:\n  title:\n    required: true\n");
+        write_schema_file(
+            &tmp,
+            "food/recipes",
+            "fields:\n  prep:\n    type: integer\n    indexed: true\n",
+        );
+        let server = schema_tool_server(&tmp);
+
+        let result = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("food/recipes".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        let fields = structured["fields"].as_array().unwrap();
+        let names: Vec<&str> = fields
+            .iter()
+            .map(|f| f["field"].as_str().unwrap())
+            .collect();
+
+        assert!(names.contains(&"title"), "inherited from the root scope");
+        assert!(names.contains(&"prep"), "declared in this scope");
+        assert_eq!(structured["frozen"], serde_json::json!(false));
+
+        let prep = fields.iter().find(|f| f["field"] == "prep").unwrap();
+        assert_eq!(prep["type"], serde_json::json!("integer"));
+        assert!(
+            prep["declared_in"]
+                .as_str()
+                .unwrap()
+                .contains("food/recipes"),
+            "provenance points at the declaring file"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_tools_accept_a_leading_slash_as_the_kb_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "food/recipes",
+            "fields:\n  prep:\n    type: integer\n",
+        );
+        let server = schema_tool_server(&tmp);
+
+        let with_slash = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("/food/recipes".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let without = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("food/recipes".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            with_slash.structured_content, without.structured_content,
+            "callers cannot know where the KB lives, so `/x` and `x` must agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schema_resolves_a_partial_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "food/recipes",
+            "fields:\n  prep:\n    type: integer\n",
+        );
+        let server = schema_tool_server(&tmp);
+
+        let result = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("recipes".into()),
+                ..Default::default()
+            }))
+            .await
+            .expect("a unique trailing match resolves");
+
+        let fields = result.structured_content.unwrap()["fields"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            fields.iter().any(|f| f["field"] == "prep"),
+            "should have resolved to food/recipes, got: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_partial_scope_reports_the_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "food/recipes", "fields:\n  a:\n    type: text\n");
+        write_schema_file(&tmp, "archive/recipes", "fields:\n  b:\n    type: text\n");
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("recipes".into()),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("two scopes end in recipes; guessing would be wrong");
+
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("matches 2 scopes"), "got: {msg}");
+        assert!(msg.contains("food/recipes"));
+        assert!(msg.contains("archive/recipes"));
+    }
+
+    #[tokio::test]
+    async fn update_schema_can_still_create_a_scope_that_does_not_exist_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let _ = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("/brand/new".into()),
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["x".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await;
+
+        assert!(
+            tmp.path()
+                .join("brand/new")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists(),
+            "an unmatched path must be taken literally so new scopes can be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schema_surfaces_a_frozen_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "broken", "fields: [not a mapping\n");
+        let server = schema_tool_server(&tmp);
+
+        let result = server
+            .get_schema(Parameters(GetSchemaParams {
+                path: Some("broken".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["frozen"], serde_json::json!(true));
+        assert!(structured["frozen_reason"].is_string());
+    }
+
+    #[tokio::test]
+    async fn get_schema_values_only_filters_to_vocabularies() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  title:\n    required: true\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        let server = schema_tool_server(&tmp);
+
+        let result = server
+            .get_schema(Parameters(GetSchemaParams {
+                values_only: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let fields = result.structured_content.unwrap()["fields"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let names: Vec<&str> = fields
+            .iter()
+            .map(|f| f["field"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["status"], "only closed-set fields are reported");
+    }
+
+    #[tokio::test]
+    async fn update_schema_dry_run_writes_nothing_and_reports_casualties() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(&server, "notes/a.md", serde_json::json!({ "title": "A" })).await;
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: None,
+                definition: Some(serde_json::json!({ "required": true })),
+                dry_run: Some(true),
+                force: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["dry_run"], serde_json::json!(true));
+        assert_eq!(
+            structured["would_invalidate"].as_array().unwrap().len(),
+            1,
+            "the seeded document has no status and would fail the new rule"
+        );
+        assert!(
+            !tmp.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists(),
+            "a dry run must not touch the filesystem"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_refuses_a_breaking_change_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(&server, "notes/a.md", serde_json::json!({ "title": "A" })).await;
+
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: None,
+                definition: Some(serde_json::json!({ "required": true })),
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .expect_err("must refuse rather than silently invalidate documents");
+
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("Refusing to apply"), "got: {msg}");
+        assert!(
+            !tmp.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists(),
+            "a refused change must leave the filesystem untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_accepts_a_change_that_breaks_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({ "title": "A", "status": "active" }),
+        )
+        .await;
+
+        // Reaches the git step, which fails in this harness — but only AFTER the file
+        // has been written, which is what this test pins down.
+        let _ = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "status".into(),
+                values: Some(vec!["active".into(), "draft".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await;
+
+        let written = tmp
+            .path()
+            .join("notes")
+            .join(crate::schema::SCHEMA_FILE_NAME);
+        assert!(
+            written.exists(),
+            "a non-breaking change must be written before the git step"
+        );
+        let yaml = std::fs::read_to_string(&written).unwrap();
+        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            reparsed.fields["status"].values,
+            Some(vec!["active".to_string(), "draft".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_dry_run_ignores_documents_a_deeper_scope_governs() {
+        // A descendant scope that redefines the edited field shadows the parent, so its
+        // documents are unaffected and must not be reported as casualties.
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "notes/archive",
+            "fields:\n  status:\n    type: enum\n    values: [archived]\n",
+        );
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "notes/archive/old.md",
+            serde_json::json!({ "title": "Old", "status": "archived" }),
+        )
+        .await;
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: Some(vec!["active".into()]),
+                definition: Some(
+                    serde_json::json!({ "type": "enum", "values": ["active"], "required": true }),
+                ),
+                dry_run: Some(true),
+                force: None,
+            }))
+            .await
+            .unwrap();
+
+        let casualties = result.structured_content.unwrap()["would_invalidate"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            casualties.is_empty(),
+            "notes/archive/ has its own status rule and is unaffected, got: {casualties:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_force_applies_despite_casualties() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(&server, "notes/a.md", serde_json::json!({ "title": "A" })).await;
+
+        // Reaches the git step and fails there, but only after writing — which is the
+        // point: force must not be blocked by the casualty check.
+        let _ = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: None,
+                definition: Some(serde_json::json!({ "required": true })),
+                dry_run: None,
+                force: Some(true),
+            }))
+            .await;
+
+        assert!(
+            tmp.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists(),
+            "force must write the schema even though a document would fail it"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_rejects_a_self_contradictory_definition() {
+        // Parses fine, but declaring a scalar type alongside nested children freezes
+        // the whole subtree at the next index run — long after this call reported
+        // success. It must be caught here instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "planning".into(),
+                values: None,
+                definition: Some(serde_json::json!({
+                    "type": "integer",
+                    "fields": { "prep": { "type": "integer" } }
+                })),
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .expect_err("a field cannot be both a value and a container");
+
+        assert!(format!("{:?}", err).contains("not both"));
+        assert!(
+            !tmp.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_rejects_a_path_escaping_the_knowledge_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("../escape".into()),
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["x".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .expect_err("traversal must be rejected");
+
+        assert!(format!("{:?}", err).contains(".."));
+    }
+
+    #[tokio::test]
+    async fn list_documents_reports_total_and_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        for i in 0..5 {
+            seed_document(
+                &server,
+                &format!("notes/{i}.md"),
+                serde_json::json!({ "title": format!("Doc {i}"), "tags": ["note"] }),
+            )
+            .await;
+        }
+
+        let result = server
+            .list_documents(Parameters(ListDocumentsParams {
+                limit: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["total"], serde_json::json!(5));
+        assert_eq!(structured["returned"], serde_json::json!(2));
+        assert_eq!(
+            structured["has_more"],
+            serde_json::json!(true),
+            "truncation must never be silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_documents_filters_through_the_tool_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "food/chili.md",
+            serde_json::json!({ "title": "Chili", "tags": ["recipe"], "prep": 20 }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "food/stew.md",
+            serde_json::json!({ "title": "Stew", "tags": ["recipe"], "prep": 90 }),
+        )
+        .await;
+
+        let mut filters = serde_json::Map::new();
+        filters.insert("prep".into(), serde_json::json!({ "lt": 30 }));
+        let result = server
+            .list_documents(Parameters(ListDocumentsParams {
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["total"], serde_json::json!(1));
+        assert_eq!(
+            structured["documents"][0]["file_path"],
+            serde_json::json!("food/chili.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_documents_reports_an_empty_result_clearly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let result = server
+            .list_documents(Parameters(ListDocumentsParams::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.structured_content.unwrap()["total"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[test]
+    fn compound_filters_are_rejected_rather_than_silently_narrowed() {
+        // Honoring only one half of a mixed filter returns a broader set than asked for.
+        let err = build_document_query(&filters_from(
+            serde_json::json!({ "tags": { "all_of": ["a"], "gte": 5 } }),
+        ))
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("cannot combine"));
+
+        let err = build_document_query(&filters_from(
+            serde_json::json!({ "tags": { "any_of": ["a"], "all_of": ["b"] } }),
+        ))
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("not both"));
+    }
+
+    #[test]
+    fn oversized_filter_value_lists_are_rejected() {
+        let many: Vec<serde_json::Value> = (0..MAX_FILTER_VALUES + 1)
+            .map(|i| serde_json::json!(format!("v{i}")))
+            .collect();
+        let err = build_document_query(&filters_from(
+            serde_json::json!({ "tags": serde_json::Value::Array(many) }),
+        ))
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("too many values"));
+    }
+
+    #[test]
+    fn oversized_schema_edits_are_rejected() {
+        let mut params = update_params("add_values", "tags");
+        params.values = Some(
+            (0..MAX_SCHEMA_VALUES + 1)
+                .map(|i| format!("v{i}"))
+                .collect(),
+        );
+        assert!(build_schema_edit(&params).is_err());
+
+        let mut params = update_params("add_values", "tags");
+        params.values = Some(vec!["x".repeat(MAX_FILTER_STR_LEN + 1)]);
+        assert!(build_schema_edit(&params).is_err());
+    }
 
     // --- build_commit_message tests ---
 
@@ -2198,11 +4265,17 @@ mod tests {
         };
         let result = server.create_document(Parameters(params)).await;
 
-        assert!(result.is_err(), "absolute path should be rejected");
+        // A leading `/` now means the knowledge-base root, so this resolves to
+        // `<kb>/etc/passwd` — safely inside the KB — and is then rejected by the
+        // include-pattern guard because it is not an indexable markdown path.
+        assert!(
+            result.is_err(),
+            "a non-indexable path must still be rejected"
+        );
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("relative"),
-            "error should mention relative path requirement, got: {}",
+            err.message.contains("include pattern"),
+            "error should cite the include-pattern guard, got: {}",
             err.message
         );
     }
@@ -2745,15 +4818,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn safe_write_path_rejects_absolute() {
+    fn safe_write_path_treats_a_leading_slash_as_the_kb_root() {
+        // Callers cannot know where the KB lives inside the container, so `/x.md` and
+        // `x.md` must address the same document. The escape checks still apply — this
+        // resolves under the data root, it does not reach the real /etc.
         let tmp = tempfile::tempdir().unwrap();
-        let result = resolve_safe_write_path(tmp.path(), "/etc/passwd");
-        assert!(result.is_err(), "absolute path must be rejected");
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("relative"),
-            "error should mention relative requirement, got: {msg}"
-        );
+
+        let rooted = resolve_safe_write_path(tmp.path(), "/notes/a.md").unwrap();
+        let relative = resolve_safe_write_path(tmp.path(), "notes/a.md").unwrap();
+        assert_eq!(rooted, relative);
+        assert!(rooted.starts_with(tmp.path()));
+
+        // And traversal is still rejected however it is spelled.
+        assert!(resolve_safe_write_path(tmp.path(), "/../escape.md").is_err());
+        assert!(resolve_safe_write_path(tmp.path(), "../escape.md").is_err());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use qdrant_client::qdrant::{
     UpsertPointsBuilder, Value as QdrantValue, Vector, VectorInput, VectorParamsBuilder,
     VectorsConfigBuilder, facet_value, value::Kind,
 };
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::config::ResolvedQdrantConfig;
 
@@ -65,6 +65,45 @@ pub struct QdrantPoint {
     /// when present; `None` stores only the dense vector.
     pub sparse: Option<(Vec<u32>, Vec<f32>)>,
     pub payload: HashMap<String, serde_json::Value>,
+}
+
+/// Kind of payload index to create for a field.
+///
+/// A keyword index serves equality and any-of matching; numeric and boolean fields need
+/// their own index kinds for range and comparison filters to work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    Keyword,
+    Integer,
+    Float,
+    Bool,
+}
+
+impl IndexKind {
+    fn to_qdrant(self) -> FieldType {
+        match self {
+            IndexKind::Keyword => FieldType::Keyword,
+            IndexKind::Integer => FieldType::Integer,
+            IndexKind::Float => FieldType::Float,
+            IndexKind::Bool => FieldType::Bool,
+        }
+    }
+}
+
+/// A payload field to index, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedField {
+    pub name: String,
+    pub kind: IndexKind,
+}
+
+impl IndexedField {
+    pub fn keyword(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: IndexKind::Keyword,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -273,7 +312,7 @@ impl QdrantStore {
         &self,
         collection: &str,
         vector_size: u64,
-        indexed_fields: &[String],
+        indexed_fields: &[IndexedField],
     ) -> Result<()> {
         let exists = self
             .client
@@ -312,40 +351,61 @@ impl QdrantStore {
             debug!("Collection '{}' already exists", collection);
         }
 
-        for field in indexed_fields {
+        for indexed in indexed_fields {
+            let kind = indexed.kind.to_qdrant();
             debug!(
-                "Ensuring keyword index on field '{}' in collection '{}'",
-                field, collection
+                "Ensuring {:?} index on field '{}' in collection '{}'",
+                kind, indexed.name, collection
             );
-            self.client
+            let result = self
+                .client
                 .create_field_index(CreateFieldIndexCollectionBuilder::new(
                     collection,
-                    field,
-                    FieldType::Keyword,
+                    &indexed.name,
+                    kind,
                 ))
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to create keyword index on field '{}' in collection '{}'",
-                        field, collection
-                    )
-                })?;
+                .await;
+
+            if let Err(e) = result {
+                // Creating an index that already exists with the same type is a no-op,
+                // so a failure here usually means the declared type changed and Qdrant
+                // is holding an index of the old kind. Dropping and recreating it would
+                // be destructive on a live collection, and failing the whole run because
+                // of one field is worse than proceeding — so warn precisely and carry on.
+                // Deliberate: failing the whole run — and therefore server startup — over
+                // one field is worse than proceeding without its index, and dropping a
+                // live index to recreate it is destructive. But a filter on this field
+                // may now be slow or incomplete, so this is an error, not a warning.
+                error!(
+                    "Could not ensure {:?} index on '{}' in collection '{}': {:#}. \
+                     Filters on this field may be slow or return incomplete results. \
+                     If its declared type changed, delete the payload index in Qdrant \
+                     and reindex.",
+                    kind, indexed.name, collection, e
+                );
+            }
         }
 
         // Ensure integer index on mtime for range-filter queries (idempotent).
-        self.client
+        //
+        // Non-fatal for the same reason as the schema-declared indexes above: Qdrant
+        // filters correctly without a payload index, just more slowly, so failing
+        // startup over one index is worse than proceeding loudly without it.
+        if let Err(e) = self
+            .client
             .create_field_index(CreateFieldIndexCollectionBuilder::new(
                 collection,
                 "mtime",
                 FieldType::Integer,
             ))
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to create integer index on field 'mtime' in collection '{}'",
-                    collection
-                )
-            })?;
+        {
+            error!(
+                "Could not ensure the integer index on 'mtime' in collection '{}': {:#}. \
+                 Recency filters may be slow until this is resolved.",
+                collection, e
+            );
+        }
 
         info!(
             collection,
@@ -932,7 +992,11 @@ mod tests {
 
         let vector_size = 4;
         store
-            .ensure_collection(&config.collection, vector_size, &["file_path".to_string()])
+            .ensure_collection(
+                &config.collection,
+                vector_size,
+                &[IndexedField::keyword("file_path")],
+            )
             .await
             .unwrap();
 
@@ -1172,7 +1236,7 @@ mod tests {
         let _ = store.client.delete_collection(&config.collection).await;
 
         store
-            .ensure_collection(&config.collection, 4, &["domain".to_string()])
+            .ensure_collection(&config.collection, 4, &[IndexedField::keyword("domain")])
             .await
             .unwrap();
 

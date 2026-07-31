@@ -15,7 +15,6 @@ Every document in your knowledge base should look like this:
 title: Deploying with Docker Compose
 description: Step-by-step guide to deploying services with Docker Compose.
 type: guide
-domain: infrastructure
 tags:
   - docker
   - deployment
@@ -33,7 +32,7 @@ The chunker splits at heading boundaries, so each major section
 becomes part of a chunk.
 ```
 
-A complete sample file is available at [`docs/sample-document.md`](../docs/sample-document.md).
+A complete sample file is available at [`docs/sample-document.md`](../docs/sample-document.md). Note there's no `domain:` key — `domain` isn't author-written frontmatter; see the note below.
 
 **Frontmatter fields used by the system:**
 
@@ -42,10 +41,12 @@ A complete sample file is available at [`docs/sample-document.md`](../docs/sampl
 | `title` | Document title (stored as Qdrant payload) |
 | `description` | Summary text; optionally prepended to every chunk for better embedding context |
 | `type` | Document type (e.g. `guide`, `reference`, `runbook`); filterable in MCP search |
-| `domain` | Knowledge domain (e.g. `infrastructure`, `backend`); filterable in MCP search |
+| `domain` | **Not a frontmatter field.** Derived automatically from the document's top-level folder — see below. Still filterable in MCP search |
 | `tags` | List of tags; filterable in MCP search (match-any) |
 
-You can add any other fields you like. Only fields listed in `frontmatter.indexed_fields` are stored as Qdrant payload for filtering. Everything else is ignored during search but preserved in the state DB.
+**`domain` is derived, not authored.** `domain` is computed from the document's top-level folder name (e.g. a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`) and written into both the Qdrant payload and the SQLite metadata index — it is *not* read from a `domain:` key in frontmatter. If you write one anyway, it's overwritten on the next index run and the server logs a warning when the two disagree. Documents sitting directly at the knowledge-base root (no top-level folder) have no domain at all. This only changes where the value comes from: `search(domain=...)`, the CLI's `--domain` flag, and `list_documents(filters={"domain": ...})` all still work exactly as before.
+
+You can add any other fields you like. Only fields listed in `frontmatter.indexed_fields` are stored as Qdrant payload for filtering by `search`. All frontmatter fields, however, are stored (as JSON, and projected into a filterable dot-path index) in the state DB, so any field — indexed or not — can be filtered, ranged, and sorted on via the `list_documents` MCP tool.
 
 ## How Chunking Works
 
@@ -112,7 +113,8 @@ frontmatter:
   # Closed-set (enum) enforcement. Maps a field to its exhaustive list of
   # allowed values; a present field whose value isn't in the list fails
   # validation. Absent fields are governed by `required`, not here. Leave a
-  # field out of this map to keep it open-ended (e.g. domain, tags).
+  # field out of this map to keep it open-ended (e.g. tags). `domain` isn't
+  # author-set at all — it's derived from the folder — so it never belongs here.
   allowed:
     type: [guide, reference, research, config, troubleshooting, architecture, project, decision-record, migration]
     status: [active, draft, archived]
@@ -128,9 +130,66 @@ validation:
 - `strict: false` (default) — invalid files are skipped with a warning; indexing continues.
 - `strict: true` — the first invalid file aborts the entire indexing run.
 
-`frontmatter.allowed` is enforced by both `md-kb-rag validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint`), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
+With `validation.enabled: false`, frontmatter is still parsed — just not checked against `required`/`allowed`/lint rules — so Qdrant and the state DB's metadata index still reflect each file's actual frontmatter, rather than treating unvalidated files as fieldless.
+
+`frontmatter.allowed` is enforced by both `md-kb-rag validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
 
 Run `md-kb-rag validate` to check all files without indexing — useful for CI or pre-commit hooks.
+
+## Directory Schemas (`.kb-schema.yaml`)
+
+The `frontmatter` block above is a single, global rule set. For a knowledge base where different folders need different fields — recipes need `planning.prep_minutes`, runbooks need `severity` — drop a `.kb-schema.yaml` file into a directory. It governs that directory and everything beneath it, cascading like `CLAUDE.md`.
+
+### Authoring
+
+```yaml
+fields:
+  planning:
+    type: object
+    open: false          # reject undeclared keys under planning.* (default: true)
+    fields:
+      prep_minutes: { type: integer, indexed: true }
+      effort:       { type: enum, values: [low, medium, high], indexed: true }
+  tags:
+    type: list
+    extend: true          # union values with the inherited definition instead of replacing
+    values: [dinner, quick]
+```
+
+Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are equivalent — nesting is sugar flattened at parse time.
+
+**Types:** `text`, `integer`, `number`, `boolean`, `enum`, `list`, `date` (`YYYY-MM-DD`), `timestamp` (RFC 3339), `object`. Types are strictly enforced with no coercion (`prep_minutes: "45"` fails against `type: integer`). Undeclared fields are never type-checked and remain legal.
+
+A field definition can't declare both a scalar `type` and nested `fields:` — a field is either a value or a container, not both. `type: object` is the exception, since `object` inherently means "has nested fields." `update_schema` rejects this the same way a hand-edited `.kb-schema.yaml` does.
+
+`.kb-schema.yaml` files themselves are not indexed as documents.
+
+### Cascade and merge rules
+
+- The **set** of fields unions across levels; a field redefined at a deeper level **replaces** its inherited definition wholesale.
+- `extend: true` is the opt-out — it unions only `values` with the inherited set, everything else on the child definition still wins.
+- Top-level folder names are the KB's areas (this is also what `domain` is derived from — see [Sample Document](#sample-document) above); the MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is in `frontmatter.indexed_fields`.
+
+### Freezing
+
+A malformed `.kb-schema.yaml` **freezes its subtree**: nothing under it is indexed or re-indexed, and existing index entries are left untouched — it never silently falls back to the parent's rules. `md-kb-rag validate` reports broken schema files in a `SCHEMA ERRORS` section, and they count as a failure under `validation.strict: true`.
+
+A `.kb-schema.yaml` larger than 256 KB is rejected outright — it's never read or parsed, just refused on its file size — and freezes its subtree the same way any other invalid schema does.
+
+`md-kb-rag index --full` refuses to run at all while any scope is frozen, naming the offending directories: a full run drops and recreates the Qdrant collection, and a frozen scope's documents would be skipped during the rebuild — losing their vectors outright rather than merely leaving them stale. Fix the schema first, or keep making progress with an incremental `md-kb-rag index`, which is unaffected by scopes frozen elsewhere in the tree.
+
+### Backward compatibility and upgrade note
+
+With no `.kb-schema.yaml` files anywhere, the global `frontmatter` block continues to act as the implicit root schema — existing deployments keep working unchanged.
+
+Under the hood, each indexed file now also tracks a `schema_hash` fingerprint (a new `indexed_files` column, added automatically via a guarded `ALTER TABLE ... ADD COLUMN` — no manual migration step). The incremental indexer skips a file only when both its content hash *and* schema fingerprint are unchanged, since editing a schema doesn't touch a document's bytes. Two practical consequences:
+
+- The **first index run after upgrading** to a version with schema support revalidates every file once, to backfill the fingerprint. This is also the run where every document's `domain` gets (re)computed from its folder and written to Qdrant and the state DB — see [Sample Document](#sample-document) above. If a document's old, hand-authored `domain:` disagreed with its folder, its effective `domain` value changes at that point, and any saved `search`/`list_documents` filters built around the old value will need updating. Remove now-redundant `domain:` keys from your frontmatter — they're ignored either way.
+- Editing a **root-level** schema revalidates the entire knowledge base on the next run.
+
+If you only need to rebuild the `list_documents` metadata projection (e.g. after changing a field-projection rule) without a full reindex, `md-kb-rag reproject-fields` does that from the frontmatter JSON already stored in the state DB — no markdown re-read, no re-embedding. It's safe to run against a live server: each document's frontmatter is re-read inside the same transaction that rewrites it, so it retries past contention with a running index or write tool rather than reverting a concurrent update. A document whose stored frontmatter is unparseable is skipped with a warning instead of aborting the run, and the command reports how many documents were reprojected. Note also that a full reindex (`index --full`) clears the metadata index along with the vector collection, so a file deleted from disk since the last full run can't leave a phantom `list_documents` entry behind.
+
+Declared fields also get typed Qdrant payload indexes (Integer/Float/Bool for numeric and boolean fields, instead of a blanket Keyword index), which is what makes `list_documents` range filters (`gte`/`lte`/`gt`/`lt`) usable on them. The same applies to the built-in `mtime` index used by `search`'s `modified_after`/`modified_before` filters. If a payload index fails to create — most often because a field's declared type changed and Qdrant is still holding an index of the old kind — it's logged as an error but never aborts startup or indexing; filters on that field keep returning correct results, just more slowly until you delete the stale payload index in Qdrant and reindex.
 
 ## Agent Write Tools
 
@@ -140,7 +199,7 @@ Beyond read-only search, the MCP server lets a connected agent **author the know
 
 All three tools run the same pipeline server-side:
 
-1. **Resolve and guard the path** — relative to the KB root, a unique basename, or absolute. Absolute paths, `..` components, and symlinked ancestors that escape the data root are rejected, as are paths that don't match `indexing.include` (a file the indexer would never pick up).
+1. **Resolve and guard the path** — relative to the KB root, or a unique basename. A leading `/` is also accepted, and means the KB root, not a filesystem path: a caller has no way to know where the KB actually lives inside the container, so `/food/chili.md` and `food/chili.md` resolve to the same file. `..` components and symlinked ancestors that escape the data root are still rejected — `/../x` is refused exactly like `../x` — as are paths that don't match `indexing.include` (a file the indexer would never pick up).
 2. **Validate frontmatter** — required fields, `allowed` enums, and any `validation.lint_command`. Failures come back as structured `field_errors` (see [Frontmatter Validation](#frontmatter-validation)) so the agent can self-correct.
 3. **Write to disk** — in the container-owned KB clone.
 4. **Commit with provenance** — the commit message gets `Tool: md-kb-rag` and `Operation: <tool>` trailers, authored under the `write.commit_author_*` identity. Tool-authored commits are trivially distinguishable from your own in `git log`.
@@ -154,6 +213,15 @@ Each tool returns a one-line summary with the commit SHA plus a unified diff of 
 - **`create_document`** — new file only (errors if it already exists). Before writing, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. The score is always a **dense cosine similarity** — this check is pinned to dense-only retrieval with reranking detached, regardless of `search.hybrid` and `reranking.enabled`, because hybrid RRF scores (~0.01–0.03) and cross-encoder relevance scores are not on the same scale as the threshold. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations). The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
 - **`edit_document`** — existing file only. **Surgical mode** (`old_string` + `new_string`) replaces a single unique occurrence; **full-replace mode** (`content`) swaps the whole file and re-validates its frontmatter. The two modes are mutually exclusive.
 - **`delete_document`** — removes the file, commits and pushes the deletion, then purges the document's vectors from Qdrant and its row from the state DB directly (no full reindex needed).
+
+### Schema tools
+
+Two more MCP tools let a connected agent inspect and evolve the [directory schema cascade](#directory-schemas-kb-schemayaml) itself, rather than working around it:
+
+- **`get_schema`** — shows the fully merged rules governing a path (directory or document; omit `path` for the root), with per-field provenance naming which `.kb-schema.yaml` declared each field. Optional `fields` restricts the report to specific dot-paths; `values_only` limits it to fields with a closed value set.
+- **`update_schema`** — edits a directory's `.kb-schema.yaml` through constrained operations (`add_values`, `remove_values`, `set_field`, `remove_field`) rather than free-form text. Before writing anything, the change is validated against every document already indexed under that scope, using the frontmatter stored in the metadata index — no markdown re-read. If any document would fail the new rules, the change is refused and they're listed; pass `force` to apply anyway, or `dry_run` to see the effect without writing. The rendered YAML is re-parsed before writing, so an unparseable schema can never be committed. Like the document write tools, the file is written temp-then-rename, committed and pushed, and triggers an incremental reindex.
+
+Both tools accept a partial directory for `path`, matching on trailing segments — e.g. `recipes` resolves to `lifestyle/kitchen/recipes` if that's the only scope ending in `recipes`. A unique match resolves silently; several matches are refused with the candidates listed rather than guessed at. `update_schema` alone treats zero matches as success rather than an error: it falls back to the literal path, since declaring a schema for a directory that doesn't have one yet is the normal way to introduce one.
 
 ### Configuration
 
@@ -183,7 +251,7 @@ Keep `mcp.instructions` short — the dynamic sections supply the detail. Exampl
 
 ```yaml
 mcp:
-  instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document; write with create_document, edit_document, delete_document."
+  instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document/list_documents; write with create_document, edit_document, delete_document."
 ```
 
 ## Knowledge Base Storage
