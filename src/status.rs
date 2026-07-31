@@ -472,38 +472,62 @@ pub fn redact_error(msg: &str) -> String {
 
     // Scrub `key=value` pairs wherever they appear, not only after a `?` — error text
     // wraps and reformats URLs, so anchoring on URL structure would miss cases.
-    let lower = out.to_lowercase();
-    let mut replacements: Vec<(usize, usize)> = Vec::new();
+    //
+    // The search is ASCII-case-insensitive over the ORIGINAL bytes. Searching a
+    // lowercased copy and reusing its offsets would be wrong, because lowercasing can
+    // change a string's byte length: U+0130 'İ' (2 bytes) lowercases to two chars
+    // (3 bytes), and U+212A 'K' (3 bytes) lowercases to 'k' (1 byte). One such
+    // character before a credential shifts every later offset, so the redaction would
+    // cut the wrong span and leave part of the secret behind. Every key is ASCII, and
+    // an ASCII byte can never appear inside a multi-byte UTF-8 sequence, so a byte
+    // match is always on a char boundary.
+    let bytes = out.as_bytes().to_vec();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     for key in SECRET_QUERY_KEYS {
         let needle = format!("{key}=");
-        let mut from = 0;
-        while let Some(pos) = lower[from..].find(&needle) {
-            let start = from + pos;
+        let needle = needle.as_bytes();
+        if bytes.len() < needle.len() {
+            continue;
+        }
+        for start in 0..=bytes.len() - needle.len() {
+            if !bytes[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+                continue;
+            }
             // Require a delimiter before the key so `monkey=` does not match `key=`.
-            let preceded_ok = start == 0
-                || !lower.as_bytes()[start - 1].is_ascii_alphanumeric()
-                    && lower.as_bytes()[start - 1] != b'_'
-                    && lower.as_bytes()[start - 1] != b'-';
-            let value_start = start + needle.len();
-            if preceded_ok && value_start < out.len() {
-                let value_end = out[value_start..]
-                    .find(|c: char| c == '&' || c == '"' || c == '\'' || c.is_whitespace())
-                    .map(|i| value_start + i)
-                    .unwrap_or(out.len());
-                if value_end > value_start {
-                    replacements.push((value_start, value_end));
+            if start > 0 {
+                let prev = bytes[start - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-' {
+                    continue;
                 }
             }
-            from = value_start.min(lower.len());
+            let value_start = start + needle.len();
+            if value_start >= out.len() {
+                continue;
+            }
+            let value_end = out[value_start..]
+                .find(|c: char| c == '&' || c == '"' || c == '\'' || c.is_whitespace())
+                .map(|i| value_start + i)
+                .unwrap_or(out.len());
+            if value_end > value_start {
+                spans.push((value_start, value_end));
+            }
+        }
+    }
+
+    // Merge overlaps before rewriting. `password=key=x` matches twice with overlapping
+    // spans; applying both would rewrite already-rewritten text.
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
         }
     }
 
     // Apply right-to-left so earlier offsets stay valid.
-    replacements.sort_unstable_by_key(|(start, _)| std::cmp::Reverse(*start));
-    for (start, end) in replacements {
-        if out.is_char_boundary(start) && out.is_char_boundary(end) {
-            out.replace_range(start..end, "***");
-        }
+    for (start, end) in merged.into_iter().rev() {
+        out.replace_range(start..end, "***");
     }
 
     out
@@ -867,6 +891,42 @@ mod tests {
     fn redact_error_leaves_ordinary_messages_alone() {
         let msg = "no such table: documents";
         assert_eq!(redact_error(msg), msg);
+    }
+
+    #[test]
+    fn redact_error_survives_length_changing_lowercase() {
+        // U+212A KELVIN SIGN is 3 bytes and lowercases to 1; U+0130 is 2 bytes and
+        // lowercases to 3. Searching a lowercased copy and reusing its byte offsets
+        // would cut the wrong span here and leave part of the secret in the output.
+        for prefix in ["\u{212A}", "\u{130}", "\u{1E9E}", "\u{212A}\u{130}"] {
+            let out = redact_error(&format!("{prefix} token=sup3rs3cret rest"));
+            assert!(
+                !out.contains("sup3rs3cret"),
+                "secret survived after prefix {prefix:?}: {out}"
+            );
+            assert!(out.contains("token=***"), "{out}");
+            assert!(
+                out.contains("rest"),
+                "over-consumed after {prefix:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_error_is_case_insensitive_on_the_key() {
+        for key in ["TOKEN", "Api-Key", "PassWord"] {
+            let out = redact_error(&format!("{key}=s3cret x"));
+            assert!(!out.contains("s3cret"), "{key}: {out}");
+        }
+    }
+
+    #[test]
+    fn redact_error_merges_overlapping_matches() {
+        // `password=` and `key=` both match, with overlapping spans. Rewriting both
+        // independently would rewrite already-rewritten text.
+        let out = redact_error("password=key=hunter2");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert_eq!(out, "password=***");
     }
 
     #[test]
