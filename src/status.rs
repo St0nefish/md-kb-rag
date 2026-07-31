@@ -454,6 +454,12 @@ impl IndexStatus {
 /// Query-string keys whose values are scrubbed by [`redact_error`].
 const SECRET_QUERY_KEYS: [&str; 6] = ["api-key", "api_key", "apikey", "key", "token", "password"];
 
+/// Authorization scheme prefixes whose following token is scrubbed by [`redact_error`].
+///
+/// `key=value` matching misses the prose form an HTTP layer emits when it echoes a
+/// request header back in an error.
+const SECRET_AUTH_PREFIXES: [&str; 2] = ["bearer ", "basic "];
+
 /// Scrub credentials out of an error message before it is served over HTTP.
 ///
 /// Error text reaching `/status` comes from `anyhow`-wrapped Qdrant and sqlx failures,
@@ -506,6 +512,34 @@ pub fn redact_error(msg: &str) -> String {
             }
             let value_end = out[value_start..]
                 .find(|c: char| c == '&' || c == '"' || c == '\'' || c.is_whitespace())
+                .map(|i| value_start + i)
+                .unwrap_or(out.len());
+            if value_end > value_start {
+                spans.push((value_start, value_end));
+            }
+        }
+    }
+
+    // Same ASCII-on-original-bytes scan for `Bearer <token>` / `Basic <token>`, which
+    // no `key=value` pattern catches.
+    for prefix in SECRET_AUTH_PREFIXES {
+        let needle = prefix.as_bytes();
+        if bytes.len() < needle.len() {
+            continue;
+        }
+        for start in 0..=bytes.len() - needle.len() {
+            if !bytes[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+                continue;
+            }
+            if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            let value_start = start + needle.len();
+            if value_start >= out.len() {
+                continue;
+            }
+            let value_end = out[value_start..]
+                .find(|c: char| c == '"' || c == '\'' || c == ',' || c.is_whitespace())
                 .map(|i| value_start + i)
                 .unwrap_or(out.len());
             if value_end > value_start {
@@ -918,6 +952,27 @@ mod tests {
             let out = redact_error(&format!("{key}=s3cret x"));
             assert!(!out.contains("s3cret"), "{key}: {out}");
         }
+    }
+
+    #[test]
+    fn redact_error_strips_authorization_scheme_tokens() {
+        // The prose form an HTTP layer emits when it echoes a request header back.
+        let out = redact_error("request failed: Authorization: Bearer eyJhbGci.SECRET, retrying");
+        assert!(!out.contains("eyJhbGci.SECRET"), "{out}");
+        assert!(out.contains("Bearer ***"), "{out}");
+        assert!(out.contains("retrying"), "over-consumed: {out}");
+
+        let out = redact_error("Basic dXNlcjpwYXNz end");
+        assert!(!out.contains("dXNlcjpwYXNz"), "{out}");
+        assert!(out.contains("end"), "{out}");
+    }
+
+    #[test]
+    fn redact_error_does_not_match_a_scheme_word_suffix() {
+        // `Overbearing ` ends in neither prefix; `bearer` inside a longer word must not
+        // trigger and eat the following text.
+        let out = redact_error("unbearable latency observed");
+        assert_eq!(out, "unbearable latency observed");
     }
 
     #[test]

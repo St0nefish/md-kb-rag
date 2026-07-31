@@ -177,6 +177,10 @@ const MAX_VALUE_LEN: usize = 200;
 /// How long a collected status is reused. Short enough that `/status` still reads as
 /// live, long enough that a scrape storm cannot turn into a query storm.
 const STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+/// Hard bound on the Qdrant round trip while collecting status. Degrading to "no
+/// response" beats making the endpoint that answers "is anything wrong?" the one thing
+/// that hangs when something is.
+const STATUS_QDRANT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct StatusState {
@@ -365,17 +369,28 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
         }
     }
 
-    match state
-        .qdrant
-        .collection_info(&state.config.qdrant.collection)
-        .await
+    // Explicitly bounded. `qdrant-client` happens to default to a 5s timeout, but
+    // relying on a dependency's default is not a guarantee — and this call is made
+    // while holding the single-flight cache lock, so an unbounded stall here would
+    // wedge every status request behind it.
+    match tokio::time::timeout(
+        STATUS_QDRANT_TIMEOUT,
+        state
+            .qdrant
+            .collection_info(&state.config.qdrant.collection),
+    )
+    .await
     {
-        Ok(Some(points)) => store.qdrant_points = Some(points),
-        Ok(None) => store.errors.push(format!(
+        Ok(Ok(Some(points))) => store.qdrant_points = Some(points),
+        Ok(Ok(None)) => store.errors.push(format!(
             "collection '{}' does not exist",
             state.config.qdrant.collection
         )),
-        Err(e) => store.errors.push(store_error("qdrant", &e)),
+        Ok(Err(e)) => store.errors.push(store_error("qdrant", &e)),
+        Err(_) => store.errors.push(format!(
+            "qdrant: no response within {}s",
+            STATUS_QDRANT_TIMEOUT.as_secs()
+        )),
     }
 
     StatusResponse {
