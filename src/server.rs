@@ -890,10 +890,23 @@ pub fn build_authoring_section(frontmatter: &FrontmatterConfig) -> String {
 
     if !frontmatter.required.is_empty() || !frontmatter.allowed.is_empty() {
         s.push_str(
-            "\nOther fields (e.g. domain, tags) are open; \
+            "\nOther fields (e.g. tags) are open; \
              see the \"Available ...\" lines above for values already in use.",
         );
     }
+
+    // `domain` used to be listed as an open field here, next to `tags`. It is a search
+    // filter, not an authored one: since the reorg it is derived from the top-level
+    // folder and any authored value is overridden server-side. Naming it alongside the
+    // "Available domain: ..." facet line told agents to write it, and they did — the
+    // resulting `domain:` key is invisible to search but fails the knowledge base's own
+    // frontmatter lint, so an MCP-authored document plants a pre-commit failure that
+    // surfaces later in an unrelated commit.
+    s.push_str(
+        "\nDo NOT write a `domain` field. It is derived from the document's top-level \
+         folder — putting the file in the right directory is what sets it. It remains a \
+         search filter, but authoring it is an error.",
+    );
 
     s
 }
@@ -2362,6 +2375,40 @@ mod tests {
     }
 
     // --- build_authoring_section tests ---
+
+    #[test]
+    fn authoring_section_never_presents_domain_as_writable() {
+        // `domain` is derived from the top-level folder and overridden server-side, so
+        // an authored `domain:` key is invisible to search but fails the knowledge
+        // base's frontmatter lint — planting a pre-commit failure that surfaces later
+        // in an unrelated commit. Listing it as an open field made agents write it.
+        for fm in [
+            FrontmatterConfig::default(),
+            FrontmatterConfig {
+                required: vec!["title".into(), "type".into()],
+                ..Default::default()
+            },
+            FrontmatterConfig {
+                required: vec!["title".into()],
+                allowed: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("status".into(), vec!["active".into()]);
+                    m
+                },
+                ..Default::default()
+            },
+        ] {
+            let section = build_authoring_section(&fm);
+            assert!(
+                !section.contains("e.g. domain"),
+                "domain must not be offered as an open field: {section}"
+            );
+            assert!(
+                section.contains("Do NOT write a `domain` field"),
+                "the derivation must be stated explicitly: {section}"
+            );
+        }
+    }
 
     #[test]
     fn authoring_section_with_required_and_allowed() {
