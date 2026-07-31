@@ -110,7 +110,10 @@ enum Commands {
     /// Print collection stats and state DB info
     Status {
         /// Emit the same JSON the server's /status endpoint returns
-        #[arg(long)]
+        ///
+        /// Conflicts with --files rather than silently losing to it: the two ask for
+        /// different things, and quietly ignoring one is worse than refusing both.
+        #[arg(long, conflicts_with = "files")]
         json: bool,
         /// List every indexed file instead of aggregate counts
         #[arg(long)]
