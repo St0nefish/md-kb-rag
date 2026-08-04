@@ -235,7 +235,7 @@ write:
   commit_author_email: "md-kb-rag@localhost"
 ```
 
-For writes to push successfully, the container needs a writable, non-shallow clone of the KB and push credentials — i.e. `source.git_url` set and `GIT_PULL_TOKEN` carrying a token with **write** access (read-only is enough for webhook pulls, but not for the write tools).
+For writes to push successfully, the container needs a writable, non-shallow clone of the KB and push credentials — i.e. `GIT_URL` set and `GIT_PULL_TOKEN` carrying a token with **write** access (read-only is enough for webhook pulls, but not for the write tools).
 
 ### Telling the agent what the KB is for
 
@@ -258,17 +258,16 @@ mcp:
 
 There are two ways to provide your knowledge base to the container. The **named volume** approach is recommended for most deployments.
 
-**State database location:** The SQLite state database (`state.db`) is written to `<source.data_path>/state.db` — by default `/data/state.db`, i.e. inside the knowledge-base volume. With the named-volume setup this means `state.db` is automatically persisted alongside the repository content in `kb_data`. No separate mount is needed.
+**State database location:** The SQLite state database (`state.db`) is written to `<DATA_PATH>/state.db` — by default `/data/state.db`, i.e. inside the knowledge-base volume. With the named-volume setup this means `state.db` is automatically persisted alongside the repository content in `kb_data`. No separate mount is needed.
 
-### Named volume with `git_url` (recommended)
+### Named volume with `GIT_URL` (recommended)
 
 The container manages the knowledge base itself: it clones the repo on first start, and pulls updates via webhook. No host-side git operations needed.
 
-```yaml
-# config.yaml
-source:
-  git_url: "https://your-forge.example.com/org/knowledge-base.git"
-  branch: "master"
+```env
+# .env
+GIT_URL=https://your-forge.example.com/org/knowledge-base.git
+GIT_BRANCH=master
 ```
 
 ```yaml
@@ -301,7 +300,7 @@ Replace `1000:1000` with the UID:GID from your compose `user:` setting.
 
 ### Bind-mount (alternative)
 
-Mount a pre-cloned repo from the host. Useful when you need direct host access to the files or can't use `git_url` (e.g. local-only repos).
+Mount a pre-cloned repo from the host. Useful when you need direct host access to the files or can't use `GIT_URL` (e.g. local-only repos).
 
 ```yaml
 # docker-compose.yml (kb-rag service)
@@ -309,9 +308,9 @@ volumes:
   - ${KB_PATH:-./data/repo}:/data:rw
 ```
 
-With this approach, you're responsible for keeping the directory up to date. If `source.git_url` is also set, the webhook will still run `git fetch` + `git merge` inside the container, but having the directory accessible on the host risks accidental modifications that could cause merge conflicts.
+With this approach, you're responsible for keeping the directory up to date. If `GIT_URL` is also set, the webhook will still run `git fetch` + `git merge` inside the container, but having the directory accessible on the host risks accidental modifications that could cause merge conflicts.
 
-Without `git_url`, you'll need an external process to update the bind-mounted directory and trigger a reindex (either via webhook or by running `docker compose exec kb-rag md-kb-rag index`).
+Without `GIT_URL`, you'll need an external process to update the bind-mounted directory and trigger a reindex (either via webhook or by running `docker compose exec kb-rag md-kb-rag index`).
 
 ## Configuring Your Project
 
@@ -325,10 +324,6 @@ Skip this step if the default chunking and frontmatter settings work for your kn
 
 ```yaml
 # config.yaml — minimal production config
-source:
-  git_url: "https://your-forge.example.com/org/knowledge-base.git"
-  branch: "master"
-
 indexing:
   include: ["**/*.md"]
   exclude:
@@ -347,7 +342,7 @@ chunking:
   max_chunk_size: 1500
 ```
 
-All other sections (`embedding`, `qdrant`, `mcp`, `webhook`) use defaults that work with the Docker Compose stack. Override only if you need different values.
+Point `GIT_URL` (and optionally `GIT_BRANCH`) at your knowledge base repo via environment variables — see step 3. All other sections (`embedding`, `mcp`, `webhook`) use defaults that work with the Docker Compose stack. Override only if you need different values.
 
 ### 3. Set up environment variables
 
@@ -365,7 +360,7 @@ WEBHOOK_SECRET=your-webhook-secret
 RUST_LOG=info
 ```
 
-If you set `source.git_url` in your config, also set `GIT_PULL_TOKEN` to a personal access token. Read access is enough for cloning and webhook pulls; grant **write** access if you plan to use the MCP write tools (they push commits back to the repo — see [Agent Write Tools](#agent-write-tools)). The token is injected transiently into the HTTPS clone/fetch URL and never written to disk. SSH URLs don't need a token.
+If you set `GIT_URL`, also set `GIT_PULL_TOKEN` to a personal access token. Read access is enough for cloning and webhook pulls; grant **write** access if you plan to use the MCP write tools (they push commits back to the repo — see [Agent Write Tools](#agent-write-tools)). The token is injected transiently into the HTTPS clone/fetch URL and never written to disk. SSH URLs don't need a token.
 
 ### 4. Start the stack
 
@@ -375,17 +370,17 @@ docker compose up -d
 
 This starts Qdrant, the embedding server, and the md-kb-rag service. The kb-rag service waits for both dependencies to be healthy before starting.
 
-If `source.git_url` is configured and the data volume is empty, the server **automatically clones the repo and runs a full index** — no manual step needed. Check progress with `docker logs -f kb-rag`.
+If `GIT_URL` is set and the data volume is empty, the server **automatically clones the repo and runs a full index** — no manual step needed. Check progress with `docker logs -f kb-rag`.
 
 ### 5. Run the initial index (bind-mount only)
 
-If you're using the bind-mount approach without `git_url`, run the initial index manually:
+If you're using the bind-mount approach without `GIT_URL`, run the initial index manually:
 
 ```bash
 docker compose exec kb-rag md-kb-rag index --full
 ```
 
-Full index drops any existing Qdrant collection and re-processes every file. Also use this after changing `vector_size`.
+Full index drops any existing Qdrant collection and re-processes every file. Also use this after changing `EMBEDDING_VECTOR_SIZE`.
 
 ### 6. Connect an MCP client
 
@@ -397,7 +392,7 @@ claude mcp add --transport http kb-search \
 
 ### 7. Set up incremental reindexing (optional)
 
-When a webhook fires, the service verifies the HMAC signature, runs `git fetch` + `git merge --ff-only` (if `source.git_url` is set), and triggers an incremental reindex of changed files.
+When a webhook fires, the service verifies the HMAC signature, runs `git fetch` + `git merge --ff-only` (if `GIT_URL` is set), and triggers an incremental reindex of changed files.
 
 #### Option A: Native forge webhook (recommended)
 
@@ -450,7 +445,7 @@ If you prefer to trigger the webhook from a CI pipeline (e.g. to add logging or 
 The `indexing` section controls which files are processed:
 
 - `include` — glob patterns for files to index (default: `["**/*.md"]`)
-- `exclude` — glob patterns for directories/files to skip (matched against paths relative to `data_path`)
+- `exclude` — glob patterns for directories/files to skip (matched against paths relative to `DATA_PATH`)
 - `exclude_files` — exact filenames to skip regardless of path (e.g. `README.md`)
 
 Setting any list **replaces** the default — it does not merge. If you add a custom exclude pattern, include the defaults too or they won't apply.

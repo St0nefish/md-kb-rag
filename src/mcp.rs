@@ -2630,7 +2630,7 @@ impl ServerHandler for KbSearchServer {
 #[cfg(test)]
 pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<ResolvedConfig> {
     Arc::new(ResolvedConfig {
-        source: crate::config::SourceConfig {
+        source: crate::config::ResolvedSourceConfig {
             git_url: None,
             branch: "master".into(),
             data_path: Some(data_path.to_string_lossy().into_owned()),
@@ -2654,11 +2654,12 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
         },
         validation: crate::config::ValidationConfig::default(),
         webhook: crate::config::WebhookConfig::default(),
-        mcp: crate::config::McpConfig::default(),
+        mcp: crate::config::ResolvedMcpConfig::default(),
         rate_limit: crate::config::RateLimitConfig::default(),
         write: crate::config::WriteConfig::default(),
         search: crate::config::SearchConfig::default(),
         reranking: None,
+        provenance: Default::default(),
     })
 }
 
@@ -4252,7 +4253,7 @@ mod tests {
 
         // Config with validation enabled requiring "title" field
         let config = Arc::new(ResolvedConfig {
-            source: crate::config::SourceConfig {
+            source: crate::config::ResolvedSourceConfig {
                 git_url: None,
                 branch: "master".into(),
                 data_path: Some(tmp.path().to_string_lossy().into_owned()),
@@ -4283,11 +4284,12 @@ mod tests {
                 lint_command: None,
             },
             webhook: crate::config::WebhookConfig::default(),
-            mcp: crate::config::McpConfig::default(),
+            mcp: crate::config::ResolvedMcpConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             write: crate::config::WriteConfig::default(),
             search: crate::config::SearchConfig::default(),
             reranking: None,
+            provenance: Default::default(),
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
@@ -4502,7 +4504,7 @@ mod tests {
 
         // Config with dedup disabled.
         let config = Arc::new(ResolvedConfig {
-            source: crate::config::SourceConfig {
+            source: crate::config::ResolvedSourceConfig {
                 git_url: None,
                 branch: "master".into(),
                 data_path: Some(tmp.path().to_string_lossy().into_owned()),
@@ -4526,7 +4528,7 @@ mod tests {
             },
             validation: crate::config::ValidationConfig::default(),
             webhook: crate::config::WebhookConfig::default(),
-            mcp: crate::config::McpConfig::default(),
+            mcp: crate::config::ResolvedMcpConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             write: crate::config::WriteConfig {
                 dedup_enabled: false,
@@ -4536,6 +4538,7 @@ mod tests {
             },
             search: crate::config::SearchConfig::default(),
             reranking: None,
+            provenance: Default::default(),
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);

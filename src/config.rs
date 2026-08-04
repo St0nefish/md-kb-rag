@@ -1,8 +1,8 @@
 use anyhow::Context;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -17,8 +17,6 @@ pub struct Config {
     pub chunking: ChunkingConfig,
     #[serde(default)]
     pub embedding: EmbeddingConfig,
-    #[serde(default)]
-    pub qdrant: QdrantConfig,
     #[serde(default)]
     pub validation: ValidationConfig,
     #[serde(default)]
@@ -35,16 +33,19 @@ pub struct Config {
     pub reranking: RerankingConfig,
 }
 
+/// `source` — YAML side. Every setting is either a secret name-indirection field
+/// (`git_token_env`, unaffected by the ENV/YAML split since it never held a secret
+/// value itself) or moved to ENV-only. `git_url`, `branch`, and `data_path` used to
+/// live here with YAML defaults; they are bootstrap bindings ("what repo, what
+/// path") that cannot change without a restart, so they now come exclusively from
+/// `GIT_URL` / `GIT_BRANCH` / `DATA_PATH` — see [`ResolvedSourceConfig`]. Setting any
+/// of them here now fails loudly via `deny_unknown_fields` rather than being
+/// silently ignored.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
-    pub git_url: Option<String>,
-    #[serde(default = "default_branch")]
-    pub branch: String,
-    /// Path to the knowledge base root (defaults to /data in Docker)
-    #[serde(default = "default_data_path")]
-    pub data_path: Option<String>,
-    /// Name of the env var containing the personal access token for git fetch over HTTPS.
+    /// Name of the env var containing the personal access token for git fetch
+    /// over HTTPS.
     #[serde(default = "default_git_token_env")]
     pub git_token_env: String,
 }
@@ -52,11 +53,50 @@ pub struct SourceConfig {
 impl Default for SourceConfig {
     fn default() -> Self {
         Self {
+            git_token_env: default_git_token_env(),
+        }
+    }
+}
+
+/// `source` — resolved side. `git_url`/`branch`/`data_path` are read once from
+/// `GIT_URL` / `GIT_BRANCH` / `DATA_PATH` in [`Config::resolve`] and carried here;
+/// `git_token_env` just passes through from [`SourceConfig`] unchanged (it is a
+/// secret name-indirection field, read lazily at each use site via
+/// `std::env::var(&config.source.git_token_env)`, not a value itself).
+#[derive(Debug, Clone)]
+pub struct ResolvedSourceConfig {
+    pub git_url: Option<String>,
+    pub branch: String,
+    /// Path to the knowledge base root (defaults to /data in Docker)
+    pub data_path: Option<String>,
+    pub git_token_env: String,
+}
+
+impl Default for ResolvedSourceConfig {
+    fn default() -> Self {
+        Self {
             git_url: None,
             branch: default_branch(),
             data_path: default_data_path(),
             git_token_env: default_git_token_env(),
         }
+    }
+}
+
+impl ResolvedSourceConfig {
+    /// True when no git remote is configured (`GIT_URL` unset).
+    ///
+    /// This is a legitimate, deliberate configuration — a bind-mount-only
+    /// deployment provides the knowledge base directly and never wants a clone or
+    /// a webhook pull. But `git_url` being `None` is ALSO exactly what a
+    /// deployment produces if `GIT_URL` is dropped by accident during a config
+    /// migration: the server starts fine, keeps serving whatever is already at
+    /// the data path, and every fetch/merge call that gates on `git_url` being
+    /// `Some` becomes a permanent, silent no-op — no error, anywhere. Pulled out
+    /// as its own predicate (rather than inlined at the log call site) so the
+    /// condition can be unit-tested without capturing tracing output.
+    pub fn git_integration_disabled(&self) -> bool {
+        self.git_url.is_none()
     }
 }
 
@@ -185,14 +225,24 @@ fn default_target_chunk_size() -> Option<usize> {
     Some(1000)
 }
 
+/// `embedding` — YAML side. `base_url`, `model`, `vector_size` are connection wiring
+/// and model identity: they cannot change without a restart (the embedding client
+/// and the Qdrant collection's vector size are both fixed at startup), so they are
+/// ENV-only (`EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_VECTOR_SIZE`) and
+/// do not appear here — see [`ResolvedEmbeddingConfig`]. The API key is a secret, so
+/// it follows the same name-indirection pattern as `source.git_token_env`:
+/// `api_key_env` names the env var, never the key itself. `batch_size`,
+/// `request_timeout_secs`, and `batch_concurrency` are pure tuning knobs and stay
+/// YAML-only with no env override at all.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    pub base_url: Option<String>,
-    pub model: Option<String>,
-    pub api_key: Option<String>,
-    #[serde(default = "default_vector_size")]
-    pub vector_size: u64,
+    /// Name of the env var containing the API key for the embedding provider.
+    /// Required for OpenAI, hosted Ollama, or any authenticated embedding service.
+    /// Leave the env var unset for local/unauthenticated servers (e.g. bundled
+    /// llama.cpp) — an unset var is not an error, it just means no key is sent.
+    #[serde(default = "default_embedding_api_key_env")]
+    pub api_key_env: String,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Wall-clock timeout for a single embedding HTTP request. A tuning knob, not a
@@ -209,15 +259,16 @@ pub struct EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            base_url: None,
-            model: None,
-            api_key: None,
-            vector_size: default_vector_size(),
+            api_key_env: default_embedding_api_key_env(),
             batch_size: default_batch_size(),
             request_timeout_secs: default_request_timeout_secs(),
             batch_concurrency: default_batch_concurrency(),
         }
     }
+}
+
+fn default_embedding_api_key_env() -> String {
+    "EMBEDDING_API_KEY".into()
 }
 
 fn default_vector_size() -> u64 {
@@ -248,14 +299,24 @@ fn default_batch_concurrency() -> usize {
     4
 }
 
+/// `reranking` — YAML side. `enabled` and `candidate_limit` are pure tuning knobs
+/// and stay YAML-only with NO env override — `RERANKING_ENABLED` /
+/// `RERANKING_CANDIDATE_LIMIT` used to silently override these (the incident this
+/// migration fixes: a deployed `RERANKING_CANDIDATE_LIMIT` env var made a YAML
+/// change a no-op), so both env vars are now recognized-but-unhonored (see
+/// [`DEPRECATED_ENV_VARS`]). `base_url`/`model` are connection wiring and model
+/// identity — ENV-only, same reasoning as `embedding.base_url`/`model` — so they
+/// live on [`ResolvedRerankingConfig`] instead. `api_key_env` follows the same
+/// secret name-indirection pattern as `embedding.api_key_env`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RerankingConfig {
     #[serde(default)]
     pub enabled: bool,
-    pub base_url: Option<String>,
-    pub model: Option<String>,
-    pub api_key: Option<String>,
+    /// Name of the env var containing the API key for the reranking provider.
+    /// Same semantics as `embedding.api_key_env`: unset means no key is sent.
+    #[serde(default = "default_reranking_api_key_env")]
+    pub api_key_env: String,
     #[serde(default = "default_reranking_candidate_limit")]
     pub candidate_limit: usize,
 }
@@ -264,12 +325,14 @@ impl Default for RerankingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_url: None,
-            model: None,
-            api_key: None,
+            api_key_env: default_reranking_api_key_env(),
             candidate_limit: default_reranking_candidate_limit(),
         }
     }
+}
+
+fn default_reranking_api_key_env() -> String {
+    "RERANKING_API_KEY".into()
 }
 
 fn default_reranking_candidate_limit() -> usize {
@@ -283,23 +346,6 @@ pub struct ResolvedRerankingConfig {
     pub model: String,
     pub api_key: Option<String>,
     pub candidate_limit: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QdrantConfig {
-    pub url: Option<String>,
-    #[serde(default = "default_collection")]
-    pub collection: String,
-}
-
-impl Default for QdrantConfig {
-    fn default() -> Self {
-        Self {
-            url: None,
-            collection: default_collection(),
-        }
-    }
 }
 
 fn default_collection() -> String {
@@ -361,11 +407,13 @@ fn default_webhook_secret_env() -> String {
     "WEBHOOK_SECRET".into()
 }
 
+/// `mcp` — YAML side. `port` is a bootstrap binding (the process cannot change
+/// which port it is listening on without a restart), so it moved to `MCP_PORT` —
+/// see [`ResolvedMcpConfig`]. Everything else here is genuine runtime/tuning
+/// behaviour and stays YAML-only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
-    #[serde(default = "default_mcp_port")]
-    pub port: u16,
     #[serde(default = "default_bearer_token_env")]
     pub bearer_token_env: String,
     #[serde(default)]
@@ -391,6 +439,31 @@ pub struct McpConfig {
 }
 
 impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            bearer_token_env: default_bearer_token_env(),
+            allow_unauthenticated: false,
+            instructions: None,
+            metadata_refresh_secs: default_metadata_refresh_secs(),
+            allowed_hosts: Vec::new(),
+        }
+    }
+}
+
+/// `mcp` — resolved side. `port` is read once from `MCP_PORT` in
+/// [`Config::resolve`]; every other field passes through from [`McpConfig`]
+/// unchanged.
+#[derive(Debug, Clone)]
+pub struct ResolvedMcpConfig {
+    pub port: u16,
+    pub bearer_token_env: String,
+    pub allow_unauthenticated: bool,
+    pub instructions: Option<String>,
+    pub metadata_refresh_secs: u64,
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for ResolvedMcpConfig {
     fn default() -> Self {
         Self {
             port: default_mcp_port(),
@@ -552,10 +625,174 @@ pub struct ResolvedQdrantConfig {
     pub collection: String,
 }
 
+/// Where a single resolved setting's value came from. Never carries a secret
+/// VALUE — for the `*_env` indirection fields (`embedding.api_key`,
+/// `reranking.api_key`) this names the env var that was read, not its contents.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum SettingSource {
+    /// Read from the named environment variable.
+    Env { var: String },
+    /// Read from the YAML config file (the setting's top-level section was present
+    /// in the parsed document).
+    Yaml,
+    /// Neither ENV nor the YAML file supplied a value; the built-in default applies
+    /// (or, for an optional secret like an API key, none was configured at all).
+    Default,
+}
+
+impl SettingSource {
+    /// Human-readable form for logs and `/status`, e.g. `"env EMBEDDING_BASE_URL"`.
+    pub fn describe(&self) -> String {
+        match self {
+            SettingSource::Env { var } => format!("env {var}"),
+            SettingSource::Yaml => "yaml".to_string(),
+            SettingSource::Default => "default".to_string(),
+        }
+    }
+}
+
+/// Provenance of every resolved setting, keyed by dotted config path (e.g.
+/// `"embedding.base_url"`). Built once in [`Config::resolve`] and carried on
+/// [`ResolvedConfig`] so the startup log and `/status` can both report it without
+/// re-deriving anything — this is what would have made `RERANKING_CANDIDATE_LIMIT`
+/// silently overriding YAML obvious immediately instead of requiring a source read.
+///
+/// YAML-only settings are tracked at *section* granularity: a setting reports
+/// `Yaml` if its top-level YAML section (e.g. `chunking:`) was present in the
+/// parsed document, even if that specific leaf relied on its own default within
+/// the section. Full leaf-level precision would need a second walk of the parsed
+/// document per field; section granularity answers the practically useful question
+/// — "is my config.yaml being read at all for this area" — far more cheaply.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ConfigProvenance(pub BTreeMap<String, SettingSource>);
+
+impl ConfigProvenance {
+    /// Log one INFO line summarizing every setting's source. Never logs a secret
+    /// VALUE — only which source (env var name, yaml, or default) supplied it.
+    pub fn log(&self) {
+        use std::fmt::Write as _;
+        let mut lines = String::from("Configuration provenance (source of each resolved setting):");
+        for (name, source) in &self.0 {
+            let _ = write!(lines, "\n  {name}: {}", source.describe());
+        }
+        info!("{lines}");
+    }
+}
+
+/// Env var names this project used to honor as overrides and no longer does. A
+/// deployment that still sets one of these silently stops applying it — this list
+/// is the safety net: [`Config::resolve`] warns once at startup for each one found
+/// set, naming it explicitly, rather than leaving the drift to be discovered by
+/// reading source.
+///
+/// `RERANKING_ENABLED` and `RERANKING_CANDIDATE_LIMIT` are pure tuning knobs that
+/// moved to YAML-only (`reranking.enabled` / `reranking.candidate_limit`) — this is
+/// exactly the incident that motivated this list: a deployed
+/// `RERANKING_CANDIDATE_LIMIT` silently overrode a YAML change until someone read
+/// the source to find out why.
+pub const DEPRECATED_ENV_VARS: &[&str] = &["RERANKING_ENABLED", "RERANKING_CANDIDATE_LIMIT"];
+
+/// Which of [`DEPRECATED_ENV_VARS`] are currently set in the process environment.
+/// Pure function (no logging) so tests can assert on detection without capturing
+/// tracing output.
+fn deprecated_env_vars_present() -> Vec<&'static str> {
+    DEPRECATED_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| std::env::var(name).is_ok())
+        .collect()
+}
+
+/// Dotted setting name → the top-level YAML section it lives under, for every
+/// YAML-only setting. Drives [`ConfigProvenance`]'s `Yaml`/`Default` split for
+/// these fields — see that type's doc comment for the section-granularity caveat.
+const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
+    ("source.git_token_env", "source"),
+    ("indexing.include", "indexing"),
+    ("indexing.exclude", "indexing"),
+    ("indexing.exclude_files", "indexing"),
+    ("indexing.reconcile_interval_secs", "indexing"),
+    ("frontmatter.required", "frontmatter"),
+    ("frontmatter.indexed_fields", "frontmatter"),
+    ("frontmatter.defaults", "frontmatter"),
+    ("frontmatter.allowed", "frontmatter"),
+    ("chunking.max_chunk_size", "chunking"),
+    ("chunking.target_chunk_size", "chunking"),
+    ("chunking.prepend_description", "chunking"),
+    ("embedding.api_key_env", "embedding"),
+    ("embedding.batch_size", "embedding"),
+    ("embedding.request_timeout_secs", "embedding"),
+    ("embedding.batch_concurrency", "embedding"),
+    ("validation.enabled", "validation"),
+    ("validation.strict", "validation"),
+    ("validation.lint_command", "validation"),
+    ("webhook.secret_env", "webhook"),
+    ("webhook.provider", "webhook"),
+    ("mcp.bearer_token_env", "mcp"),
+    ("mcp.allow_unauthenticated", "mcp"),
+    ("mcp.instructions", "mcp"),
+    ("mcp.metadata_refresh_secs", "mcp"),
+    ("mcp.allowed_hosts", "mcp"),
+    ("rate_limit.enabled", "rate_limit"),
+    ("rate_limit.per_second", "rate_limit"),
+    ("rate_limit.burst_size", "rate_limit"),
+    ("write.dedup_enabled", "write"),
+    ("write.dedup_threshold", "write"),
+    ("write.commit_author_name", "write"),
+    ("write.commit_author_email", "write"),
+    ("search.hybrid", "search"),
+    ("search.rrf_candidates", "search"),
+    ("search.min_score", "search"),
+    ("reranking.enabled", "reranking"),
+    ("reranking.candidate_limit", "reranking"),
+    ("reranking.api_key_env", "reranking"),
+];
+
+/// Every top-level section name [`YAML_ONLY_SETTINGS`] can point at. Used to filter
+/// a parsed document's top-level keys down to ones this project actually resolves,
+/// so an already-rejected (`deny_unknown_fields`) or renamed section cannot end up
+/// looking like a recognized one.
+const KNOWN_SECTIONS: &[&str] = &[
+    "source",
+    "indexing",
+    "frontmatter",
+    "chunking",
+    "embedding",
+    "validation",
+    "webhook",
+    "mcp",
+    "rate_limit",
+    "write",
+    "search",
+    "reranking",
+];
+
+/// Top-level YAML section keys actually present in `content`, intersected with
+/// [`KNOWN_SECTIONS`]. Best-effort: if `content` fails to parse as generic YAML
+/// (should not happen — `Config::load` only calls this after already deserializing
+/// the same content into a typed `Config`), an empty set is returned, which just
+/// makes every YAML-only setting report `Default` provenance rather than failing
+/// the whole load over an observability nicety.
+fn yaml_top_level_sections(content: &str) -> HashSet<&'static str> {
+    let Ok(value) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content) else {
+        return HashSet::new();
+    };
+    let Some(mapping) = value.as_mapping() else {
+        return HashSet::new();
+    };
+    KNOWN_SECTIONS
+        .iter()
+        .copied()
+        .filter(|section| mapping.contains_key(serde_yaml_ng::Value::String((*section).into())))
+        .collect()
+}
+
 /// Fully resolved configuration — all required fields validated and present.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
-    pub source: SourceConfig,
+    pub source: ResolvedSourceConfig,
     pub indexing: IndexingConfig,
     pub frontmatter: FrontmatterConfig,
     pub chunking: ChunkingConfig,
@@ -563,70 +800,253 @@ pub struct ResolvedConfig {
     pub qdrant: ResolvedQdrantConfig,
     pub validation: ValidationConfig,
     pub webhook: WebhookConfig,
-    pub mcp: McpConfig,
+    pub mcp: ResolvedMcpConfig,
     pub rate_limit: RateLimitConfig,
     pub write: WriteConfig,
     pub search: SearchConfig,
     pub reranking: Option<ResolvedRerankingConfig>,
+    /// Where every resolved setting's value came from — see [`ConfigProvenance`].
+    pub provenance: ConfigProvenance,
 }
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<ResolvedConfig> {
-        let config = if path.exists() {
+        let (config, present_sections) = if path.exists() {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
-            serde_yaml_ng::from_str(&content).with_context(|| {
+            let config: Config = serde_yaml_ng::from_str(&content).with_context(|| {
                 format!(
                     "Failed to parse config file '{}'. \
                      If you see 'unknown field', compare your config against \
                      config.example.yaml — fields may have been added or removed.",
                     path.display()
                 )
-            })?
+            })?;
+            let sections = yaml_top_level_sections(&content);
+            (config, sections)
         } else {
             warn!("Config file '{}' not found, using defaults", path.display());
-            Config::default()
+            (Config::default(), HashSet::new())
         };
-        config.resolve()
+        config.resolve_inner(&present_sections)
     }
 
     /// Apply env var overrides and validate required fields.
-    fn resolve(mut self) -> anyhow::Result<ResolvedConfig> {
-        // Env var overrides
-        if let Ok(val) = std::env::var("EMBEDDING_BASE_URL") {
-            self.embedding.base_url = Some(val);
-        }
-        if let Ok(val) = std::env::var("EMBEDDING_MODEL") {
-            self.embedding.model = Some(val);
-        }
-        if let Ok(val) = std::env::var("EMBEDDING_API_KEY") {
-            self.embedding.api_key = Some(val);
-        }
-        if let Ok(val) = std::env::var("EMBEDDING_VECTOR_SIZE") {
-            self.embedding.vector_size = val
-                .parse()
-                .map_err(|_| anyhow::anyhow!("EMBEDDING_VECTOR_SIZE must be a valid integer"))?;
-        }
-        if let Ok(val) = std::env::var("QDRANT_URL") {
-            self.qdrant.url = Some(val);
+    ///
+    /// Thin wrapper around [`Self::resolve_inner`] with no section-presence
+    /// context, so YAML-only settings conservatively report `Default` provenance.
+    /// Real provenance precision comes from [`Self::load`], which does track
+    /// section presence; this entry point exists for tests that only have a typed
+    /// `Config` (no source text) to work with — [`Self::load`] is the only
+    /// non-test caller, and it calls `resolve_inner` directly.
+    #[cfg(test)]
+    fn resolve(self) -> anyhow::Result<ResolvedConfig> {
+        self.resolve_inner(&HashSet::new())
+    }
+
+    fn resolve_inner(
+        self,
+        present_sections: &HashSet<&'static str>,
+    ) -> anyhow::Result<ResolvedConfig> {
+        // Safety net for the migration: a deployment that still sets one of these
+        // silently stops applying it, since ENV/YAML are now mutually exclusive per
+        // setting and these two were dropped rather than migrated. Named explicitly
+        // rather than discovered by reading source, which is the whole point.
+        for name in deprecated_env_vars_present() {
+            warn!(
+                "Environment variable {name} is set but no longer honored (it moved to \
+                 YAML-only config — see deploy/config.example.yaml). It is currently a \
+                 silent no-op; remove it from your deployment."
+            );
         }
 
-        if let Ok(val) = std::env::var("RERANKING_ENABLED") {
-            self.reranking.enabled = matches!(val.trim(), "true" | "1");
+        let mut provenance: BTreeMap<&'static str, SettingSource> = BTreeMap::new();
+
+        // ── ENV-only settings ───────────────────────────────────────────────────
+        // Connection wiring, model identity, and bootstrap bindings each have
+        // exactly one legal source: the environment. None of these fields exist on
+        // the YAML-deserializable structs any more, so a leftover YAML key for one
+        // of them is already caught loudly by `deny_unknown_fields`; what's left
+        // here is reading each var (falling back to its built-in default when
+        // optional and unset) and recording where the value came from.
+
+        let embedding_base_url = std::env::var("EMBEDDING_BASE_URL").ok();
+        if embedding_base_url.is_some() {
+            provenance.insert(
+                "embedding.base_url",
+                SettingSource::Env {
+                    var: "EMBEDDING_BASE_URL".into(),
+                },
+            );
         }
-        if let Ok(val) = std::env::var("RERANKING_BASE_URL") {
-            self.reranking.base_url = Some(val);
+
+        let embedding_model = std::env::var("EMBEDDING_MODEL").ok();
+        if embedding_model.is_some() {
+            provenance.insert(
+                "embedding.model",
+                SettingSource::Env {
+                    var: "EMBEDDING_MODEL".into(),
+                },
+            );
         }
-        if let Ok(val) = std::env::var("RERANKING_MODEL") {
-            self.reranking.model = Some(val);
+
+        let embedding_vector_size = match std::env::var("EMBEDDING_VECTOR_SIZE") {
+            Ok(val) => {
+                provenance.insert(
+                    "embedding.vector_size",
+                    SettingSource::Env {
+                        var: "EMBEDDING_VECTOR_SIZE".into(),
+                    },
+                );
+                val.parse()
+                    .map_err(|_| anyhow::anyhow!("EMBEDDING_VECTOR_SIZE must be a valid integer"))?
+            }
+            Err(_) => {
+                provenance.insert("embedding.vector_size", SettingSource::Default);
+                default_vector_size()
+            }
+        };
+
+        let embedding_api_key_env = self.embedding.api_key_env.clone();
+        let embedding_api_key = std::env::var(&embedding_api_key_env).ok();
+        provenance.insert(
+            "embedding.api_key",
+            match &embedding_api_key {
+                Some(_) => SettingSource::Env {
+                    var: embedding_api_key_env,
+                },
+                None => SettingSource::Default,
+            },
+        );
+
+        let qdrant_url = std::env::var("QDRANT_URL").ok();
+        if qdrant_url.is_some() {
+            provenance.insert(
+                "qdrant.url",
+                SettingSource::Env {
+                    var: "QDRANT_URL".into(),
+                },
+            );
         }
-        if let Ok(val) = std::env::var("RERANKING_API_KEY") {
-            self.reranking.api_key = Some(val);
+
+        let qdrant_collection = match std::env::var("QDRANT_COLLECTION") {
+            Ok(val) => {
+                provenance.insert(
+                    "qdrant.collection",
+                    SettingSource::Env {
+                        var: "QDRANT_COLLECTION".into(),
+                    },
+                );
+                val
+            }
+            Err(_) => {
+                provenance.insert("qdrant.collection", SettingSource::Default);
+                default_collection()
+            }
+        };
+
+        let reranking_base_url = std::env::var("RERANKING_BASE_URL").ok();
+        if reranking_base_url.is_some() {
+            provenance.insert(
+                "reranking.base_url",
+                SettingSource::Env {
+                    var: "RERANKING_BASE_URL".into(),
+                },
+            );
         }
-        if let Ok(val) = std::env::var("RERANKING_CANDIDATE_LIMIT") {
-            self.reranking.candidate_limit = val.parse().map_err(|_| {
-                anyhow::anyhow!("RERANKING_CANDIDATE_LIMIT must be a valid integer")
-            })?;
+
+        let reranking_model = std::env::var("RERANKING_MODEL").ok();
+        if reranking_model.is_some() {
+            provenance.insert(
+                "reranking.model",
+                SettingSource::Env {
+                    var: "RERANKING_MODEL".into(),
+                },
+            );
+        }
+
+        let reranking_api_key_env = self.reranking.api_key_env.clone();
+        let reranking_api_key = std::env::var(&reranking_api_key_env).ok();
+        provenance.insert(
+            "reranking.api_key",
+            match &reranking_api_key {
+                Some(_) => SettingSource::Env {
+                    var: reranking_api_key_env,
+                },
+                None => SettingSource::Default,
+            },
+        );
+
+        let source_git_url = std::env::var("GIT_URL").ok();
+        provenance.insert(
+            "source.git_url",
+            match &source_git_url {
+                Some(_) => SettingSource::Env {
+                    var: "GIT_URL".into(),
+                },
+                None => SettingSource::Default,
+            },
+        );
+
+        let source_branch = match std::env::var("GIT_BRANCH") {
+            Ok(val) => {
+                provenance.insert(
+                    "source.branch",
+                    SettingSource::Env {
+                        var: "GIT_BRANCH".into(),
+                    },
+                );
+                val
+            }
+            Err(_) => {
+                provenance.insert("source.branch", SettingSource::Default);
+                default_branch()
+            }
+        };
+
+        let source_data_path = match std::env::var("DATA_PATH") {
+            Ok(val) => {
+                provenance.insert(
+                    "source.data_path",
+                    SettingSource::Env {
+                        var: "DATA_PATH".into(),
+                    },
+                );
+                Some(val)
+            }
+            Err(_) => {
+                provenance.insert("source.data_path", SettingSource::Default);
+                default_data_path()
+            }
+        };
+
+        let mcp_port = match std::env::var("MCP_PORT") {
+            Ok(val) => {
+                provenance.insert(
+                    "mcp.port",
+                    SettingSource::Env {
+                        var: "MCP_PORT".into(),
+                    },
+                );
+                val.parse().map_err(|_| {
+                    anyhow::anyhow!("MCP_PORT must be a valid port number (0-65535)")
+                })?
+            }
+            Err(_) => {
+                provenance.insert("mcp.port", SettingSource::Default);
+                default_mcp_port()
+            }
+        };
+
+        // ── YAML-only settings ──────────────────────────────────────────────────
+        // See `YAML_ONLY_SETTINGS`'s doc comment for the section-granularity caveat.
+        for (name, section) in YAML_ONLY_SETTINGS {
+            let source = if present_sections.contains(section) {
+                SettingSource::Yaml
+            } else {
+                SettingSource::Default
+            };
+            provenance.insert(*name, source);
         }
 
         // Validate chunk size config
@@ -641,7 +1061,7 @@ impl Config {
         }
 
         // Validate lower bounds
-        if self.embedding.vector_size == 0 {
+        if embedding_vector_size == 0 {
             anyhow::bail!("embedding.vector_size must be >= 1");
         }
         if self.embedding.batch_size == 0 {
@@ -675,89 +1095,104 @@ impl Config {
             anyhow::bail!("indexing.reconcile_interval_secs must be >= 1");
         }
 
-        // Validate required fields
+        // Validate required env vars — named all at once, not one at a time, so a
+        // fresh deployment finds every missing var on the first failed start
+        // instead of fixing them one restart at a time.
         let mut missing = Vec::new();
-        if self.embedding.base_url.is_none() {
-            missing
-                .push("embedding.base_url (set EMBEDDING_BASE_URL or config embedding.base_url)");
+        if embedding_base_url.is_none() {
+            missing.push("EMBEDDING_BASE_URL");
         }
-        if self.embedding.model.is_none() {
-            missing.push("embedding.model (set EMBEDDING_MODEL or config embedding.model)");
+        if embedding_model.is_none() {
+            missing.push("EMBEDDING_MODEL");
         }
-        if self.qdrant.url.is_none() {
-            missing.push("qdrant.url (set QDRANT_URL or config qdrant.url)");
+        if qdrant_url.is_none() {
+            missing.push("QDRANT_URL");
         }
         if self.reranking.enabled {
-            if self.reranking.base_url.is_none() {
-                missing.push(
-                    "reranking.base_url (set RERANKING_BASE_URL or config reranking.base_url)",
-                );
+            if reranking_base_url.is_none() {
+                missing.push("RERANKING_BASE_URL");
             }
-            if self.reranking.model.is_none() {
-                missing.push("reranking.model (set RERANKING_MODEL or config reranking.model)");
+            if reranking_model.is_none() {
+                missing.push("RERANKING_MODEL");
             }
         }
         if !missing.is_empty() {
             anyhow::bail!(
-                "Missing required configuration:\n  - {}",
+                "Missing required environment variable(s):\n  - {}",
                 missing.join("\n  - ")
             );
         }
 
-        // SAFETY: all three fields were checked for None above; bail! prevents reaching here
-        // with any of them absent. We use ok_or_else rather than unwrap so the compiler
-        // enforces the invariant — if the check block above is ever refactored, this will
-        // produce a proper error instead of a panic.
-        let embedding_base_url = self.embedding.base_url.ok_or_else(|| {
+        // SAFETY: all fields referenced below were checked for None above; bail!
+        // prevents reaching here with any of them absent. We use ok_or_else rather
+        // than unwrap so the compiler enforces the invariant — if the check block
+        // above is ever refactored, this produces a proper error instead of a panic.
+        let embedding_base_url = embedding_base_url.ok_or_else(|| {
             anyhow::anyhow!(
-                "embedding.base_url must be set (internal error: missing field after validation)"
+                "EMBEDDING_BASE_URL must be set (internal error: missing after validation)"
             )
         })?;
-        let embedding_model = self.embedding.model.ok_or_else(|| {
+        let embedding_model = embedding_model.ok_or_else(|| {
             anyhow::anyhow!(
-                "embedding.model must be set (internal error: missing field after validation)"
+                "EMBEDDING_MODEL must be set (internal error: missing after validation)"
             )
         })?;
-        let qdrant_url = self.qdrant.url.ok_or_else(|| {
-            anyhow::anyhow!(
-                "qdrant.url must be set (internal error: missing field after validation)"
-            )
+        let qdrant_url = qdrant_url.ok_or_else(|| {
+            anyhow::anyhow!("QDRANT_URL must be set (internal error: missing after validation)")
         })?;
 
         Ok(ResolvedConfig {
-            source: self.source,
+            source: ResolvedSourceConfig {
+                git_url: source_git_url,
+                branch: source_branch,
+                data_path: source_data_path,
+                git_token_env: self.source.git_token_env,
+            },
             indexing: self.indexing,
             frontmatter: self.frontmatter,
             chunking: self.chunking,
             embedding: ResolvedEmbeddingConfig {
                 base_url: embedding_base_url,
                 model: embedding_model,
-                api_key: self.embedding.api_key,
-                vector_size: self.embedding.vector_size,
+                api_key: embedding_api_key,
+                vector_size: embedding_vector_size,
                 batch_size: self.embedding.batch_size,
                 request_timeout_secs: self.embedding.request_timeout_secs,
                 batch_concurrency: self.embedding.batch_concurrency,
             },
             qdrant: ResolvedQdrantConfig {
                 url: qdrant_url,
-                collection: self.qdrant.collection,
+                collection: qdrant_collection,
             },
             validation: self.validation,
             webhook: self.webhook,
-            mcp: self.mcp,
+            mcp: ResolvedMcpConfig {
+                port: mcp_port,
+                bearer_token_env: self.mcp.bearer_token_env,
+                allow_unauthenticated: self.mcp.allow_unauthenticated,
+                instructions: self.mcp.instructions,
+                metadata_refresh_secs: self.mcp.metadata_refresh_secs,
+                allowed_hosts: self.mcp.allowed_hosts,
+            },
             rate_limit: self.rate_limit,
             write: self.write,
             search: self.search,
             reranking: if self.reranking.enabled {
                 Some(ResolvedRerankingConfig {
-                    base_url: self.reranking.base_url.unwrap(),
-                    model: self.reranking.model.unwrap(),
-                    api_key: self.reranking.api_key.clone(),
+                    base_url: reranking_base_url.unwrap(),
+                    model: reranking_model.unwrap(),
+                    api_key: reranking_api_key,
                     candidate_limit: self.reranking.candidate_limit,
                 })
             } else {
                 None
             },
+            provenance: ConfigProvenance(
+                provenance
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            ),
         })
     }
 }
@@ -805,6 +1240,27 @@ impl ResolvedConfig {
         }
         fields
     }
+
+    /// Log a startup-time note when git integration is off — see
+    /// [`ResolvedSourceConfig::git_integration_disabled`] for why this is worth
+    /// surfacing even though it is not an error: a deliberate bind-mount-only
+    /// deployment and a migration that dropped `GIT_URL` by accident look
+    /// IDENTICAL from the process's point of view (no error, no crash, just a
+    /// server that quietly never fetches again), so this is the only place either
+    /// case becomes visible. Deliberately worded as informational rather than
+    /// alarming — a bind-mount deployment reading this at every startup should
+    /// not read it as something broken.
+    pub fn log_git_integration_status(&self) {
+        if self.source.git_integration_disabled() {
+            warn!(
+                "Git integration is disabled (GIT_URL is not set): the server will only \
+                 ever serve whatever is already present at '{}' — no clone-on-empty, no \
+                 webhook-driven pulls. This is expected for a bind-mount-only deployment; \
+                 if you meant to track a git remote, set GIT_URL.",
+                self.data_path()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -815,8 +1271,28 @@ mod tests {
     /// Mutex to serialize tests that modify environment variables.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    /// The three env vars every successful `resolve()` needs at minimum
+    /// (reranking is disabled by default, so its vars are not required).
+    fn set_required_env() {
+        // SAFETY: caller holds ENV_MUTEX
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+    }
+
+    fn clear_required_env() {
+        // SAFETY: caller holds ENV_MUTEX
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+    }
+
     impl Config {
-        /// Deserialize + resolve (requires env vars or config values for required fields)
+        /// Deserialize + resolve (requires env vars for the required fields)
         fn from_str(yaml: &str) -> anyhow::Result<ResolvedConfig> {
             let config: Config = serde_yaml_ng::from_str(yaml)?;
             config.resolve()
@@ -828,42 +1304,30 @@ mod tests {
         }
     }
 
+    /// A YAML doc using only settings that are still YAML-settable post-migration.
     const MINIMAL_CONFIG: &str = r#"
-source:
-  git_url: "https://example.com/repo.git"
 indexing:
   include: ["**/*.md"]
 frontmatter:
   required: [title, description]
 chunking:
   max_chunk_size: 1000
-embedding:
-  base_url: "http://localhost:8080/v1"
-  model: "test-model"
-qdrant:
-  url: "http://localhost:6334"
 "#;
 
     #[test]
     fn parse_minimal_config() {
         let cfg = Config::from_str_raw(MINIMAL_CONFIG).unwrap();
-        assert_eq!(cfg.source.branch, "master");
-        assert_eq!(cfg.embedding.vector_size, 768);
+        assert_eq!(cfg.source.git_token_env, "GIT_PULL_TOKEN");
         assert_eq!(cfg.embedding.batch_size, 32);
-        assert_eq!(cfg.qdrant.collection, "knowledge-base");
         assert_eq!(cfg.chunking.max_chunk_size, 1000);
         assert!(cfg.validation.enabled);
         assert!(!cfg.validation.strict);
-        assert_eq!(cfg.mcp.port, 8001);
     }
 
     #[test]
     fn parse_full_config() {
         let yaml = r#"
 source:
-  git_url: "https://example.com/repo.git"
-  branch: "main"
-  data_path: "/custom/path"
   git_token_env: "MY_GIT_TOKEN"
 indexing:
   include: ["**/*.md"]
@@ -878,13 +1342,8 @@ chunking:
   max_chunk_size: 2000
   prepend_description: true
 embedding:
-  base_url: "http://embed:8080/v1"
-  model: "nomic"
-  vector_size: 512
+  api_key_env: "MY_EMBEDDING_KEY"
   batch_size: 16
-qdrant:
-  url: "http://qdrant:6334"
-  collection: "my-kb"
 validation:
   enabled: false
   strict: true
@@ -892,15 +1351,12 @@ webhook:
   secret_env: "MY_SECRET"
   provider: "github"
 mcp:
-  port: 9002
   bearer_token_env: "MY_TOKEN"
 "#;
         let cfg = Config::from_str_raw(yaml).unwrap();
-        assert_eq!(cfg.source.branch, "main");
-        assert_eq!(cfg.source.data_path.as_deref(), Some("/custom/path"));
         assert_eq!(cfg.source.git_token_env, "MY_GIT_TOKEN");
-        assert_eq!(cfg.embedding.vector_size, 512);
-        assert_eq!(cfg.qdrant.collection, "my-kb");
+        assert_eq!(cfg.embedding.api_key_env, "MY_EMBEDDING_KEY");
+        assert_eq!(cfg.embedding.batch_size, 16);
         assert!(!cfg.validation.enabled);
         assert!(cfg.validation.strict);
         assert_eq!(cfg.webhook.provider, WebhookProvider::Github);
@@ -910,16 +1366,15 @@ mcp:
     #[test]
     fn default_data_path() {
         let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.data_path(), "/data");
+        clear_required_env();
     }
 
     #[test]
     fn empty_yaml_deserializes_to_defaults() {
         let cfg = Config::from_str_raw("{}").unwrap();
-        assert_eq!(cfg.source.branch, "master");
-        assert_eq!(cfg.source.data_path.as_deref(), Some("/data"));
-        assert_eq!(cfg.source.git_url, None);
         assert_eq!(cfg.source.git_token_env, "GIT_PULL_TOKEN");
         assert_eq!(cfg.indexing.include, vec!["**/*.md"]);
         assert_eq!(
@@ -932,20 +1387,15 @@ mcp:
         assert_eq!(cfg.chunking.max_chunk_size, 1500);
         assert_eq!(cfg.chunking.target_chunk_size, Some(1000));
         assert!(cfg.chunking.prepend_description);
-        assert_eq!(cfg.embedding.vector_size, 768);
         assert_eq!(cfg.embedding.batch_size, 32);
-        assert_eq!(cfg.embedding.base_url, None);
-        assert_eq!(cfg.embedding.model, None);
-        assert_eq!(cfg.qdrant.url, None);
-        assert_eq!(cfg.qdrant.collection, "knowledge-base");
+        assert_eq!(cfg.embedding.api_key_env, "EMBEDDING_API_KEY");
         assert!(cfg.validation.enabled);
-        assert_eq!(cfg.mcp.port, 8001);
         assert_eq!(cfg.rate_limit.per_second, 20);
         assert_eq!(cfg.rate_limit.burst_size, 50);
     }
 
     #[test]
-    fn env_vars_override_config_values() {
+    fn env_only_settings_are_read_from_env() {
         let _lock = ENV_MUTEX.lock().unwrap();
 
         // SAFETY: serialized by ENV_MUTEX
@@ -972,87 +1422,101 @@ mcp:
     }
 
     #[test]
-    fn missing_required_fields_produces_clear_error() {
+    fn missing_required_env_produces_clear_error_naming_all_of_them() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        // SAFETY: serialized by ENV_MUTEX
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
 
         let result = Config::from_str_raw("{}").unwrap().resolve();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("embedding.base_url"),
-            "error should mention embedding.base_url: {err}"
+            err.contains("EMBEDDING_BASE_URL"),
+            "error should mention EMBEDDING_BASE_URL: {err}"
         );
         assert!(
-            err.contains("embedding.model"),
-            "error should mention embedding.model: {err}"
+            err.contains("EMBEDDING_MODEL"),
+            "error should mention EMBEDDING_MODEL: {err}"
         );
         assert!(
-            err.contains("qdrant.url"),
-            "error should mention qdrant.url: {err}"
+            err.contains("QDRANT_URL"),
+            "error should mention QDRANT_URL: {err}"
         );
+    }
+
+    #[test]
+    fn missing_reranking_env_is_only_required_when_enabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::remove_var("RERANKING_BASE_URL");
+            std::env::remove_var("RERANKING_MODEL");
+        }
+
+        // Disabled: resolves fine even with no reranking env vars set.
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert!(cfg.reranking.is_none());
+
+        // Enabled: now both become required, and both missing ones are named.
+        let yaml = format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: true\n");
+        let result = Config::from_str_raw(&yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("RERANKING_BASE_URL"), "{err}");
+        assert!(err.contains("RERANKING_MODEL"), "{err}");
+
+        clear_required_env();
     }
 
     #[test]
     fn load_missing_file_returns_defaults() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        // Provide required env vars so resolve() succeeds
-        unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
-        }
+        set_required_env();
 
         let cfg = Config::load(Path::new("/nonexistent/config.yaml")).unwrap();
         assert_eq!(cfg.source.branch, "master");
         assert_eq!(cfg.chunking.max_chunk_size, 1500);
         assert_eq!(cfg.qdrant.collection, "knowledge-base");
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
     }
 
     #[test]
     fn env_var_vector_size_override() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
+        set_required_env();
         unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
             std::env::set_var("EMBEDDING_VECTOR_SIZE", "1024");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
         }
 
         let cfg = Config::from_str_raw("{}").unwrap().resolve().unwrap();
         assert_eq!(cfg.embedding.vector_size, 1024);
 
         unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
             std::env::remove_var("EMBEDDING_VECTOR_SIZE");
-            std::env::remove_var("QDRANT_URL");
         }
+        clear_required_env();
+    }
+
+    #[test]
+    fn vector_size_defaults_when_env_unset() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::remove_var("EMBEDDING_VECTOR_SIZE");
+        }
+
+        let cfg = Config::from_str_raw("{}").unwrap().resolve().unwrap();
+        assert_eq!(cfg.embedding.vector_size, 768);
+
+        clear_required_env();
     }
 
     #[test]
     fn env_var_vector_size_invalid() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
+        set_required_env();
         unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
             std::env::set_var("EMBEDDING_VECTOR_SIZE", "not-a-number");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
         }
 
         let result = Config::from_str_raw("{}").unwrap().resolve();
@@ -1066,94 +1530,152 @@ mcp:
         );
 
         unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
             std::env::remove_var("EMBEDDING_VECTOR_SIZE");
-            std::env::remove_var("QDRANT_URL");
         }
+        clear_required_env();
     }
 
     #[test]
-    fn partial_config_with_env_filling_gaps() {
+    fn mcp_port_defaults_when_env_unset() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        // Config provides qdrant.url, env provides embedding fields
+        set_required_env();
         unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://env:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "env-model");
-            std::env::remove_var("QDRANT_URL");
+            std::env::remove_var("MCP_PORT");
+        }
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(cfg.mcp.port, 8001);
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_port_read_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("MCP_PORT", "9002");
+        }
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(cfg.mcp.port, 9002);
+        unsafe {
+            std::env::remove_var("MCP_PORT");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_port_invalid_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("MCP_PORT", "not-a-port");
+        }
+        let result = Config::from_str(MINIMAL_CONFIG);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("MCP_PORT"));
+        unsafe {
+            std::env::remove_var("MCP_PORT");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn source_bootstrap_bindings_read_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("GIT_URL", "https://example.com/repo.git");
+            std::env::set_var("GIT_BRANCH", "main");
+            std::env::set_var("DATA_PATH", "/custom/path");
+            std::env::set_var("QDRANT_COLLECTION", "my-kb");
         }
 
-        let yaml = r#"
-qdrant:
-  url: "http://config-qdrant:6334"
-chunking:
-  max_chunk_size: 2000
-"#;
-        let cfg = Config::from_str_raw(yaml).unwrap().resolve().unwrap();
-        assert_eq!(cfg.embedding.base_url, "http://env:8080/v1");
-        assert_eq!(cfg.embedding.model, "env-model");
-        assert_eq!(cfg.qdrant.url, "http://config-qdrant:6334");
-        assert_eq!(cfg.chunking.max_chunk_size, 2000);
-        // Other fields should still be defaults
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(
+            cfg.source.git_url.as_deref(),
+            Some("https://example.com/repo.git")
+        );
+        assert_eq!(cfg.source.branch, "main");
+        assert_eq!(cfg.source.data_path.as_deref(), Some("/custom/path"));
+        assert_eq!(cfg.qdrant.collection, "my-kb");
+        assert_eq!(cfg.state_db_path(), "/custom/path/state.db");
+
+        unsafe {
+            std::env::remove_var("GIT_URL");
+            std::env::remove_var("GIT_BRANCH");
+            std::env::remove_var("DATA_PATH");
+            std::env::remove_var("QDRANT_COLLECTION");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn source_bootstrap_bindings_default_when_env_unset() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::remove_var("GIT_URL");
+            std::env::remove_var("GIT_BRANCH");
+            std::env::remove_var("DATA_PATH");
+            std::env::remove_var("QDRANT_COLLECTION");
+        }
+
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(cfg.source.git_url, None);
         assert_eq!(cfg.source.branch, "master");
+        assert_eq!(cfg.source.data_path.as_deref(), Some("/data"));
         assert_eq!(cfg.qdrant.collection, "knowledge-base");
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-        }
+        clear_required_env();
     }
 
     #[test]
-    fn resolved_fields_accessible_after_resolve() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
-
-        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
-        assert_eq!(cfg.embedding.base_url, "http://localhost:8080/v1");
-        assert_eq!(cfg.embedding.model, "test-model");
-        assert_eq!(cfg.qdrant.url, "http://localhost:6334");
+    fn git_integration_disabled_when_git_url_absent() {
+        let source = ResolvedSourceConfig {
+            git_url: None,
+            ..Default::default()
+        };
+        assert!(source.git_integration_disabled());
     }
 
     #[test]
-    fn resolve_converts_option_fields_to_plain_strings() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+    fn git_integration_not_disabled_when_git_url_present() {
+        let source = ResolvedSourceConfig {
+            git_url: Some("https://example.com/repo.git".into()),
+            ..Default::default()
+        };
+        assert!(!source.git_integration_disabled());
+    }
 
+    #[test]
+    fn git_integration_disabled_via_full_resolve_when_env_unset() {
+        // End-to-end through Config::resolve, not just the predicate in isolation
+        // — confirms GIT_URL unset really does propagate to the disabled state.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
         unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
+            std::env::remove_var("GIT_URL");
         }
 
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert!(cfg.source.git_integration_disabled());
 
-        // These are plain String fields on ResolvedConfig, not Option<String>.
-        // If they were still Option<String>, this code would fail to compile.
-        let _base_url: &String = &cfg.embedding.base_url;
-        let _model: &String = &cfg.embedding.model;
-        let _url: &String = &cfg.qdrant.url;
+        unsafe {
+            std::env::set_var("GIT_URL", "https://example.com/repo.git");
+        }
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert!(!cfg.source.git_integration_disabled());
 
-        assert_eq!(_base_url, "http://localhost:8080/v1");
-        assert_eq!(_model, "test-model");
-        assert_eq!(_url, "http://localhost:6334");
-
-        // Non-optional fields are carried through unchanged
-        assert_eq!(cfg.embedding.vector_size, 768);
-        assert_eq!(cfg.embedding.batch_size, 32);
-        assert_eq!(cfg.qdrant.collection, "knowledge-base");
+        unsafe {
+            std::env::remove_var("GIT_URL");
+        }
+        clear_required_env();
     }
 
     #[test]
     fn resolved_config_usable_without_raw_config() {
         // Construct ResolvedConfig directly — proves no Option unwrapping needed at use sites.
         let cfg = ResolvedConfig {
-            source: SourceConfig::default(),
+            source: ResolvedSourceConfig::default(),
             indexing: IndexingConfig::default(),
             frontmatter: FrontmatterConfig::default(),
             chunking: ChunkingConfig::default(),
@@ -1172,11 +1694,12 @@ chunking:
             },
             validation: ValidationConfig::default(),
             webhook: WebhookConfig::default(),
-            mcp: McpConfig::default(),
+            mcp: ResolvedMcpConfig::default(),
             rate_limit: RateLimitConfig::default(),
             write: WriteConfig::default(),
             search: SearchConfig::default(),
             reranking: None,
+            provenance: ConfigProvenance::default(),
         };
 
         // All fields are directly accessible — no unwrap, no panic path.
@@ -1191,7 +1714,6 @@ chunking:
     #[test]
     fn load_returns_resolved_config() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
         unsafe {
             std::env::set_var("EMBEDDING_BASE_URL", "http://load-test:8080/v1");
             std::env::set_var("EMBEDDING_MODEL", "load-model");
@@ -1200,7 +1722,6 @@ chunking:
 
         let cfg = Config::load(Path::new("/nonexistent/config.yaml")).unwrap();
 
-        // Config::load returns ResolvedConfig — fields are plain Strings.
         assert_eq!(cfg.embedding.base_url, "http://load-test:8080/v1");
         assert_eq!(cfg.embedding.model, "load-model");
         assert_eq!(cfg.qdrant.url, "http://load-qdrant:6334");
@@ -1216,13 +1737,8 @@ chunking:
     fn unknown_fields_are_rejected() {
         let yaml = r#"
 source:
-  branch: "main"
+  git_token_env: "X"
 unknown_top_level: true
-embedding:
-  base_url: "http://localhost:8080/v1"
-  model: "test"
-qdrant:
-  url: "http://localhost:6334"
 "#;
         let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
         assert!(
@@ -1234,8 +1750,8 @@ qdrant:
     #[test]
     fn unknown_fields_in_nested_struct_are_rejected() {
         let yaml = r#"
-source:
-  branch: "main"
+mcp:
+  bearer_token_env: "X"
   unknown_nested: "oops"
 "#;
         let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
@@ -1243,34 +1759,56 @@ source:
     }
 
     #[test]
+    fn removed_bootstrap_fields_are_rejected_in_yaml() {
+        // source.git_url / branch / data_path, embedding.base_url / model /
+        // vector_size, and qdrant.url / collection all moved to ENV-only. A
+        // deployed config.yaml that still sets any of them must fail loudly at
+        // parse time rather than have the setting silently stop applying.
+        for yaml in [
+            "source:\n  git_url: \"https://example.com/repo.git\"\n",
+            "source:\n  branch: \"main\"\n",
+            "source:\n  data_path: \"/data\"\n",
+            "embedding:\n  base_url: \"http://embed:8080/v1\"\n",
+            "embedding:\n  model: \"nomic\"\n",
+            "embedding:\n  vector_size: 768\n",
+            "embedding:\n  api_key: \"sk-leaked\"\n",
+            "reranking:\n  base_url: \"http://rerank:8081/v1\"\n",
+            "reranking:\n  model: \"reranker\"\n",
+            "reranking:\n  api_key: \"sk-leaked\"\n",
+            "mcp:\n  port: 9002\n",
+        ] {
+            let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+            assert!(
+                result.is_err(),
+                "expected '{yaml}' to be rejected as an unknown field"
+            );
+        }
+    }
+
+    #[test]
     fn state_db_path_derived_from_data_path() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
+        set_required_env();
         unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
+            std::env::set_var("DATA_PATH", "/custom/path");
         }
 
-        let yaml = r#"
-source:
-  data_path: "/custom/path"
-"#;
-        let cfg = Config::from_str_raw(yaml).unwrap().resolve().unwrap();
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.state_db_path(), "/custom/path/state.db");
 
         unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
+            std::env::remove_var("DATA_PATH");
         }
+        clear_required_env();
     }
 
     #[test]
     fn state_db_path_uses_default_data_path() {
         let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.state_db_path(), "/data/state.db");
+        clear_required_env();
     }
 
     #[test]
@@ -1300,17 +1838,13 @@ mcp:
         let yaml = include_str!("../deploy/config.example.yaml");
         let cfg: Config = serde_yaml_ng::from_str(yaml).expect("config.example.yaml should parse");
         // Spot-check a few values to catch drift between example and struct
-        assert_eq!(cfg.source.branch, "master");
         assert_eq!(cfg.chunking.max_chunk_size, 1500);
         assert_eq!(cfg.chunking.target_chunk_size, Some(1000));
         assert!(cfg.chunking.prepend_description);
-        assert_eq!(cfg.embedding.vector_size, 768);
         assert_eq!(cfg.embedding.batch_size, 32);
-        assert_eq!(cfg.qdrant.collection, "knowledge-base");
         assert!(cfg.validation.enabled);
         assert!(!cfg.validation.strict);
         assert_eq!(cfg.webhook.provider, WebhookProvider::Gitea);
-        assert_eq!(cfg.mcp.port, 8001);
         // Verify new write identity fields round-trip from the example config
         assert_eq!(cfg.write.commit_author_name, "md-kb-rag");
         assert_eq!(cfg.write.commit_author_email, "md-kb-rag@localhost");
@@ -1400,32 +1934,9 @@ webhook:
     }
 
     #[test]
-    fn config_file_values_preserved_when_env_absent() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("EMBEDDING_VECTOR_SIZE");
-            std::env::remove_var("QDRANT_URL");
-        }
-
-        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
-        assert_eq!(cfg.embedding.base_url, "http://localhost:8080/v1");
-        assert_eq!(cfg.embedding.model, "test-model");
-        assert_eq!(cfg.qdrant.url, "http://localhost:6334");
-        assert_eq!(cfg.embedding.vector_size, 768);
-    }
-
-    #[test]
     fn target_exceeds_max_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
-        }
+        set_required_env();
 
         let yaml = r#"
 chunking:
@@ -1444,22 +1955,13 @@ chunking:
             "error should mention max_chunk_size: {err}"
         );
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
     }
 
     #[test]
     fn zero_batch_size_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
-        }
+        set_required_env();
 
         let yaml = r#"
 embedding:
@@ -1473,22 +1975,13 @@ embedding:
             "error should mention batch_size: {err}"
         );
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
     }
 
     #[test]
     fn zero_max_chunk_size_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
-        }
+        set_required_env();
 
         let yaml = r#"
 chunking:
@@ -1502,28 +1995,18 @@ chunking:
             "error should mention max_chunk_size: {err}"
         );
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
     }
 
     #[test]
     fn zero_vector_size_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
+        set_required_env();
         unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
+            std::env::set_var("EMBEDDING_VECTOR_SIZE", "0");
         }
 
-        let yaml = r#"
-embedding:
-  vector_size: 0
-"#;
-        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        let result = Config::from_str_raw("{}").unwrap().resolve();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1532,21 +2015,15 @@ embedding:
         );
 
         unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
+            std::env::remove_var("EMBEDDING_VECTOR_SIZE");
         }
+        clear_required_env();
     }
 
     #[test]
     fn effective_indexed_fields_always_includes_file_path() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        set_required_env();
 
         // When indexed_fields is empty, file_path is injected.
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
@@ -1556,6 +2033,8 @@ embedding:
             fields.contains(&"file_path".to_string()),
             "effective_indexed_fields must include file_path"
         );
+
+        clear_required_env();
     }
 
     #[test]
@@ -1583,17 +2062,10 @@ embedding:
     #[test]
     fn effective_indexed_fields_no_duplicate_file_path() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        set_required_env();
 
         // When indexed_fields already contains file_path, it should not be duplicated.
         let yaml = r#"
-source:
-  git_url: "https://example.com/repo.git"
 indexing:
   include: ["**/*.md"]
 frontmatter:
@@ -1601,28 +2073,20 @@ frontmatter:
   indexed_fields: [file_path, domain]
 chunking:
   max_chunk_size: 1000
-embedding:
-  base_url: "http://localhost:8080/v1"
-  model: "test-model"
-qdrant:
-  url: "http://localhost:6334"
 "#;
         let cfg = Config::from_str(yaml).unwrap();
         let fields = cfg.effective_indexed_fields();
         let count = fields.iter().filter(|f| f.as_str() == "file_path").count();
         assert_eq!(count, 1, "file_path should appear exactly once");
         assert!(fields.contains(&"domain".to_string()));
+
+        clear_required_env();
     }
 
     #[test]
     fn zero_per_second_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
-        }
+        set_required_env();
 
         let yaml = r#"
 rate_limit:
@@ -1636,11 +2100,7 @@ rate_limit:
             "error should mention rate_limit.per_second: {err}"
         );
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
     }
 
     #[test]
@@ -1656,12 +2116,7 @@ indexing:
     #[test]
     fn zero_reconcile_interval_secs_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
-        }
+        set_required_env();
 
         let yaml = r#"
 indexing:
@@ -1675,22 +2130,13 @@ indexing:
             "error should mention reconcile_interval_secs: {err}"
         );
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
     }
 
     #[test]
     fn zero_burst_size_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
-        }
+        set_required_env();
 
         let yaml = r#"
 rate_limit:
@@ -1704,22 +2150,13 @@ rate_limit:
             "error should mention rate_limit.burst_size: {err}"
         );
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
     }
 
     #[test]
     fn low_metadata_refresh_secs_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
-            std::env::set_var("EMBEDDING_MODEL", "test-model");
-            std::env::set_var("QDRANT_URL", "http://test:6334");
-        }
+        set_required_env();
 
         let yaml = r#"
 mcp:
@@ -1733,17 +2170,13 @@ mcp:
             "error should mention mcp.metadata_refresh_secs: {err}"
         );
 
-        unsafe {
-            std::env::remove_var("EMBEDDING_BASE_URL");
-            std::env::remove_var("EMBEDDING_MODEL");
-            std::env::remove_var("QDRANT_URL");
-        }
+        clear_required_env();
     }
 
     #[test]
-    fn api_key_absent_defaults_to_none() {
+    fn api_key_env_absent_defaults_to_none() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
+        set_required_env();
         unsafe {
             std::env::remove_var("EMBEDDING_API_KEY");
         }
@@ -1751,80 +2184,46 @@ mcp:
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert!(
             cfg.embedding.api_key.is_none(),
-            "api_key should be None when absent from config and env"
+            "api_key should be None when the named env var is unset"
         );
+
+        clear_required_env();
     }
 
     #[test]
-    fn api_key_from_config_file() {
+    fn api_key_read_from_default_named_env_var() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
-        unsafe {
-            std::env::remove_var("EMBEDDING_API_KEY");
-        }
-
-        let yaml = r#"
-source:
-  git_url: "https://example.com/repo.git"
-embedding:
-  base_url: "http://localhost:8080/v1"
-  model: "test-model"
-  api_key: "sk-from-config"
-qdrant:
-  url: "http://localhost:6334"
-"#;
-        let cfg = Config::from_str(yaml).unwrap();
-        assert_eq!(cfg.embedding.api_key.as_deref(), Some("sk-from-config"));
-    }
-
-    #[test]
-    fn api_key_env_overrides_config() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
+        set_required_env();
         unsafe {
             std::env::set_var("EMBEDDING_API_KEY", "sk-from-env");
         }
 
-        let yaml = r#"
-source:
-  git_url: "https://example.com/repo.git"
-embedding:
-  base_url: "http://localhost:8080/v1"
-  model: "test-model"
-  api_key: "sk-from-config"
-qdrant:
-  url: "http://localhost:6334"
-"#;
-        let cfg = Config::from_str(yaml).unwrap();
-        assert_eq!(
-            cfg.embedding.api_key.as_deref(),
-            Some("sk-from-env"),
-            "env var should override config file value"
-        );
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(cfg.embedding.api_key.as_deref(), Some("sk-from-env"));
 
         unsafe {
             std::env::remove_var("EMBEDDING_API_KEY");
         }
+        clear_required_env();
     }
 
     #[test]
-    fn api_key_env_alone() {
+    fn api_key_env_indirection_uses_custom_var_name() {
         let _lock = ENV_MUTEX.lock().unwrap();
-
+        set_required_env();
         unsafe {
-            std::env::set_var("EMBEDDING_API_KEY", "sk-env-only");
+            std::env::set_var("MY_CUSTOM_EMBED_KEY", "sk-custom");
         }
 
-        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
-        assert_eq!(
-            cfg.embedding.api_key.as_deref(),
-            Some("sk-env-only"),
-            "env var should work without config file field"
-        );
+        let yaml =
+            format!("{MINIMAL_CONFIG}\nembedding:\n  api_key_env: \"MY_CUSTOM_EMBED_KEY\"\n");
+        let cfg = Config::from_str(&yaml).unwrap();
+        assert_eq!(cfg.embedding.api_key.as_deref(), Some("sk-custom"));
 
         unsafe {
-            std::env::remove_var("EMBEDDING_API_KEY");
+            std::env::remove_var("MY_CUSTOM_EMBED_KEY");
         }
+        clear_required_env();
     }
 
     #[test]
@@ -1832,38 +2231,227 @@ qdrant:
         let cfg = Config::from_str_raw("{}").unwrap();
         assert!(!cfg.reranking.enabled);
         assert_eq!(cfg.reranking.candidate_limit, 50);
-        assert!(cfg.reranking.base_url.is_none());
-        assert!(cfg.reranking.model.is_none());
+        assert_eq!(cfg.reranking.api_key_env, "RERANKING_API_KEY");
     }
 
     #[test]
     fn reranking_config_full() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("RERANKING_BASE_URL", "http://reranker:8081/v1");
+            std::env::set_var("RERANKING_MODEL", "reranker");
+            std::env::set_var("RERANKING_API_KEY", "sk-rerank");
+        }
+
         let yaml = r#"
 reranking:
   enabled: true
-  base_url: "http://reranker:8081/v1"
-  model: "reranker"
-  api_key: "sk-rerank"
   candidate_limit: 100
 "#;
-        let cfg = Config::from_str_raw(yaml).unwrap();
-        assert!(cfg.reranking.enabled);
-        assert_eq!(
-            cfg.reranking.base_url.as_deref(),
-            Some("http://reranker:8081/v1")
-        );
-        assert_eq!(cfg.reranking.model.as_deref(), Some("reranker"));
-        assert_eq!(cfg.reranking.api_key.as_deref(), Some("sk-rerank"));
-        assert_eq!(cfg.reranking.candidate_limit, 100);
+        let cfg = Config::from_str(yaml).unwrap();
+        let reranking = cfg.reranking.expect("reranking should be resolved");
+        assert_eq!(reranking.base_url, "http://reranker:8081/v1");
+        assert_eq!(reranking.model, "reranker");
+        assert_eq!(reranking.api_key.as_deref(), Some("sk-rerank"));
+        assert_eq!(reranking.candidate_limit, 100);
+
+        unsafe {
+            std::env::remove_var("RERANKING_BASE_URL");
+            std::env::remove_var("RERANKING_MODEL");
+            std::env::remove_var("RERANKING_API_KEY");
+        }
+        clear_required_env();
     }
 
     #[test]
     fn resolved_reranking_is_none_when_disabled() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("RERANKING_ENABLED");
-        }
+        set_required_env();
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert!(cfg.reranking.is_none());
+        clear_required_env();
+    }
+
+    // ── Migration-specific coverage ─────────────────────────────────────────────
+    // The three behaviors this migration is required to prove: a removed env
+    // override no longer takes effect, a recognized-but-unhonored var triggers the
+    // deprecation warning path, and fail-fast names every missing required var at
+    // once (already covered above by
+    // `missing_required_env_produces_clear_error_naming_all_of_them`, which now
+    // asserts on env var names instead of dotted YAML paths).
+
+    #[test]
+    fn removed_reranking_env_overrides_no_longer_apply() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("RERANKING_BASE_URL", "http://reranker:8081/v1");
+            std::env::set_var("RERANKING_MODEL", "reranker");
+            // Both of these used to override the YAML value; now they must be
+            // fully inert. RERANKING_ENABLED=false previously would have disabled
+            // reranking despite `enabled: true` in YAML — here it does nothing.
+            std::env::set_var("RERANKING_ENABLED", "false");
+            std::env::set_var("RERANKING_CANDIDATE_LIMIT", "999");
+        }
+
+        let yaml = r#"
+reranking:
+  enabled: true
+  candidate_limit: 25
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        let reranking = cfg
+            .reranking
+            .expect("YAML enabled=true must win — RERANKING_ENABLED=false must be ignored");
+        assert_eq!(
+            reranking.candidate_limit, 25,
+            "YAML candidate_limit must win — RERANKING_CANDIDATE_LIMIT must be ignored"
+        );
+
+        unsafe {
+            std::env::remove_var("RERANKING_BASE_URL");
+            std::env::remove_var("RERANKING_MODEL");
+            std::env::remove_var("RERANKING_ENABLED");
+            std::env::remove_var("RERANKING_CANDIDATE_LIMIT");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn deprecated_env_var_is_detected_when_set() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("RERANKING_ENABLED");
+            std::env::remove_var("RERANKING_CANDIDATE_LIMIT");
+        }
+        assert!(deprecated_env_vars_present().is_empty());
+
+        unsafe {
+            std::env::set_var("RERANKING_CANDIDATE_LIMIT", "999");
+        }
+        let present = deprecated_env_vars_present();
+        assert_eq!(present, vec!["RERANKING_CANDIDATE_LIMIT"]);
+
+        unsafe {
+            std::env::set_var("RERANKING_ENABLED", "false");
+        }
+        let present = deprecated_env_vars_present();
+        assert_eq!(
+            present,
+            vec!["RERANKING_ENABLED", "RERANKING_CANDIDATE_LIMIT"]
+        );
+
+        unsafe {
+            std::env::remove_var("RERANKING_ENABLED");
+            std::env::remove_var("RERANKING_CANDIDATE_LIMIT");
+        }
+    }
+
+    // ── Provenance ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn provenance_reports_env_source_with_var_name() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(
+            cfg.provenance.0.get("embedding.base_url"),
+            Some(&SettingSource::Env {
+                var: "EMBEDDING_BASE_URL".into()
+            })
+        );
+        assert_eq!(
+            cfg.provenance.0.get("qdrant.url"),
+            Some(&SettingSource::Env {
+                var: "QDRANT_URL".into()
+            })
+        );
+
+        clear_required_env();
+    }
+
+    #[test]
+    fn provenance_reports_default_for_unset_env_only_settings() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::remove_var("MCP_PORT");
+            std::env::remove_var("DATA_PATH");
+        }
+
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(
+            cfg.provenance.0.get("mcp.port"),
+            Some(&SettingSource::Default)
+        );
+        assert_eq!(
+            cfg.provenance.0.get("source.data_path"),
+            Some(&SettingSource::Default)
+        );
+
+        clear_required_env();
+    }
+
+    #[test]
+    fn provenance_never_carries_a_secret_value() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("EMBEDDING_API_KEY", "sk-super-secret-value");
+        }
+
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        let source = cfg.provenance.0.get("embedding.api_key").unwrap();
+        let described = source.describe();
+        assert!(!described.contains("sk-super-secret-value"), "{described}");
+        assert_eq!(described, "env EMBEDDING_API_KEY");
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_API_KEY");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn provenance_reports_yaml_for_a_present_section() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        // MINIMAL_CONFIG sets `chunking:` and `frontmatter:` but not `search:`.
+        let cfg = Config::load(Path::new("/nonexistent/config.yaml")).unwrap();
+        // No file at all: every YAML-only setting must report Default.
+        assert_eq!(
+            cfg.provenance.0.get("search.hybrid"),
+            Some(&SettingSource::Default)
+        );
+
+        clear_required_env();
+    }
+
+    #[test]
+    fn provenance_reports_yaml_when_section_present_in_loaded_file() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let dir = std::env::temp_dir().join("md-kb-rag-test-provenance-yaml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        std::fs::write(&config_path, "search:\n  hybrid: false\n").unwrap();
+
+        let cfg = Config::load(&config_path).unwrap();
+        assert_eq!(
+            cfg.provenance.0.get("search.hybrid"),
+            Some(&SettingSource::Yaml)
+        );
+        assert_eq!(
+            cfg.provenance.0.get("chunking.max_chunk_size"),
+            Some(&SettingSource::Default),
+            "a section absent from the file must still report Default"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        clear_required_env();
     }
 }

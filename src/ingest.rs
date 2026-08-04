@@ -1404,6 +1404,7 @@ mod tests {
             write: Default::default(),
             search: Default::default(),
             reranking: None,
+            provenance: Default::default(),
         }
     }
 

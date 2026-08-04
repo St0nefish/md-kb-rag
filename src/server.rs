@@ -274,6 +274,11 @@ pub struct StatusResponse {
     pub store: StoreCounts,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub breakdown: Vec<FieldBreakdown>,
+    /// Where every resolved config setting's value came from (env var name, yaml,
+    /// or built-in default). This is what would have made a deployed
+    /// `RERANKING_CANDIDATE_LIMIT` silently overriding YAML obvious immediately
+    /// instead of requiring a source read — see `config::ConfigProvenance`.
+    pub config: crate::config::ConfigProvenance,
 }
 
 /// Errors are scrubbed before they reach the wire: the Qdrant client renders its full
@@ -412,6 +417,7 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
         queue: crate::reindex::REINDEX_QUEUE.snapshot(),
         store,
         breakdown,
+        config: state.config.provenance.clone(),
     }
 }
 
@@ -1508,6 +1514,7 @@ mod tests {
                     },
                 ],
             }],
+            config: crate::config::ConfigProvenance::default(),
         }
     }
 
@@ -1643,7 +1650,7 @@ mod tests {
     /// A config pointing at a temp state DB and a Qdrant that is not listening.
     fn status_config(state_dir: &std::path::Path) -> Arc<ResolvedConfig> {
         Arc::new(ResolvedConfig {
-            source: crate::config::SourceConfig {
+            source: crate::config::ResolvedSourceConfig {
                 git_url: None,
                 branch: "master".into(),
                 data_path: Some(state_dir.to_string_lossy().into_owned()),
@@ -1673,6 +1680,7 @@ mod tests {
             write: Default::default(),
             search: Default::default(),
             reranking: None,
+            provenance: Default::default(),
         })
     }
 

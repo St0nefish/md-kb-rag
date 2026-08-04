@@ -458,7 +458,7 @@ mod tests {
 
     fn minimal_config() -> Arc<ResolvedConfig> {
         Arc::new(ResolvedConfig {
-            source: crate::config::SourceConfig {
+            source: crate::config::ResolvedSourceConfig {
                 git_url: None,
                 branch: "master".into(),
                 data_path: Some("/tmp".into()),
@@ -487,6 +487,7 @@ mod tests {
             write: Default::default(),
             search: Default::default(),
             reranking: None,
+            provenance: Default::default(),
         })
     }
 

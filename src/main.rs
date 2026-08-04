@@ -159,6 +159,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::Config::load(Path::new(&cli.config))?;
+    // Log where every setting's value came from before doing anything else — this
+    // is what would have made a deployed `RERANKING_CANDIDATE_LIMIT` silently
+    // overriding YAML obvious immediately instead of requiring a source read.
+    cfg.provenance.log();
+    // Same idea, for a case provenance alone doesn't cover: a MISSING var, not a
+    // deprecated one. `GIT_URL` unset is legitimate (bind-mount-only deployments)
+    // but otherwise indistinguishable from a migration that dropped it by
+    // accident, so surface it explicitly rather than leaving it silent.
+    cfg.log_git_integration_status();
 
     match cli.command.unwrap_or(Commands::Serve) {
         Commands::Serve => {
@@ -609,6 +618,7 @@ mod tests {
                 errors: vec![],
             },
             breakdown: vec![],
+            config: crate::config::ConfigProvenance::default(),
         }
     }
 

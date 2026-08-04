@@ -8,46 +8,40 @@
 # STRICT SCHEMA: Unknown fields cause a startup error. If you copied this
 # file previously and the schema has changed, remove any unrecognized keys.
 #
-# RESOLUTION ORDER (highest wins):
-#   1. Environment variable    (connection settings only — see [env] tags)
-#   2. Config file value
-#   3. Built-in default
+# SOURCE OF TRUTH: every setting has exactly ONE legal source — either ENV
+# or YAML, never both.
+#   - ENV only: secrets, connection wiring (URLs), model identity, and
+#     bootstrap bindings that cannot change without a restart. NONE of these
+#     appear in this file — setting one here is a schema error, not a no-op,
+#     so a leftover key from an old config fails loudly instead of silently
+#     doing nothing.
+#   - YAML only: runtime and tuning settings — everything below.
+# See the "ENV-only settings" section at the bottom of this file for the
+# full list of environment variables and what each one controls.
 #
 # QUICK START (Docker Compose):
 #   Only .env is required. Set MCP_BEARER_TOKEN + MODEL_PATH/MODEL_FILE,
 #   then `docker compose up -d`. Connection env vars are wired in compose.
-#   Mount this file at /app/config.yaml only to override non-connection
+#   Mount this file at /app/config.yaml only to override runtime/tuning
 #   settings like frontmatter rules, chunking, or extra exclude patterns.
 #
 # ============================================================================
 
 
 # ----------------------------------------------------------------------------
-# source — where the knowledge base lives
+# source — git token indirection only; git_url/branch/data_path are ENV-only
 # ----------------------------------------------------------------------------
 source:
-
-  # Git remote URL. When set, the server auto-clones the repo into data_path
-  # on first start (if data_path is not already a git repo) and runs a full
-  # initial index. Subsequent updates are pulled via the webhook endpoint.
-  # If omitted, the knowledge base must be provided via a bind-mount at
-  # data_path (the classic Docker workflow).
-  git_url: null
-
-  # Branch to track when using git_url.
-  branch: "master"
 
   # Name of the env var containing the personal access token for git fetch
   # over HTTPS. Token is injected transiently and never written to disk.
   # Omit or leave the env var unset for public repositories.
   git_token_env: "GIT_PULL_TOKEN"
 
-  # Filesystem path to the knowledge base root. In Docker, bind-mount your
-  # repo to this path. The indexer walks this directory for markdown files.
-  # The SQLite state database is written to <data_path>/state.db (default:
-  # /data/state.db), so it lives inside the knowledge-base volume — no
-  # separate state mount is needed.
-  data_path: "/data"
+  # git_url, branch, and data_path used to live here. They are bootstrap
+  # bindings — which repo, which branch, which filesystem path — that
+  # cannot change without a restart, so they moved to GIT_URL / GIT_BRANCH /
+  # DATA_PATH. See "ENV-only settings" below.
 
 
 # ----------------------------------------------------------------------------
@@ -162,38 +156,21 @@ chunking:
 
 
 # ----------------------------------------------------------------------------
-# embedding — connection to an OpenAI-compatible embedding API
+# embedding — tuning knobs and secret indirection only
 # ----------------------------------------------------------------------------
-# The default Docker Compose stack runs llama.cpp as the embedding server.
-# These settings also work with vLLM, TEI, OpenAI, or any server that
-# implements the /v1/embeddings endpoint.
-#
-# Connection fields (base_url, model) are REQUIRED — set them here or via
-# env vars. In Docker Compose, the env vars are pre-wired to the bundled
-# llama.cpp service, so no config is needed.
+# base_url, model, and vector_size are connection wiring / model identity —
+# they cannot change without a restart, so they are ENV-only
+# (EMBEDDING_BASE_URL / EMBEDDING_MODEL / EMBEDDING_VECTOR_SIZE). See
+# "ENV-only settings" below. Everything in this section is a pure tuning
+# knob or a secret name-indirection field, and stays YAML-only.
 embedding:
 
-  # Base URL of the embedding API (without /embeddings).
-  # [env] EMBEDDING_BASE_URL — overrides this value if set.
-  base_url: "http://embeddings:8080/v1"   # REQUIRED (or set env var)
-
-  # Model name passed in the API request body. For llama.cpp this can be
-  # any string (it serves whatever model was loaded), but it's used for
-  # logging and identification.
-  # [env] EMBEDDING_MODEL — overrides this value if set.
-  model: "nomic-embed-text-v2-moe"        # REQUIRED (or set env var)
-
-  # API key for the embedding provider. Required for OpenAI, hosted Ollama,
-  # or any authenticated embedding service. Omit for local/unauthenticated
-  # servers (e.g. bundled llama.cpp).
-  # [env] EMBEDDING_API_KEY — overrides this value if set.
-  # api_key: null
-
-  # Dimensionality of the embedding vectors. Must match the model's output.
-  # IMPORTANT: changing this requires a full reindex (drops + recreates the
-  # Qdrant collection).
-  # [env] EMBEDDING_VECTOR_SIZE — overrides this value if set.
-  vector_size: 768
+  # Name of the env var containing the API key for the embedding provider.
+  # Required for OpenAI, hosted Ollama, or any authenticated embedding
+  # service. Leave the named env var unset for local/unauthenticated
+  # servers (e.g. bundled llama.cpp) — that is not an error, it just means
+  # no key is sent. The key VALUE never goes in this file.
+  api_key_env: "EMBEDDING_API_KEY"
 
   # Number of texts to send per API request. Higher values are faster but
   # use more memory on the embedding server. Tune based on your model's
@@ -217,17 +194,12 @@ embedding:
 
 
 # ----------------------------------------------------------------------------
-# qdrant — vector database connection
+# qdrant — moved entirely to ENV (QDRANT_URL, QDRANT_COLLECTION)
 # ----------------------------------------------------------------------------
-qdrant:
-
-  # Qdrant gRPC endpoint URL (port 6334, not the REST port 6333).
-  # [env] QDRANT_URL — overrides this value if set.
-  url: "http://qdrant:6334"               # REQUIRED (or set env var)
-
-  # Collection name. One collection per knowledge base. Changing this creates
-  # a new empty collection on next startup; the old one is not deleted.
-  collection: "knowledge-base"
+# There is no `qdrant:` section any more — url is connection wiring and
+# collection is a bootstrap binding (changing it points the server at a
+# different collection, which needs a restart either way). Setting a
+# `qdrant:` key here is now a schema error. See "ENV-only settings" below.
 
 
 # ----------------------------------------------------------------------------
@@ -280,10 +252,11 @@ webhook:
 # Exposes a `search` tool over MCP at /mcp. Clients authenticate with a
 # Bearer token. The search tool accepts: query (required), domain, type,
 # tags, and limit (default 10, max 50) parameters.
+#
+# The listen port used to live here (`port:`). It is a bootstrap binding —
+# the process cannot change which port it listens on without a restart —
+# so it moved to MCP_PORT. See "ENV-only settings" below.
 mcp:
-
-  # Port the HTTP server listens on (serves both MCP and webhook routes).
-  port: 8001
 
   # Name of the environment variable containing the Bearer token for MCP
   # authentication.
@@ -392,3 +365,75 @@ search:
   # Candidates fetched from each arm (dense + sparse) before RRF fusion.
   # Higher values improve recall at the cost of query latency.
   rrf_candidates: 50
+
+
+# ----------------------------------------------------------------------------
+# reranking — cross-encoder reranking of search results
+# ----------------------------------------------------------------------------
+# base_url and model are connection wiring / model identity — ENV-only
+# (RERANKING_BASE_URL / RERANKING_MODEL), required only when enabled is
+# true. See "ENV-only settings" below. `enabled` and `candidate_limit` are
+# pure tuning knobs and stay YAML-only — RERANKING_ENABLED and
+# RERANKING_CANDIDATE_LIMIT env vars are NOT honored (a deployment that
+# still sets one logs a startup warning and the var is otherwise ignored).
+reranking:
+
+  # Master switch. When true, RERANKING_BASE_URL and RERANKING_MODEL become
+  # required env vars at startup.
+  enabled: false
+
+  # Name of the env var containing the API key for the reranking provider.
+  # Same semantics as embedding.api_key_env.
+  api_key_env: "RERANKING_API_KEY"
+
+  # Number of candidates fetched before reranking narrows them down.
+  # Higher values improve rerank quality at the cost of latency.
+  candidate_limit: 50
+
+
+# ============================================================================
+# ENV-only settings — cannot be set here; setting any of these under the
+# matching YAML section above is a schema error (unknown field)
+# ============================================================================
+#
+# Secrets (name-indirection — the *_env fields above name which var to read;
+# the secret VALUE only ever comes from the named env var):
+#   EMBEDDING_API_KEY   — named by embedding.api_key_env, default name shown
+#   RERANKING_API_KEY   — named by reranking.api_key_env, default name shown
+#   GIT_PULL_TOKEN      — named by source.git_token_env
+#   WEBHOOK_SECRET      — named by webhook.secret_env
+#   MCP_BEARER_TOKEN    — named by mcp.bearer_token_env
+#
+# Connection wiring (required, no default):
+#   EMBEDDING_BASE_URL  — base URL of the embedding API
+#   QDRANT_URL          — Qdrant gRPC endpoint (port 6334, not REST 6333)
+#   RERANKING_BASE_URL  — required only when reranking.enabled: true
+#
+# Model identity:
+#   EMBEDDING_MODEL     — required, no default
+#   EMBEDDING_VECTOR_SIZE — optional, default 768. Must match the model's
+#                         output dimensionality. Changing it requires a full
+#                         reindex (drops + recreates the Qdrant collection).
+#   RERANKING_MODEL     — required only when reranking.enabled: true
+#
+# Bootstrap bindings (optional, sensible defaults — cannot change without a
+# restart):
+#   GIT_URL             — git remote URL. When set, the server auto-clones
+#                         the repo into DATA_PATH on first start and runs a
+#                         full initial index. Subsequent updates are pulled
+#                         via the webhook endpoint. If unset, the knowledge
+#                         base must be provided via a bind-mount at
+#                         DATA_PATH. Default: unset.
+#   GIT_BRANCH          — branch to track when GIT_URL is set. Default: "master".
+#   DATA_PATH           — filesystem path to the knowledge base root. In
+#                         Docker, bind-mount your repo to this path. The
+#                         SQLite state database is written to
+#                         <DATA_PATH>/state.db. Default: "/data".
+#   QDRANT_COLLECTION   — collection name. One collection per knowledge
+#                         base. Changing this creates a new empty collection
+#                         on next startup; the old one is not deleted.
+#                         Default: "knowledge-base".
+#   MCP_PORT            — port the HTTP server listens on (serves both MCP
+#                         and webhook routes). Default: 8001.
+#
+# ============================================================================
