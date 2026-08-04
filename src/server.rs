@@ -1640,6 +1640,8 @@ mod tests {
                 api_key: None,
                 vector_size: 768,
                 batch_size: 32,
+                request_timeout_secs: 60,
+                batch_concurrency: 4,
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 // Port 1 refuses immediately rather than hanging the test.
@@ -2140,6 +2142,8 @@ mod tests {
             api_key: None,
             vector_size: 8,
             batch_size: 1,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         });
 
         let state = HealthState {
@@ -2308,6 +2312,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 

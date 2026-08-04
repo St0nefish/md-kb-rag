@@ -2590,6 +2590,8 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         },
         qdrant: crate::config::ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
@@ -3807,6 +3809,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -3845,6 +3849,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -3976,6 +3982,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         let server = KbSearchServer::new(
@@ -4021,6 +4029,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         let instructions = Arc::new(RwLock::new(String::new()));
@@ -4185,6 +4195,8 @@ mod tests {
                 api_key: None,
                 vector_size: 768,
                 batch_size: 32,
+                request_timeout_secs: 60,
+                batch_concurrency: 4,
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://localhost:6334".into(),
@@ -4430,6 +4442,8 @@ mod tests {
                 api_key: None,
                 vector_size: 768,
                 batch_size: 32,
+                request_timeout_secs: 60,
+                batch_concurrency: 4,
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://localhost:6334".into(),

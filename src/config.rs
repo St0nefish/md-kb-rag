@@ -195,6 +195,15 @@ pub struct EmbeddingConfig {
     pub vector_size: u64,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Wall-clock timeout for a single embedding HTTP request. A tuning knob, not a
+    /// startup-required connection setting, so (per project convention) this is
+    /// YAML-only with no env var override.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Max number of embedding batches sent concurrently. A tuning knob — YAML-only,
+    /// no env var override.
+    #[serde(default = "default_batch_concurrency")]
+    pub batch_concurrency: usize,
 }
 
 impl Default for EmbeddingConfig {
@@ -205,6 +214,8 @@ impl Default for EmbeddingConfig {
             api_key: None,
             vector_size: default_vector_size(),
             batch_size: default_batch_size(),
+            request_timeout_secs: default_request_timeout_secs(),
+            batch_concurrency: default_batch_concurrency(),
         }
     }
 }
@@ -215,6 +226,26 @@ fn default_vector_size() -> u64 {
 
 fn default_batch_size() -> usize {
     32
+}
+
+fn default_request_timeout_secs() -> u64 {
+    // Embedding a batch of 32 chunks legitimately takes several seconds on the
+    // deployed CPU-only embeddings service, so this needs to be generous rather
+    // than a typical short API timeout (compare rerank.rs's 10s for a single
+    // lightweight rerank call). A hung connection that never errors is still
+    // caught once this elapses, at which point it becomes a retryable error via
+    // the exponential backoff in embed.rs instead of blocking forever.
+    60
+}
+
+fn default_batch_concurrency() -> usize {
+    // The deployed kb-embeddings service (llama.cpp) runs with `--parallel 2`, so
+    // concurrency beyond 2 in-flight batches mostly queues server-side today rather
+    // than speeding anything up. 4 is a compromise: it doesn't leave throughput on
+    // the table if the service later moves to GPU with more parallel slots, and it
+    // costs nothing extra when the server is the bottleneck since the excess
+    // requests just queue rather than error.
+    4
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -510,6 +541,8 @@ pub struct ResolvedEmbeddingConfig {
     pub api_key: Option<String>,
     pub vector_size: u64,
     pub batch_size: usize,
+    pub request_timeout_secs: u64,
+    pub batch_concurrency: usize,
 }
 
 /// Resolved Qdrant config — `url` is guaranteed present.
@@ -614,6 +647,12 @@ impl Config {
         if self.embedding.batch_size == 0 {
             anyhow::bail!("embedding.batch_size must be >= 1");
         }
+        if self.embedding.request_timeout_secs == 0 {
+            anyhow::bail!("embedding.request_timeout_secs must be >= 1");
+        }
+        if self.embedding.batch_concurrency == 0 {
+            anyhow::bail!("embedding.batch_concurrency must be >= 1");
+        }
         if self.chunking.max_chunk_size == 0 {
             anyhow::bail!("chunking.max_chunk_size must be >= 1");
         }
@@ -696,6 +735,8 @@ impl Config {
                 api_key: self.embedding.api_key,
                 vector_size: self.embedding.vector_size,
                 batch_size: self.embedding.batch_size,
+                request_timeout_secs: self.embedding.request_timeout_secs,
+                batch_concurrency: self.embedding.batch_concurrency,
             },
             qdrant: ResolvedQdrantConfig {
                 url: qdrant_url,
@@ -1102,6 +1143,8 @@ chunking:
                 api_key: None,
                 vector_size: 768,
                 batch_size: 32,
+                request_timeout_secs: 60,
+                batch_concurrency: 4,
             },
             qdrant: ResolvedQdrantConfig {
                 url: "http://qdrant:6334".into(),

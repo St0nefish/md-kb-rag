@@ -5,12 +5,19 @@ use async_openai::{
     types::{CreateEmbeddingRequestArgs, EmbeddingInput},
 };
 use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
+use std::future::Future;
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 use crate::config::ResolvedEmbeddingConfig;
 
 /// How often `embed_texts` logs progress through a long batch sequence.
 const EMBED_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A completed batch task's result: (batch index, chunk count, embeddings-or-error).
+/// The index is what `embed_batches_ordered` uses to write into the correct slot
+/// regardless of completion order — see its doc comment.
+type BatchOutcome = (usize, usize, Result<Vec<Vec<f32>>>);
 
 pub trait EmbedStore: Send + Sync {
     async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
@@ -20,11 +27,17 @@ pub trait QueryEmbedder: Send + Sync {
     async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>>;
 }
 
+/// Cloning is cheap: `Client<OpenAIConfig>` and `reqwest::Client` both clone an
+/// internal `Arc`, and the rest of the fields are small owned values. This makes
+/// `EmbedClient` spawn-friendly — `embed_texts` clones it into each concurrent
+/// batch task (see below) rather than needing `Arc<EmbedClient>` at every call site.
+#[derive(Clone)]
 pub struct EmbedClient {
     client: Client<OpenAIConfig>,
     http_client: reqwest::Client,
     model: String,
     batch_size: usize,
+    batch_concurrency: usize,
     api_key: Option<String>,
 }
 
@@ -35,7 +48,23 @@ impl EmbedClient {
             .with_api_base(&config.base_url)
             .with_api_key(api_key);
 
-        let client = Client::with_config(openai_config);
+        // async-openai's `Client::with_config` builds its own internal
+        // `reqwest::Client` with NO timeout — unlike `self.http_client` below (used
+        // only by `health_check`), that internal client is what actually issues
+        // embedding requests, so without attaching our own, a hung connection would
+        // block forever instead of erroring. The existing exponential backoff in
+        // `embed_backoff` only bounds requests that *fail*; it does nothing for a
+        // request that never returns. `with_http_client` (a builder method on
+        // `Client`, verified against async-openai 0.27.2's `client.rs`) is how a
+        // custom `reqwest::Client` gets wired in. The default of 60s (vs.
+        // rerank.rs's 10s for a single lightweight call) reflects that embedding a
+        // full batch on the deployed CPU-only service legitimately takes several
+        // seconds.
+        let embed_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .expect("static reqwest client config");
+        let client = Client::with_config(openai_config).with_http_client(embed_http_client);
 
         Self {
             client,
@@ -45,6 +74,7 @@ impl EmbedClient {
                 .expect("static reqwest client config"),
             model: config.model.clone(),
             batch_size: config.batch_size,
+            batch_concurrency: config.batch_concurrency,
             api_key: config.api_key.clone(),
         }
     }
@@ -93,37 +123,143 @@ impl EmbedClient {
     /// reads are unrestricted), so routing a query's embedding through this method
     /// would add it to that run's `INDEX_STATUS` chunk tally and push reported
     /// progress past 100%.
+    ///
+    /// Batches run concurrently, bounded by `self.batch_concurrency` — see
+    /// [`embed_batches_ordered`] for how results stay positionally aligned with
+    /// `texts` despite batches completing out of order.
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-
         let total = texts.len();
+        let batches: Vec<Vec<String>> = texts.chunks(self.batch_size).map(|b| b.to_vec()).collect();
+
+        let mut done = 0usize;
         let mut last_progress = std::time::Instant::now();
 
-        for (batch_index, batch) in texts.chunks(self.batch_size).enumerate() {
-            all_embeddings.extend(self.embed_batch(batch, batch_index).await?);
+        // Cloned once up front, then cloned again per spawned batch task inside
+        // `embed_batches_ordered` — both clones are cheap (see the doc comment on
+        // `EmbedClient`).
+        let client = self.clone();
+        embed_batches_ordered(
+            batches,
+            self.batch_concurrency,
+            move |batch_index, batch| {
+                let client = client.clone();
+                async move { client.embed_batch(&batch, batch_index).await }
+            },
+            move |batch_len| {
+                // No-op unless an indexing run is in flight.
+                crate::status::INDEX_STATUS.add_chunks_embedded(batch_len as u64);
 
-            // No-op unless an indexing run is in flight.
-            crate::status::INDEX_STATUS.add_chunks_embedded(batch.len() as u64);
-
-            let done = all_embeddings.len();
-            if last_progress.elapsed() >= EMBED_PROGRESS_INTERVAL && done < total {
-                let pct = if total > 0 {
-                    (done as f64 / total as f64) * 100.0
-                } else {
-                    100.0
-                };
-                tracing::info!(
-                    embedded = done,
-                    total,
-                    percent = format_args!("{pct:.1}"),
-                    "Embedding progress"
-                );
-                last_progress = std::time::Instant::now();
-            }
-        }
-
-        Ok(all_embeddings)
+                done += batch_len;
+                if last_progress.elapsed() >= EMBED_PROGRESS_INTERVAL && done < total {
+                    let pct = if total > 0 {
+                        (done as f64 / total as f64) * 100.0
+                    } else {
+                        100.0
+                    };
+                    tracing::info!(
+                        embedded = done,
+                        total,
+                        percent = format_args!("{pct:.1}"),
+                        "Embedding progress"
+                    );
+                    last_progress = std::time::Instant::now();
+                }
+            },
+        )
+        .await
     }
+}
+
+/// Runs `batches` through `embed_one`, keeping at most `concurrency` batches in
+/// flight at a time, and reassembles the results in **input order** regardless of
+/// which batch happens to complete first.
+///
+/// # Why this exists
+///
+/// The returned `Vec<Vec<f32>>` must correspond positionally to the flattened
+/// input batches — chunk *N* must get embedding *N*, always. Under concurrency,
+/// batches do not complete in the order they were spawned (a later batch can
+/// finish before an earlier one, e.g. if the embedding server picks it up first).
+/// If results were assembled in *completion* order instead of *input* order (e.g.
+/// by naively `extend`-ing a `Vec` as each batch finishes, the way the old
+/// strictly-sequential loop did), every chunk from that point on would silently
+/// receive some other chunk's vector — no error, no panic, just permanently wrong
+/// search results. `slots` below is indexed by batch position specifically to
+/// make that failure mode structurally impossible: a batch can only ever write
+/// into its own slot, no matter when it finishes.
+///
+/// Extracted as a free function (generic over `embed_one`) so this reassembly
+/// logic can be exercised directly in tests with a fake embedder whose batches
+/// complete out of order, without needing a real HTTP embedding service.
+async fn embed_batches_ordered<F, Fut>(
+    batches: Vec<Vec<String>>,
+    concurrency: usize,
+    embed_one: F,
+    mut on_batch_done: impl FnMut(usize),
+) -> Result<Vec<Vec<f32>>>
+where
+    F: Fn(usize, Vec<String>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Result<Vec<Vec<f32>>>> + Send + 'static,
+{
+    let batch_count = batches.len();
+    if batch_count == 0 {
+        return Ok(Vec::new());
+    }
+    let concurrency = concurrency.max(1);
+
+    // Written by batch index, never by completion order — see the function doc
+    // comment above for why that's the load-bearing correctness property here.
+    let mut slots: Vec<Option<Vec<Vec<f32>>>> = vec![None; batch_count];
+
+    let mut set: JoinSet<BatchOutcome> = JoinSet::new();
+    let mut queue = batches.into_iter().enumerate();
+
+    // Prime the pipeline with up to `concurrency` in-flight batches. Each time one
+    // completes below, its slot is filled and (if the queue isn't empty) the next
+    // queued batch is spawned — so at most `concurrency` requests are ever
+    // outstanding at once, no matter how fast or slow individual batches are.
+    for (batch_index, batch) in queue.by_ref().take(concurrency) {
+        let embed_one = embed_one.clone();
+        set.spawn(async move {
+            let batch_len = batch.len();
+            (batch_index, batch_len, embed_one(batch_index, batch).await)
+        });
+    }
+
+    while let Some(joined) = set.join_next().await {
+        let (batch_index, batch_len, result) =
+            joined.map_err(|e| anyhow::anyhow!("embedding task panicked: {e}"))?;
+        // A batch error propagates immediately, same as the old sequential `?`.
+        // Dropping `set` here (via early return) aborts any still-in-flight
+        // sibling batches rather than letting them run to a result nobody reads.
+        let embeddings = result?;
+        slots[batch_index] = Some(embeddings);
+        on_batch_done(batch_len);
+
+        if let Some((next_index, next_batch)) = queue.next() {
+            let embed_one = embed_one.clone();
+            set.spawn(async move {
+                let batch_len = next_batch.len();
+                (
+                    next_index,
+                    batch_len,
+                    embed_one(next_index, next_batch).await,
+                )
+            });
+        }
+    }
+
+    let mut all_embeddings = Vec::with_capacity(batch_count);
+    for slot in slots {
+        // Every slot is guaranteed filled here: the loop above only exits once
+        // `set` is empty, and it returns early (before this point) on any batch
+        // error, so reaching this line means every spawned batch — i.e. every
+        // slot — succeeded.
+        all_embeddings
+            .extend(slot.expect("all batch slots are filled when no batch returned an error"));
+    }
+
+    Ok(all_embeddings)
 }
 
 /// Thin delegation impl — calls the identically-named inherent method.
@@ -357,6 +493,8 @@ mod tests {
             api_key: Some("sk-test-key-123".into()),
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let client = EmbedClient::new(&config);
         assert_eq!(client.api_key.as_deref(), Some("sk-test-key-123"));
@@ -370,6 +508,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let client = EmbedClient::new(&config);
         assert!(client.api_key.is_none());
@@ -383,6 +523,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let client = EmbedClient::new(&config);
         // The health_check URL should not have a double slash
@@ -392,5 +534,148 @@ mod tests {
             !url.contains("//models"),
             "URL should not have double slash: {url}"
         );
+    }
+
+    /// The regression test for the highest-risk part of concurrent batch
+    /// embedding: if `embed_batches_ordered` assembled results by *completion*
+    /// order instead of *batch index* (e.g. a naive `extend` as each batch
+    /// finishes — which is exactly what the old strictly-sequential loop did,
+    /// and which happens to still pass if batches merely complete in the order
+    /// they were spawned), every chunk would silently get some other chunk's
+    /// embedding.
+    ///
+    /// To actually exercise that failure mode, this deliberately makes batches
+    /// complete in the REVERSE of spawn order (batch 0 sleeps longest, batch 2
+    /// sleeps shortest) and encodes each batch's index into its fake
+    /// "embedding" so misassembly is directly observable in the assertion.
+    /// `start_paused = true` lets the sleeps resolve instantly in wall-clock
+    /// terms while still forcing that completion ordering.
+    #[tokio::test(start_paused = true)]
+    async fn embed_batches_ordered_reassembles_reversed_completions() {
+        let batches = vec![
+            vec!["a".to_string()],
+            vec!["b".to_string(), "b2".to_string()],
+            vec!["c".to_string()],
+        ];
+
+        let embed_one = |batch_index: usize, batch: Vec<String>| async move {
+            // Batch 0 finishes last, batch 2 finishes first: completion order is
+            // the exact reverse of input/spawn order.
+            let delay = Duration::from_secs(3 - batch_index as u64);
+            tokio::time::sleep(delay).await;
+            Ok(batch
+                .into_iter()
+                .map(|_| vec![batch_index as f32])
+                .collect())
+        };
+
+        // All 3 batches fit within the concurrency budget, so all spawn at once
+        // and race to completion in reverse order.
+        let result = embed_batches_ordered(batches, 3, embed_one, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            vec![vec![0.0], vec![1.0], vec![1.0], vec![2.0]],
+            "output must stay positionally aligned with input batch order, \
+             not completion order"
+        );
+    }
+
+    /// Confirms `embed_batches_ordered` actually bounds concurrency rather than
+    /// firing every batch at once — the point of this change is to not overrun
+    /// the embedding server's `--parallel` slot count.
+    #[tokio::test(start_paused = true)]
+    async fn embed_batches_ordered_bounds_concurrency() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let batches: Vec<Vec<String>> = (0..6).map(|i| vec![format!("t{i}")]).collect();
+
+        let in_flight_for_closure = in_flight.clone();
+        let max_in_flight_for_closure = max_in_flight.clone();
+        let embed_one = move |batch_index: usize, batch: Vec<String>| {
+            let in_flight = in_flight_for_closure.clone();
+            let max_in_flight = max_in_flight_for_closure.clone();
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(batch
+                    .into_iter()
+                    .map(|_| vec![batch_index as f32])
+                    .collect())
+            }
+        };
+
+        let result = embed_batches_ordered(batches, 2, embed_one, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            (0..6).map(|i| vec![i as f32]).collect::<Vec<_>>(),
+            "order must still be preserved under bounded concurrency"
+        );
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= 2,
+            "concurrency exceeded the configured limit of 2: saw {} in flight",
+            max_in_flight.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A permanent error from any batch must still propagate out of
+    /// `embed_batches_ordered`, same as the old sequential `?` did.
+    #[tokio::test(start_paused = true)]
+    async fn embed_batches_ordered_propagates_batch_error() {
+        let batches = vec![vec!["a".to_string()], vec!["b".to_string()]];
+
+        let embed_one = |batch_index: usize, _batch: Vec<String>| async move {
+            if batch_index == 1 {
+                anyhow::bail!("simulated permanent failure");
+            }
+            Ok(vec![vec![0.0]])
+        };
+
+        let result = embed_batches_ordered(batches, 2, embed_one, |_| {}).await;
+        assert!(result.is_err());
+    }
+
+    /// `on_batch_done` must fire once per batch with that batch's chunk count,
+    /// regardless of completion order — this is what keeps `embed_texts`'s
+    /// progress counter (and `INDEX_STATUS.add_chunks_embedded`) accurate under
+    /// concurrency.
+    #[tokio::test(start_paused = true)]
+    async fn embed_batches_ordered_reports_each_batch_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let batches = vec![
+            vec!["a".to_string(), "a2".to_string()],
+            vec!["b".to_string()],
+            vec!["c".to_string(), "c2".to_string(), "c3".to_string()],
+        ];
+
+        let embed_one = |batch_index: usize, batch: Vec<String>| async move {
+            Ok(batch
+                .into_iter()
+                .map(|_| vec![batch_index as f32])
+                .collect())
+        };
+
+        let total_reported = Arc::new(AtomicUsize::new(0));
+        let total_reported_for_closure = total_reported.clone();
+        embed_batches_ordered(batches, 2, embed_one, move |batch_len| {
+            total_reported_for_closure.fetch_add(batch_len, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(total_reported.load(Ordering::SeqCst), 6);
     }
 }

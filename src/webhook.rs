@@ -473,6 +473,8 @@ mod tests {
                 api_key: None,
                 vector_size: 768,
                 batch_size: 32,
+                request_timeout_secs: 60,
+                batch_concurrency: 4,
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://localhost:6334".into(),

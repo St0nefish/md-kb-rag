@@ -200,6 +200,21 @@ embedding:
   # context window and available VRAM.
   batch_size: 32
 
+  # Wall-clock timeout (seconds) for a single embedding HTTP request. A batch
+  # of 32 chunks can legitimately take several seconds on a CPU-only embedding
+  # server, so this needs headroom above a typical API timeout — a request
+  # that hangs past this becomes a retryable error instead of blocking
+  # forever. Tuning knob, not a connection setting — no env var override.
+  request_timeout_secs: 60
+
+  # Max number of embedding batches sent concurrently during indexing. The
+  # bundled llama.cpp embedding service runs with `--parallel 2`, so
+  # concurrency beyond 2 mostly queues server-side rather than helping today;
+  # 4 is a compromise that leaves headroom for a future GPU deployment with
+  # more parallel slots. Tuning knob, not a connection setting — no env var
+  # override.
+  batch_concurrency: 4
+
 
 # ----------------------------------------------------------------------------
 # qdrant — vector database connection
