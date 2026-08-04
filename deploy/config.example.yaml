@@ -25,6 +25,19 @@
 #   Mount this file at /app/config.yaml only to override runtime/tuning
 #   settings like frontmatter rules, chunking, or extra exclude patterns.
 #
+# RELOADING AFTER A CHANGE: edit this file, then
+#   POST /admin/reload  (bearer auth, same token as /mcp)
+# re-reads and re-validates it and swaps it into the running server — no
+# restart. Not every setting takes effect immediately: some are baked into
+# a value or service built once at startup (rate_limit, embedding batch/
+# timeout/concurrency tuning, anything auth-related) and stay restart-only;
+# chunking.* needs `md-kb-rag index --full` afterward to be meaningful (a
+# new chunk size only applies to documents indexed after the change). The
+# reload response reports exactly which category each changed setting fell
+# into — see README.md's "Config reload" section for the full contract. A
+# malformed or invalid file is rejected and the running config is left
+# completely untouched, same as a failed restart would leave it.
+#
 # ============================================================================
 
 
@@ -139,6 +152,11 @@ frontmatter:
 # The chunker is section-aware: it splits at heading boundaries first, then
 # combines small consecutive sections up to target_chunk_size. Sections that
 # exceed max_chunk_size are split further by a secondary text splitter.
+#
+# REINDEX REQUIRED (whole section): POST /admin/reload picks these up for
+# the NEXT indexing run, but only for documents that run touches — existing
+# Qdrant chunks keep the old boundaries. Run `md-kb-rag index --full`
+# afterward for a consistent corpus.
 chunking:
 
   # Ideal chunk size in characters. The chunker accumulates sections until
@@ -175,6 +193,8 @@ embedding:
   # Number of texts to send per API request. Higher values are faster but
   # use more memory on the embedding server. Tune based on your model's
   # context window and available VRAM.
+  # RESTART REQUIRED: baked into the embedding client at startup — POST
+  # /admin/reload cannot change this on a running server.
   batch_size: 32
 
   # Wall-clock timeout (seconds) for a single embedding HTTP request. A batch
@@ -182,6 +202,8 @@ embedding:
   # server, so this needs headroom above a typical API timeout — a request
   # that hangs past this becomes a retryable error instead of blocking
   # forever. Tuning knob, not a connection setting — no env var override.
+  # RESTART REQUIRED: baked into the embedding client's HTTP timeout at
+  # startup — POST /admin/reload cannot change this on a running server.
   request_timeout_secs: 60
 
   # Max number of embedding batches sent concurrently during indexing. The
@@ -190,6 +212,8 @@ embedding:
   # 4 is a compromise that leaves headroom for a future GPU deployment with
   # more parallel slots. Tuning knob, not a connection setting — no env var
   # override.
+  # RESTART REQUIRED: baked into the embedding client at startup — POST
+  # /admin/reload cannot change this on a running server.
   batch_concurrency: 4
 
 
@@ -236,10 +260,14 @@ webhook:
 
   # Name of the environment variable containing the HMAC shared secret
   # (or GitLab token). The actual secret value goes in .env, not here.
+  # RESTART REQUIRED: the secret is resolved once at startup, and whether
+  # /hooks/reindex is even mounted is decided at that same startup lookup —
+  # POST /admin/reload cannot add, remove, or re-key the route.
   secret_env: "WEBHOOK_SECRET"
 
   # Webhook provider determines which header is checked for the signature
-  # and how verification works:
+  # and how verification works. Live-reloadable: POST /admin/reload changes
+  # which header the very next delivery is checked against.
   #   "gitea"  — X-Gitea-Signature header, HMAC-SHA256 hex
   #   "github" — X-Hub-Signature-256 header, HMAC-SHA256 with sha256= prefix
   #   "gitlab" — X-Gitlab-Token header, constant-time string comparison
@@ -260,11 +288,16 @@ mcp:
 
   # Name of the environment variable containing the Bearer token for MCP
   # authentication.
+  # RESTART REQUIRED: the token is resolved from the named env var once at
+  # startup — POST /admin/reload cannot change which var it reads, or
+  # re-check the var's value, on a running server. Security-critical by
+  # design: auth must not change underneath an in-flight deployment silently.
   bearer_token_env: "MCP_BEARER_TOKEN"
 
   # When false (the default), the server refuses to start if the bearer token
   # env var is unset or empty. Set to true only in trusted environments where
   # authentication is handled by an upstream proxy or is genuinely not needed.
+  # RESTART REQUIRED — same reasoning as bearer_token_env above.
   allow_unauthenticated: false
 
   # Hostnames accepted in the inbound Host header. Empty (the default) accepts
@@ -276,6 +309,8 @@ mcp:
   # proxy forwards the original Host header, not the container's address.
   # Include a port only if clients send one.
   #
+  # RESTART REQUIRED: baked into the MCP transport when it is built at
+  # startup — POST /admin/reload cannot change this on a running server.
   # allowed_hosts:
   #   - "kb.example.com"
 
@@ -285,11 +320,15 @@ mcp:
   # tags, etc.) from the indexed data, then a write-authoring section that lists
   # required frontmatter fields and any fixed allowed values from the config.
   # Keep this short — the dynamic sections add the detail.
+  # Live-reloadable: picked up by the periodic metadata-refresh timer below,
+  # so it takes effect within metadata_refresh_secs of a POST /admin/reload.
   # instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document; write with create_document, edit_document, delete_document."
 
   # How often (in seconds) to refresh discovered metadata (filter values)
   # from Qdrant. Appended to the instructions so agents know what filters
   # are available. Default: 300 (5 minutes).
+  # Live-reloadable: governs the timer's OWN next sleep, so a reload changes
+  # how long until the following refresh, not the one already in progress.
   # metadata_refresh_secs: 300
 
 
@@ -331,6 +370,10 @@ write:
 #
 # Responses include standard rate limit headers:
 #   x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-after, retry-after
+#
+# RESTART REQUIRED (whole section): the rate limiter is built once when the
+# HTTP router is assembled at startup — POST /admin/reload cannot add,
+# remove, or retune it on a running server.
 rate_limit:
 
   # Set to false to disable rate limiting entirely (e.g. in trusted internal deployments).
@@ -380,6 +423,10 @@ reranking:
 
   # Master switch. When true, RERANKING_BASE_URL and RERANKING_MODEL become
   # required env vars at startup.
+  # RESTART REQUIRED: whether the server holds a reranking client at all is
+  # decided once at startup — POST /admin/reload cannot flip this on a
+  # running server. candidate_limit below IS live-reloadable, but only on a
+  # server that already started with reranking enabled.
   enabled: false
 
   # Name of the env var containing the API key for the reranking provider.

@@ -1010,8 +1010,11 @@ pub struct KbSearchServer {
     include_patterns: Arc<GlobSet>,
     /// Dynamic MCP server instructions, refreshed periodically with discovered metadata.
     instructions: Arc<RwLock<String>>,
-    /// Resolved config, needed by write tools (create_document, etc.).
-    config: Arc<ResolvedConfig>,
+    /// Live config handle. Every tool call fetches its own fresh snapshot via
+    /// [`Self::config`] rather than caching one at construction, so `POST
+    /// /admin/reload` is observed by the very next call — see that method's doc
+    /// comment for exactly which settings this makes dynamic.
+    config: crate::config::SharedConfig,
     /// The shared, cached schema tree — built once at server startup and kept
     /// current by the reindex worker (which rebuilds it before indexing any
     /// dirty `.kb-schema.yaml`) and by `update_schema`'s own synchronous rebuild.
@@ -1062,7 +1065,7 @@ impl KbSearchServer {
         data_path: PathBuf,
         include_patterns: &[String],
         instructions: Arc<RwLock<String>>,
-        config: Arc<ResolvedConfig>,
+        config: crate::config::SharedConfig,
         schema_cache: crate::schema::SharedSchemaCache,
         rerank_client: Option<Arc<RerankClient>>,
     ) -> anyhow::Result<Self> {
@@ -1074,6 +1077,10 @@ impl KbSearchServer {
             qdrant,
             collection,
             canonical_data_path,
+            // Compiled once from the config snapshot at construction time — a
+            // `POST /admin/reload` that changes `indexing.include` does NOT change
+            // what get_document accepts until a restart. See
+            // `reload.rs`'s "indexing.include (MCP get_document path filter)" entry.
             include_patterns: Arc::new(build_include_globset(include_patterns)),
             instructions,
             config,
@@ -1081,6 +1088,14 @@ impl KbSearchServer {
             rerank_client,
             state_db: Arc::new(tokio::sync::OnceCell::new()),
         })
+    }
+
+    /// A fresh snapshot of the live config — a lock acquisition plus an `Arc`
+    /// clone, mirroring `schema::load_shared`. Every tool call fetches its own
+    /// snapshot here rather than reading a value captured at construction, so a
+    /// `POST /admin/reload` swap is observed starting with the very next call.
+    fn config(&self) -> Arc<ResolvedConfig> {
+        crate::config::load_shared_config(&self.config)
     }
 
     /// Write a non-document file into the KB, commit it, and queue a full reconcile.
@@ -1094,7 +1109,7 @@ impl KbSearchServer {
         content: &str,
         commit_message: &str,
     ) -> Result<(), McpError> {
-        let config = &self.config;
+        let config = self.config();
 
         // Same resolver the document write tools use. Joining the data root with a
         // caller-supplied path is NOT sufficient on its own: the knowledge base is a
@@ -1246,7 +1261,7 @@ impl KbSearchServer {
     async fn state_db(&self) -> anyhow::Result<&StateDb> {
         self.state_db
             .get_or_try_init(|| async {
-                let path = self.config.state_db_path();
+                let path = self.config().state_db_path();
                 StateDb::new(std::path::Path::new(&path))
                     .await
                     .with_context(|| format!("Failed to open state DB at {}", path))
@@ -1323,20 +1338,20 @@ impl KbSearchServer {
             .transpose()
             .map_err(|e| McpError::invalid_params(e, None))?;
 
+        // Fetched once per call so every field below — including
+        // reranking.candidate_limit — reflects the same live snapshot, rather than
+        // racing a concurrent `POST /admin/reload` mid-request.
+        let config = self.config();
         let explain = params.explain.unwrap_or(false);
         let opts = SearchOptions {
             limit,
-            min_score: params.min_score.or(self.config.search.min_score),
-            hybrid: self.config.search.hybrid,
-            rrf_candidates: self.config.search.rrf_candidates as u64,
+            min_score: params.min_score.or(config.search.min_score),
+            hybrid: config.search.hybrid,
+            rrf_candidates: config.search.rrf_candidates as u64,
             explain,
             modified_after,
             modified_before,
-            rerank_candidate_limit: self
-                .config
-                .reranking
-                .as_ref()
-                .map(|r| r.candidate_limit as u64),
+            rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
         };
 
         let results = retrieval::search(&self.deps(), &params.query, &filters, &opts)
@@ -1435,7 +1450,7 @@ impl KbSearchServer {
             ));
 
             if explain {
-                let mode = if self.config.search.hybrid {
+                let mode = if config.search.hybrid {
                     "hybrid RRF"
                 } else {
                     "dense cosine"
@@ -1755,7 +1770,7 @@ impl KbSearchServer {
         // because anything here needs to run off-thread for its own sake — `.await`ing
         // it still makes this call return only once the rebuild has completed.
         let rebuild_data_path = self.canonical_data_path.clone();
-        let rebuild_frontmatter = self.config.frontmatter.clone();
+        let rebuild_frontmatter = self.config().frontmatter.clone();
         match tokio::task::spawn_blocking(move || {
             SchemaCache::build(&rebuild_data_path, &rebuild_frontmatter)
         })
@@ -2002,7 +2017,9 @@ impl KbSearchServer {
         force_new: Option<bool>,
         operation: &str,
     ) -> Result<CallToolResult, McpError> {
-        let config = &self.config;
+        // One snapshot for the whole call, so a concurrent `POST /admin/reload`
+        // cannot mix old and new values across this method's several config reads.
+        let config = self.config();
 
         if new_content.len() > MAX_CONTENT_LEN {
             return Err(McpError::invalid_params(
@@ -2073,7 +2090,7 @@ impl KbSearchServer {
         // 2. Dedup gate: on create paths, check for near-duplicate existing documents.
         //    Gate runs only when: this is a create (not edit), dedup is enabled in
         //    config, and the caller has not set force_new = true.
-        if is_create && self.config.write.dedup_enabled && !matches!(force_new, Some(true)) {
+        if is_create && config.write.dedup_enabled && !matches!(force_new, Some(true)) {
             // Reuse the body already parsed during validation above rather than
             // re-deriving it here: that keeps the dedup query on exactly the
             // frontmatter-stripped basis the indexer embeds.
@@ -2081,11 +2098,7 @@ impl KbSearchServer {
                 .as_ref()
                 .map(|v| {
                     let description = v.frontmatter.get("description").and_then(|d| d.as_str());
-                    build_dedup_query(
-                        &v.body,
-                        description,
-                        self.config.chunking.prepend_description,
-                    )
+                    build_dedup_query(&v.body, description, config.chunking.prepend_description)
                 })
                 .unwrap_or_default();
 
@@ -2128,11 +2141,11 @@ impl KbSearchServer {
                             debug!(
                                 "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} \
                                  (threshold {:.2})",
-                                rel_path, path, score, self.config.write.dedup_threshold
+                                rel_path, path, score, config.write.dedup_threshold
                             );
                         }
-                        if let Some(hit) = dedup_verdict(top, self.config.write.dedup_threshold) {
-                            let threshold = self.config.write.dedup_threshold;
+                        if let Some(hit) = dedup_verdict(top, config.write.dedup_threshold) {
+                            let threshold = config.write.dedup_threshold;
                             return Err(McpError::invalid_params(
                                 format!(
                                     "A similar document already exists: '{}' \
@@ -2472,7 +2485,7 @@ impl KbSearchServer {
         &self,
         Parameters(params): Parameters<DeleteDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
-        let config = &self.config;
+        let config = self.config();
 
         let raw = params.path.trim();
         if raw.is_empty() {
@@ -3886,7 +3899,7 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
-            make_test_resolved_config(tmp.path()),
+            crate::config::shared_config(make_test_resolved_config(tmp.path())),
             empty_test_schema_cache(),
             None,
         )
@@ -3927,7 +3940,7 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             Arc::clone(&instructions),
-            make_test_resolved_config(tmp.path()),
+            crate::config::shared_config(make_test_resolved_config(tmp.path())),
             empty_test_schema_cache(),
             None,
         )
@@ -4060,7 +4073,7 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
-            make_test_resolved_config(tmp.path()),
+            crate::config::shared_config(make_test_resolved_config(tmp.path())),
             empty_test_schema_cache(),
             None,
         )
@@ -4116,7 +4129,7 @@ mod tests {
             tmp.path().to_path_buf(),
             include_patterns,
             instructions,
-            config,
+            crate::config::shared_config(config),
             schema_cache,
             None,
         )

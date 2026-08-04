@@ -22,7 +22,7 @@ use tower_governor::{
 };
 use tracing::{debug, info, warn};
 
-use crate::config::{FrontmatterConfig, ResolvedConfig};
+use crate::config::{self, FrontmatterConfig, ResolvedConfig, SharedConfig};
 use crate::embed::EmbedClient;
 use crate::git;
 use crate::ingest;
@@ -189,7 +189,11 @@ const SHUTDOWN_INDEX_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct StatusState {
-    config: Arc<ResolvedConfig>,
+    /// Live handle: `/status`/`/metrics` re-read this on every request (via
+    /// [`collect_status`]), so a `POST /admin/reload` swap is visible on the very
+    /// next scrape — no restart, no cache-TTL delay beyond the normal
+    /// [`STATUS_CACHE_TTL`].
+    config: SharedConfig,
     qdrant: Arc<QdrantStore>,
     /// Opened on first use rather than at boot, matching how the MCP handler reaches
     /// the state DB — a status request must not be the thing that creates the file.
@@ -204,10 +208,13 @@ impl StatusState {
     /// Sharing the collector is what keeps `md-kb-rag status --json` and the `/status`
     /// endpoint from drifting apart. The `indexing` half will always report idle here:
     /// run state is per-process, and the CLI is not the process doing the indexing.
+    ///
+    /// The CLI has no reload endpoint of its own, so this just wraps the one-off
+    /// config as a `SharedConfig` that nothing else ever writes to.
     pub fn for_cli(config: Arc<ResolvedConfig>) -> anyhow::Result<Self> {
         Ok(Self {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant)?),
-            config,
+            config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -216,7 +223,7 @@ impl StatusState {
     async fn state_db(&self) -> anyhow::Result<&crate::state::StateDb> {
         self.state_db
             .get_or_try_init(|| async {
-                let path = self.config.state_db_path();
+                let path = config::load_shared_config(&self.config).state_db_path();
                 crate::state::StateDb::new(Path::new(&path)).await
             })
             .await
@@ -291,6 +298,9 @@ fn store_error(prefix: &str, e: &anyhow::Error) -> String {
 /// Gather everything the status views need. Never fails: unreachable stores are
 /// reported as errors inside the response rather than as a failed request.
 pub async fn collect_status(state: &StatusState) -> StatusResponse {
+    // Fresh snapshot for this request — see `StatusState::config`'s doc comment for
+    // why this is what makes `/status` observe a `POST /admin/reload` immediately.
+    let config = config::load_shared_config(&state.config);
     let mut store = StoreCounts::default();
     let mut breakdown: Vec<FieldBreakdown> = Vec::new();
 
@@ -391,16 +401,14 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
     // wedge every status request behind it.
     match tokio::time::timeout(
         STATUS_QDRANT_TIMEOUT,
-        state
-            .qdrant
-            .collection_info(&state.config.qdrant.collection),
+        state.qdrant.collection_info(&config.qdrant.collection),
     )
     .await
     {
         Ok(Ok(Some(points))) => store.qdrant_points = Some(points),
         Ok(Ok(None)) => store.errors.push(format!(
             "collection '{}' does not exist",
-            state.config.qdrant.collection
+            config.qdrant.collection
         )),
         Ok(Err(e)) => store.errors.push(store_error("qdrant", &e)),
         Err(_) => store.errors.push(format!(
@@ -411,13 +419,13 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
 
     StatusResponse {
         uptime_secs: crate::status::uptime_secs(),
-        collection: state.config.qdrant.collection.clone(),
-        data_path: state.config.data_path().to_string(),
+        collection: config.qdrant.collection.clone(),
+        data_path: config.data_path().to_string(),
         indexing: crate::status::INDEX_STATUS.snapshot(),
         queue: crate::reindex::REINDEX_QUEUE.snapshot(),
         store,
         breakdown,
-        config: state.config.provenance.clone(),
+        config: config.provenance.clone(),
     }
 }
 
@@ -815,6 +823,69 @@ async fn bearer_auth(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Admin: config reload
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct AdminState {
+    shared_config: SharedConfig,
+    /// Behind an `Arc` purely so `AdminState` stays cheaply `Clone` (axum clones
+    /// per-request state) — the path itself never changes after startup.
+    config_path: Arc<std::path::PathBuf>,
+}
+
+/// `POST /admin/reload` — re-read and re-validate `config.yaml` from disk and swap
+/// it into every live config reader, without restarting the process.
+///
+/// No request body: the file to reload is always the one this process was started
+/// with (`--config` / the `config` CLI default), never a caller-supplied path — an
+/// admin endpoint that reads an arbitrary path named in the request would let an
+/// authenticated-but-untrusted caller read any file the process can see. Behind the
+/// same bearer-token auth as `/status`/`/metrics` (see `bearer_auth`); this action
+/// can change how the write tools authenticate content or which webhook provider is
+/// trusted, so it gets no weaker a gate than those.
+///
+/// See `reload::reload_config` for the validate-before-swap contract: a malformed or
+/// invalid YAML file is rejected exactly the way a restart on that same file would
+/// fail, and the running config is left completely untouched — this endpoint just
+/// reports the failure over HTTP (400) instead of exiting the process.
+async fn reload_handler(State(state): State<AdminState>) -> (StatusCode, Json<serde_json::Value>) {
+    match crate::reload::reload_config(&state.config_path, &state.shared_config) {
+        Ok(report) => {
+            info!(
+                applied = report.applied.len(),
+                restart_required = report.restart_required.len(),
+                reindex_required = report.reindex_required.len(),
+                "Config reloaded from {}",
+                state.config_path.display()
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "reloaded",
+                    "changed": !report.is_empty(),
+                    "report": report,
+                })),
+            )
+        }
+        Err(e) => {
+            warn!(
+                "Config reload from {} rejected — running config left untouched: {:#}",
+                state.config_path.display(),
+                e
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "rejected",
+                    "error": format!("{e:#}"),
+                })),
+            )
+        }
+    }
+}
+
 /// Streamable HTTP transport settings for the MCP service.
 ///
 /// Stateless deliberately: every POST is self-contained, so there is no server-side
@@ -1065,8 +1136,16 @@ async fn build_instructions(
     instructions
 }
 
-pub async fn run_server(config: ResolvedConfig) -> Result<()> {
+pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf) -> Result<()> {
     let config = Arc::new(config);
+    // The live handle `POST /admin/reload` swaps into. Every consumer built from
+    // this point that should observe a reload holds a clone of `shared_config`
+    // (and reads a fresh snapshot per request/iteration) rather than the plain
+    // `config` above, which stays the immutable startup snapshot everything else —
+    // the embedding client, the rate limiter, the MCP transport, and everything
+    // else `reload::diff` classifies as restart-required — is legitimately built
+    // from exactly once.
+    let shared_config: SharedConfig = config::shared_config(Arc::clone(&config));
 
     // Resolve git token early (reused by ensure_repo and later by WebhookState)
     let git_pull_token = std::env::var(&config.source.git_token_env)
@@ -1149,11 +1228,14 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let refresh_instructions = Arc::clone(&shared_instructions);
     let refresh_qdrant = Arc::clone(&qdrant);
     let refresh_collection = config.qdrant.collection.clone();
-    let refresh_base = base_instructions.to_string();
     let refresh_data_path = instructions_data_path.clone();
-    let refresh_frontmatter = config.frontmatter.clone();
-    let refresh_secs = config.mcp.metadata_refresh_secs;
     let refresh_schema_cache = Arc::clone(&shared_schema_cache);
+    // Live handle, not a captured `mcp.instructions`/`frontmatter`/
+    // `metadata_refresh_secs` snapshot: this loop re-reads all three from
+    // `shared_config` on every iteration below, which is what makes them
+    // `reload::ReloadEffect::Applied` rather than restart-required (see
+    // `reload.rs`'s classification table).
+    let refresh_shared_config = Arc::clone(&shared_config);
 
     let ct = CancellationToken::new();
     let refresh_ct = ct.child_token();
@@ -1162,9 +1244,12 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     // and is the only thing (besides the CLI, which has no worker) that ever calls
     // `ingest::index_paths`. From here on, the MCP write tools and the webhook handler
     // just mark paths dirty and return; this task does the actual chunk/embed/upsert
-    // work out of band.
+    // work out of band. It takes `shared_config` (not `config`) and loads a fresh
+    // snapshot before every drain, so `indexing.include`/`exclude`/`exclude_files`,
+    // `frontmatter.*`, `validation.*`, and `chunking.*` all observe a reload on the
+    // worker's next wake rather than needing a restart.
     tokio::spawn(crate::reindex::run_worker(
-        Arc::clone(&config),
+        Arc::clone(&shared_config),
         Arc::clone(&shared_schema_cache),
     ));
 
@@ -1179,9 +1264,15 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     // interval — ordinary writes and webhook pushes are indexed near-instantly via
     // `Notify`, independent of this timer.
     let reconcile_ct = ct.child_token();
-    let reconcile_secs = config.indexing.reconcile_interval_secs;
+    let reconcile_shared_config = Arc::clone(&shared_config);
     tokio::spawn(async move {
         loop {
+            // Read fresh every iteration (not captured once) so a reload's new
+            // interval governs the very next sleep this task schedules, not just
+            // sleeps scheduled after a restart.
+            let reconcile_secs = config::load_shared_config(&reconcile_shared_config)
+                .indexing
+                .reconcile_interval_secs;
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(reconcile_secs)) => {}
                 () = reconcile_ct.cancelled() => {
@@ -1195,6 +1286,11 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
 
     tokio::spawn(async move {
         loop {
+            // Read fresh before sleeping so a reload's new metadata_refresh_secs
+            // governs the very next sleep, same reasoning as the reconcile loop above.
+            let refresh_secs = config::load_shared_config(&refresh_shared_config)
+                .mcp
+                .metadata_refresh_secs;
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(refresh_secs)) => {}
                 () = refresh_ct.cancelled() => {
@@ -1211,14 +1307,25 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
             // something has to poll regardless — collapsing this into a
             // worker-pushed signal would only remove the schema-change case, not the
             // facet-drift case, for the cost of a second notification channel.
+            //
+            // Read again (post-sleep) rather than reusing the pre-sleep snapshot
+            // above: a reload may have landed during the sleep, and `mcp.instructions`
+            // / `frontmatter` should reflect whatever is live AT refresh time, not
+            // whatever was live when this iteration started waiting.
+            let live_config = config::load_shared_config(&refresh_shared_config);
+            let base = live_config
+                .mcp
+                .instructions
+                .as_deref()
+                .unwrap_or(mcp::DEFAULT_INSTRUCTIONS);
             let refreshed_schemas = schema::load_shared(&refresh_schema_cache);
             let updated = build_instructions(
-                &refresh_base,
+                base,
                 &refresh_qdrant,
                 &refresh_collection,
                 &refresh_data_path,
                 &refreshed_schemas,
-                &refresh_frontmatter,
+                &live_config.frontmatter,
             )
             .await;
             match refresh_instructions.write() {
@@ -1238,7 +1345,12 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let include_patterns = config.indexing.include.clone();
     let embed_for_mcp = Arc::clone(&embed_client);
     let qdrant_for_mcp = Arc::clone(&qdrant);
-    let config_for_mcp = Arc::clone(&config);
+    // Live handle: every MCP tool call fetches its own fresh snapshot (see
+    // `KbSearchServer::config`), which is what makes `search.*`, `write.*`,
+    // `chunking.prepend_description`, `source.git_token_env` (for commits), and
+    // `frontmatter.*` (for update_schema's rebuild) observe a reload immediately —
+    // see `reload.rs`'s classification table.
+    let config_for_mcp = Arc::clone(&shared_config);
     let rerank_for_mcp: Option<Arc<RerankClient>> = config
         .reranking
         .as_ref()
@@ -1350,7 +1462,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     // vocabularies, area names and document counts, which is a readable sketch of the
     // knowledge base's contents. Prometheus scrapes them with an `authorization` stanza.
     let status_state = StatusState {
-        config: Arc::clone(&config),
+        config: Arc::clone(&shared_config),
         qdrant: Arc::clone(&qdrant),
         state_db: Arc::new(tokio::sync::OnceCell::new()),
         cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1364,17 +1476,36 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
             bearer_auth,
         ));
 
+    // `/admin/reload` sits behind the same bearer token as `/status`/`/metrics` —
+    // triggering it can change how the write tools authenticate content or which
+    // webhook provider is trusted, so it gets no weaker a gate than those, and it is
+    // an explicit, single-purpose action (not exposed on `/status`'s GET) so it can
+    // never be triggered by an unauthenticated crawler or a misconfigured health
+    // check hitting it with the wrong verb.
+    let admin_state = AdminState {
+        shared_config: Arc::clone(&shared_config),
+        config_path: Arc::new(config_path),
+    };
+    let admin_router = Router::new()
+        .route("/admin/reload", axum::routing::post(reload_handler))
+        .with_state(admin_state)
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            bearer_auth,
+        ));
+
     let mut app = Router::new()
         .route(
             "/health",
             axum::routing::get(health_handler).with_state(health_state),
         )
         .merge(status_router)
+        .merge(admin_router)
         .merge(mcp_router);
 
     if let Some(secret) = webhook_secret {
         let webhook_state = WebhookState {
-            config: Arc::clone(&config),
+            config: Arc::clone(&shared_config),
             secret,
             git_token: git_pull_token.clone(),
         };
@@ -1405,6 +1536,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     info!("Starting server on {}", bind_addr);
     info!("  MCP endpoint: /mcp");
     info!("  Status endpoints: /status (JSON), /metrics (Prometheus)");
+    info!("  Admin endpoint: POST /admin/reload (re-reads config.yaml without a restart)");
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -1705,7 +1837,7 @@ mod tests {
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
-            config,
+            config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -1755,7 +1887,7 @@ mod tests {
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
-            config,
+            config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -1777,7 +1909,7 @@ mod tests {
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
-            config,
+            config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -1822,7 +1954,7 @@ mod tests {
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
-            config,
+            config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -1863,7 +1995,7 @@ mod tests {
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
-            config,
+            config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -1892,7 +2024,7 @@ mod tests {
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
-            config,
+            config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -2350,7 +2482,7 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
-            mcp::make_test_resolved_config(tmp.path()),
+            config::shared_config(mcp::make_test_resolved_config(tmp.path())),
             mcp::empty_test_schema_cache(),
             None,
         )

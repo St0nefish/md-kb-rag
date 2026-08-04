@@ -38,7 +38,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::warn;
 
-use crate::config::ResolvedConfig;
+use crate::config::{ResolvedConfig, SharedConfig};
 use crate::schema::SharedSchemaCache;
 use crate::status::Trigger;
 
@@ -313,7 +313,16 @@ fn schema_rebuild_runner(
 /// `schema_cache` is the same `SharedSchemaCache` the MCP handler reads from
 /// (`KbSearchServer::schema_cache`) — this task is the other of the two places that
 /// ever write to it, the first being `update_schema`'s own synchronous rebuild.
-pub async fn run_worker(config: Arc<ResolvedConfig>, schema_cache: SharedSchemaCache) {
+///
+/// Takes the LIVE `SharedConfig` handle, not a one-off `Arc<ResolvedConfig>`: a
+/// fresh snapshot is loaded before every drain (see the `load_shared_config` call
+/// below), so `indexing.include`/`exclude`/`exclude_files`, `frontmatter.*`,
+/// `validation.*`, and `chunking.*` all pick up a `POST /admin/reload` swap on the
+/// worker's very next wake — no restart needed. This is what makes those settings
+/// `reload::ReloadEffect::Applied` (or `ReindexRequired` for `chunking.*`, since the
+/// effect only reaches documents indexed after the change) rather than
+/// restart-required — see `reload.rs`'s classification table.
+pub async fn run_worker(shared_config: SharedConfig, schema_cache: SharedSchemaCache) {
     // A closure rather than passing `schema_cache` straight into `drain_and_run_with`
     // so the rebuild step has the same test-injectable shape as `ingest_runner` (see
     // `RebuildFuture`'s doc comment) — production and tests both go through one
@@ -323,6 +332,8 @@ pub async fn run_worker(config: Arc<ResolvedConfig>, schema_cache: SharedSchemaC
     };
     loop {
         REINDEX_QUEUE.notify.notified().await;
+        // Fresh snapshot per wake, not per process — see this function's doc comment.
+        let config = crate::config::load_shared_config(&shared_config);
         drain_and_run_with(&REINDEX_QUEUE, &config, &ingest_runner, &rebuild).await;
     }
 }

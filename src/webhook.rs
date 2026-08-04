@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -13,7 +12,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
-use crate::config::{ResolvedConfig, WebhookProvider};
+use crate::config::{SharedConfig, WebhookProvider};
 use crate::git::GIT_TIMEOUT;
 use crate::git::{inject_token_into_url, redact_url};
 use crate::reindex;
@@ -22,7 +21,15 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct WebhookState {
-    pub config: Arc<ResolvedConfig>,
+    /// Live handle: `handle_webhook` re-reads this on every request, so `webhook.provider`
+    /// observes a `POST /admin/reload` immediately. `secret` below deliberately is NOT
+    /// part of this live config — see its own doc comment.
+    pub config: SharedConfig,
+    /// Resolved once at server startup from `webhook.secret_env` (server.rs
+    /// run_server) and never re-read: whether `/hooks/reindex` even exists is
+    /// decided at that same startup lookup, so a reload changing
+    /// `webhook.secret_env` cannot retroactively add/remove the route or the
+    /// secret this compares against. See `reload.rs`'s "webhook.secret_env" entry.
     pub secret: String,
     pub git_token: Option<String>,
 }
@@ -101,7 +108,12 @@ pub async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let provider = &state.config.webhook.provider;
+    // One snapshot for the whole request, so a concurrent `POST /admin/reload`
+    // cannot mix old and new values across this handler's several config reads.
+    // This is what makes `webhook.provider` observe a reload immediately — see
+    // reload.rs's "webhook.provider" entry.
+    let config = crate::config::load_shared_config(&state.config);
+    let provider = &config.webhook.provider;
 
     if !verify_signature(&state.secret, &body, &headers, provider) {
         warn!(provider = ?provider, "Webhook signature verification failed");
@@ -109,15 +121,15 @@ pub async fn handle_webhook(
     }
 
     // Check branch
-    if let Err(resp) = check_branch(&body, &state.config.source.branch) {
+    if let Err(resp) = check_branch(&body, &config.source.branch) {
         info!("{}", resp.1);
         return resp;
     }
 
     // Git fetch + merge if git_url is configured
-    if let Some(ref git_url) = state.config.source.git_url {
-        let data_path = state.config.data_path();
-        let branch = &state.config.source.branch;
+    if let Some(ref git_url) = config.source.git_url {
+        let data_path = config.data_path();
+        let branch = &config.source.branch;
 
         // Build fetch URL with optional token injection
         let fetch_url = match &state.git_token {
@@ -282,7 +294,9 @@ pub async fn handle_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ResolvedConfig;
     use axum::http::HeaderValue;
+    use std::sync::Arc;
 
     fn compute_hmac(secret: &str, body: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
@@ -501,7 +515,7 @@ mod tests {
 
         let config = minimal_config();
         let state = WebhookState {
-            config,
+            config: crate::config::shared_config(config),
             secret: secret.to_string(),
             git_token: None,
         };
@@ -527,7 +541,7 @@ mod tests {
 
         let config = minimal_config();
         let state = WebhookState {
-            config,
+            config: crate::config::shared_config(config),
             secret: "correct-secret".to_string(),
             git_token: None,
         };
@@ -556,7 +570,7 @@ mod tests {
 
         let config = minimal_config();
         let state = WebhookState {
-            config,
+            config: crate::config::shared_config(config),
             secret: secret.to_string(),
             git_token: None,
         };
@@ -599,7 +613,7 @@ mod tests {
         // handler's only option is to fall back to a full reconcile.
         let config = minimal_config();
         let state = WebhookState {
-            config,
+            config: crate::config::shared_config(config),
             secret: secret.to_string(),
             git_token: None,
         };
@@ -618,6 +632,85 @@ mod tests {
         assert!(
             reindex::REINDEX_QUEUE.snapshot().full_pending,
             "a webhook with no git_url must fall back to a full reconcile"
+        );
+    }
+
+    /// End-to-end proof that a config swap is observed by the very next request, not
+    /// merely by a fresh `load_shared_config` call in isolation: `handle_webhook`
+    /// reads `webhook.provider` fresh on every call (see `reload.rs`'s
+    /// "webhook.provider" entry), so swapping the live config must change which
+    /// signature header the VERY NEXT delivery is checked against.
+    ///
+    /// Builds both resolved configs (via the real `Config::load`, same as
+    /// `reload_config` uses) up front, entirely before any `.await` — the shared
+    /// `ENV_MUTEX` this needs (see `config::test_support`) guards a std `Mutex`, and
+    /// holding that guard across an await point is unsound in principle and
+    /// clippy-denied (`await_holding_lock`). `reload_config`'s own
+    /// validate-then-swap behavior (parse/validate, then atomic swap, then queue a
+    /// reconcile) is covered directly by `reload.rs`'s own tests; this test's job is
+    /// only to prove a REAL request-handling consumer reacts to
+    /// `config::store_shared_config` — exactly the swap `reload_config` performs —
+    /// on its very next call.
+    #[tokio::test]
+    async fn a_config_swap_changes_which_webhook_provider_the_next_request_is_verified_against() {
+        use axum::response::IntoResponse;
+
+        let (gitea_config, github_config) = {
+            let _lock = crate::config::test_support::ENV_MUTEX.lock().unwrap();
+            crate::config::test_support::set_required_env();
+            let tmp = tempfile::tempdir().unwrap();
+            let config_path = tmp.path().join("config.yaml");
+            std::fs::write(&config_path, "webhook:\n  provider: gitea\n").unwrap();
+            let gitea = crate::config::Config::load(&config_path).unwrap();
+            std::fs::write(&config_path, "webhook:\n  provider: github\n").unwrap();
+            let github = crate::config::Config::load(&config_path).unwrap();
+            crate::config::test_support::clear_required_env();
+            (gitea, github)
+        };
+
+        let shared = crate::config::shared_config(Arc::new(gitea_config));
+
+        let secret = "test-secret";
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+        let gitea_sig = compute_hmac(secret, body);
+        let mut gitea_headers = HeaderMap::new();
+        gitea_headers.insert(
+            "x-gitea-signature",
+            axum::http::HeaderValue::from_str(&gitea_sig).unwrap(),
+        );
+
+        let state = WebhookState {
+            config: Arc::clone(&shared),
+            secret: secret.to_string(),
+            git_token: None,
+        };
+
+        // Before the swap: provider is gitea, so a Gitea-style signature is accepted.
+        let resp = handle_webhook(
+            State(state.clone()),
+            gitea_headers.clone(),
+            Bytes::copy_from_slice(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The same swap `reload_config` performs after its (separately tested)
+        // validate step.
+        crate::config::store_shared_config(&shared, github_config);
+
+        // Same secret, same body, same (now-stale) Gitea-style header — but the very
+        // next request now checks it against `x-hub-signature-256` (GitHub's header
+        // name) instead, so the Gitea header is never even consulted and
+        // verification fails. This is the "subsequent request sees it" contract, not
+        // just "the SharedConfig cell holds a new value somewhere".
+        let resp = handle_webhook(State(state), gitea_headers, Bytes::copy_from_slice(body))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the swap must be visible to the very next request"
         );
     }
 
@@ -692,7 +785,7 @@ mod tests {
     /// just the status code — the shared plumbing for the tests below.
     async fn deliver_webhook(config: Arc<ResolvedConfig>, secret: &str, sig: &str) -> StatusCode {
         let state = WebhookState {
-            config,
+            config: crate::config::shared_config(config),
             secret: secret.to_string(),
             git_token: None,
         };

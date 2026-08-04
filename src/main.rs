@@ -7,6 +7,7 @@ mod ingest;
 mod mcp;
 mod qdrant;
 mod reindex;
+mod reload;
 mod rerank;
 mod retrieval;
 mod schema;
@@ -171,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command.unwrap_or(Commands::Serve) {
         Commands::Serve => {
-            server::run_server(cfg).await?;
+            server::run_server(cfg, PathBuf::from(&cli.config)).await?;
         }
         Commands::Index { full } => {
             // Ensure parent directory exists for state DB

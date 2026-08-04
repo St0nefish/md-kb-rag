@@ -344,6 +344,24 @@ chunking:
 
 Point `GIT_URL` (and optionally `GIT_BRANCH`) at your knowledge base repo via environment variables — see step 3. All other sections (`embedding`, `mcp`, `webhook`) use defaults that work with the Docker Compose stack. Override only if you need different values.
 
+**Changing `config.yaml` later:** most settings in this file can be applied to a
+running server without a restart — edit the file and call:
+
+```bash
+curl -X POST -H "Authorization: Bearer $MCP_BEARER_TOKEN" \
+  http://localhost:8001/admin/reload
+```
+
+The response reports exactly what happened: settings that took effect immediately,
+settings that need a restart (rate limiting, embedding batch tuning, and anything
+tied to authentication — these are baked into services built once at startup), and
+settings that need `md-kb-rag index --full` to be meaningful (`chunking.*` — a new
+chunk size only applies to documents indexed after the change, so the corpus is
+inconsistent until a full reindex rewrites it). A malformed or invalid file is
+rejected with the parse/validation error and the running server is left completely
+untouched — same as a failed restart would leave it. See [README.md](../README.md#observability)
+for the full endpoint reference.
+
 ### 3. Set up environment variables
 
 Create a `.env` file (see [`.env.example`](.env.example)):

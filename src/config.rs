@@ -2,6 +2,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1263,17 +1264,85 @@ impl ResolvedConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live config handle — backs `POST /admin/reload` (src/reload.rs)
+// ---------------------------------------------------------------------------
+
+/// Live handle to the process's resolved configuration, following the same
+/// `RwLock<Arc<_>>` idiom as `schema::SharedSchemaCache`: a reader takes the lock,
+/// clones the `Arc`, and drops the guard immediately (see [`load_shared_config`]) —
+/// a handful of atomic operations, cheap enough for a read-mostly value that a
+/// lock-free-swap crate is not justified. `reload::reload_config` is the only
+/// writer; every other holder just reads whatever snapshot is current.
+///
+/// Not every consumer of `ResolvedConfig` holds this type. Plenty of settings are
+/// baked into a value or service built once at server startup — a `reqwest::Client`
+/// timeout, a compiled `GlobSet`, a `GovernorLayer` — and stay that way for the rest
+/// of the process's life by construction, restart or not. `SharedConfig` is only for
+/// the subset of consumers that genuinely re-read the config on every use (an MCP
+/// tool call, a webhook request, the reindex worker's next drain, a periodic
+/// refresh's next tick); see `reload::diff`'s classification table for exactly which
+/// setting falls into which category and the file:line evidence behind each one.
+pub type SharedConfig = Arc<RwLock<Arc<ResolvedConfig>>>;
+
+/// Wrap an already-resolved config as a fresh `SharedConfig` handle. Used by server
+/// startup (building the live view from its initial `Config::load`) and by tests
+/// (building one from a one-off `ResolvedConfig`) — anywhere a caller has an owned
+/// snapshot and needs a handle other code can later swap.
+pub fn shared_config(config: Arc<ResolvedConfig>) -> SharedConfig {
+    Arc::new(RwLock::new(config))
+}
+
+/// Clone the current config out of `shared`. Cheap: a lock acquisition plus an `Arc`
+/// clone, with the guard dropped before returning — never held across an `.await`.
+/// Mirrors `schema::load_shared`.
+///
+/// A poisoned lock (a reader or writer panicked while holding it) is recovered
+/// rather than propagated, the same policy already applied to the schema cache and
+/// the MCP instructions lock: a panic in one caller must not brick every subsequent
+/// config read for the rest of the process's life.
+pub fn load_shared_config(shared: &SharedConfig) -> Arc<ResolvedConfig> {
+    shared
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Swap a freshly validated `ResolvedConfig` into `shared`, replacing whatever was
+/// there. Mirrors `schema::store_shared`.
+///
+/// Callers of [`load_shared_config`] that are already mid-request hold their own
+/// `Arc` clone and are unaffected by a swap landing underneath them — they simply
+/// finish using the snapshot they already took, and the next `load_shared_config`
+/// call sees the new one. This is what makes the swap atomic from every reader's
+/// point of view: there is no instant at which a caller can observe a
+/// partially-applied config.
+pub fn store_shared_config(shared: &SharedConfig, new: ResolvedConfig) {
+    let new = Arc::new(new);
+    match shared.write() {
+        Ok(mut guard) => *guard = new,
+        Err(poisoned) => *poisoned.into_inner() = new,
+    }
+}
+
+/// Test-only env var helpers shared across modules whose tests exercise
+/// `Config::load`/`resolve` (this module and `reload.rs`). Deliberately `pub(crate)`
+/// rather than private-to-`mod tests`: a SEPARATE, module-local `Mutex` per test file
+/// would not actually serialize anything, since `cargo test` runs every test in this
+/// crate in one multi-threaded binary — two different mutexes guarding the same
+/// process-global env vars race exactly as if there were no lock at all. Every test
+/// anywhere in the crate that sets `EMBEDDING_BASE_URL`/`EMBEDDING_MODEL`/
+/// `QDRANT_URL` must go through this single `ENV_MUTEX`.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
     use std::sync::Mutex;
 
     /// Mutex to serialize tests that modify environment variables.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// The three env vars every successful `resolve()` needs at minimum
     /// (reranking is disabled by default, so its vars are not required).
-    fn set_required_env() {
+    pub(crate) fn set_required_env() {
         // SAFETY: caller holds ENV_MUTEX
         unsafe {
             std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
@@ -1282,7 +1351,7 @@ mod tests {
         }
     }
 
-    fn clear_required_env() {
+    pub(crate) fn clear_required_env() {
         // SAFETY: caller holds ENV_MUTEX
         unsafe {
             std::env::remove_var("EMBEDDING_BASE_URL");
@@ -1290,6 +1359,12 @@ mod tests {
             std::env::remove_var("QDRANT_URL");
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{ENV_MUTEX, clear_required_env, set_required_env};
+    use super::*;
 
     impl Config {
         /// Deserialize + resolve (requires env vars for the required fields)
