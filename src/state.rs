@@ -2316,4 +2316,330 @@ mod tests {
         assert_eq!(db.count().await.unwrap(), 1);
         assert_eq!(db.document_count().await.unwrap(), 0);
     }
+
+    // -- pagination / chunking boundaries -------------------------------------
+    //
+    // `fetch_indexed_files_page`, `get_many`, and `get_document_hashes_many` are
+    // exercised end-to-end by `ingest.rs`'s `scan_for_dirty` tests, but those
+    // fixtures hold only a handful of files — never enough to reach a second page or
+    // a second 500-param chunk. That leaves exactly the boundary these methods exist
+    // for untested: an off-by-one here would silently skip files during a reconcile
+    // sweep, and nothing would ever error — search would just quietly go stale. The
+    // tests below insert through hand-rolled multi-row `INSERT`s rather than
+    // `upsert`/`upsert_document_metadata` (one round trip per row) specifically to
+    // keep the 500-1000+ row cases fast.
+
+    /// Insert `entries` (file_path, content_hash) into `indexed_files` via a handful
+    /// of multi-row `INSERT`s rather than one round trip per row, so the 500+ row
+    /// boundary tests below stay fast. Each statement stays well under SQLite's
+    /// 999-bound-parameter ceiling on its own — this helper's job is to seed data
+    /// quickly, not to probe that limit itself.
+    async fn bulk_insert_indexed_files(db: &StateDb, entries: &[(String, String)]) {
+        const ROWS_PER_STATEMENT: usize = 100;
+        for chunk in entries.chunks(ROWS_PER_STATEMENT) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO indexed_files (file_path, content_hash, chunk_count, schema_hash, mtime, size) ",
+            );
+            builder.push_values(chunk, |mut b, (path, hash)| {
+                b.push_bind(path)
+                    .push_bind(hash)
+                    .push_bind(1i64)
+                    .push_bind("")
+                    .push_bind(0i64)
+                    .push_bind(0i64);
+            });
+            builder.build().execute(db.pool_for_test()).await.unwrap();
+        }
+    }
+
+    /// Insert `entries` (file_path, content_hash) directly into `documents`,
+    /// bypassing `upsert_document_metadata`'s per-row transaction and field
+    /// projection — this helper only needs to produce rows `get_document_hashes_many`
+    /// can read, not realistic frontmatter, and it needs to do it fast.
+    async fn bulk_insert_documents(db: &StateDb, entries: &[(String, String)]) {
+        const ROWS_PER_STATEMENT: usize = 100;
+        for chunk in entries.chunks(ROWS_PER_STATEMENT) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO documents (file_path, frontmatter, mtime, content_hash, chunk_count) ",
+            );
+            builder.push_values(chunk, |mut b, (path, hash)| {
+                b.push_bind(path)
+                    .push_bind("{}")
+                    .push_bind(0i64)
+                    .push_bind(hash)
+                    .push_bind(1i64);
+            });
+            builder.build().execute(db.pool_for_test()).await.unwrap();
+        }
+    }
+
+    // -- fetch_indexed_files_page ---------------------------------------------
+
+    /// Walk `fetch_indexed_files_page` to exhaustion at `page_size`, reassembling
+    /// every returned `file_path` (in page order) and counting how many pages it
+    /// took. Guards against a regression that makes the loop never terminate — the
+    /// exact failure an off-by-one in the `LIMIT`/`OFFSET` boundary would cause.
+    async fn drain_all_pages(db: &StateDb, page_size: i64) -> (Vec<String>, usize) {
+        let mut all = Vec::new();
+        let mut offset = 0i64;
+        let mut pages = 0usize;
+        loop {
+            let page = db
+                .fetch_indexed_files_page(page_size, offset)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            pages += 1;
+            all.extend(page.into_iter().map(|r| r.file_path));
+            offset += page_size;
+            assert!(
+                pages < 10_000,
+                "pagination did not terminate for page_size={page_size} — likely an \
+                 off-by-one that never advances past a non-empty page"
+            );
+        }
+        (all, pages)
+    }
+
+    #[tokio::test]
+    async fn fetch_indexed_files_page_on_an_empty_table_returns_no_pages() {
+        let (db, _dir) = test_db().await;
+        let (all, pages) = drain_all_pages(&db, 5).await;
+        assert_eq!(pages, 0);
+        assert!(all.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pagination_covers_every_row_exactly_once_at_an_exact_page_multiple() {
+        let (db, _dir) = test_db().await;
+        let entries: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("f-{i:03}.md"), "h".to_string()))
+            .collect();
+        bulk_insert_indexed_files(&db, &entries).await;
+
+        let (all, pages) = drain_all_pages(&db, 5).await;
+
+        assert_eq!(
+            pages, 2,
+            "10 rows at page size 5 must take exactly 2 pages, not a trailing empty \
+             third page"
+        );
+        let mut expected: Vec<String> = entries.into_iter().map(|(p, _)| p).collect();
+        expected.sort();
+        let mut got = all;
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "every row must be reassembled exactly once — no gaps, no duplicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_handles_one_less_than_a_page_multiple() {
+        let (db, _dir) = test_db().await;
+        let entries: Vec<(String, String)> = (0..9)
+            .map(|i| (format!("f-{i:03}.md"), "h".to_string()))
+            .collect();
+        bulk_insert_indexed_files(&db, &entries).await;
+
+        let (all, pages) = drain_all_pages(&db, 5).await;
+
+        assert_eq!(
+            pages, 2,
+            "9 rows at page size 5: one full page of 5, one partial page of 4"
+        );
+        assert_eq!(all.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn pagination_handles_one_more_than_a_page_multiple() {
+        let (db, _dir) = test_db().await;
+        let entries: Vec<(String, String)> = (0..11)
+            .map(|i| (format!("f-{i:03}.md"), "h".to_string()))
+            .collect();
+        bulk_insert_indexed_files(&db, &entries).await;
+
+        let (all, pages) = drain_all_pages(&db, 5).await;
+
+        assert_eq!(
+            pages, 3,
+            "11 rows at page size 5: two full pages plus one row spilling into a \
+             third — an off-by-one here would either drop that 11th row or spin \
+             forever re-fetching an empty page"
+        );
+        assert_eq!(all.len(), 11);
+    }
+
+    #[tokio::test]
+    async fn fetch_indexed_files_page_limit_is_clamped_to_at_least_one() {
+        // The implementation binds `limit.max(1)`. SQLite reads `LIMIT 0` as "zero
+        // rows" — unlike the negative-limit-means-unbounded convention this file uses
+        // elsewhere (`count_by_field`, `breakdown_fields`), so this method cannot
+        // reuse that clamp. An unclamped 0 (or a negative value slipping through)
+        // here would make `ingest::scan_for_dirty`'s paging loop spin forever, since
+        // `offset` would never advance past a permanently empty page.
+        let (db, _dir) = test_db().await;
+        db.upsert("only.md", "h", 1, "", 0, 0).await.unwrap();
+
+        let zero = db.fetch_indexed_files_page(0, 0).await.unwrap();
+        assert_eq!(
+            zero.len(),
+            1,
+            "a limit of 0 must be clamped to at least 1 row, not returned empty"
+        );
+
+        let negative = db.fetch_indexed_files_page(-5, 0).await.unwrap();
+        assert_eq!(negative.len(), 1, "a negative limit must also clamp to 1");
+    }
+
+    // -- get_many ---------------------------------------------------------------
+
+    /// Insert `n` distinct rows and assert `get_many` returns every single one with
+    /// its correct content hash. `n` is chosen by each call site to sit at or
+    /// straddle the 500-bind-parameter chunk boundary, so this checks both that
+    /// nothing is dropped at a chunk seam and that no row's data gets attached to the
+    /// wrong key while chunks are reassembled into one map.
+    async fn assert_get_many_returns_every_requested_key(n: usize) {
+        let (db, _dir) = test_db().await;
+        let entries: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("file-{i:05}.md"), format!("hash-{i}")))
+            .collect();
+        bulk_insert_indexed_files(&db, &entries).await;
+
+        let paths: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
+        let result = db.get_many(&paths).await.unwrap();
+
+        assert_eq!(result.len(), n, "every requested key must come back, n={n}");
+        for (path, hash) in &entries {
+            let row = result.get(path).unwrap_or_else(|| {
+                panic!("'{path}' missing from get_many's result — a chunk-seam drop at n={n}")
+            });
+            assert_eq!(
+                &row.content_hash, hash,
+                "wrong row attached to '{path}' at n={n}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_many_at_499_below_the_chunk_boundary() {
+        assert_get_many_returns_every_requested_key(499).await;
+    }
+
+    #[tokio::test]
+    async fn get_many_at_exactly_500_the_chunk_boundary() {
+        assert_get_many_returns_every_requested_key(500).await;
+    }
+
+    #[tokio::test]
+    async fn get_many_at_501_one_past_the_chunk_boundary() {
+        assert_get_many_returns_every_requested_key(501).await;
+    }
+
+    #[tokio::test]
+    async fn get_many_at_1001_spanning_three_chunks() {
+        assert_get_many_returns_every_requested_key(1001).await;
+    }
+
+    #[tokio::test]
+    async fn get_many_distinguishes_absent_keys_from_present_ones() {
+        let (db, _dir) = test_db().await;
+        let entries: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("present-{i}.md"), format!("hash-{i}")))
+            .collect();
+        bulk_insert_indexed_files(&db, &entries).await;
+
+        let mut requested: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
+        requested.push("missing-1.md".into());
+        requested.push("missing-2.md".into());
+
+        let result = db.get_many(&requested).await.unwrap();
+
+        assert_eq!(
+            result.len(),
+            5,
+            "only rows that actually exist come back; a missing key must not be \
+             confused with a chunking bug"
+        );
+        assert!(!result.contains_key("missing-1.md"));
+        assert!(!result.contains_key("missing-2.md"));
+        for (path, _) in &entries {
+            assert!(result.contains_key(path));
+        }
+    }
+
+    #[tokio::test]
+    async fn get_many_empty_input_returns_empty_map() {
+        let (db, _dir) = test_db().await;
+        assert!(db.get_many(&[]).await.unwrap().is_empty());
+    }
+
+    // -- get_document_hashes_many ------------------------------------------------
+
+    /// Same shape as [`assert_get_many_returns_every_requested_key`], for the
+    /// `documents`-table equivalent.
+    async fn assert_get_document_hashes_many_returns_every_requested_key(n: usize) {
+        let (db, _dir) = test_db().await;
+        let entries: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("doc-{i:05}.md"), format!("hash-{i}")))
+            .collect();
+        bulk_insert_documents(&db, &entries).await;
+
+        let paths: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
+        let result = db.get_document_hashes_many(&paths).await.unwrap();
+
+        assert_eq!(result.len(), n, "every requested key must come back, n={n}");
+        for (path, hash) in &entries {
+            assert_eq!(
+                result.get(path).map(String::as_str),
+                Some(hash.as_str()),
+                "wrong hash attached to '{path}' at n={n}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_document_hashes_many_at_499_below_the_chunk_boundary() {
+        assert_get_document_hashes_many_returns_every_requested_key(499).await;
+    }
+
+    #[tokio::test]
+    async fn get_document_hashes_many_at_exactly_500_the_chunk_boundary() {
+        assert_get_document_hashes_many_returns_every_requested_key(500).await;
+    }
+
+    #[tokio::test]
+    async fn get_document_hashes_many_at_501_one_past_the_chunk_boundary() {
+        assert_get_document_hashes_many_returns_every_requested_key(501).await;
+    }
+
+    #[tokio::test]
+    async fn get_document_hashes_many_at_1001_spanning_three_chunks() {
+        assert_get_document_hashes_many_returns_every_requested_key(1001).await;
+    }
+
+    #[tokio::test]
+    async fn get_document_hashes_many_distinguishes_absent_keys_from_present_ones() {
+        let (db, _dir) = test_db().await;
+        let entries: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("present-{i}.md"), format!("hash-{i}")))
+            .collect();
+        bulk_insert_documents(&db, &entries).await;
+
+        let mut requested: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
+        requested.push("missing-1.md".into());
+
+        let result = db.get_document_hashes_many(&requested).await.unwrap();
+
+        assert_eq!(result.len(), 5);
+        assert!(!result.contains_key("missing-1.md"));
+    }
+
+    #[tokio::test]
+    async fn get_document_hashes_many_empty_input_returns_empty_map() {
+        let (db, _dir) = test_db().await;
+        assert!(db.get_document_hashes_many(&[]).await.unwrap().is_empty());
+    }
 }

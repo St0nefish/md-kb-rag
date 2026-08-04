@@ -620,4 +620,176 @@ mod tests {
             "a webhook with no git_url must fall back to a full reconcile"
         );
     }
+
+    // --- git-backed integration tests -------------------------------------------
+    //
+    // `handle_webhook` now captures HEAD before the fetch, does an ff-only merge,
+    // diffs the resulting range, and marks exactly those paths dirty instead of
+    // indexing inline. `git.rs` already covers `parse_diff_name_status` (including
+    // renames) in isolation, so these do not re-test diff parsing — they exercise the
+    // webhook's OWN wiring around it: does the pre-fetch HEAD actually get captured
+    // before the fetch (not after, which would diff an empty range), does the merge
+    // really run, and does the result really reach `reindex::mark_paths`. A local
+    // bare repo stands in for the live remote, following the same pattern already
+    // used by `git.rs`'s `commit_and_sync` tests and `mcp.rs`'s write-tool tests
+    // (`crate::git::tests::create_bare_repo` / `clone_bare_repo`) — no live network,
+    // no mocks.
+
+    /// Push one new file to `bare_path`'s `branch` from a throwaway clone, simulating
+    /// an upstream commit landing between webhook deliveries.
+    fn push_file_from_a_fresh_clone(
+        bare_path: &std::path::Path,
+        branch: &str,
+        rel_path: &str,
+        contents: &str,
+    ) {
+        let work = crate::git::tests::clone_bare_repo(bare_path, branch);
+        let file_path = work.path().join(rel_path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&file_path, contents).unwrap();
+        std::process::Command::new("git")
+            .args(["add", rel_path])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                &format!("add {rel_path}"),
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push", "origin", branch])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+    }
+
+    /// A config with real git integration wired up: `git_url` is a `file://` URL
+    /// pointing at a local bare repo (exactly like `git.rs`'s `commit_and_sync`
+    /// tests use), and `data_path` is an already-cloned working copy.
+    fn git_backed_config(
+        bare_path: &std::path::Path,
+        local_path: &std::path::Path,
+    ) -> Arc<ResolvedConfig> {
+        let mut config = minimal_config();
+        let inner = Arc::get_mut(&mut config).expect("freshly built config has one owner");
+        inner.source.git_url = Some(format!("file://{}", bare_path.to_str().unwrap()));
+        inner.source.data_path = Some(local_path.to_str().unwrap().to_string());
+        config
+    }
+
+    /// Deliver a signed webhook for `refs/heads/master` against `config` and return
+    /// just the status code — the shared plumbing for the tests below.
+    async fn deliver_webhook(config: Arc<ResolvedConfig>, secret: &str, sig: &str) -> StatusCode {
+        let state = WebhookState {
+            config,
+            secret: secret.to_string(),
+            git_token: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitea-signature", HeaderValue::from_str(sig).unwrap());
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+        handle_webhook(State(state), headers, Bytes::copy_from_slice(body))
+            .await
+            .into_response()
+            .status()
+    }
+
+    /// The core regression this gap exists for: the paths `handle_webhook`'s own
+    /// fetch + ff-only merge + diff computed for the pulled range must actually reach
+    /// `reindex::mark_paths`. Capturing HEAD after the fetch instead of before (an
+    /// easy mistake given `commit_and_sync` does the same before/after dance around
+    /// its own fetch+rebase) would diff an empty range and silently mark nothing,
+    /// even though the fetch and merge both succeeded.
+    #[tokio::test]
+    async fn handle_webhook_marks_the_paths_the_pull_diff_actually_touched() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let local = crate::git::tests::clone_bare_repo(bare.path(), "master");
+
+        // Two files land upstream between deployments — both must survive the
+        // fetch+merge+diff+mark pipeline, not just the first.
+        push_file_from_a_fresh_clone(bare.path(), "master", "webhook-diff/added-1.md", "one");
+        push_file_from_a_fresh_clone(bare.path(), "master", "webhook-diff/added-2.md", "two");
+
+        let secret = "test-secret";
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+        let sig = compute_hmac(secret, body);
+        let config = git_backed_config(bare.path(), local.path());
+
+        let pending_before = reindex::REINDEX_QUEUE.snapshot().pending_paths;
+
+        let status = deliver_webhook(config, secret, &sig).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The ff-only merge must actually have pulled the new commits in.
+        assert!(local.path().join("webhook-diff/added-1.md").exists());
+        assert!(local.path().join("webhook-diff/added-2.md").exists());
+
+        // REINDEX_QUEUE is process-global, shared with every other test in this
+        // binary (see the note on `handle_webhook_marks_a_full_reconcile_...` above),
+        // so this can only assert a lower bound under parallel `cargo test`. That is
+        // still a real assertion: if the diff came back empty — the exact regression
+        // this test targets — the delta would be 0, and this would fail.
+        let pending_after = reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        assert!(
+            pending_after >= pending_before + 2,
+            "the two files the pull brought in must reach the reindex queue: \
+             before={pending_before} after={pending_after}"
+        );
+    }
+
+    /// The bug this whole architecture replaced: under the old inline-indexing
+    /// design, a webhook delivery that arrived while a previous one's reindex was
+    /// still running raced on `REINDEX_LOCK`, and the loser's changes were dropped
+    /// rather than queued. `mark_paths` never blocks and never checks whether
+    /// anything is already pending, so a second delivery arriving while the first
+    /// delivery's mark is still sitting undrained (no worker is spawned in this test,
+    /// so nothing ever drains it) must still add its own path on top — not be
+    /// silently absorbed into or replaced by the first delivery's work.
+    #[tokio::test]
+    async fn handle_webhook_does_not_drop_a_second_pull_while_the_first_is_still_queued() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let local = crate::git::tests::clone_bare_repo(bare.path(), "master");
+
+        let secret = "test-secret";
+        let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
+        let sig = compute_hmac(secret, body);
+        let config = git_backed_config(bare.path(), local.path());
+
+        let pending_before = reindex::REINDEX_QUEUE.snapshot().pending_paths;
+
+        push_file_from_a_fresh_clone(bare.path(), "master", "webhook-drop-check/first.md", "one");
+        let first_status = deliver_webhook(Arc::clone(&config), secret, &sig).await;
+        assert_eq!(first_status, StatusCode::OK);
+        let pending_after_first = reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        assert!(
+            pending_after_first > pending_before,
+            "first delivery must mark its own path: before={pending_before} \
+             after={pending_after_first}"
+        );
+
+        // Second delivery, with the first delivery's mark still undrained — exactly
+        // the "reindex already in progress" scenario the old REINDEX_LOCK used to
+        // drop the loser on.
+        push_file_from_a_fresh_clone(bare.path(), "master", "webhook-drop-check/second.md", "two");
+        let second_status = deliver_webhook(Arc::clone(&config), secret, &sig).await;
+        assert_eq!(second_status, StatusCode::OK);
+        let pending_after_second = reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        assert!(
+            pending_after_second > pending_after_first,
+            "a second delivery must add its own path on top of the first's still-\
+             undrained work, not be dropped because something is already queued: \
+             after_first={pending_after_first} after_second={pending_after_second}"
+        );
+    }
 }
