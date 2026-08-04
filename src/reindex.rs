@@ -39,6 +39,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::config::ResolvedConfig;
+use crate::schema::SharedSchemaCache;
 use crate::status::Trigger;
 
 /// Dirty state accumulated since the worker's last drain, behind a plain
@@ -216,6 +217,39 @@ enum Unit {
     FullReconcile,
 }
 
+/// Whether `unit` might have changed the schema tree, and therefore requires the
+/// shared `SchemaCache` (see `schema::SharedSchemaCache`) to be rebuilt and swapped
+/// in BEFORE this unit is indexed — not after.
+///
+/// Ordering matters: `ingest::index_paths`/`ingest::scan_and_index` always re-read
+/// `.kb-schema.yaml` fresh off disk on every run (they build their own throwaway
+/// `SchemaCache` internally, unrelated to this shared one), so indexing itself is
+/// never stale. What WOULD go stale is every concurrent MCP call in the meantime:
+/// `get_schema` describing the old rules, or a write validating against them, while
+/// this unit is busy indexing documents under the new ones — a window that can last
+/// as long as this unit takes to embed (seconds to minutes for a large change). So
+/// the shared cache is rebuilt first, closing that window before it opens rather
+/// than after.
+///
+/// A `FullReconcile` always rebuilds: it already means "something the queue's own
+/// path-level tracking doesn't capture may have changed" (periodic sweep, startup
+/// catch-up, or `write_raw_file` after ANY schema write, via `mark_full`), and
+/// `scan_for_dirty` is about to do its own full walk regardless — a schema rebuild
+/// alongside it is a rounding error on that cost, not worth the precision of trying
+/// to detect "no, THIS particular full reconcile didn't touch a schema". A `Paths`
+/// unit rebuilds only when one of the changed paths is literally a
+/// `.kb-schema.yaml` — the case a webhook delivers when someone pushes straight to
+/// the KB's git host without going through `update_schema` (which already rebuilds
+/// synchronously on its own, before ever reaching this queue).
+fn unit_touches_schema(unit: &Unit) -> bool {
+    match unit {
+        Unit::FullReconcile => true,
+        Unit::Paths(paths) => paths.iter().any(|p| {
+            p.file_name().and_then(|n| n.to_str()) == Some(crate::schema::SCHEMA_FILE_NAME)
+        }),
+    }
+}
+
 /// A boxed, owned future — the runner's return type. Owned (`Arc`/by-value
 /// arguments) rather than borrowing `&ResolvedConfig`/`&Unit` specifically so this
 /// type has no lifetime parameter: a borrowed version here forces every caller
@@ -224,6 +258,14 @@ enum Unit {
 /// fake-runner tests below impossible to write as closures. Cloning an `Arc` and a
 /// small `Unit` once per drained batch is not worth fighting that for.
 type RunFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+
+/// Same shape as [`RunFuture`], for the schema-rebuild step. No `Result`: a failed
+/// rebuild (in practice only a panic inside the blocking walk — `SchemaCache::build`
+/// has no fallible return) is logged and swallowed by the real implementation rather
+/// than aborting the unit's indexing, for the same reason [`is_permanent_failure`]
+/// biases toward retrying too much rather than too little — a stale cache for one
+/// more cycle is a much smaller failure than skipping indexing entirely.
+type RebuildFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// The real runner: calls into `ingest`, exactly as the module doc's diagram promises.
 /// This is the ONLY place in the worker that talks to `ingest::index_paths` /
@@ -241,13 +283,47 @@ fn ingest_runner(config: Arc<ResolvedConfig>, unit: Unit) -> RunFuture {
     })
 }
 
+/// The real schema-rebuild step: walk the tree (off the executor — this is blocking
+/// filesystem work, same as every other `SchemaCache::build` call site) and swap the
+/// result into `schema_cache`. This is the ONLY place the worker itself rebuilds the
+/// shared cache; `update_schema` has its own synchronous rebuild, independent of this
+/// one, for the reasons documented on that call site.
+fn schema_rebuild_runner(
+    config: Arc<ResolvedConfig>,
+    schema_cache: SharedSchemaCache,
+) -> RebuildFuture {
+    Box::pin(async move {
+        let data_path = config.canonical_data_path();
+        let frontmatter = config.frontmatter.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::schema::SchemaCache::build(&data_path, &frontmatter)
+        })
+        .await
+        {
+            Ok(schemas) => crate::schema::store_shared(&schema_cache, schemas),
+            Err(e) => warn!("Schema rebuild panicked in the reindex worker: {e}"),
+        }
+    })
+}
+
 /// Run the reindex worker forever: sleep until the queue has something, then drain and
 /// run until it is empty again. Spawned once at server startup. The CLI never runs
 /// this — `ingest::scan_and_index` is its synchronous, no-worker equivalent.
-pub async fn run_worker(config: Arc<ResolvedConfig>) {
+///
+/// `schema_cache` is the same `SharedSchemaCache` the MCP handler reads from
+/// (`KbSearchServer::schema_cache`) — this task is the other of the two places that
+/// ever write to it, the first being `update_schema`'s own synchronous rebuild.
+pub async fn run_worker(config: Arc<ResolvedConfig>, schema_cache: SharedSchemaCache) {
+    // A closure rather than passing `schema_cache` straight into `drain_and_run_with`
+    // so the rebuild step has the same test-injectable shape as `ingest_runner` (see
+    // `RebuildFuture`'s doc comment) — production and tests both go through one
+    // `Fn(Arc<ResolvedConfig>) -> RebuildFuture` parameter.
+    let rebuild = move |config: Arc<ResolvedConfig>| -> RebuildFuture {
+        schema_rebuild_runner(config, Arc::clone(&schema_cache))
+    };
     loop {
         REINDEX_QUEUE.notify.notified().await;
-        drain_and_run_with(&REINDEX_QUEUE, &config, &ingest_runner).await;
+        drain_and_run_with(&REINDEX_QUEUE, &config, &ingest_runner, &rebuild).await;
     }
 }
 
@@ -263,6 +339,7 @@ async fn drain_and_run_with(
     queue: &ReindexQueue,
     config: &Arc<ResolvedConfig>,
     run: &(dyn Fn(Arc<ResolvedConfig>, Unit) -> RunFuture + Sync),
+    rebuild_schema: &(dyn Fn(Arc<ResolvedConfig>) -> RebuildFuture + Sync),
 ) {
     loop {
         let (paths, full) = queue.drain();
@@ -276,6 +353,11 @@ async fn drain_and_run_with(
         } else {
             Unit::Paths(paths.into_iter().collect())
         };
+        // See `unit_touches_schema`'s doc comment for why this must happen BEFORE
+        // `run_with_retry` below, not after or concurrently with it.
+        if unit_touches_schema(&unit) {
+            rebuild_schema(Arc::clone(config)).await;
+        }
         run_with_retry(config, unit, run).await;
     }
 }
@@ -480,6 +562,12 @@ mod tests {
         }
     }
 
+    /// A rebuild step that does nothing — for tests exercising coalesce/retry
+    /// mechanics that have no opinion on schema handling.
+    fn noop_rebuild() -> impl Fn(Arc<ResolvedConfig>) -> RebuildFuture {
+        |_cfg| Box::pin(async {})
+    }
+
     #[tokio::test]
     async fn a_write_that_lands_mid_run_causes_exactly_one_follow_up_run() {
         let queue = ReindexQueue::new();
@@ -507,7 +595,7 @@ mod tests {
         let config = test_config();
         let runner_for_closure = Arc::clone(&runner);
         let run_fn = boxed_runner(move |unit| runner_for_closure.run_sync(unit));
-        drain_and_run_with(&queue, &config, &run_fn).await;
+        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
 
         assert_eq!(
             runner.call_count(),
@@ -536,7 +624,7 @@ mod tests {
         let config = test_config();
         let runner_for_closure = Arc::clone(&runner);
         let run_fn = boxed_runner(move |unit| runner_for_closure.run_sync(unit));
-        drain_and_run_with(&queue, &config, &run_fn).await;
+        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
 
         assert_eq!(runner.call_count(), 1);
         assert_eq!(runner.calls.lock().unwrap()[0], Unit::FullReconcile);
@@ -557,7 +645,7 @@ mod tests {
                 "Validation failed for 'bad.md' (strict mode): [\"bad\"]"
             ))
         });
-        drain_and_run_with(&queue, &config, &run_fn).await;
+        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -581,7 +669,7 @@ mod tests {
             attempts_for_closure.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!("embeddings service unreachable"))
         });
-        drain_and_run_with(&queue, &config, &run_fn).await;
+        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -607,7 +695,7 @@ mod tests {
                 Ok(())
             }
         });
-        drain_and_run_with(&queue, &config, &run_fn).await;
+        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -627,8 +715,114 @@ mod tests {
             calls_for_closure.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
-        drain_and_run_with(&queue, &config, &run_fn).await;
+        drain_and_run_with(&queue, &config, &run_fn, &noop_rebuild()).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // -- schema-cache rebuild gating and ordering --------------------------------
+
+    #[test]
+    fn full_reconcile_always_touches_schema() {
+        assert!(unit_touches_schema(&Unit::FullReconcile));
+    }
+
+    #[test]
+    fn paths_without_a_schema_file_do_not_touch_schema() {
+        let unit = Unit::Paths(vec![path("notes/a.md"), path("food/recipes/b.md")]);
+        assert!(!unit_touches_schema(&unit));
+    }
+
+    #[test]
+    fn a_schema_file_among_the_paths_touches_schema() {
+        let unit = Unit::Paths(vec![path("notes/a.md"), path("food/.kb-schema.yaml")]);
+        assert!(unit_touches_schema(&unit));
+    }
+
+    /// The ordering this whole feature exists for: a dirtied `.kb-schema.yaml` must
+    /// cause the shared cache to be rebuilt BEFORE that unit is handed to the
+    /// indexer, never after and never concurrently with it. A shared timeline
+    /// (rather than two separate counters) is what actually proves the ORDER, not
+    /// just that both steps happened.
+    #[tokio::test]
+    async fn a_dirtied_schema_file_rebuilds_the_cache_before_indexing_it() {
+        let queue = ReindexQueue::new();
+        queue.mark_paths([path("food/.kb-schema.yaml")]);
+
+        let timeline: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        let timeline_for_rebuild = Arc::clone(&timeline);
+        let rebuild = move |_cfg: Arc<ResolvedConfig>| -> RebuildFuture {
+            let timeline = Arc::clone(&timeline_for_rebuild);
+            Box::pin(async move {
+                timeline.lock().unwrap().push("rebuild");
+            })
+        };
+
+        let timeline_for_run = Arc::clone(&timeline);
+        let run_fn = move |_cfg: Arc<ResolvedConfig>, _unit: Unit| -> RunFuture {
+            let timeline = Arc::clone(&timeline_for_run);
+            Box::pin(async move {
+                timeline.lock().unwrap().push("run");
+                Ok(())
+            })
+        };
+
+        let config = test_config();
+        drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
+
+        assert_eq!(
+            *timeline.lock().unwrap(),
+            vec!["rebuild", "run"],
+            "the schema cache must be rebuilt BEFORE the dirtied schema file is \
+             indexed, never after"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dirtied_path_with_no_schema_file_never_triggers_a_rebuild() {
+        let queue = ReindexQueue::new();
+        queue.mark_paths([path("notes/a.md")]);
+
+        let rebuild_calls = Arc::new(AtomicU32::new(0));
+        let rebuild_calls_for_closure = Arc::clone(&rebuild_calls);
+        let rebuild = move |_cfg: Arc<ResolvedConfig>| -> RebuildFuture {
+            rebuild_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        };
+
+        let run_fn = boxed_runner(|_unit| Ok(()));
+        let config = test_config();
+        drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
+
+        assert_eq!(
+            rebuild_calls.load(Ordering::SeqCst),
+            0,
+            "an ordinary document change must not pay for a schema-tree rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_reconcile_always_rebuilds_the_schema_cache() {
+        let queue = ReindexQueue::new();
+        queue.mark_full();
+
+        let rebuild_calls = Arc::new(AtomicU32::new(0));
+        let rebuild_calls_for_closure = Arc::clone(&rebuild_calls);
+        let rebuild = move |_cfg: Arc<ResolvedConfig>| -> RebuildFuture {
+            rebuild_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        };
+
+        let run_fn = boxed_runner(|_unit| Ok(()));
+        let config = test_config();
+        drain_and_run_with(&queue, &config, &run_fn, &rebuild).await;
+
+        assert_eq!(
+            rebuild_calls.load(Ordering::SeqCst),
+            1,
+            "a full reconcile cannot cheaply prove it didn't touch a schema, so it \
+             always rebuilds"
+        );
     }
 }

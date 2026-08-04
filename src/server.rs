@@ -29,7 +29,7 @@ use crate::ingest;
 use crate::mcp::{self, KbSearchServer};
 use crate::qdrant::{IndexedField, QdrantStore};
 use crate::rerank::RerankClient;
-use crate::schema::SchemaCache;
+use crate::schema::{self, SchemaCache};
 use crate::webhook::{self, WebhookState};
 
 #[derive(Clone)]
@@ -1089,9 +1089,24 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let embed_client = Arc::new(EmbedClient::new(&config.embedding));
     let qdrant = Arc::new(QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?);
 
-    // One schema walk serves both the payload-index list and the instructions below.
-    let instructions_data_path = std::path::PathBuf::from(config.data_path());
-    let schemas = SchemaCache::build(&instructions_data_path, &config.frontmatter);
+    // The schema tree, built once here and shared for the rest of the process's
+    // life: the payload-index list below, the instructions builder (both the
+    // initial one and the refresh timer's), every MCP write/read tool via
+    // `KbSearchServer::schema_cache`, and the reindex worker, which rebuilds and
+    // swaps it whenever a dirty path is a `.kb-schema.yaml` (see
+    // `reindex::run_worker`). A recursive walk over the whole KB is blocking
+    // filesystem work, hence `spawn_blocking` even for this one-time startup build.
+    let instructions_data_path = config.canonical_data_path();
+    let startup_data_path = instructions_data_path.clone();
+    let startup_frontmatter = config.frontmatter.clone();
+    let initial_schemas = tokio::task::spawn_blocking(move || {
+        SchemaCache::build(&startup_data_path, &startup_frontmatter)
+    })
+    .await
+    .context("Schema walk panicked during startup")?;
+    let shared_schema_cache: schema::SharedSchemaCache =
+        Arc::new(RwLock::new(Arc::new(initial_schemas)));
+    let schemas = schema::load_shared(&shared_schema_cache);
 
     // Ensure collection exists
     qdrant
@@ -1109,8 +1124,10 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         .instructions
         .as_deref()
         .unwrap_or(mcp::DEFAULT_INSTRUCTIONS);
-    // The cascade is rebuilt on each refresh tick, so a schema file added after boot is
-    // picked up without restarting the server.
+    // The cascade itself is refreshed by the reindex worker, not by this call or the
+    // timer below — both now just read whatever `shared_schema_cache` currently
+    // holds. A schema file added after boot is still picked up without a restart,
+    // just via the worker's dirty-path detection instead of a walk here.
     let initial_instructions = build_instructions(
         base_instructions,
         &qdrant,
@@ -1130,6 +1147,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     let refresh_data_path = instructions_data_path.clone();
     let refresh_frontmatter = config.frontmatter.clone();
     let refresh_secs = config.mcp.metadata_refresh_secs;
+    let refresh_schema_cache = Arc::clone(&shared_schema_cache);
 
     let ct = CancellationToken::new();
     let refresh_ct = ct.child_token();
@@ -1139,7 +1157,10 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
     // `ingest::index_paths`. From here on, the MCP write tools and the webhook handler
     // just mark paths dirty and return; this task does the actual chunk/embed/upsert
     // work out of band.
-    tokio::spawn(crate::reindex::run_worker(Arc::clone(&config)));
+    tokio::spawn(crate::reindex::run_worker(
+        Arc::clone(&config),
+        Arc::clone(&shared_schema_cache),
+    ));
 
     // Catch up on anything missed while this process was down (crash, deploy, a
     // webhook that never arrived because the server was offline). This does not index
@@ -1174,21 +1195,17 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
                     break;
                 }
             }
-            // A recursive read_dir over the whole KB is blocking filesystem work; on
-            // the refresh timer it would stall the executor on every tick.
-            let walk_path = refresh_data_path.clone();
-            let walk_frontmatter = refresh_frontmatter.clone();
-            let refreshed_schemas = match tokio::task::spawn_blocking(move || {
-                SchemaCache::build(&walk_path, &walk_frontmatter)
-            })
-            .await
-            {
-                Ok(schemas) => schemas,
-                Err(e) => {
-                    warn!("Schema walk panicked during refresh: {e}");
-                    continue;
-                }
-            };
+            // This used to re-walk the whole KB (in `spawn_blocking`, since a
+            // recursive read_dir is blocking filesystem work) on every tick. Now it
+            // just reads whatever the reindex worker last swapped in — a lock
+            // acquisition and an `Arc` clone, no filesystem access at all. The timer
+            // still polls rather than being woken by the worker: `build_instructions`
+            // also re-fetches Qdrant facet values (tag/type/domain vocabularies),
+            // which drift with ordinary indexing independent of any schema change, so
+            // something has to poll regardless — collapsing this into a
+            // worker-pushed signal would only remove the schema-change case, not the
+            // facet-drift case, for the cost of a second notification channel.
+            let refreshed_schemas = schema::load_shared(&refresh_schema_cache);
             let updated = build_instructions(
                 &refresh_base,
                 &refresh_qdrant,
@@ -1233,6 +1250,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         &include_patterns,
         Arc::clone(&shared_instructions),
         config_for_mcp,
+        Arc::clone(&shared_schema_cache),
         rerank_for_mcp,
     )?;
 
@@ -2325,6 +2343,7 @@ mod tests {
             &["**/*.md".to_string()],
             instructions,
             mcp::make_test_resolved_config(tmp.path()),
+            mcp::empty_test_schema_cache(),
             None,
         )
         .unwrap();

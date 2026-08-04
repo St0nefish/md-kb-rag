@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -466,6 +467,46 @@ pub struct SchemaCache {
     root: ResolvedSchema,
     /// KB root, so a scope's raw schema file can be read back for editing.
     root_path: PathBuf,
+}
+
+/// A `SchemaCache` shared across the server, kept current by a single owner rather
+/// than rebuilt (a full recursive tree walk) by every caller that needs it.
+///
+/// `RwLock<Arc<SchemaCache>>` rather than `arc-swap`: a reader takes the lock,
+/// clones the `Arc`, and drops the guard immediately (see [`load_shared`]) — a
+/// handful of atomic operations — which is cheap enough for a read-mostly value
+/// that pulling in a new dependency for lock-free swaps is not justified. The
+/// outer `Arc` is what makes this cloneable across the MCP handler, the reindex
+/// worker, and the instructions-refresh timer, all of which hold a handle to the
+/// SAME lock rather than independent copies.
+pub type SharedSchemaCache = Arc<RwLock<Arc<SchemaCache>>>;
+
+/// Clone the current cache out of `shared`. Cheap: a lock acquisition plus an
+/// `Arc` clone, with the guard dropped before returning — never held across an
+/// `.await`.
+///
+/// A poisoned lock (a reader or writer panicked while holding it) is recovered
+/// rather than propagated, the same policy `server.rs` already applies to the
+/// instructions lock: a panic in one caller must not brick every subsequent
+/// `get_schema`/write for the rest of the process's life.
+pub fn load_shared(shared: &SharedSchemaCache) -> Arc<SchemaCache> {
+    shared
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Swap a freshly built `SchemaCache` into `shared`, replacing whatever was there.
+///
+/// Callers of [`load_shared`] that are already mid-read hold their own `Arc` clone
+/// and are unaffected by a swap landing underneath them — they simply keep using
+/// the snapshot they took, and the next `load_shared` call sees the new one.
+pub fn store_shared(shared: &SharedSchemaCache, new: SchemaCache) {
+    let new = Arc::new(new);
+    match shared.write() {
+        Ok(mut guard) => *guard = new,
+        Err(poisoned) => *poisoned.into_inner() = new,
+    }
 }
 
 impl SchemaCache {

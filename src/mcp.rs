@@ -1012,6 +1012,12 @@ pub struct KbSearchServer {
     instructions: Arc<RwLock<String>>,
     /// Resolved config, needed by write tools (create_document, etc.).
     config: Arc<ResolvedConfig>,
+    /// The shared, cached schema tree — built once at server startup and kept
+    /// current by the reindex worker (which rebuilds it before indexing any
+    /// dirty `.kb-schema.yaml`) and by `update_schema`'s own synchronous rebuild.
+    /// `get_schema`, `update_schema`, and the write path all read this instead of
+    /// re-walking the knowledge base on every call; see `schema::SharedSchemaCache`.
+    schema_cache: crate::schema::SharedSchemaCache,
     rerank_client: Option<Arc<RerankClient>>,
     /// Handle to the document metadata index, opened on first use and held for the
     /// process lifetime. Under WAL this reader coexists with the short-lived writer
@@ -1057,6 +1063,7 @@ impl KbSearchServer {
         include_patterns: &[String],
         instructions: Arc<RwLock<String>>,
         config: Arc<ResolvedConfig>,
+        schema_cache: crate::schema::SharedSchemaCache,
         rerank_client: Option<Arc<RerankClient>>,
     ) -> anyhow::Result<Self> {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
@@ -1070,6 +1077,7 @@ impl KbSearchServer {
             include_patterns: Arc::new(build_include_globset(include_patterns)),
             instructions,
             config,
+            schema_cache,
             rerank_client,
             state_db: Arc::new(tokio::sync::OnceCell::new()),
         })
@@ -1493,7 +1501,11 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         let raw = params.path.clone().unwrap_or_default();
         let rel = normalize_scope_path(&raw)?;
-        let schemas = SchemaCache::build(&self.canonical_data_path, &self.config.frontmatter);
+        // Reads the shared, server-owned cache rather than walking the tree on every
+        // call — this tool is the one the server's own instructions tell agents to
+        // call before every write, so it needs to be cheap. See
+        // `KbSearchServer::schema_cache`'s doc comment for how it stays current.
+        let schemas = crate::schema::load_shared(&self.schema_cache);
 
         // A document path resolves via its parent; a directory resolves to itself. A
         // partial directory reference resolves like a partial document path does —
@@ -1630,7 +1642,12 @@ impl KbSearchServer {
         let requested = normalize_scope_path(params.path.as_deref().unwrap_or(""))?;
         let edit = build_schema_edit(&params)?;
 
-        let schemas = SchemaCache::build(&self.canonical_data_path, &self.config.frontmatter);
+        // Read the shared cache for the pre-edit view (casualty check, raw file
+        // lookup below). This does NOT need to be maximally fresh — worst case a
+        // concurrent change this call doesn't see yet is caught by the casualty
+        // check failing safe or by a subsequent call — but see the synchronous
+        // rebuild after the write below, which is NOT optional.
+        let schemas = crate::schema::load_shared(&self.schema_cache);
 
         // Resolve a partial reference against existing scopes, but fall back to the
         // literal path: creating a schema for a directory that has none yet is the
@@ -1724,6 +1741,38 @@ impl KbSearchServer {
 
         self.write_raw_file(&rel_file_str, &yaml, &commit_message)
             .await?;
+
+        // Rebuild the shared schema cache and swap it in SYNCHRONOUSLY — before this
+        // call returns, not merely "soon". `write_raw_file` already called
+        // `reindex::mark_full`, so the reindex worker will ALSO rebuild it, but that
+        // happens out of band on the worker's own schedule and cannot be relied on to
+        // win the race against whatever the calling agent does next. The scenario this
+        // guards against: an agent calls `update_schema` to permit a new value, then
+        // immediately calls `create_document`/`edit_document` relying on that new rule
+        // — if the write path read a stale cache, it would validate against the schema
+        // this very call just replaced and wrongly reject a now-valid document. Wrapped
+        // in `spawn_blocking` because the walk itself is blocking filesystem work, not
+        // because anything here needs to run off-thread for its own sake — `.await`ing
+        // it still makes this call return only once the rebuild has completed.
+        let rebuild_data_path = self.canonical_data_path.clone();
+        let rebuild_frontmatter = self.config.frontmatter.clone();
+        match tokio::task::spawn_blocking(move || {
+            SchemaCache::build(&rebuild_data_path, &rebuild_frontmatter)
+        })
+        .await
+        {
+            Ok(rebuilt) => crate::schema::store_shared(&self.schema_cache, rebuilt),
+            Err(e) => {
+                // A panic in the walk itself (not a normal error — `SchemaCache::build`
+                // has no fallible return). Leave the previous cache in place rather than
+                // fail the whole call: the write already succeeded and is committed: an
+                // agent's NEXT read/write may briefly see the pre-edit schema, which is
+                // the same staleness window this call exists to close, not a new one —
+                // failing here would not close it either, just add a spurious error on
+                // top of a successful write.
+                error!("Schema rebuild panicked after update_schema write: {e}");
+            }
+        }
 
         let mut text = format!("{summary}\nWrote {rel_file_str}.");
         if !casualties.is_empty() {
@@ -1971,10 +2020,16 @@ impl KbSearchServer {
         //
         // The schema is resolved from the TARGET path's directory, so writing into
         // `lifestyle/kitchen/recipes/` is governed by that folder's rules regardless of
-        // where the caller has been reading. The cascade is rebuilt per write rather
-        // than cached: writes are infrequent, a tree walk is milliseconds, and a stale
-        // cache here would validate against rules the author just changed.
-        let schemas = SchemaCache::build(&self.canonical_data_path, &config.frontmatter);
+        // where the caller has been reading. This reads the shared, server-owned cache
+        // (`KbSearchServer::schema_cache`) rather than rebuilding: at knowledge-base
+        // scale a full tree walk on every write is no longer "a few milliseconds", and
+        // going through `update_schema` keeps this from going stale — that tool
+        // rebuilds and swaps the cache SYNCHRONOUSLY before it returns, specifically so
+        // a write immediately following a schema change is validated against the new
+        // rules rather than the ones it just replaced. A schema edited directly on the
+        // KB's git host (bypassing `update_schema`) is instead picked up by the reindex
+        // worker the next time it sees that `.kb-schema.yaml` dirty.
+        let schemas = crate::schema::load_shared(&self.schema_cache);
         if let Some(reason) = schemas.is_frozen(std::path::Path::new(rel_path)) {
             return Err(McpError::invalid_params(
                 format!(
@@ -2605,6 +2660,15 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
         search: crate::config::SearchConfig::default(),
         reranking: None,
     })
+}
+
+/// An empty `SharedSchemaCache`, for tests that exercise a `KbSearchServer` but do
+/// not care about schema content (e.g. instructions plumbing, path validation).
+/// Tests that DO care build a real one from a temp dir's `.kb-schema.yaml` files —
+/// see `make_write_test_server` below.
+#[cfg(test)]
+pub(crate) fn empty_test_schema_cache() -> crate::schema::SharedSchemaCache {
+    Arc::new(RwLock::new(Arc::new(crate::schema::SchemaCache::default())))
 }
 
 #[cfg(test)]
@@ -3822,6 +3886,7 @@ mod tests {
             &["**/*.md".to_string()],
             instructions,
             make_test_resolved_config(tmp.path()),
+            empty_test_schema_cache(),
             None,
         )
         .unwrap();
@@ -3862,6 +3927,7 @@ mod tests {
             &["**/*.md".to_string()],
             Arc::clone(&instructions),
             make_test_resolved_config(tmp.path()),
+            empty_test_schema_cache(),
             None,
         )
         .unwrap();
@@ -3994,6 +4060,7 @@ mod tests {
             &["**/*.md".to_string()],
             instructions,
             make_test_resolved_config(tmp.path()),
+            empty_test_schema_cache(),
             None,
         )
         .unwrap();
@@ -4034,6 +4101,13 @@ mod tests {
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         let instructions = Arc::new(RwLock::new(String::new()));
+        // Built from whatever `.kb-schema.yaml` files already exist under `tmp` at
+        // this point — callers that need a test to see a schema written must write it
+        // before calling this, exactly as they already do for `write_schema_file`.
+        let canonical = tmp.path().canonicalize().unwrap();
+        let schema_cache: crate::schema::SharedSchemaCache = Arc::new(RwLock::new(Arc::new(
+            crate::schema::SchemaCache::build(&canonical, &config.frontmatter),
+        )));
         KbSearchServer::new(
             embed,
             qdrant,
@@ -4042,6 +4116,7 @@ mod tests {
             include_patterns,
             instructions,
             config,
+            schema_cache,
             None,
         )
         .unwrap()
@@ -5080,6 +5155,73 @@ mod tests {
         assert!(
             pending_after > pending_before,
             "create_document must mark its path dirty on the queue"
+        );
+    }
+
+    /// The correctness case the synchronous rebuild in `update_schema` exists for:
+    /// an agent that widens a rule and then immediately writes against it must be
+    /// validated against the NEW schema, not whatever was cached when the server
+    /// started. If `update_schema` only marked a full reconcile (`mark_full`) and
+    /// left the refresh to the reindex worker, this would fail here, because
+    /// nothing in this test spawns that worker — exactly the regression this test
+    /// is meant to catch.
+    #[tokio::test]
+    async fn create_document_immediately_after_update_schema_validates_against_the_new_rules() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        // The schema baked into the server's cache at construction time below: only
+        // "active" is permitted yet.
+        write_schema_file(
+            &work,
+            "notes",
+            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        let (server, _config) = make_git_backed_server(&work);
+
+        // Sanity check that the OLD schema really does reject "beta" — otherwise the
+        // second half of this test would not be proving anything.
+        let rejected = server
+            .create_document(Parameters(CreateDocumentParams {
+                path: "notes/before.md".to_string(),
+                content: "---\ntitle: Before\nstatus: beta\n---\n\n# Body\n".to_string(),
+                message: None,
+                force_new: Some(true),
+            }))
+            .await;
+        assert!(
+            rejected.is_err(),
+            "sanity check failed: 'beta' must not be permitted before the schema \
+             change — got {rejected:?}"
+        );
+
+        // Widen the rule through the tool an agent would actually use.
+        server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "status".into(),
+                values: Some(vec!["beta".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .expect("update_schema must succeed against this git-backed harness");
+
+        // Same server, same cached schema handle, next call: must see the new rule.
+        let accepted = server
+            .create_document(Parameters(CreateDocumentParams {
+                path: "notes/after.md".to_string(),
+                content: "---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string(),
+                message: None,
+                force_new: Some(true),
+            }))
+            .await;
+        assert!(
+            accepted.is_ok(),
+            "the write immediately after update_schema must validate against the \
+             NEW schema, not a stale cached copy: {:?}",
+            accepted.err()
         );
     }
 

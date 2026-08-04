@@ -768,6 +768,26 @@ impl ResolvedConfig {
         self.source.data_path.as_deref().unwrap_or("/data")
     }
 
+    /// [`Self::data_path`], canonicalized — falling back to the configured path
+    /// unresolved (with a warning) if canonicalization fails, e.g. a fresh clone
+    /// whose directory does not exist yet.
+    ///
+    /// Every consumer of the schema tree (the shared `SchemaCache`, the write
+    /// tools' `resolve_safe_write_path`, `ingest`'s own rel-key derivation) needs
+    /// to agree on the SAME base path, or a relative path computed against one
+    /// silently fails to match a lookup against the other.
+    pub fn canonical_data_path(&self) -> std::path::PathBuf {
+        let configured = std::path::PathBuf::from(self.data_path());
+        configured.canonicalize().unwrap_or_else(|e| {
+            warn!(
+                "Could not canonicalize data_path '{}': {} — using configured path as-is",
+                configured.display(),
+                e
+            );
+            configured
+        })
+    }
+
     /// Derive the state DB path from data_path: `{data_path}/state.db`
     pub fn state_db_path(&self) -> String {
         format!("{}/state.db", self.data_path())
