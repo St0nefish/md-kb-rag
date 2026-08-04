@@ -6,6 +6,7 @@ mod git;
 mod ingest;
 mod mcp;
 mod qdrant;
+mod reindex;
 mod rerank;
 mod retrieval;
 mod schema;
@@ -170,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(parent)
                     .context("Failed to create directory for state DB")?;
             }
-            ingest::run_index(&cfg, full, status::Trigger::Cli).await?;
+            ingest::scan_and_index(&cfg, full, status::Trigger::Cli).await?;
         }
         Commands::Validate { strict } => {
             let data_path = Path::new(cfg.data_path());
@@ -596,6 +597,10 @@ mod tests {
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
             indexing: status::IndexStatus::new().snapshot(),
+            queue: crate::reindex::QueueSnapshot {
+                pending_paths: 0,
+                full_pending: false,
+            },
             store: StoreCounts {
                 indexed_files: Some(330),
                 documents_with_metadata: Some(330),

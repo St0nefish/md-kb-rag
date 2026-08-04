@@ -8,6 +8,12 @@ use std::path::Path;
 use std::str::FromStr;
 use tracing::{debug, warn};
 
+/// Conservative cap on values bound into a single `WHERE file_path IN (...)` query.
+/// SQLite's default limit is 999 bound parameters per statement; staying well under it
+/// leaves room for drivers/wrappers that reserve a few, and keeps a single query from
+/// dominating the connection while a large batch is chunked through it.
+const SQLITE_MAX_PARAMS_PER_QUERY: usize = 500;
+
 /// How a single field is matched when listing documents.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldFilter {
@@ -131,6 +137,35 @@ pub struct IndexedFile {
     /// Fingerprint of the schema this file was last validated against. Empty for rows
     /// written before schema tracking existed, which forces one revalidation pass.
     pub schema_hash: String,
+    /// File modification time (Unix seconds) as of the last successful index of this
+    /// file. The reconcile scan (`ingest::scan_for_dirty`) reads these two columns
+    /// directly via [`ScanRow`] rather than through this struct — nothing currently
+    /// constructs an `IndexedFile` and then inspects `mtime`/`size` on it, hence the
+    /// `allow`. They stay on `IndexedFile` anyway for symmetry with the table schema
+    /// and because `get`/`get_many`/`list_all` are the general-purpose row accessors;
+    /// a future caller (e.g. `status --files`) reaching for "when was this last
+    /// indexed" on a specific row-lookup path shouldn't need a second query type.
+    #[allow(dead_code)]
+    pub mtime: i64,
+    /// File size in bytes as of the last successful index, same purpose and caveat as
+    /// `mtime`. `-1` for rows written before this column existed, which never matches
+    /// a real size and so forces one stat-mismatch (and therefore a content-hash
+    /// check) per file on the first reconcile scan after upgrading.
+    #[allow(dead_code)]
+    pub size: i64,
+}
+
+/// One row from [`StateDb::scan_indexed_files`]: an `indexed_files` row plus the
+/// `documents.content_hash` for the same path, if a metadata row exists at all.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ScanRow {
+    pub file_path: String,
+    pub content_hash: String,
+    pub schema_hash: String,
+    pub mtime: i64,
+    pub size: i64,
+    /// `documents.content_hash` for this path, or `None` if no metadata row exists yet.
+    pub doc_hash: Option<String>,
 }
 
 /// What happened to one document during reprojection.
@@ -261,6 +296,28 @@ impl StateDb {
         )
         .await?;
 
+        // Stat-based pre-filter columns for the reconcile scan (`ingest::scan_for_dirty`):
+        // at corpus sizes in the thousands-to-tens-of-thousands range, content-hashing
+        // every file on every sweep is too expensive, so the scan compares mtime/size
+        // first and only asks the scoped indexer to open (and therefore hash) a file
+        // when one of them changed. `size` defaults to -1, which never matches a real
+        // file size, so every row written before this column existed gets one forced
+        // stat-mismatch (and therefore a real hash check) on the first post-upgrade scan.
+        add_column_if_missing(
+            &pool,
+            "indexed_files",
+            "mtime",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        add_column_if_missing(
+            &pool,
+            "indexed_files",
+            "size",
+            "INTEGER NOT NULL DEFAULT -1",
+        )
+        .await?;
+
         // Document-level metadata index. `frontmatter` is the faithful JSON record and
         // the source of truth; document_fields below is a rebuildable projection of it.
         sqlx::query(
@@ -319,7 +376,7 @@ impl StateDb {
     #[cfg(test)]
     pub async fn get(&self, file_path: &str) -> Result<Option<IndexedFile>> {
         let row = sqlx::query_as::<_, IndexedFile>(
-            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash
+            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, mtime, size
              FROM indexed_files WHERE file_path = ?",
         )
         .bind(file_path)
@@ -329,22 +386,27 @@ impl StateDb {
         Ok(row)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         &self,
         file_path: &str,
         content_hash: &str,
         chunk_count: i64,
         schema_hash: &str,
+        mtime: i64,
+        size: i64,
     ) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO indexed_files
-                (file_path, content_hash, chunk_count, indexed_at, schema_hash)
-             VALUES (?, ?, ?, datetime('now'), ?)",
+                (file_path, content_hash, chunk_count, indexed_at, schema_hash, mtime, size)
+             VALUES (?, ?, ?, datetime('now'), ?, ?, ?)",
         )
         .bind(file_path)
         .bind(content_hash)
         .bind(chunk_count)
         .bind(schema_hash)
+        .bind(mtime)
+        .bind(size)
         .execute(&self.pool)
         .await?;
 
@@ -362,13 +424,100 @@ impl StateDb {
 
     pub async fn list_all(&self) -> Result<Vec<IndexedFile>> {
         let rows = sqlx::query_as::<_, IndexedFile>(
-            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash
+            "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, mtime, size
              FROM indexed_files ORDER BY file_path",
         )
         .fetch_all(&self.pool)
         .await?;
 
         Ok(rows)
+    }
+
+    /// One page of `indexed_files` joined with `documents`, ordered by path.
+    ///
+    /// Used only by the reconcile scan (`ingest::scan_for_dirty`), which needs to
+    /// interleave a `tokio::fs::metadata` stat call (async) between rows — a plain
+    /// callback-based "visit each row" API cannot do that without either boxing
+    /// futures or blocking the executor, so the scan owns its own paging loop and
+    /// calls this once per page instead. At corpus sizes in the thousands-to-tens-of-
+    /// thousands range, a single `list_all()`-style `Vec<IndexedFile>` covering the
+    /// whole table would be a multi-megabyte allocation held for the whole scan; paging
+    /// keeps peak memory bounded by `limit` regardless of corpus size. `LIMIT ...
+    /// OFFSET` is good enough here — a row inserted or deleted by a concurrent write
+    /// mid-scan can shift a page and be seen twice or missed once, but the scan is a
+    /// best-effort detector with a self-healing follow-up (the next scheduled
+    /// reconcile), not the system of record.
+    ///
+    /// `documents.content_hash` is carried along as `doc_hash` so the caller can detect
+    /// metadata staleness — a file whose content is unchanged but whose `documents` row
+    /// is missing or stale relative to `indexed_files.content_hash` — without a second
+    /// query per row.
+    pub async fn fetch_indexed_files_page(&self, limit: i64, offset: i64) -> Result<Vec<ScanRow>> {
+        let rows: Vec<ScanRow> = sqlx::query_as(
+            "SELECT i.file_path, i.content_hash, i.schema_hash, i.mtime, i.size, \
+                    d.content_hash AS doc_hash \
+             FROM indexed_files i LEFT JOIN documents d ON d.file_path = i.file_path \
+             ORDER BY i.file_path LIMIT ? OFFSET ?",
+        )
+        .bind(limit.max(1))
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Batch equivalent of [`Self::get`], for a caller that already knows exactly which
+    /// paths it cares about (the scoped indexer's dirty-path list) and wants one or a
+    /// few round trips instead of one per path. Chunks the `IN (...)` list so a large
+    /// batch cannot exceed SQLite's bound-parameter limit (default 999).
+    pub async fn get_many(&self, file_paths: &[String]) -> Result<HashMap<String, IndexedFile>> {
+        let mut out = HashMap::with_capacity(file_paths.len());
+        for chunk in file_paths.chunks(SQLITE_MAX_PARAMS_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "SELECT file_path, content_hash, chunk_count, indexed_at, schema_hash, mtime, size \
+                 FROM indexed_files WHERE file_path IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for path in chunk {
+                separated.push_bind(path);
+            }
+            builder.push(")");
+            let rows: Vec<IndexedFile> = builder.build_query_as().fetch_all(&self.pool).await?;
+            for row in rows {
+                out.insert(row.file_path.clone(), row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch equivalent of [`Self::get_document_hash`], for the same reason as
+    /// [`Self::get_many`].
+    pub async fn get_document_hashes_many(
+        &self,
+        file_paths: &[String],
+    ) -> Result<HashMap<String, String>> {
+        let mut out = HashMap::with_capacity(file_paths.len());
+        for chunk in file_paths.chunks(SQLITE_MAX_PARAMS_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "SELECT file_path, content_hash FROM documents WHERE file_path IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for path in chunk {
+                separated.push_bind(path);
+            }
+            builder.push(")");
+            let rows: Vec<(String, String)> =
+                builder.build_query_as().fetch_all(&self.pool).await?;
+            out.extend(rows);
+        }
+        Ok(out)
     }
 
     pub async fn clear(&self) -> Result<()> {
@@ -474,8 +623,13 @@ impl StateDb {
 
     /// Content hash of every document that has metadata, keyed by path.
     ///
-    /// Used to detect files the incremental indexer skipped but whose metadata is
-    /// missing or stale, without a per-file query.
+    /// The scoped indexer (`ingest::index_paths`) now uses [`Self::get_document_hashes_many`]
+    /// instead, scoped to just the paths it is processing — loading every document's
+    /// hash at once does not scale to a large corpus. This whole-table equivalent is
+    /// kept as a general-purpose `StateDb` accessor (parallel to [`Self::list_all`])
+    /// rather than removed with its test coverage; `#[allow(dead_code)]` because
+    /// nothing in production calls it now.
+    #[allow(dead_code)]
     pub async fn list_document_hashes(&self) -> Result<HashMap<String, String>> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT file_path, content_hash FROM documents")
@@ -930,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_get() {
         let (db, _dir) = test_db().await;
-        db.upsert("test.md", "abc123", 3, "").await.unwrap();
+        db.upsert("test.md", "abc123", 3, "", 0, 0).await.unwrap();
         let entry = db.get("test.md").await.unwrap().unwrap();
         assert_eq!(entry.file_path, "test.md");
         assert_eq!(entry.content_hash, "abc123");
@@ -940,8 +1094,8 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces() {
         let (db, _dir) = test_db().await;
-        db.upsert("test.md", "hash1", 2, "").await.unwrap();
-        db.upsert("test.md", "hash2", 5, "").await.unwrap();
+        db.upsert("test.md", "hash1", 2, "", 0, 0).await.unwrap();
+        db.upsert("test.md", "hash2", 5, "", 0, 0).await.unwrap();
         let entry = db.get("test.md").await.unwrap().unwrap();
         assert_eq!(entry.content_hash, "hash2");
         assert_eq!(entry.chunk_count, 5);
@@ -950,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes() {
         let (db, _dir) = test_db().await;
-        db.upsert("test.md", "hash", 1, "").await.unwrap();
+        db.upsert("test.md", "hash", 1, "", 0, 0).await.unwrap();
         db.delete("test.md").await.unwrap();
         assert!(db.get("test.md").await.unwrap().is_none());
     }
@@ -958,8 +1112,8 @@ mod tests {
     #[tokio::test]
     async fn list_and_count() {
         let (db, _dir) = test_db().await;
-        db.upsert("a.md", "h1", 1, "").await.unwrap();
-        db.upsert("b.md", "h2", 2, "").await.unwrap();
+        db.upsert("a.md", "h1", 1, "", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 2, "", 0, 0).await.unwrap();
         assert_eq!(db.count().await.unwrap(), 2);
         let all = db.list_all().await.unwrap();
         assert_eq!(all.len(), 2);
@@ -969,8 +1123,8 @@ mod tests {
     #[tokio::test]
     async fn clear_removes_all() {
         let (db, _dir) = test_db().await;
-        db.upsert("a.md", "h1", 1, "").await.unwrap();
-        db.upsert("b.md", "h2", 2, "").await.unwrap();
+        db.upsert("a.md", "h1", 1, "", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 2, "", 0, 0).await.unwrap();
         db.clear().await.unwrap();
         assert_eq!(db.count().await.unwrap(), 0);
     }
@@ -1025,7 +1179,7 @@ mod tests {
     async fn delete_after_failure_allows_reprocessing() {
         let (db, _dir) = test_db().await;
         // Simulate: file was indexed with hash1
-        db.upsert("doc.md", "hash1", 3, "").await.unwrap();
+        db.upsert("doc.md", "hash1", 3, "", 0, 0).await.unwrap();
 
         // Simulate: upsert to Qdrant fails, so we delete the state entry
         // (this is what ingest.rs now does on failure)
@@ -1116,7 +1270,7 @@ mod tests {
         let path = legacy_db(&dir).await;
         let db = StateDb::new(&path).await.unwrap();
 
-        db.upsert("a.md", "hash-a2", 3, "fingerprint")
+        db.upsert("a.md", "hash-a2", 3, "fingerprint", 0, 0)
             .await
             .expect("writing to a migrated row must work");
 
@@ -1165,7 +1319,7 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_db_already_has_the_column() {
         let (db, _dir) = test_db().await;
-        db.upsert("new.md", "h", 1, "fp").await.unwrap();
+        db.upsert("new.md", "h", 1, "fp", 0, 0).await.unwrap();
         assert_eq!(db.get("new.md").await.unwrap().unwrap().schema_hash, "fp");
     }
 
@@ -2082,7 +2236,7 @@ mod tests {
         // never computed on a full run. If clear() left `documents` behind, a file
         // deleted from disk would remain listed forever with no run able to detect it.
         let (db, _dir) = test_db().await;
-        db.upsert("gone.md", "h", 1, "").await.unwrap();
+        db.upsert("gone.md", "h", 1, "", 0, 0).await.unwrap();
         db.upsert_document_metadata("gone.md", &recipe_frontmatter(), 1, "h", 1)
             .await
             .unwrap();
@@ -2157,7 +2311,7 @@ mod tests {
         // The two tables track different things; an existing deployment has one
         // populated and the other empty until a backfill runs.
         let (db, _dir) = test_db().await;
-        db.upsert("r.md", "h1", 2, "").await.unwrap();
+        db.upsert("r.md", "h1", 2, "", 0, 0).await.unwrap();
 
         assert_eq!(db.count().await.unwrap(), 1);
         assert_eq!(db.document_count().await.unwrap(), 0);

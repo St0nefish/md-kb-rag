@@ -225,13 +225,17 @@ struct PendingFile {
     old_chunk_count: usize,
     /// File modification time as Unix timestamp (seconds). Falls back to 0 on metadata/clock error.
     mtime: i64,
+    /// Byte length of `content` as read from disk. Stored alongside `mtime` so the
+    /// next reconcile scan (`scan_for_dirty`) can stat-compare instead of re-reading
+    /// and re-hashing unchanged files.
+    size: i64,
     /// Fingerprint of the schema this file was validated against.
     schema_hash: String,
 }
 
 /// Result of processing a single discovered file.
 enum FileOutcome {
-    /// Unchanged since the last run. Carries the content hash so `run_index` can tell
+    /// Unchanged since the last run. Carries the content hash so `index_paths` can tell
     /// whether the document metadata index is in sync without a per-file query.
     Skipped {
         hash: String,
@@ -242,12 +246,16 @@ enum FileOutcome {
 }
 
 /// Process a single file: hash, skip-if-unchanged, validate, chunk.
+///
+/// `force` bypasses the skip-if-unchanged check below — set only by `index_paths`'
+/// destructive `md-kb-rag index --full` path, where the state DB has just been
+/// cleared, so there is nothing meaningful to compare against anyway.
 #[allow(clippy::too_many_arguments)]
 async fn process_file(
     path: &Path,
     rel_key: &str,
     content: &str,
-    full: bool,
+    force: bool,
     state_entry: Option<IndexedFile>,
     config: &ResolvedConfig,
     schema: &ResolvedSchema,
@@ -255,6 +263,7 @@ async fn process_file(
 ) -> Result<FileOutcome> {
     let file_path = rel_key.to_string();
     let hash = compute_hash_from_bytes(content.as_bytes());
+    let size = content.len() as i64;
 
     // Capture mtime now — used in PendingFile regardless of validation path.
     let mtime = file_mtime(path, &file_path).await;
@@ -264,10 +273,10 @@ async fn process_file(
         .map(|e| e.chunk_count as usize)
         .unwrap_or(0);
 
-    // Skip unchanged files in incremental mode. The schema fingerprint is part of the
+    // Skip unchanged files unless forced. The schema fingerprint is part of the
     // condition: editing a .kb-schema.yaml changes no document's bytes, so without this
     // a tightened rule would never be applied to anything already indexed.
-    if !full
+    if !force
         && let Some(ref entry) = state_entry
         && entry.content_hash == hash
         && entry.schema_hash == schema_hash
@@ -305,6 +314,7 @@ async fn process_file(
                     hash,
                     old_chunk_count,
                     mtime,
+                    size,
                     schema_hash: schema_hash.to_string(),
                 }))
             }
@@ -358,6 +368,7 @@ async fn process_file(
             hash,
             old_chunk_count,
             mtime,
+            size,
             schema_hash: schema_hash.to_string(),
         }))
     }
@@ -479,7 +490,14 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     let mut bookkeeping_failures = 0usize;
     for (pf, (_start, count)) in pending.iter().zip(file_boundaries.iter()) {
         if let Err(e) = state
-            .upsert(&pf.file_path, &pf.hash, *count as i64, &pf.schema_hash)
+            .upsert(
+                &pf.file_path,
+                &pf.hash,
+                *count as i64,
+                &pf.schema_hash,
+                pf.mtime,
+                pf.size,
+            )
             .await
         {
             error!("Failed to update state DB for '{}': {:#}", pf.file_path, e);
@@ -689,17 +707,274 @@ async fn backfill_document_metadata(
     filled
 }
 
-/// Run the indexing pipeline, recording start/finish in [`INDEX_STATUS`].
+// ---------------------------------------------------------------------------
+// Path resolution helpers shared by the scan and the scoped indexer
+// ---------------------------------------------------------------------------
+
+/// Repo-relative key for `path`, matching exactly how `indexed_files.file_path` (and
+/// every Qdrant payload's `file_path`) is stored: `path` stripped of the canonical
+/// `data_path` prefix.
 ///
-/// The body lives in `run_index_inner` so that every exit path — including the `?`
-/// early returns scattered through it — funnels through one `finish` call. The
-/// [`RunGuard`] covers the paths that skip even that: a panic (which `tokio::spawn`
-/// catches at the task boundary, leaving the process alive) or a cancelled future.
-pub async fn run_index(config: &ResolvedConfig, full: bool, trigger: Trigger) -> Result<()> {
-    let mode = RunMode::from_full(full);
+/// Every producer of a path that eventually reaches [`index_paths`] — the reconcile
+/// scan, a webhook's `git diff --name-status`, a write tool's own `rel_path` — has to
+/// agree with this shape, or the mismatch silently orphans points: a path that never
+/// matches an existing key is treated as brand new instead of as the file it actually
+/// is, and the old key's rows/vectors are never revisited by anything.
+fn rel_key_of(path: &Path, data_path: &Path) -> String {
+    match path.strip_prefix(data_path) {
+        Ok(rel) => rel.to_string_lossy().to_string(),
+        Err(_) => {
+            warn!(
+                "Path '{}' does not share data_path prefix — using absolute path as key",
+                path.display()
+            );
+            path.to_string_lossy().to_string()
+        }
+    }
+}
+
+/// Canonicalize `config.data_path()` (falling back to the configured path with a
+/// warning if it does not exist yet — the git clone may create it later) and walk it
+/// for every indexable file, off the executor since it is a synchronous directory
+/// walk. Returns the canonical root plus every discovered file as a path relative to
+/// it, in [`rel_key_of`]'s shape.
+async fn discover_relative(config: &ResolvedConfig) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let configured_data_path = PathBuf::from(config.data_path());
+    let data_path: PathBuf = match configured_data_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "Could not canonicalize data_path '{}': {} — using configured path as-is",
+                configured_data_path.display(),
+                e
+            );
+            configured_data_path.clone()
+        }
+    };
+
+    INDEX_STATUS.set_phase(Phase::Discovering);
+    let indexing_config = config.indexing.clone();
+    let walk_path = data_path.clone();
+    let discovered =
+        tokio::task::spawn_blocking(move || discover_files(&walk_path, &indexing_config))
+            .await
+            .context("File-discovery task panicked")??;
+
+    info!("Discovered {} files", discovered.len());
+    let rel: Vec<PathBuf> = discovered
+        .iter()
+        .map(|p| PathBuf::from(rel_key_of(p, &data_path)))
+        .collect();
+    Ok((data_path, rel))
+}
+
+// ---------------------------------------------------------------------------
+// The reconcile scan — read-only, produces a worklist
+// ---------------------------------------------------------------------------
+
+/// How many `indexed_files` rows [`scan_for_dirty`] holds in memory at once. See
+/// [`StateDb::fetch_indexed_files_page`] for why this is paged rather than loaded in
+/// one query.
+const SCAN_PAGE_SIZE: i64 = 1000;
+
+/// Detect which repo-relative paths need attention from [`index_paths`], without
+/// touching Qdrant or SQLite. This is the ONLY thing that decides a full-corpus
+/// reconcile is needed — `index_paths` never walks the filesystem on its own — and it
+/// is deliberately read-only: mutation lives in exactly one place (`index_paths`), so
+/// there is exactly one place a bug in embedding/upsert/purge logic can hide.
+///
+/// A path is dirty for one of three reasons, and the scan does the minimum work
+/// needed to catch each one without reading a single file's content:
+///
+/// 1. **Changed or new.** It exists on disk with no `indexed_files` row, or with an
+///    `mtime`/`size` that no longer matches the row. This is a pre-filter only — the
+///    content hash remains the sole authority on whether a file actually changed, and
+///    that authoritative check happens when `index_paths` re-reads the file. A false
+///    positive here (mtime touched, bytes unchanged) costs one wasted hash comparison
+///    downstream, not a wasted re-embed; a false negative would silently drop a real
+///    change, which stat cannot produce short of the clock going backwards.
+/// 2. **Orphaned.** It has an `indexed_files` row but no longer exists on disk.
+/// 3. **Metadata-stale.** Content is unchanged (same `indexed_files.content_hash`),
+///    but `documents` has no row for it, or a different hash — the case
+///    `index_paths` resolves with a cheap parse-only refresh, no re-embedding.
+///
+/// At a corpus size of thousands to tens of thousands of documents, content-hashing
+/// (or even just fully materializing) the whole corpus on every sweep would dominate
+/// the sweep's cost; this function never does either.
+pub async fn scan_for_dirty(config: &ResolvedConfig) -> Result<Vec<PathBuf>> {
+    let state = StateDb::new(Path::new(&config.state_db_path()))
+        .await
+        .context("Failed to open state DB")?;
+
+    let (data_path, discovered) = discover_relative(config).await?;
+    INDEX_STATUS.set_files_total(discovered.len() as u64);
+
+    let schemas = SchemaCache::build(&data_path, &config.frontmatter);
+
+    // Every path currently on disk. Needed twice: to tell an orphan (row, no file)
+    // from a live one while paging `indexed_files`, and — via `visited`, below — to
+    // find files that exist but have no row at all (brand new).
+    let seen: HashSet<String> = discovered
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let mut visited: HashSet<String> = HashSet::with_capacity(seen.len());
+    let mut dirty: HashSet<PathBuf> = HashSet::new();
+
+    INDEX_STATUS.set_phase(Phase::Scanning);
+    let mut scanned = 0usize;
+    let mut last_progress = std::time::Instant::now();
+    let mut offset = 0i64;
+    loop {
+        let page = state
+            .fetch_indexed_files_page(SCAN_PAGE_SIZE, offset)
+            .await
+            .context("Failed to page indexed_files during reconcile scan")?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+
+        for row in &page {
+            scanned += 1;
+            INDEX_STATUS.set_files_done(scanned as u64);
+            if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+                info!(scanned, "Reconcile scan in progress…");
+                last_progress = std::time::Instant::now();
+            }
+
+            visited.insert(row.file_path.clone());
+
+            if !seen.contains(&row.file_path) {
+                // Row survives, file does not: orphaned.
+                dirty.insert(PathBuf::from(&row.file_path));
+                continue;
+            }
+
+            let rel = Path::new(&row.file_path);
+            if schemas.is_frozen(rel).is_some() {
+                // Frozen scopes are never touched by the scan or the indexer, exactly
+                // as a full walk-based run has always skipped them.
+                continue;
+            }
+
+            // Reason 1a: the schema fingerprint moved. Cheap — no disk I/O, just a
+            // lookup against the already-built schema tree — and it can flip a file
+            // dirty even when its bytes and stat metadata are untouched.
+            if schemas.resolve_for(rel).fingerprint() != row.schema_hash {
+                dirty.insert(PathBuf::from(&row.file_path));
+                continue;
+            }
+
+            // Reason 1b: stat pre-filter. The only per-file disk access this function
+            // performs, and it is a metadata syscall, never a content read.
+            let abs = data_path.join(&row.file_path);
+            match tokio::fs::metadata(&abs).await {
+                Ok(meta) => {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let size = meta.len() as i64;
+                    if mtime != row.mtime || size != row.size {
+                        dirty.insert(PathBuf::from(&row.file_path));
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    // Existed moments ago in `discovered`; a stat failure now is most
+                    // likely a TOCTOU race (deleted or replaced between the walk and
+                    // this call). Mark it dirty rather than silently skipping —
+                    // `index_paths` re-checks existence itself and will resolve this
+                    // one way or the other.
+                    debug!(
+                        "Stat failed for '{}', marking dirty: {:#}",
+                        row.file_path, e
+                    );
+                    dirty.insert(PathBuf::from(&row.file_path));
+                    continue;
+                }
+            }
+
+            // Reason 3: metadata staleness. Unchanged content, but the metadata index
+            // disagrees with (or lacks) it.
+            if row.doc_hash.as_deref() != Some(row.content_hash.as_str()) {
+                dirty.insert(PathBuf::from(&row.file_path));
+            }
+        }
+
+        if (page_len as i64) < SCAN_PAGE_SIZE {
+            break;
+        }
+        offset += SCAN_PAGE_SIZE;
+    }
+
+    // Reason 2: files on disk with no `indexed_files` row at all — but still subject
+    // to the same frozen-scope exclusion as every other path here. Without this check
+    // a new file dropped into a frozen scope would be marked dirty on every sweep
+    // forever (it never gets an `indexed_files` row, since `index_paths` also skips
+    // frozen paths), for no benefit — it can never actually be indexed until the
+    // schema is fixed.
+    for rel_key in seen.difference(&visited) {
+        if schemas.is_frozen(Path::new(rel_key)).is_some() {
+            continue;
+        }
+        dirty.insert(PathBuf::from(rel_key));
+    }
+
+    info!(
+        dirty = dirty.len(),
+        discovered = discovered.len(),
+        "Reconcile scan complete"
+    );
+
+    Ok(dirty.into_iter().collect())
+}
+
+// ---------------------------------------------------------------------------
+// The scoped indexer — the only function that mutates the index
+// ---------------------------------------------------------------------------
+
+/// (Re)index exactly the given repo-relative `paths`, and nothing else. Recording
+/// start/finish in [`INDEX_STATUS`] like every indexing run.
+///
+/// **This is the only function in the whole system that ever mutates Qdrant,
+/// `indexed_files`, `documents`, or `document_fields`.** Every producer of work — the
+/// MCP write tools, the webhook handler, the background reindex worker (fed by
+/// [`scan_for_dirty`] or by a `git diff`), and the CLI (via [`scan_and_index`]) — first
+/// turns "what changed" into a list of paths, then calls this. That is a deliberate
+/// invariant, not an accident of how the code happened to get organized: there is
+/// exactly one place an embedding/upsert/purge bug can hide, and exactly one place to
+/// look when the index and the filesystem disagree.
+///
+/// For each path: if the file exists on disk it is (re)read and hashed; if its content
+/// or governing schema fingerprint actually changed (or `force` is set), it is
+/// chunked, embedded, and upserted. If unchanged but the metadata index is stale, only
+/// that (cheap, parse-only) metadata is refreshed — **no re-embedding**. If the file
+/// does not exist on disk, its points and rows are purged. This exactly mirrors
+/// [`FileOutcome`] — see [`process_file`].
+///
+/// `force = true` bypasses the skip-if-unchanged check and, before touching any path,
+/// drops and recreates the Qdrant collection and clears the state DB — this is
+/// `md-kb-rag index --full`'s destructive-rebuild semantics, unchanged from before this
+/// module split scanning out of indexing. **It is safe only when `paths` is the
+/// complete set of files on disk**, which [`scan_and_index`] guarantees by discovering
+/// fresh rather than scanning. Calling this with `force = true` on a partial path list
+/// would drop the whole collection and rebuild it from just those paths, destroying
+/// every other document's vectors — nothing in the worker/queue path ever sets `force`;
+/// only the CLI's `--full` flag does.
+pub async fn index_paths(
+    config: &ResolvedConfig,
+    paths: &[PathBuf],
+    force: bool,
+    trigger: Trigger,
+) -> Result<()> {
+    let mode = RunMode::from_full(force);
     let run = INDEX_STATUS.begin(mode, trigger);
 
-    let result = run_index_inner(config, full, trigger).await;
+    let result = index_paths_inner(config, paths, force).await;
 
     match &result {
         Ok(()) => run.finish(None),
@@ -720,11 +995,11 @@ pub async fn run_index(config: &ResolvedConfig, full: bool, trigger: Trigger) ->
     result
 }
 
-async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) -> Result<()> {
+async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bool) -> Result<()> {
     let run_start = std::time::Instant::now();
     info!(
-        mode = if full { "full" } else { "incremental" },
-        trigger = trigger.as_str(),
+        mode = if force { "full" } else { "scoped" },
+        trigger_paths = paths.len(),
         data_path = config.data_path(),
         collection = %config.qdrant.collection,
         "Starting indexing run"
@@ -756,11 +1031,24 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
     let collection = &config.qdrant.collection;
     let vector_size = config.embedding.vector_size;
 
+    // Canonicalize data_path the same way discover_relative does, so joining it with a
+    // repo-relative path and later stripping it again round-trips exactly.
+    let configured_data_path = PathBuf::from(config.data_path());
+    let data_path: PathBuf = match configured_data_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "Could not canonicalize data_path '{}': {} — using configured path as-is",
+                configured_data_path.display(),
+                e
+            );
+            configured_data_path.clone()
+        }
+    };
+
     // Discover and merge every .kb-schema.yaml once. Resolution afterwards is an
-    // in-memory prefix lookup, so this stays O(schema files) rather than O(documents).
-    // The walk root only determines the relative scope keys, so the configured path
-    // works here even though `data_path` is canonicalized further down.
-    let schemas = SchemaCache::build(Path::new(config.data_path()), &config.frontmatter);
+    // in-memory prefix lookup, so this stays O(schema files) rather than O(paths).
+    let schemas = SchemaCache::build(&data_path, &config.frontmatter);
     for (scope, reason) in schemas.broken_scopes() {
         error!(
             "Invalid schema at {}/{}: {} — documents in this scope are frozen and will \
@@ -779,8 +1067,8 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
     // A full reindex drops the collection and rebuilds it, but frozen documents are
     // skipped during the rebuild — so their vectors would be deleted and never
     // restored, leaving them invisible to search while still listed in the metadata
-    // index. Refuse rather than destroy data; incremental indexing is unaffected.
-    if full && schemas.broken_scopes().count() > 0 {
+    // index. Refuse rather than destroy data; scoped indexing is unaffected.
+    if force && schemas.broken_scopes().count() > 0 {
         let scopes: Vec<String> = schemas
             .broken_scopes()
             .map(|(dir, _)| dir.display().to_string())
@@ -788,15 +1076,15 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
         anyhow::bail!(
             "Refusing a full reindex while {} schema file(s) are invalid ({}). A full \
              run rebuilds the collection from scratch and cannot reindex frozen scopes, \
-             so their vectors would be lost. Fix the schema(s), or run an incremental \
+             so their vectors would be lost. Fix the schema(s), or run a scoped/incremental \
              index instead.",
             scopes.len(),
             scopes.join(", ")
         );
     }
 
-    // ── Full-mode: drop Qdrant collection so it is recreated clean ───────────
-    if full {
+    // ── force: drop Qdrant collection so it is recreated clean ───────────────
+    if force {
         info!("Full reindex: dropping Qdrant collection");
         store
             .drop_collection(collection)
@@ -811,80 +1099,45 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
 
     // Clear state only after the collection exists; a clear failure then leaves
     // an empty collection + populated state, which recovers on the next run.
-    if full {
+    if force {
         state.clear().await.context("Failed to clear state DB")?;
     }
 
     let embedder = EmbedClient::new(&config.embedding);
 
-    // ── File discovery ───────────────────────────────────────────────────────
-    // Canonicalize data_path once so that strip_prefix is reliable even when
-    // the path contains symlinks. We do this AFTER ensure_repo so the directory
-    // should exist by now. If canonicalize fails (path still absent), fall back
-    // to the configured path with a warning — the git clone may create it later.
-    let configured_data_path = PathBuf::from(config.data_path());
-    let data_path: PathBuf = match configured_data_path.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "Could not canonicalize data_path '{}': {} — using configured path as-is",
-                configured_data_path.display(),
-                e
-            );
-            configured_data_path.clone()
-        }
+    INDEX_STATUS.set_files_total(paths.len() as u64);
+
+    let rel_keys: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    // Batch-loaded for exactly the paths in scope — not the whole corpus. A dirty set
+    // from a big reconcile sweep can run to thousands of paths, so this is one or a
+    // few round trips (see `SQLITE_MAX_PARAMS_PER_QUERY`) rather than one per path.
+    let state_map = if force {
+        // The state DB was just cleared above; every lookup would be a wasted query
+        // that always returns nothing.
+        HashMap::new()
+    } else {
+        state
+            .get_many(&rel_keys)
+            .await
+            .context("Failed to load state rows for the given paths")?
+    };
+    let document_hashes = if force {
+        HashMap::new()
+    } else {
+        state
+            .get_document_hashes_many(&rel_keys)
+            .await
+            .context("Failed to load document metadata hashes for the given paths")?
     };
 
-    // Offload the synchronous directory walk to a blocking thread so we don't
-    // stall the tokio executor on large knowledge bases.
-    INDEX_STATUS.set_phase(Phase::Discovering);
-    let indexing_config = config.indexing.clone();
-    let walk_path = data_path.clone();
-    let discovered =
-        tokio::task::spawn_blocking(move || discover_files(&walk_path, &indexing_config))
-            .await
-            .context("File-discovery task panicked")??;
-
-    info!("Discovered {} files", discovered.len());
-    INDEX_STATUS.set_files_total(discovered.len() as u64);
-
-    // ── Determine which previously-indexed files no longer exist ─────────────
-    let all_indexed = state.list_all().await.context("Failed to list state DB")?;
-    let discovered_set: HashSet<String> = discovered
-        .iter()
-        .map(|p| match p.strip_prefix(&data_path) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
-            Err(_) => {
-                warn!(
-                    "Discovered file '{}' does not share data_path prefix",
-                    p.display()
-                );
-                p.to_string_lossy().to_string()
-            }
-        })
-        .collect();
-
-    let orphaned: Vec<String> = all_indexed
-        .iter()
-        .map(|f| f.file_path.clone())
-        .filter(|fp| !discovered_set.contains(fp))
-        .collect();
-
-    let indexed_map: HashMap<String, IndexedFile> = all_indexed
-        .into_iter()
-        .map(|f| (f.file_path.clone(), f))
-        .collect();
-
-    // Content hashes already reflected in the document metadata index. Fetched once so
-    // the per-file loop can detect metadata drift without querying per file.
-    let document_hashes = state
-        .list_document_hashes()
-        .await
-        .context("Failed to list document metadata")?;
-
-    // ── Per-file processing ──────────────────────────────────────────────────
+    // ── Per-path processing ──────────────────────────────────────────────────
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut backfill_queue: Vec<(String, PathBuf)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     let mut skipped = 0usize;
     let mut invalid = 0usize;
     let mut empty = 0usize;
@@ -895,33 +1148,38 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
     let mut scanned = 0usize;
     let mut last_progress = std::time::Instant::now();
 
-    for path in &discovered {
+    for rel_key in &rel_keys {
         // Counted at the top so the `continue` arms below still advance progress —
         // a scan that stalls on unreadable files should look like it is moving.
         scanned += 1;
         INDEX_STATUS.set_files_done(scanned as u64);
         if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
-            info!(
-                scanned,
-                total = discovered.len(),
-                "Scanning files for changes…"
-            );
+            info!(scanned, total = rel_keys.len(), "Indexing given paths…");
             last_progress = std::time::Instant::now();
         }
 
-        let rel_key = match path.strip_prefix(&data_path) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
-            Err(_) => {
-                warn!(
-                    "File path '{}' does not share data_path prefix — using absolute path as key",
-                    path.display()
-                );
-                path.to_string_lossy().to_string()
-            }
-        };
+        let abs_path = data_path.join(rel_key);
+
+        // Missing on disk: treat as a delete, purged in a single batch below rather
+        // than one Qdrant round trip per path.
+        if !abs_path.exists() {
+            missing.push(rel_key.clone());
+            continue;
+        }
+
+        let rel = Path::new(rel_key.as_str());
+        if let Some(reason) = schemas.is_frozen(rel) {
+            // The schema governing this document failed to parse. Applying the
+            // parent's rules instead would silently enforce rules we know are wrong
+            // across a whole subtree, so the scope is frozen: nothing here is indexed
+            // or re-indexed, and whatever is already in the index stays untouched.
+            debug!("Frozen scope, skipping {}: {}", rel_key, reason);
+            frozen += 1;
+            continue;
+        }
 
         // Read file once — used for hashing, validation, and chunking (fix TOCTOU #51)
-        let content = match tokio::fs::read_to_string(path).await {
+        let content = match tokio::fs::read_to_string(&abs_path).await {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to read {}: {:#}", rel_key, e);
@@ -930,26 +1188,15 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
             }
         };
 
-        let state_entry = indexed_map.get(&rel_key).cloned();
-
-        let rel = Path::new(&rel_key);
-        if let Some(reason) = schemas.is_frozen(rel) {
-            // The schema governing this document failed to parse. Applying the parent's
-            // rules instead would silently enforce rules we know are wrong across a
-            // whole subtree, so the scope is frozen: nothing here is indexed or
-            // re-indexed, and whatever is already in the index stays untouched.
-            debug!("Frozen scope, skipping {}: {}", rel_key, reason);
-            frozen += 1;
-            continue;
-        }
         let schema = schemas.resolve_for(rel);
         let schema_hash = schema.fingerprint();
+        let state_entry = state_map.get(rel_key).cloned();
 
         match process_file(
-            path,
-            &rel_key,
+            &abs_path,
+            rel_key,
             &content,
-            full,
+            force,
             state_entry,
             config,
             schema,
@@ -961,8 +1208,8 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
                 skipped += 1;
                 // Unchanged content, but the metadata index may still be missing or
                 // stale for this file — queue it for a cheap parse-only backfill.
-                if document_hashes.get(&rel_key) != Some(&hash) {
-                    backfill_queue.push((rel_key.clone(), path.clone()));
+                if document_hashes.get(rel_key) != Some(&hash) {
+                    backfill_queue.push((rel_key.clone(), abs_path.clone()));
                 }
             }
             FileOutcome::Invalid => invalid += 1,
@@ -988,19 +1235,22 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
             "Backfilling document metadata for {} unchanged file(s)",
             backfill_queue.len()
         );
-        backfill_document_metadata(&backfill_queue, &state, &indexed_map, &schemas).await
+        backfill_document_metadata(&backfill_queue, &state, &state_map, &schemas).await
     };
 
-    // ── Handle orphaned (deleted) files ──────────────────────────────────────
-    if !orphaned.is_empty() {
+    // ── Handle missing (deleted) files ───────────────────────────────────────
+    if !missing.is_empty() {
         INDEX_STATUS.set_phase(Phase::RemovingOrphans);
-        info!("Removing {} orphaned file(s) from index", orphaned.len());
-        remove_orphans(&orphaned, &store, &state, collection).await?;
+        info!("Removing {} missing file(s) from index", missing.len());
+        remove_orphans(&missing, &store, &state, collection).await?;
     }
 
     // ── Summary ──────────────────────────────────────────────────────────────
+    // `discovered` keeps its established meaning of "how many paths this run
+    // considered" — for a scoped run that is the size of the given worklist, not a
+    // filesystem walk count, which is now `scan_for_dirty`'s concern entirely.
     let counters = crate::status::RunCounters {
-        discovered: discovered.len() as u64,
+        discovered: paths.len() as u64,
         indexed: pending_count as u64,
         skipped: skipped as u64,
         invalid: invalid as u64,
@@ -1009,7 +1259,7 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
         metadata_backfilled: backfilled as u64,
         frozen_by_broken_schema: frozen as u64,
         broken_schemas: schemas.broken_scopes().count() as u64,
-        orphans_removed: orphaned.len() as u64,
+        orphans_removed: missing.len() as u64,
     };
     INDEX_STATUS.set_counters(counters.clone());
 
@@ -1029,6 +1279,33 @@ async fn run_index_inner(config: &ResolvedConfig, full: bool, trigger: Trigger) 
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous scan-then-index, for callers with no worker
+// ---------------------------------------------------------------------------
+
+/// Scan, then index whatever the scan found — for callers that have no background
+/// worker to hand a dirty-path queue to: the `md-kb-rag index` CLI subcommand, and the
+/// server's own pre-worker bootstrap immediately after a fresh git clone. Both need a
+/// synchronous, in-process "bring the index up to date" call, which this provides by
+/// composing [`scan_for_dirty`] and [`index_paths`].
+///
+/// `force = true` is `--full`: rather than scanning (which would compare against state
+/// this call is about to clear, and would trivially mark everything dirty once state
+/// IS clear), it discovers every file directly and indexes all of them with
+/// `force = true` — see [`index_paths`] for why that combination is only ever safe with
+/// a complete path list, which a fresh discovery walk guarantees.
+pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigger) -> Result<()> {
+    if force {
+        let (_data_path, all_paths) = discover_relative(config).await?;
+        index_paths(config, &all_paths, true, trigger).await
+    } else {
+        let dirty = scan_for_dirty(config)
+            .await
+            .context("Reconcile scan failed")?;
+        index_paths(config, &dirty, false, trigger).await
+    }
 }
 
 #[cfg(test)]
@@ -1134,18 +1411,18 @@ mod tests {
     /// second global-touching test is ever added, both need serializing — `cargo test`
     /// runs tests in parallel threads within one process.
     #[tokio::test]
-    async fn run_index_records_a_failed_run_in_the_global_status() {
+    async fn index_paths_records_a_failed_run_in_the_global_status() {
         let dir = TempDir::new().unwrap();
         let mut config = config_no_validation();
         config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
-        // Port 1 refuses immediately, so `ensure_collection` fails before discovery and
-        // the run ends in an error without needing any live service.
+        // Port 1 refuses immediately, so `ensure_collection` fails before any per-path
+        // work and the run ends in an error without needing any live service.
         config.qdrant.url = "http://127.0.0.1:1".into();
 
-        let result = run_index(&config, false, Trigger::Cli).await;
+        let result = index_paths(&config, &[], false, Trigger::Cli).await;
         assert!(result.is_err(), "expected the run to fail");
 
-        // Without this assertion, swapping the Ok/Err arms in `run_index` — reporting a
+        // Without this assertion, swapping the Ok/Err arms in `index_paths` — reporting a
         // failed run as a success — passes the entire suite. That would defeat the
         // point of the feature: `/status` would claim the index is healthy while every
         // run is failing, and `kb_index_last_success_timestamp_seconds` would keep
@@ -1165,6 +1442,198 @@ mod tests {
         assert!(
             snap.last_success_unix.is_none(),
             "a failing run must not stamp a success timestamp"
+        );
+    }
+
+    // -- scan_for_dirty -------------------------------------------------------
+    //
+    // Pure state-DB + filesystem behavior — no Qdrant or embeddings involved, since
+    // the scan never touches either. Every test opens a real (tempfile-backed)
+    // StateDb, matching how `scan_for_dirty` itself opens one.
+
+    /// Fingerprint of the schema `scan_for_dirty` will compute for `rel_path` given a
+    /// KB rooted at `data_path` with no `.kb-schema.yaml` files — i.e. the plain
+    /// config-derived root schema, computed the exact same way `scan_for_dirty` does
+    /// internally, so tests never have to assume anything about the hash's shape.
+    fn expected_schema_hash(
+        data_path: &std::path::Path,
+        frontmatter: &crate::config::FrontmatterConfig,
+    ) -> String {
+        let schemas = SchemaCache::build(data_path, frontmatter);
+        schemas
+            .resolve_for(std::path::Path::new("doc.md"))
+            .fingerprint()
+    }
+
+    /// Build a config rooted at `dir`, with a real (not-yet-created) state DB path.
+    fn scan_test_config(dir: &TempDir) -> ResolvedConfig {
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        config
+    }
+
+    async fn open_scan_test_db(config: &ResolvedConfig) -> StateDb {
+        StateDb::new(Path::new(&config.state_db_path()))
+            .await
+            .unwrap()
+    }
+
+    fn stat(path: &Path) -> (i64, i64) {
+        let meta = std::fs::metadata(path).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        (mtime, meta.len() as i64)
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_flags_a_file_with_no_indexed_files_row() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        std::fs::write(dir.path().join("new.md"), "# New").unwrap();
+
+        let dirty = scan_for_dirty(&config).await.unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("new.md")]);
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_ignores_a_file_whose_stat_and_metadata_are_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc").unwrap();
+        let (mtime, size) = stat(&path);
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+
+        let db = open_scan_test_db(&config).await;
+        db.upsert("doc.md", "some-hash", 1, &schema_hash, mtime, size)
+            .await
+            .unwrap();
+        let mut fm = HashMap::new();
+        fm.insert("title".into(), serde_json::json!("Doc"));
+        db.upsert_document_metadata("doc.md", &fm, mtime, "some-hash", 1)
+            .await
+            .unwrap();
+
+        let dirty = scan_for_dirty(&config).await.unwrap();
+        assert!(
+            dirty.is_empty(),
+            "unchanged stat + fresh metadata must not be marked dirty: {dirty:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_flags_a_file_whose_mtime_changed() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc").unwrap();
+        let (mtime, size) = stat(&path);
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+
+        let db = open_scan_test_db(&config).await;
+        // Record a DIFFERENT mtime than what's actually on disk, simulating a file
+        // that was touched (or genuinely edited) since the last index.
+        db.upsert("doc.md", "some-hash", 1, &schema_hash, mtime - 1000, size)
+            .await
+            .unwrap();
+        let mut fm = HashMap::new();
+        fm.insert("title".into(), serde_json::json!("Doc"));
+        db.upsert_document_metadata("doc.md", &fm, mtime, "some-hash", 1)
+            .await
+            .unwrap();
+
+        let dirty = scan_for_dirty(&config).await.unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("doc.md")]);
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_flags_a_row_whose_file_no_longer_exists() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+
+        // No file written to disk at all — a row with nothing behind it.
+        let db = open_scan_test_db(&config).await;
+        db.upsert("gone.md", "some-hash", 1, &schema_hash, 0, 0)
+            .await
+            .unwrap();
+
+        let dirty = scan_for_dirty(&config).await.unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("gone.md")]);
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_flags_stale_metadata_without_a_content_change() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc").unwrap();
+        let (mtime, size) = stat(&path);
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+
+        // indexed_files says "some-hash", but there is no `documents` row at all —
+        // the upgrade/backfill case, not a content change.
+        let db = open_scan_test_db(&config).await;
+        db.upsert("doc.md", "some-hash", 1, &schema_hash, mtime, size)
+            .await
+            .unwrap();
+
+        let dirty = scan_for_dirty(&config).await.unwrap();
+        assert_eq!(
+            dirty,
+            vec![PathBuf::from("doc.md")],
+            "stat and schema are unchanged, but missing metadata must still surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_flags_a_schema_fingerprint_change_even_with_unchanged_stat() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc").unwrap();
+        let (mtime, size) = stat(&path);
+
+        let db = open_scan_test_db(&config).await;
+        // A fingerprint that will never match the real one built from `dir` — stands
+        // in for "the schema changed since this was last indexed".
+        db.upsert("doc.md", "some-hash", 1, "stale-fingerprint", mtime, size)
+            .await
+            .unwrap();
+        let mut fm = HashMap::new();
+        fm.insert("title".into(), serde_json::json!("Doc"));
+        db.upsert_document_metadata("doc.md", &fm, mtime, "some-hash", 1)
+            .await
+            .unwrap();
+
+        let dirty = scan_for_dirty(&config).await.unwrap();
+        assert_eq!(dirty, vec![PathBuf::from("doc.md")]);
+    }
+
+    #[tokio::test]
+    async fn scan_for_dirty_never_flags_a_file_under_a_frozen_scope() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        std::fs::create_dir_all(dir.path().join("broken")).unwrap();
+        // Deliberately invalid schema YAML — this scope is "frozen": the indexer
+        // refuses to touch anything under it until the file is fixed.
+        std::fs::write(
+            dir.path().join("broken/.kb-schema.yaml"),
+            "fields: [not, a, mapping]",
+        )
+        .unwrap();
+        // Neither a new file nor a previously-indexed one under the broken scope
+        // should ever be marked dirty.
+        std::fs::write(dir.path().join("broken/new.md"), "# New").unwrap();
+
+        let dirty = scan_for_dirty(&config).await.unwrap();
+        assert!(
+            dirty.is_empty(),
+            "a frozen scope must never be marked dirty by the scan: {dirty:?}"
         );
     }
 
@@ -1291,7 +1760,9 @@ mod tests {
         )
         .unwrap();
 
-        db.upsert("recipe.md", "stale-hash", 3, "").await.unwrap();
+        db.upsert("recipe.md", "stale-hash", 3, "", 0, 0)
+            .await
+            .unwrap();
         assert_eq!(db.document_count().await.unwrap(), 0);
 
         let indexed: HashMap<String, IndexedFile> = db
@@ -1394,6 +1865,8 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            mtime: 0,
+            size: 0,
         });
 
         let config = config_no_validation();
@@ -1425,6 +1898,8 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            mtime: 0,
+            size: 0,
         });
 
         let config = config_no_validation();
@@ -1464,6 +1939,8 @@ mod tests {
             chunk_count: 1,
             indexed_at: String::new(),
             schema_hash: String::new(),
+            mtime: 0,
+            size: 0,
         });
 
         let config = config_no_validation();
@@ -1651,6 +2128,8 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: "abc".into(),
+            mtime: 0,
+            size: 0,
         });
 
         let outcome = process_file(
@@ -1684,6 +2163,8 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: "old-fingerprint".into(),
+            mtime: 0,
+            size: 0,
         });
 
         let outcome = process_file(
@@ -1723,6 +2204,8 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: String::new(),
+            mtime: 0,
+            size: 0,
         });
 
         let outcome = process_file(
@@ -1761,6 +2244,8 @@ mod tests {
             chunk_count: 1,
             indexed_at: "now".into(),
             schema_hash: String::new(),
+            mtime: 0,
+            size: 0,
         });
 
         let outcome = process_file(
@@ -1827,6 +2312,7 @@ mod tests {
             include: vec!["**/*.md".into()],
             exclude: vec![],
             exclude_files: vec![],
+            reconcile_interval_secs: 60,
         };
         let files = discover_files(dir.path(), &indexing).unwrap();
         assert_eq!(files.len(), 2);
@@ -1846,6 +2332,7 @@ mod tests {
             include: vec!["**/*.md".into()],
             exclude: vec!["archive/**".into()],
             exclude_files: vec!["README.md".into()],
+            reconcile_interval_secs: 60,
         };
         let files = discover_files(dir.path(), &indexing).unwrap();
         assert_eq!(files.len(), 1);
@@ -2026,6 +2513,7 @@ mod tests {
             hash: "abc123".to_string(),
             old_chunk_count,
             mtime: 1_700_000_000,
+            size: 123,
         }
     }
 
@@ -2061,7 +2549,7 @@ mod tests {
 
         // Seed state DB with an entry
         state
-            .upsert("data/orphan.md", "hash1", 3, "")
+            .upsert("data/orphan.md", "hash1", 3, "", 0, 0)
             .await
             .unwrap();
 
@@ -2091,7 +2579,7 @@ mod tests {
         fm.insert("title".into(), serde_json::json!("Orphan"));
         fm.insert("tags".into(), serde_json::json!(["note", "stale"]));
 
-        state.upsert("gone.md", "h", 1, "").await.unwrap();
+        state.upsert("gone.md", "h", 1, "", 0, 0).await.unwrap();
         state
             .upsert_document_metadata("gone.md", &fm, 1, "h", 1)
             .await
@@ -2129,7 +2617,7 @@ mod tests {
 
         // Seed state with a previously-indexed file
         state
-            .upsert("data/test.md", "old-hash", 2, "")
+            .upsert("data/test.md", "old-hash", 2, "", 0, 0)
             .await
             .unwrap();
 
@@ -2220,7 +2708,7 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         state
-            .upsert("data/test.md", "old-hash", 2, "")
+            .upsert("data/test.md", "old-hash", 2, "", 0, 0)
             .await
             .unwrap();
 
@@ -2246,7 +2734,7 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         state
-            .upsert("data/shrink.md", "old-hash", 3, "")
+            .upsert("data/shrink.md", "old-hash", 3, "", 0, 0)
             .await
             .unwrap();
 
@@ -2285,7 +2773,7 @@ mod tests {
         let state = test_state_db(&dir).await;
 
         state
-            .upsert("data/grow.md", "old-hash", 1, "")
+            .upsert("data/grow.md", "old-hash", 1, "", 0, 0)
             .await
             .unwrap();
 
@@ -2331,6 +2819,7 @@ mod tests {
             include: vec!["**/*.md".into()],
             exclude: vec![],
             exclude_files: vec![],
+            reconcile_interval_secs: 60,
         };
         let files = discover_files(dir.path(), &indexing).unwrap();
 
@@ -2357,6 +2846,7 @@ mod tests {
             include: vec!["**/*.md".into()],
             exclude: vec![],
             exclude_files: vec![],
+            reconcile_interval_secs: 60,
         };
 
         // This should complete without hanging or panicking

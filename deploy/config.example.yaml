@@ -74,6 +74,14 @@ indexing:
     - "CLAUDE.md"
     - "README.md"
 
+  # How often (seconds) the background reindex worker runs a full reconcile sweep,
+  # independent of anything a write/webhook/startup already marked dirty. This is a
+  # backstop for LOST events (process died mid-run, a webhook never arrived, Qdrant
+  # was down when a write tried to mark its path) — not the indexing interval. Normal
+  # writes and webhook pushes are indexed near-instantly regardless of this value; a
+  # lost event can go unnoticed for up to this long before the next sweep catches it.
+  reconcile_interval_secs: 600
+
 
 # ----------------------------------------------------------------------------
 # frontmatter — YAML frontmatter schema and enforcement

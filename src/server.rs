@@ -181,6 +181,11 @@ const STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 /// response" beats making the endpoint that answers "is anything wrong?" the one thing
 /// that hangs when something is.
 const STATUS_QDRANT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long graceful shutdown waits for an in-flight indexing run to finish before
+/// giving up and letting the process exit anyway. A run this long is already an
+/// anomaly the reconcile sweep will retry after restart; shutdown should not hang
+/// indefinitely behind it.
+const SHUTDOWN_INDEX_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct StatusState {
@@ -262,6 +267,10 @@ pub struct StatusResponse {
     pub collection: String,
     pub data_path: String,
     pub indexing: crate::status::StatusSnapshot,
+    /// Pending work on the reindex worker's dirty-path queue — always idle (0 paths,
+    /// no full reconcile pending) for `md-kb-rag status`, which runs in its own
+    /// process with no worker of its own, same caveat as `indexing`.
+    pub queue: crate::reindex::QueueSnapshot,
     pub store: StoreCounts,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub breakdown: Vec<FieldBreakdown>,
@@ -297,9 +306,11 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
                 // Orphan removal always deletes metadata before bookkeeping, so within
                 // one process `documents <= indexed_files` holds by construction. A
                 // negative value means something violated that — most plausibly a CLI
-                // `index` run interleaving with the server's, since REINDEX_LOCK only
-                // serializes within a process. Clamping it to zero would report perfect
-                // health for exactly the corruption this field exists to catch.
+                // `index` run interleaving with the server's, since the reindex worker
+                // (`src/reindex.rs`) is the sole index mutator only WITHIN a process; it
+                // has no way to coordinate with a separate `md-kb-rag index` process.
+                // Clamping it to zero would report perfect health for exactly the
+                // corruption this field exists to catch.
                 if missing < 0 {
                     store.errors.push(format!(
                         "metadata index has {} more document(s) than the state DB tracks; \
@@ -398,6 +409,7 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
         collection: state.config.qdrant.collection.clone(),
         data_path: state.config.data_path().to_string(),
         indexing: crate::status::INDEX_STATUS.snapshot(),
+        queue: crate::reindex::REINDEX_QUEUE.snapshot(),
         store,
         breakdown,
     }
@@ -512,6 +524,21 @@ pub fn render_prometheus(status: &StatusResponse) -> String {
         "Seconds since this process started.",
         "gauge",
         &plain(status.uptime_secs),
+    );
+
+    metric(
+        "kb_reindex_queue_pending_paths",
+        "Repo-relative paths currently marked dirty on the reindex worker's queue, \
+         awaiting the next drain.",
+        "gauge",
+        &plain(status.queue.pending_paths as f64),
+    );
+    metric(
+        "kb_reindex_queue_full_pending",
+        "1 if a full reconcile sweep is queued (startup catch-up or the periodic \
+         safety-net timer), 0 otherwise.",
+        "gauge",
+        &plain(if status.queue.full_pending { 1.0 } else { 0.0 }),
     );
 
     let idx = &status.indexing;
@@ -827,8 +854,8 @@ fn mcp_transport_config(
 
 /// Payload fields to index at server startup.
 ///
-/// Mirrors what `ingest::run_index` registers, so a server that boots before the first
-/// index run still creates the right indexes for every scope's declared fields.
+/// Mirrors what `ingest::index_paths` registers, so a server that boots before the
+/// first index run still creates the right indexes for every scope's declared fields.
 fn indexed_fields_for(config: &ResolvedConfig, schemas: &SchemaCache) -> Vec<IndexedField> {
     let mut fields = schemas.all_indexed_fields();
     for name in config.effective_indexed_fields() {
@@ -1052,7 +1079,7 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         .context("Failed to ensure git repository")?;
         if fresh {
             info!("Fresh clone — running initial full index");
-            ingest::run_index(&config, true, crate::status::Trigger::Startup)
+            ingest::scan_and_index(&config, true, crate::status::Trigger::Startup)
                 .await
                 .context("Initial index after clone failed")?;
         }
@@ -1106,6 +1133,38 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
 
     let ct = CancellationToken::new();
     let refresh_ct = ct.child_token();
+
+    // Spawn the reindex worker — the single task that drains `reindex::REINDEX_QUEUE`
+    // and is the only thing (besides the CLI, which has no worker) that ever calls
+    // `ingest::index_paths`. From here on, the MCP write tools and the webhook handler
+    // just mark paths dirty and return; this task does the actual chunk/embed/upsert
+    // work out of band.
+    tokio::spawn(crate::reindex::run_worker(Arc::clone(&config)));
+
+    // Catch up on anything missed while this process was down (crash, deploy, a
+    // webhook that never arrived because the server was offline). This does not index
+    // synchronously — it marks a full reconcile pending and the worker just spawned
+    // picks it up on its own schedule, same as any other queued work.
+    crate::reindex::mark_full();
+
+    // Periodic safety-net sweep. See `IndexingConfig::reconcile_interval_secs`'s doc
+    // comment for why this interval is a backstop for LOST events, not the indexing
+    // interval — ordinary writes and webhook pushes are indexed near-instantly via
+    // `Notify`, independent of this timer.
+    let reconcile_ct = ct.child_token();
+    let reconcile_secs = config.indexing.reconcile_interval_secs;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(reconcile_secs)) => {}
+                () = reconcile_ct.cancelled() => {
+                    break;
+                }
+            }
+            debug!("Periodic reconcile sweep: marking a full reconcile");
+            crate::reindex::mark_full();
+        }
+    });
 
     tokio::spawn(async move {
         loop {
@@ -1348,7 +1407,17 @@ pub async fn run_server(config: ResolvedConfig) -> Result<()> {
         }
         info!("Shutting down server");
         ct.cancel();
-        let _guard = crate::webhook::REINDEX_LOCK.lock().await;
+        // Let an in-flight indexing run finish rather than killing it mid-write. The
+        // reindex worker is now the sole index mutator, so there is no lock to acquire
+        // here as there was under `REINDEX_LOCK` — instead, poll the same
+        // `INDEX_STATUS` the worker already keeps current, bounded so a genuinely
+        // stuck run cannot hang shutdown forever.
+        let shutdown_deadline = std::time::Instant::now() + SHUTDOWN_INDEX_WAIT;
+        while crate::status::INDEX_STATUS.snapshot().indexing
+            && std::time::Instant::now() < shutdown_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     })
     .await
     .context("Server error")?;
@@ -1395,6 +1464,10 @@ mod tests {
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
             indexing: s.snapshot(),
+            queue: crate::reindex::QueueSnapshot {
+                pending_paths: 3,
+                full_pending: false,
+            },
             store: StoreCounts {
                 indexed_files: Some(329),
                 documents_with_metadata: Some(300),
@@ -1423,6 +1496,10 @@ mod tests {
     #[test]
     fn prometheus_output_covers_indexing_store_and_breakdown() {
         let out = render_prometheus(&sample_status());
+
+        // Pending reindex-queue work.
+        assert!(out.contains("kb_reindex_queue_pending_paths 3"));
+        assert!(out.contains("kb_reindex_queue_full_pending 0"));
 
         // In-flight state — the question that was previously unanswerable.
         assert!(out.contains("kb_indexing_in_progress 1"));
@@ -1596,7 +1673,7 @@ mod tests {
         db.upsert_document_metadata("food/a.md", &fm, 1700, "h", 1)
             .await
             .unwrap();
-        db.upsert("food/a.md", "h", 1, "sh").await.unwrap();
+        db.upsert("food/a.md", "h", 1, "sh", 0, 0).await.unwrap();
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
@@ -1645,7 +1722,7 @@ mod tests {
             .await
             .unwrap();
         for path in ["a.md", "b.md", "c.md"] {
-            db.upsert(path, "h", 1, "sh").await.unwrap();
+            db.upsert(path, "h", 1, "sh", 0, 0).await.unwrap();
         }
 
         let state = StatusState {
@@ -1741,7 +1818,7 @@ mod tests {
 
         // More metadata rows than bookkeeping rows. Can only happen if something
         // violated the ordering guarantee — e.g. a CLI index run interleaving with the
-        // server's, since REINDEX_LOCK only serializes within one process.
+        // server's, since the reindex worker only serializes within one process.
         let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
             .await
             .unwrap();
@@ -1783,7 +1860,7 @@ mod tests {
         let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
             .await
             .unwrap();
-        db.upsert("a.md", "h", 1, "sh").await.unwrap();
+        db.upsert("a.md", "h", 1, "sh", 0, 0).await.unwrap();
 
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
@@ -1797,7 +1874,7 @@ mod tests {
 
         // A change the cache must not yet reflect: one request costs ~24 queries plus a
         // Qdrant round trip, so a scrape burst has to collapse into one refresh.
-        db.upsert("b.md", "h", 1, "sh").await.unwrap();
+        db.upsert("b.md", "h", 1, "sh", 0, 0).await.unwrap();
         let second = cached_status(&state).await;
         assert_eq!(second.store.indexed_files, Some(1), "served from cache");
 

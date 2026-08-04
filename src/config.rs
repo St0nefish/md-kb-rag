@@ -81,6 +81,23 @@ pub struct IndexingConfig {
     pub exclude: Vec<String>,
     #[serde(default = "default_exclude_files")]
     pub exclude_files: Vec<String>,
+    /// How often (in seconds) the background reindex worker runs a full reconcile
+    /// sweep (`ingest::scan_for_dirty`), independent of anything a write, webhook, or
+    /// startup explicitly marked dirty.
+    ///
+    /// This is a backstop for LOST events — the process died mid-run, a webhook was
+    /// never delivered, Qdrant was unavailable when a write tried to mark its path —
+    /// not the indexing interval. The worker is event-driven and wakes on `Notify`
+    /// immediately when a write commits or a webhook lands, so ordinary post-write
+    /// index latency is near-instant and does not depend on this value at all. This
+    /// interval only bounds how long a *lost* event can go unnoticed before the next
+    /// full sweep rediscovers it, which is why an interval measured in minutes (not
+    /// seconds) is the right cost/benefit trade at this project's scale: a full sweep
+    /// pages through `indexed_files` and stats each file it already knows about
+    /// (`StateDb::fetch_indexed_files_page`), not full content hashing, so its cost
+    /// grows with corpus size, not with how often it runs.
+    #[serde(default = "default_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
 }
 
 impl Default for IndexingConfig {
@@ -89,6 +106,7 @@ impl Default for IndexingConfig {
             include: default_include(),
             exclude: default_exclude(),
             exclude_files: default_exclude_files(),
+            reconcile_interval_secs: default_reconcile_interval_secs(),
         }
     }
 }
@@ -108,6 +126,10 @@ fn default_exclude() -> Vec<String> {
 
 fn default_exclude_files() -> Vec<String> {
     vec!["CLAUDE.md".into(), "README.md".into()]
+}
+
+fn default_reconcile_interval_secs() -> u64 {
+    600
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -610,6 +632,9 @@ impl Config {
         if self.mcp.metadata_refresh_secs < 10 {
             anyhow::bail!("mcp.metadata_refresh_secs must be >= 10");
         }
+        if self.indexing.reconcile_interval_secs == 0 {
+            anyhow::bail!("indexing.reconcile_interval_secs must be >= 1");
+        }
 
         // Validate required fields
         let mut missing = Vec::new();
@@ -841,6 +866,7 @@ mcp:
             vec![".git/**", ".claude/**", ".tools/**", "node_modules/**"]
         );
         assert_eq!(cfg.indexing.exclude_files, vec!["CLAUDE.md", "README.md"]);
+        assert_eq!(cfg.indexing.reconcile_interval_secs, 600);
         assert!(cfg.frontmatter.required.is_empty());
         assert_eq!(cfg.chunking.max_chunk_size, 1500);
         assert_eq!(cfg.chunking.target_chunk_size, Some(1000));
@@ -1545,6 +1571,45 @@ rate_limit:
         assert!(
             err.contains("rate_limit.per_second"),
             "error should mention rate_limit.per_second: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("EMBEDDING_BASE_URL");
+            std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("QDRANT_URL");
+        }
+    }
+
+    #[test]
+    fn reconcile_interval_secs_custom_value() {
+        let yaml = r#"
+indexing:
+  reconcile_interval_secs: 120
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.indexing.reconcile_interval_secs, 120);
+    }
+
+    #[test]
+    fn zero_reconcile_interval_secs_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        unsafe {
+            std::env::set_var("EMBEDDING_BASE_URL", "http://test:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "test-model");
+            std::env::set_var("QDRANT_URL", "http://test:6334");
+        }
+
+        let yaml = r#"
+indexing:
+  reconcile_interval_secs: 0
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("reconcile_interval_secs"),
+            "error should mention reconcile_interval_secs: {err}"
         );
 
         unsafe {

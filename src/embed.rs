@@ -87,9 +87,12 @@ impl EmbedClient {
     /// one `await` that can run for minutes, so per-batch reporting is what turns it
     /// from indistinguishable-from-hung into observable progress.
     ///
-    /// Query embedding deliberately does **not** route through here: `search` is not
-    /// gated by `REINDEX_LOCK`, so a query served during a reindex would add itself to
-    /// that run's chunk tally and push reported progress past 100%.
+    /// Query embedding deliberately does **not** route through here: a search can run
+    /// concurrently with an indexing run (nothing serializes them against each other
+    /// anymore — the reindex worker is the only thing that mutates the index, but
+    /// reads are unrestricted), so routing a query's embedding through this method
+    /// would add it to that run's `INDEX_STATUS` chunk tally and push reported
+    /// progress past 100%.
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 

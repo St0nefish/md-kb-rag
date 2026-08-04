@@ -1,9 +1,6 @@
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::timeout;
-
-use tokio::sync::Mutex;
 
 use axum::{
     body::Bytes,
@@ -19,21 +16,9 @@ use tracing::{error, info, warn};
 use crate::config::{ResolvedConfig, WebhookProvider};
 use crate::git::GIT_TIMEOUT;
 use crate::git::{inject_token_into_url, redact_url};
-use crate::ingest;
+use crate::reindex;
 
 type HmacSha256 = Hmac<Sha256>;
-
-/// Prevents concurrent reindex tasks from interleaving Qdrant/SQLite operations.
-/// Wrapped in Arc so we can acquire OwnedMutexGuard and move it into tokio::spawn;
-/// `pub(crate)` so the MCP write tools can share the same single-flight lock.
-pub(crate) static REINDEX_LOCK: LazyLock<Arc<Mutex<()>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(())));
-
-/// How long an MCP write tool waits for REINDEX_LOCK before giving up and skipping its
-/// index update. A webhook-triggered reindex can hold the lock for minutes, so waiting
-/// unbounded means the tool call never returns. Kept under typical MCP client timeouts so
-/// the caller sees our explanation rather than a client-side timeout.
-pub(crate) const REINDEX_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct WebhookState {
@@ -140,6 +125,20 @@ pub async fn handle_webhook(
             None => git_url.clone(),
         };
 
+        // Captured before the fetch so the range diffed below covers exactly what
+        // this webhook's pull brought in — the same before/after pattern
+        // `commit_and_sync` uses around its own fetch + rebase.
+        let old_head = match crate::git::rev_parse_head(data_path).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                error!("Failed to read HEAD before fetch: {:#}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read local HEAD".to_string(),
+                );
+            }
+        };
+
         info!(
             "Running git fetch in {} from {}",
             data_path,
@@ -234,37 +233,50 @@ pub async fn handle_webhook(
                 );
             }
         }
+
+        // Diff exactly what this pull changed and mark those paths dirty. The worker
+        // (src/reindex.rs) picks this up and does the actual indexing out of band, so
+        // this handler can return as soon as the local clone is up to date — it no
+        // longer waits for (or even starts) a reindex itself.
+        let new_head = match crate::git::rev_parse_head(data_path).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                error!("Failed to read HEAD after merge: {:#}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read local HEAD".to_string(),
+                );
+            }
+        };
+
+        let changed = match crate::git::git_diff_name_status(data_path, &old_head, &new_head).await
+        {
+            Ok(paths) => paths,
+            Err(e) => {
+                error!("Failed to diff webhook pull range: {:#}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to diff pulled changes".to_string(),
+                );
+            }
+        };
+
+        info!(
+            provider = ?provider,
+            branch = %branch,
+            changed = changed.len(),
+            "Webhook pull applied; marking changed paths dirty"
+        );
+        reindex::mark_paths(changed);
+    } else {
+        // No git_url configured, so there was nothing to fetch and therefore no range
+        // to diff. Fall back to a full reconcile so the webhook still causes the
+        // worker to look for whatever changed on disk out-of-band.
+        info!(provider = ?provider, "Webhook accepted with no git_url configured; marking a full reconcile");
+        reindex::mark_full();
     }
 
-    // Attempt to acquire the reindex lock. If already held, coalesce (skip).
-    match Arc::clone(&REINDEX_LOCK).try_lock_owned() {
-        Ok(guard) => {
-            info!(provider = ?provider, branch = %state.config.source.branch, "Webhook accepted, spawning incremental reindex");
-            let config = Arc::clone(&state.config);
-            let task = tokio::spawn(async move {
-                let _guard = guard; // hold for the duration of the reindex
-                info!("Webhook triggered incremental reindex");
-                if let Err(e) =
-                    ingest::run_index(&config, false, crate::status::Trigger::Webhook).await
-                {
-                    error!("Reindex failed: {:#}", e);
-                }
-            });
-            tokio::spawn(async move {
-                if let Err(e) = task.await {
-                    error!("Reindex task panicked: {e}");
-                }
-            });
-            (StatusCode::OK, "Reindex triggered".to_string())
-        }
-        Err(_) => {
-            info!(provider = ?provider, branch = %state.config.source.branch, "Reindex already in progress; coalescing/skipping this webhook");
-            (
-                StatusCode::OK,
-                "Reindex already in progress, webhook coalesced".to_string(),
-            )
-        }
-    }
+    (StatusCode::OK, "Changes queued for indexing".to_string())
 }
 
 #[cfg(test)]
@@ -559,29 +571,35 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // NOTE: we intentionally do NOT unit-test the "lock free → triggered" body
-    // here. REINDEX_LOCK is a process-global shared with the MCP write tools, so
-    // under parallel test execution another test can legitimately hold it, making
-    // any "lock is free" assertion racy. The coalescing path below is deterministic
-    // because it holds the lock itself.
+    // NOTE: there is no "reindex already in progress, coalesced" path to test anymore
+    // — that drop-on-collision bug is exactly what the dirty-path queue replaces.
+    // `mark_paths`/`mark_full` never block and never fail, so every accepted webhook
+    // takes the same success path regardless of what the worker is doing concurrently.
+    //
+    // We also do not assert on `reindex::REINDEX_QUEUE`'s state here: it is a
+    // process-global shared with every other test in this binary (git.rs's
+    // `commit_and_sync` tests, mcp.rs's write-tool tests), so under parallel
+    // `cargo test` execution its exact contents at any instant are not this test's to
+    // own. `handle_webhook_marks_a_full_reconcile_when_no_git_url_is_configured` below
+    // checks the one flag that is safe to assert on (`full_pending`), since it is only
+    // ever set to `true` and never cleared by anything reachable from tests.
+
     #[tokio::test]
-    async fn handle_webhook_coalesces_when_lock_held() {
-        use axum::body::to_bytes;
+    async fn handle_webhook_marks_a_full_reconcile_when_no_git_url_is_configured() {
         use axum::response::IntoResponse;
 
         let secret = "test-secret";
         let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
         let sig = compute_hmac(secret, body);
 
+        // minimal_config() has git_url: None, so there is nothing to fetch/diff — the
+        // handler's only option is to fall back to a full reconcile.
         let config = minimal_config();
         let state = WebhookState {
             config,
             secret: secret.to_string(),
             git_token: None,
         };
-
-        // Hold the lock to simulate an in-progress reindex
-        let _guard = Arc::clone(&REINDEX_LOCK).lock_owned().await;
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -594,11 +612,9 @@ mod tests {
             .into_response();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body_str = std::str::from_utf8(&body_bytes).unwrap();
         assert!(
-            body_str.contains("coalesced") || body_str.contains("already in progress"),
-            "Expected coalesced response, got: {body_str}"
+            reindex::REINDEX_QUEUE.snapshot().full_pending,
+            "a webhook with no git_url must fall back to a full reconcile"
         );
     }
 }
