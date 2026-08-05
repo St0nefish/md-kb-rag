@@ -1000,6 +1000,61 @@ pub fn build_commit_message(
     format!("{}\n\nTool: md-kb-rag\nOperation: {}", subject, operation)
 }
 
+/// The definitive, machine-readable outcome of a write tool call
+/// (`create_document`/`edit_document`/`delete_document`), exposed via
+/// `CallToolResult::structured_content` under the `"outcome"` key so a caller can
+/// branch on `result.structured_content["outcome"]` instead of pattern-matching the
+/// human-readable summary text.
+///
+/// The last three variants map directly onto `git::CommitSyncError`'s pre-commit /
+/// post-commit split (see that type's docs for why the two need opposite recovery):
+/// `FailedNoChange` and `FailedInconsistentState` both come from a `PreCommit`
+/// failure (the former rolled back cleanly, the latter's rollback itself failed);
+/// `CommittedPendingSync` comes from a `PostCommit` failure, which is deliberately
+/// left uncorrected. `NotFound` and validation failures never reach `write_document`/
+/// `delete_document` at all — they are rejected earlier via `McpError::invalid_params`
+/// — so they are not modeled here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    /// Committed and pushed. The tool's happy path.
+    Synced,
+    /// Committed locally, but the remote push failed. NOT rolled back — the commit is
+    /// real. Will sync on the next successful write, or on manual intervention.
+    CommittedPendingSync,
+    /// Nothing was committed and the pre-commit rollback succeeded: filesystem and
+    /// git state are back to exactly how they were before this call. Safe to retry.
+    FailedNoChange,
+    /// Nothing was committed AND the pre-commit rollback itself failed. Filesystem
+    /// and git are now inconsistent with each other and with HEAD. This needs
+    /// operator attention, not a blind retry — logged at `error!` for that reason.
+    FailedInconsistentState,
+}
+
+impl WriteOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            WriteOutcome::Synced => "synced",
+            WriteOutcome::CommittedPendingSync => "committed_pending_sync",
+            WriteOutcome::FailedNoChange => "failed_no_change",
+            WriteOutcome::FailedInconsistentState => "failed_inconsistent_state",
+        }
+    }
+}
+
+/// Attach a machine-readable `{"outcome": ...}` discriminant to a successful
+/// `CallToolResult`, alongside its human-readable text content.
+fn with_outcome(mut result: CallToolResult, outcome: WriteOutcome) -> CallToolResult {
+    result.structured_content = Some(serde_json::json!({ "outcome": outcome.as_str() }));
+    result
+}
+
+/// Build the `data` payload for an `McpError` reporting a failed write-tool outcome,
+/// so the same `{"outcome": ...}` discriminant is available on the error path too
+/// (`ErrorData::data`), not just on success.
+fn outcome_data(outcome: WriteOutcome) -> Option<serde_json::Value> {
+    Some(serde_json::json!({ "outcome": outcome.as_str() }))
+}
+
 #[derive(Clone)]
 pub struct KbSearchServer {
     embed_client: Arc<EmbedClient>,
@@ -2262,11 +2317,20 @@ impl KbSearchServer {
             .ok()
             .filter(|s| !s.is_empty());
 
-        // 6. Commit and sync to remote
-        let commit_outcome = git::commit_and_sync(
+        // 6. Commit and sync to remote.
+        //
+        // `commit_and_sync` distinguishes WHERE it failed — see `git::CommitSyncError`
+        // — and the two phases demand opposite handling. A `PreCommit` failure means
+        // HEAD never moved, so the file write above (already on disk, not yet
+        // committed) is rolled back and reported as "nothing changed". A `PostCommit`
+        // failure means the commit is a real, durable part of local history — rolling
+        // it back here would silently undo work that genuinely happened, so it is
+        // left alone and reported as "committed, sync pending" instead.
+        let data_path_str = self.canonical_data_path.to_str().unwrap_or_default();
+        let commit_outcome = match git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
-            self.canonical_data_path.to_str().unwrap_or_default(),
+            data_path_str,
             token.as_deref(),
             rel_path,
             &commit_message,
@@ -2274,10 +2338,99 @@ impl KbSearchServer {
             &config.write.commit_author_email,
         )
         .await
-        .map_err(|e| {
-            error!("commit_and_sync failed for '{}': {:#}", rel_path, e);
-            McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
-        })?;
+        {
+            Ok(outcome) => outcome,
+
+            Err(git::CommitSyncError::PreCommit(source)) => {
+                error!(
+                    "commit_and_sync pre-commit failure for '{}', rolling back: {:#}",
+                    rel_path, source
+                );
+
+                // For a create, there is no HEAD content to restore to — undo the
+                // filesystem write directly and unstage whatever `git add` staged.
+                // For an edit, HEAD already has the previous content, so restore it
+                // (this also un-stages any partial `git add`, in one step).
+                let rollback = if is_create {
+                    match tokio::fs::remove_file(abs_path).await {
+                        Ok(()) => git::unstage(data_path_str, rel_path).await,
+                        Err(e) => Err(anyhow::Error::new(e)
+                            .context("Failed to remove newly-written file during rollback")),
+                    }
+                } else {
+                    git::restore_from_head(data_path_str, rel_path).await
+                };
+
+                return match rollback {
+                    Ok(()) => Err(McpError::internal_error(
+                        format!(
+                            "'{}' was not {}: git commit failed and the attempted change has \
+                             been rolled back — nothing changed, safe to retry. Cause: {:#}",
+                            rel_path,
+                            if is_create { "created" } else { "edited" },
+                            source
+                        ),
+                        outcome_data(WriteOutcome::FailedNoChange),
+                    )),
+                    // The rollback ITSELF failed — a third, worse state than either of
+                    // the above. The file may now be gone/changed on disk with no
+                    // corresponding commit, or the index may not match HEAD. Report it
+                    // distinctly and loudly rather than letting it masquerade as a
+                    // clean no-op.
+                    Err(rollback_err) => {
+                        error!(
+                            "Rollback FAILED after a pre-commit git failure for '{}': {:#}. \
+                             Original cause: {:#}. Filesystem and git state may now be \
+                             inconsistent.",
+                            rel_path, rollback_err, source
+                        );
+                        Err(McpError::internal_error(
+                            format!(
+                                "'{}' is in an INCONSISTENT state: git commit failed AND the \
+                                 rollback attempt itself failed. The working tree may not \
+                                 match git history for this path — do not assume this \
+                                 operation did or did not take effect. Manual inspection is \
+                                 required. Commit cause: {:#}. Rollback cause: {:#}",
+                                rel_path, source, rollback_err
+                            ),
+                            outcome_data(WriteOutcome::FailedInconsistentState),
+                        ))
+                    }
+                };
+            }
+
+            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+                warn!(
+                    "commit_and_sync post-commit (sync) failure for '{}', commit {} stands \
+                     uncorrected: {:#}",
+                    rel_path, sha, source
+                );
+
+                // The local file already reflects the new content regardless of push
+                // status, so the local index should too. `rebased_paths` is empty
+                // here — the rebase never ran (fetch/rebase/push all happen after the
+                // commit, so any of them failing means we never got as far as a
+                // trustworthy rebase diff).
+                crate::reindex::mark_paths(std::iter::once(std::path::PathBuf::from(rel_path)));
+
+                let action = if is_create { "Created" } else { "Edited" };
+                let summary = format!(
+                    "{} '{}' (commit {}) — committed locally, but the push to the remote \
+                     failed: {:#}. It will sync on the next successful write or manual \
+                     intervention. Indexing has been queued from the local copy.",
+                    action, rel_path, sha, source
+                );
+                let diff = render_unified_diff(old_content, new_content, rel_path);
+                let mut result_text = summary;
+                if !diff.is_empty() {
+                    result_text = format!("{}\n\n{}", result_text, diff);
+                }
+                return Ok(with_outcome(
+                    CallToolResult::success(vec![Content::text(result_text)]),
+                    WriteOutcome::CommittedPendingSync,
+                ));
+            }
+        };
 
         // 7. Mark this path — and anything the rebase pulled in from other commits —
         //    dirty and return immediately. The reindex worker (src/reindex.rs) does
@@ -2300,7 +2453,10 @@ impl KbSearchServer {
         if !diff.is_empty() {
             result_text = format!("{}\n\n{}", result_text, diff);
         }
-        Ok(CallToolResult::success(vec![Content::text(result_text)]))
+        Ok(with_outcome(
+            CallToolResult::success(vec![Content::text(result_text)]),
+            WriteOutcome::Synced,
+        ))
     }
 
     #[tool(description = "Create a new document in the knowledge base. \
@@ -2561,10 +2717,23 @@ impl KbSearchServer {
             .ok()
             .filter(|s| !s.is_empty());
 
-        let commit_outcome = git::commit_and_sync(
+        // `commit_and_sync` distinguishes WHERE it failed — see `git::CommitSyncError`
+        // — which matters a great deal here, since the file is already gone from disk
+        // by this point:
+        //
+        // - `PreCommit` (add/commit failed): HEAD never recorded the deletion, so the
+        //   file's absence from disk is the ONLY trace of this call. Restore it from
+        //   HEAD so the caller sees "nothing changed" and can safely retry.
+        // - `PostCommit` (fetch/rebase/push failed): the deletion IS a real local
+        //   commit — HEAD already reflects the file being gone. Restoring it here
+        //   would resurrect a document that, as far as local git history is
+        //   concerned, was legitimately deleted. Leave it deleted and report the
+        //   push as pending instead.
+        let data_path_str = self.canonical_data_path.to_str().unwrap_or_default();
+        let commit_outcome = match git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
-            self.canonical_data_path.to_str().unwrap_or_default(),
+            data_path_str,
             token.as_deref(),
             &rel_path,
             &commit_message,
@@ -2572,20 +2741,82 @@ impl KbSearchServer {
             &config.write.commit_author_email,
         )
         .await
-        .map_err(|e| {
-            error!(
-                "commit_and_sync failed for '{}' after file was removed from disk: {:#}",
-                rel_path, e
-            );
-            McpError::internal_error(
-                format!(
-                    "File was removed from disk but git commit/sync failed: {}. \
-                     The file is gone locally but the git repo may be out of sync.",
-                    e
-                ),
-                None,
-            )
-        })?;
+        {
+            Ok(outcome) => outcome,
+
+            Err(git::CommitSyncError::PreCommit(source)) => {
+                error!(
+                    "commit_and_sync pre-commit failure deleting '{}', restoring from HEAD: {:#}",
+                    rel_path, source
+                );
+
+                match git::restore_from_head(data_path_str, &rel_path).await {
+                    Ok(()) => {
+                        return Err(McpError::internal_error(
+                            format!(
+                                "'{}' was NOT deleted: git commit failed and the file has been \
+                                 restored from HEAD — nothing changed, safe to retry. \
+                                 Cause: {:#}",
+                                rel_path, source
+                            ),
+                            outcome_data(WriteOutcome::FailedNoChange),
+                        ));
+                    }
+                    // The restore ITSELF failed — a third, worse state than either a
+                    // clean delete or a clean no-op: the file is gone from disk with
+                    // no corresponding commit. Report it distinctly and loudly rather
+                    // than letting it masquerade as either of the other two.
+                    Err(restore_err) => {
+                        error!(
+                            "Restore FAILED after a pre-commit git failure deleting '{}': {:#}. \
+                             Original cause: {:#}. The file is gone from disk and NOT \
+                             committed — filesystem and git are now inconsistent.",
+                            rel_path, restore_err, source
+                        );
+                        return Err(McpError::internal_error(
+                            format!(
+                                "'{}' is in an INCONSISTENT state: git commit failed AND the \
+                                 attempt to restore the file from HEAD also failed. The file is \
+                                 gone from disk but was never committed as deleted — do not \
+                                 assume it exists or that the deletion is durable. Manual \
+                                 inspection is required. Commit cause: {:#}. \
+                                 Restore cause: {:#}",
+                                rel_path, source, restore_err
+                            ),
+                            outcome_data(WriteOutcome::FailedInconsistentState),
+                        ));
+                    }
+                }
+            }
+
+            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+                warn!(
+                    "commit_and_sync post-commit (sync) failure deleting '{}', deletion commit \
+                     {} stands uncorrected: {:#}",
+                    rel_path, sha, source
+                );
+
+                // The file is already gone from local disk regardless of push status,
+                // so the local index should reflect that regardless too.
+                crate::reindex::mark_paths(std::iter::once(std::path::PathBuf::from(&rel_path)));
+
+                let summary = format!(
+                    "Deleted '{}' (commit {}) — committed locally, but the push to the remote \
+                     failed: {:#}. It will sync on the next successful write or manual \
+                     intervention. Index cleanup has been queued from the local copy.",
+                    rel_path, sha, source
+                );
+                let diff = render_unified_diff(&old_content, "", &rel_path);
+                let mut result_text = summary;
+                if !diff.is_empty() {
+                    result_text = format!("{}\n\n{}", result_text, diff);
+                }
+                return Ok(with_outcome(
+                    CallToolResult::success(vec![Content::text(result_text)]),
+                    WriteOutcome::CommittedPendingSync,
+                ));
+            }
+        };
 
         // 5. Mark this path — and anything the rebase pulled in — dirty and return
         //    immediately. The worker's scoped indexer purges a path's Qdrant points
@@ -2608,7 +2839,10 @@ impl KbSearchServer {
         if !diff.is_empty() {
             result_text = format!("{}\n\n{}", result_text, diff);
         }
-        Ok(CallToolResult::success(vec![Content::text(result_text)]))
+        Ok(with_outcome(
+            CallToolResult::success(vec![Content::text(result_text)]),
+            WriteOutcome::Synced,
+        ))
     }
 }
 
@@ -4760,44 +4994,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn delete_document_existing_file_proceeds_to_git_step() {
-        // Create a real file in tmp; the tool should resolve it and proceed past
-        // path-resolution and file-removal to the git step (which will fail since
-        // there's no git repo). The error must NOT be a path-resolution error.
-        let tmp = tempfile::tempdir().unwrap();
-        let sub = tmp.path().join("docs");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(
-            sub.join("delete-me.md"),
-            "---\ntitle: Delete Me\n---\n# Body",
-        )
-        .unwrap();
-
-        let config = make_test_resolved_config(tmp.path());
-        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
-
-        let params = DeleteDocumentParams {
-            path: "docs/delete-me.md".to_string(),
-            message: None,
-        };
-        let result = server.delete_document(Parameters(params)).await;
-
-        // File removal happens before git; the file should be gone regardless.
-        assert!(
-            !sub.join("delete-me.md").exists(),
-            "file should have been removed from disk"
-        );
-
-        // The error (if any) should be git- or index-related, not path-resolution.
-        if let Err(e) = result {
-            assert!(
-                !e.message.contains("does not exist"),
-                "error should not be path-resolution, got: {}",
-                e.message
-            );
-        }
-    }
+    // `delete_document_existing_file_proceeds_to_git_step` used to live here: create
+    // a file in a plain tempdir with no git repo, delete it, and check the failure
+    // wasn't a path-resolution error. `delete_document_with_no_git_repo_reports_
+    // inconsistent_state` (below, in the pre-commit/post-commit test group) drives
+    // the exact same scenario with assertions that actually pin down the new
+    // behavior — the FailedInconsistentState outcome and message — so it replaces
+    // this test rather than sitting alongside a strictly weaker duplicate.
 
     // -----------------------------------------------------------------------
     // resolve_safe_write_path unit tests
@@ -5300,5 +5503,382 @@ mod tests {
             pending_after > pending_before,
             "delete_document must mark its path dirty on the queue rather than purging inline"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-commit vs. post-commit failure handling (git::CommitSyncError) —
+    // create_document / edit_document / delete_document
+    // -----------------------------------------------------------------------
+
+    /// `HEAD` of `work`, as a trimmed hex string.
+    fn head_sha(work: &tempfile::TempDir) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `git status --porcelain` of `work`, as a trimmed string ("" means clean).
+    fn git_status(work: &tempfile::TempDir) -> String {
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_commit_all(work: &tempfile::TempDir, rel_path: &str, message: &str) {
+        std::process::Command::new("git")
+            .args(["add", "--", rel_path])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                message,
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+    }
+
+    /// Force `git commit` to fail in `work` while leaving the repo otherwise
+    /// completely healthy: `git add` still succeeds, HEAD is still valid, and a
+    /// restore from HEAD should still succeed. This is `CommitSyncError::PreCommit`
+    /// with the failure specifically at the `commit` step rather than `add`.
+    ///
+    /// Deliberately NOT a `.git/hooks/pre-commit` script: a machine (or CI image)
+    /// with a global `core.hooksPath` override — common for commit-signing or
+    /// linting setups — would silently ignore a repo-local hook, making that
+    /// approach environment-dependent. Repo-local git CONFIG, by contrast, always
+    /// applies: enabling commit signing and pointing at a signing key that does not
+    /// exist makes `git commit` fail deterministically on any machine, with or
+    /// without gpg installed (no gpg binary fails it too, just with a different
+    /// message), and without touching global state.
+    fn force_git_commit_to_fail(work: &tempfile::TempDir) {
+        for args in [
+            ["config", "commit.gpgsign", "true"],
+            ["config", "user.signingkey", "nonexistent-bogus-key-id"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(work.path())
+                .output()
+                .unwrap();
+        }
+    }
+
+    /// Extract `structured_content["outcome"]` (success path) or `data["outcome"]`
+    /// (error path) as a `&str`, so tests can assert on the machine-readable
+    /// discriminant instead of parsing prose.
+    fn outcome_of(value: &Option<serde_json::Value>) -> Option<&str> {
+        value.as_ref()?.get("outcome")?.as_str()
+    }
+
+    #[tokio::test]
+    async fn delete_document_precommit_failure_restores_the_file_and_reports_no_change() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "---\ntitle: D\n---\n\n# Body\n";
+        std::fs::write(work.path().join("doomed.md"), original).unwrap();
+        git_commit_all(&work, "doomed.md", "add doomed.md");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "doomed.md".to_string(),
+                message: None,
+            }))
+            .await;
+
+        let err = result.expect_err("a rejected pre-commit hook must fail the delete");
+        assert_eq!(
+            outcome_of(&err.data),
+            Some("failed_no_change"),
+            "error data must carry the outcome discriminant, got: {:?}",
+            err
+        );
+
+        assert!(
+            work.path().join("doomed.md").exists(),
+            "the file must be restored to disk after a rolled-back pre-commit failure"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("doomed.md")).unwrap(),
+            original,
+            "restored content must match what was at HEAD"
+        );
+        assert_eq!(
+            head_before,
+            head_sha(&work),
+            "HEAD must not move on a rolled-back pre-commit failure"
+        );
+        assert_eq!(
+            git_status(&work),
+            "",
+            "working tree must be clean after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_postcommit_failure_leaves_commit_and_reports_pending_sync() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("doomed.md"),
+            "---\ntitle: D\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "doomed.md", "add doomed.md");
+
+        let mut config = make_test_resolved_config(work.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            // No such path — `git fetch` fails immediately, no network required, but
+            // only AFTER the deletion's `git add`/`git commit` have already
+            // succeeded locally.
+            c.source.git_url = Some("/nonexistent/path/to/repo.git".to_string());
+        }
+        let server = make_write_test_server(&work, &["**/*.md".to_string()], config);
+
+        let result = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "doomed.md".to_string(),
+                message: None,
+            }))
+            .await;
+
+        let result = result.expect("a post-commit sync failure must still report as success");
+        assert_eq!(
+            outcome_of(&result.structured_content),
+            Some("committed_pending_sync"),
+            "got: {:?}",
+            result
+        );
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("push") && text.contains("sync on the next successful write"),
+            "must explain the push failure and that sync is pending: {text}"
+        );
+
+        // The deletion IS a real local commit — the file must remain gone, and HEAD
+        // must record the deletion. None of this is rolled back.
+        assert!(
+            !work.path().join("doomed.md").exists(),
+            "a post-commit failure must NOT resurrect the file"
+        );
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&show.stdout).contains("doomed.md"),
+            "the deletion commit must be present in local HEAD"
+        );
+    }
+
+    /// When there is no git repository at all, `git add` fails (`PreCommit`) and the
+    /// rollback attempt (`git restore`) ALSO fails, since there is nothing to restore
+    /// from. This is the third, worse outcome: the file is gone from disk with no
+    /// corresponding commit anywhere. It must be reported distinctly rather than
+    /// masquerading as either a clean delete or a clean no-op.
+    #[tokio::test]
+    async fn delete_document_with_no_git_repo_reports_inconsistent_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("delete-me.md"),
+            "---\ntitle: Delete Me\n---\n# Body",
+        )
+        .unwrap();
+
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let params = DeleteDocumentParams {
+            path: "docs/delete-me.md".to_string(),
+            message: None,
+        };
+        let result = server.delete_document(Parameters(params)).await;
+
+        let err = result.expect_err("deleting with no git repo must fail");
+        assert_eq!(
+            outcome_of(&err.data),
+            Some("failed_inconsistent_state"),
+            "got: {:?}",
+            err
+        );
+        assert!(
+            err.message.contains("INCONSISTENT"),
+            "the message must call out the inconsistent state loudly, got: {}",
+            err.message
+        );
+
+        // The restore could not put it back (there is no repo to restore from), so
+        // the file really is gone — that IS the inconsistent state being reported.
+        assert!(!sub.join("delete-me.md").exists());
+    }
+
+    #[tokio::test]
+    async fn create_document_precommit_failure_removes_the_new_file_and_reports_no_change() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .create_document(Parameters(CreateDocumentParams {
+                path: "docs/new.md".to_string(),
+                content: "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
+                    .to_string(),
+                message: None,
+                force_new: Some(true),
+            }))
+            .await;
+
+        let err = result.expect_err("a rejected pre-commit hook must fail the create");
+        assert_eq!(
+            outcome_of(&err.data),
+            Some("failed_no_change"),
+            "got: {:?}",
+            err
+        );
+
+        assert!(
+            !work.path().join("docs/new.md").exists(),
+            "the newly-written file must be removed on rollback — there is no HEAD \
+             content for a brand-new create to fall back to"
+        );
+        assert_eq!(
+            head_before,
+            head_sha(&work),
+            "HEAD must not move on a rolled-back pre-commit failure"
+        );
+        assert_eq!(
+            git_status(&work),
+            "",
+            "the aborted `git add` must be unstaged too — no leftover addition that \
+             could ride along on a later, unrelated commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_document_precommit_failure_restores_previous_content_and_reports_no_change() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .edit_document(Parameters(EditDocumentParams {
+                path: "edit-me.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some(
+                    "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n"
+                        .to_string(),
+                ),
+                message: None,
+            }))
+            .await;
+
+        let err = result.expect_err("a rejected pre-commit hook must fail the edit");
+        assert_eq!(
+            outcome_of(&err.data),
+            Some("failed_no_change"),
+            "got: {:?}",
+            err
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
+            original,
+            "the edit must be rolled back to the previous HEAD content"
+        );
+        assert_eq!(
+            head_before,
+            head_sha(&work),
+            "HEAD must not move on a rolled-back pre-commit failure"
+        );
+        assert_eq!(
+            git_status(&work),
+            "",
+            "working tree must be clean after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_document_postcommit_failure_leaves_commit_and_reports_pending_sync() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+
+        let mut config = make_test_resolved_config(work.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            c.source.git_url = Some("/nonexistent/path/to/repo.git".to_string());
+        }
+        let server = make_write_test_server(&work, &["**/*.md".to_string()], config);
+
+        let new_content =
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
+        let result = server
+            .edit_document(Parameters(EditDocumentParams {
+                path: "edit-me.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some(new_content.to_string()),
+                message: None,
+            }))
+            .await;
+
+        let result = result.expect("a post-commit sync failure must still report as success");
+        assert_eq!(
+            outcome_of(&result.structured_content),
+            Some("committed_pending_sync"),
+            "got: {:?}",
+            result
+        );
+
+        // The edit IS a real local commit — the new content stays on disk, and HEAD
+        // records it. None of this is rolled back just because the push failed.
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
+            new_content,
+            "a post-commit failure must NOT revert the edit"
+        );
+        let show = std::process::Command::new("git")
+            .args(["show", "HEAD:edit-me.md"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&show.stdout), new_content);
     }
 }
