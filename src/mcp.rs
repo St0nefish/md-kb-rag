@@ -871,6 +871,15 @@ pub struct EditDocumentParams {
     /// Optional commit message; defaults to "docs: update {path}".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Optional stale-read guard: the SHA-256 hex digest of the document's full
+    /// content (frontmatter included) at the time you read it — the same
+    /// `content_hash` `get_document` returns in `structured_content`, and the same
+    /// hashing this project already uses to detect changed files. When set, the edit
+    /// is refused with an explicit "changed since you read it" error if the file's
+    /// current content hash does not match, instead of a confusing old_string/content
+    /// mismatch. Omit to skip this check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<String>,
 }
 
 /// Parameters for the `delete_document` tool.
@@ -947,21 +956,131 @@ pub fn parse_edit_mode(params: &EditDocumentParams) -> Result<EditMode, String> 
     }
 }
 
+/// Number of leading characters of `old_string` used as a search anchor when no exact
+/// or whitespace-normalized match exists at all. Long enough to be a specific location
+/// in most real documents, short enough that a single `str::find` over the document
+/// stays cheap.
+const NOT_FOUND_ANCHOR_CHARS: usize = 40;
+
+/// How many characters of surrounding document text to show on each side of an anchor
+/// match, when reporting a near-match diagnostic. Kept small deliberately: this text
+/// goes into an error a caller (and possibly its logs) will see, so it is an
+/// orientation snippet, not a document excerpt.
+const NOT_FOUND_CONTEXT_CHARS: usize = 80;
+
+/// Above this size, skip the near-match/anchor diagnostics below and fall back to the
+/// plain not-found message. `old_content` is the on-disk document and, unlike
+/// `new_content`, is not itself bounded by `MAX_CONTENT_LEN` — it could predate that
+/// cap or have been written outside these tools entirely — so this is a second,
+/// independent bound rather than an assumption that the write-path cap already covers
+/// it.
+const NOT_FOUND_DIAGNOSTIC_MAX_BYTES: usize = MAX_CONTENT_LEN;
+
+/// Collapse every run of whitespace (including newlines) to a single space and trim
+/// the ends, for a whitespace-insensitive comparison.
+///
+/// This treats differing indentation, trailing spaces, and CRLF-vs-LF line endings as
+/// equal — by far the most common reason a caller's `old_string` fails to match
+/// verbatim (e.g. it was retyped or reformatted rather than copied from
+/// `get_document`'s output). One linear pass, no allocation beyond the output string,
+/// so it stays cheap up to `NOT_FOUND_DIAGNOSTIC_MAX_BYTES`.
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A small window of `content` centered on the char-boundary byte offset `pos`,
+/// clamped to `radius` characters on each side. Used to show just enough surrounding
+/// text to orient a caller, never a large slice of the document.
+fn context_window(content: &str, pos: usize, radius: usize) -> &str {
+    let start = content[..pos]
+        .char_indices()
+        .rev()
+        .nth(radius.saturating_sub(1))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let end = content[pos..]
+        .char_indices()
+        .nth(radius)
+        .map(|(i, _)| pos + i)
+        .unwrap_or(content.len());
+    &content[start..end]
+}
+
 /// Apply a surgical edit: replace the single occurrence of `old_string` with
 /// `new_string` in `old_content`.
 ///
 /// Returns the new content string on success, or a descriptive error string.
+/// `display_path` is the document's KB-relative path, used only to make the error
+/// message name the file directly rather than the generic word "document".
+///
+/// When `old_string` occurs zero times, the error is built to help the caller decide
+/// what to do next rather than just restating the failure (issue #88):
+/// 1. If a whitespace-insensitive match exists, say so — that is almost always the
+///    actual cause, and the fix is "copy it verbatim" rather than "re-read the file".
+/// 2. Otherwise, anchor on the start of `old_string` and, if that much appears in the
+///    document, show the surrounding text so the caller can see exactly how reality
+///    diverges (a stale read, a typo partway through, wrong section, etc).
+/// 3. Otherwise, nothing in the document resembles `old_string` at all — most likely
+///    the wrong document or content that changed substantially.
+///
+/// Cost is bounded: every diagnostic pass here is a single linear scan (`split_whitespace`,
+/// `contains`, or `str::find`) over `old_content`, and the whole diagnostic block is
+/// skipped above `NOT_FOUND_DIAGNOSTIC_MAX_BYTES`, so a failed edit is never
+/// accidentally quadratic in document size.
 pub fn apply_surgical(
     old_content: &str,
     old_string: &str,
     new_string: &str,
+    display_path: &str,
 ) -> Result<String, String> {
     let count = old_content.matches(old_string).count();
     match count {
-        0 => Err("old_string not found in document".to_string()),
+        0 => {
+            if old_content.len() > NOT_FOUND_DIAGNOSTIC_MAX_BYTES {
+                return Err(format!("old_string not found in '{display_path}'"));
+            }
+
+            if !old_string.trim().is_empty()
+                && normalize_whitespace(old_content).contains(&normalize_whitespace(old_string))
+            {
+                return Err(format!(
+                    "old_string not found in '{display_path}', but a near-match exists \
+                     differing only in whitespace — indentation, trailing spaces, or \
+                     line endings. Copy old_string exactly as returned by get_document \
+                     rather than retyping or reformatting it."
+                ));
+            }
+
+            let anchor_end = old_string
+                .char_indices()
+                .nth(NOT_FOUND_ANCHOR_CHARS)
+                .map(|(i, _)| i)
+                .unwrap_or(old_string.len());
+            let anchor = old_string[..anchor_end].trim();
+
+            if !anchor.is_empty()
+                && let Some(pos) = old_content.find(anchor)
+            {
+                let window = context_window(old_content, pos, NOT_FOUND_CONTEXT_CHARS);
+                return Err(format!(
+                    "old_string not found in '{display_path}'. Its start ('{anchor}') \
+                     does appear, but the text after that point differs from \
+                     old_string — nearby document content: \"…{window}…\". The file may \
+                     have changed since you read it, or old_string may have a typo past \
+                     that point."
+                ));
+            }
+
+            Err(format!(
+                "old_string not found in '{display_path}', and nothing resembling it \
+                 was located either. This may be the wrong document, or its content has \
+                 changed substantially since it was last read — re-read it with \
+                 get_document before editing."
+            ))
+        }
         1 => Ok(old_content.replacen(old_string, new_string, 1)),
         n => Err(format!(
-            "old_string is not unique in document (found {n} occurrences); \
+            "old_string is not unique in '{display_path}' (found {n} occurrences); \
              include more surrounding context to disambiguate"
         )),
     }
@@ -2142,7 +2261,10 @@ impl KbSearchServer {
         Accepts paths relative to the knowledge base root (e.g. \
         'lifestyle/vehicles/foo.md', as returned by the `search` tool) or just \
         the basename if it's unique across the index. Returns the complete \
-        markdown including frontmatter."
+        markdown including frontmatter. \
+        structured_content.content_hash is a SHA-256 hex digest of the returned \
+        content — pass it as edit_document's expected_hash to guard against editing \
+        stale content."
     )]
     async fn get_document(
         &self,
@@ -2177,7 +2299,15 @@ impl KbSearchServer {
         match retrieval::get_document(&self.deps(), index, raw).await {
             Ok(doc) => {
                 debug!(path = %raw, "get_document served");
-                Ok(CallToolResult::success(vec![Content::text(doc.content)]))
+                // Same hash indexed_files.content_hash already stores for this exact
+                // content, so a caller can round-trip it straight into edit_document's
+                // expected_hash without this project introducing a second hash scheme.
+                let content_hash = crate::ingest::compute_hash_from_bytes(doc.content.as_bytes());
+                let mut result = CallToolResult::success(vec![Content::text(doc.content)]);
+                result.structured_content = Some(serde_json::json!({
+                    "content_hash": content_hash
+                }));
+                Ok(result)
             }
             Err(GetDocumentError::Outside) => {
                 warn!(path = %raw, "get_document: path outside data directory");
@@ -2719,6 +2849,11 @@ impl KbSearchServer {
         root, a unique basename, or absolute. The document must already exist — use \
         create_document for new files.\n\
         \n\
+        OPTIONAL STALE-READ GUARD — expected_hash:\n\
+        Pass the content_hash get_document returned in structured_content when you read this \
+        document, and the edit is refused with an explicit error if the file has changed since \
+        then, instead of a confusing old_string/content mismatch. Omit to skip this check.\n\
+        \n\
         SCOPE: this knowledge base holds durable reference knowledge only. NEVER append session \
         notes, task state, or other transient content to a document.")]
     async fn edit_document(
@@ -2783,15 +2918,34 @@ impl KbSearchServer {
             McpError::internal_error(format!("Failed to read existing file: {}", e), None)
         })?;
 
+        // Optional stale-read guard: if the caller tells us what content it based this
+        // edit on, refuse up front when the file has since changed, rather than let a
+        // shifted `old_string` fail with a confusing (and, for a full replace, silent)
+        // mismatch. Same hash `get_document` reports back as `content_hash` and
+        // `indexed_files.content_hash` already uses — see `EditDocumentParams::expected_hash`.
+        if let Some(expected) = params.expected_hash.as_deref() {
+            let actual = crate::ingest::compute_hash_from_bytes(old_content.as_bytes());
+            if !expected.trim().eq_ignore_ascii_case(&actual) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "'{}' has changed since you read it: expected content_hash '{}' \
+                         but the current document hash is '{}'. Re-read it with \
+                         get_document and reapply your edit against the current content.",
+                        rel_path,
+                        expected.trim(),
+                        actual
+                    ),
+                    None,
+                ));
+            }
+        }
+
         // Compute new_content and operation label based on mode.
         let (new_content, operation) = match mode {
             EditMode::Full { content } => (content, "edit_document (full replace)"),
             EditMode::Surgical { old, new } => {
-                let result = apply_surgical(&old_content, &old, &new).map_err(|e| {
-                    // Enrich the error with the resolved relative path for context.
-                    let msg = e.replace("document", &format!("'{}'", rel_path));
-                    McpError::invalid_params(msg, None)
-                })?;
+                let result = apply_surgical(&old_content, &old, &new, &rel_path)
+                    .map_err(|e| McpError::invalid_params(e, None))?;
                 (result, "edit_document (surgical replace)")
             }
         };
@@ -4582,6 +4736,7 @@ mod tests {
             new_string: None,
             content: Some("---\ntitle: Test\n---\n# Body".to_string()),
             message: None,
+            expected_hash: None,
         };
         let result = server.edit_document(Parameters(params)).await;
 
@@ -5064,6 +5219,7 @@ mod tests {
             new_string: None,
             content: Some("---\ntitle: Edited Doc\n---\n# New content".to_string()),
             message: None,
+            expected_hash: None,
         };
         let result = server.edit_document(Parameters(params)).await;
 
@@ -5290,6 +5446,7 @@ mod tests {
             old_string: old_string.map(|s| s.to_string()),
             new_string: new_string.map(|s| s.to_string()),
             message: None,
+            expected_hash: None,
         }
     }
 
@@ -5375,38 +5532,119 @@ mod tests {
     #[test]
     fn apply_surgical_single_occurrence_replaced() {
         let old = "Hello world!\nGoodbye earth!";
-        let result = apply_surgical(old, "world", "Rust").unwrap();
+        let result = apply_surgical(old, "world", "Rust", "d.md").unwrap();
         assert_eq!(result, "Hello Rust!\nGoodbye earth!");
     }
 
     #[test]
-    fn apply_surgical_not_found_returns_error() {
-        let old = "Hello world!";
-        let err = apply_surgical(old, "missing text", "replacement").unwrap_err();
+    fn apply_surgical_not_found_names_the_document_path() {
+        // Regression coverage for issue #88: the error must name the actual document,
+        // not the word "document" — and, now that the message is built directly
+        // rather than via a blind `.replace("document", ...)`, an occurrence of the
+        // word "document" elsewhere in the message (e.g. in "get_document") must
+        // survive untouched.
+        let old = "Hello world! Nothing here resembles the needle at all, at all.";
+        let err = apply_surgical(
+            old,
+            "missing text entirely unrelated to this content, over forty chars long",
+            "replacement",
+            "food/plans/2026-07-30.md",
+        )
+        .unwrap_err();
         assert!(
-            err.contains("not found"),
-            "expected 'not found' in error, got: {err}"
+            err.contains("not found in 'food/plans/2026-07-30.md'"),
+            "expected the document path in the error, got: {err}"
+        );
+        assert!(
+            err.contains("get_document"),
+            "the word 'document' inside 'get_document' must survive intact, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_surgical_not_found_but_whitespace_normalized_match_exists() {
+        // The most common real cause per issue #88: same text, different indentation /
+        // line endings / trailing whitespace. Must be called out explicitly rather than
+        // left for the caller to guess.
+        let old = "line one\n    line two   \nline three";
+        let old_string = "line one\nline two\nline three"; // no indentation, no trailing spaces
+        let err = apply_surgical(old, old_string, "replacement", "notes.md").unwrap_err();
+        assert!(
+            err.contains("whitespace"),
+            "expected a whitespace near-match callout, got: {err}"
+        );
+        assert!(
+            err.contains("notes.md"),
+            "expected the document path in the error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_surgical_not_found_but_anchor_matches_shows_context() {
+        // old_string's first 40 chars appear verbatim in the document, but the text
+        // diverges after that point — the caller gets to see exactly where and how.
+        let anchor = "0123456789012345678901234567890123456789"; // exactly 40 chars
+        let old_string = format!("{anchor}XYZ_EXPECTED_TAIL");
+        let old = format!("prefix text before it {anchor}ABC_ACTUAL_TAIL and trailing text after");
+        let err = apply_surgical(&old, &old_string, "replacement", "d.md").unwrap_err();
+        assert!(
+            err.contains(anchor),
+            "expected the matched anchor text in the error, got: {err}"
+        );
+        assert!(
+            err.contains("ABC_ACTUAL_TAIL"),
+            "expected surrounding document context in the error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_surgical_not_found_and_nothing_resembles_it() {
+        let old = "A short paragraph about something else entirely.";
+        let old_string = "Completely unrelated text that will never appear anywhere in the source, over forty chars.";
+        let err = apply_surgical(old, old_string, "replacement", "d.md").unwrap_err();
+        assert!(
+            err.contains("wrong document") || err.contains("changed substantially"),
+            "expected guidance that nothing resembles old_string, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_surgical_not_found_diagnostics_are_skipped_above_the_size_cap() {
+        // Bounds the diagnostic work: past NOT_FOUND_DIAGNOSTIC_MAX_BYTES, fall back to
+        // the plain message rather than running whitespace-normalization or an anchor
+        // search over an arbitrarily large document.
+        let old = "x".repeat(NOT_FOUND_DIAGNOSTIC_MAX_BYTES + 1);
+        let err = apply_surgical(
+            &old,
+            "missing text over forty characters long, easily",
+            "r",
+            "big.md",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err, "old_string not found in 'big.md'",
+            "past the size cap the message must be the plain fallback, got: {err}"
         );
     }
 
     #[test]
     fn apply_surgical_multiple_occurrences_returns_error_with_count() {
         let old = "foo bar foo baz foo";
-        let err = apply_surgical(old, "foo", "qux").unwrap_err();
+        let err = apply_surgical(old, "foo", "qux", "d.md").unwrap_err();
         assert!(
             err.contains("3"),
             "error should mention occurrence count (3), got: {err}"
         );
         assert!(
-            err.contains("not unique"),
-            "error should mention 'not unique', got: {err}"
+            err.contains("not unique in 'd.md'"),
+            "error should name the document and say 'not unique', got: {err}"
         );
     }
 
     #[test]
     fn apply_surgical_exact_single_unique_string() {
         let old = "---\ntitle: My Doc\n---\n# Content\nSome text here.";
-        let result = apply_surgical(old, "Some text here.", "Updated text.").unwrap();
+        let result = apply_surgical(old, "Some text here.", "Updated text.", "d.md").unwrap();
         assert_eq!(result, "---\ntitle: My Doc\n---\n# Content\nUpdated text.");
     }
 
@@ -6001,6 +6239,7 @@ mod tests {
                         .to_string(),
                 ),
                 message: None,
+                expected_hash: None,
             }))
             .await;
 
@@ -6055,6 +6294,7 @@ mod tests {
                 new_string: None,
                 content: Some(new_content.to_string()),
                 message: None,
+                expected_hash: None,
             }))
             .await;
 
@@ -6079,6 +6319,126 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&show.stdout), new_content);
+    }
+
+    // -----------------------------------------------------------------------
+    // expected_hash — optional stale-read guard (issue #88)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_document_reports_a_content_hash_matching_indexed_files_hashing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        let content = "---\ntitle: T\ntype: guide\n---\n# Body\n";
+        std::fs::write(sub.join("guide.md"), content).unwrap();
+
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let result = server
+            .get_document(Parameters(GetDocumentParams {
+                path: "docs/guide.md".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let structured = result
+            .structured_content
+            .expect("get_document must report a content_hash in structured_content");
+        let hash = structured["content_hash"]
+            .as_str()
+            .expect("content_hash must be a string");
+        assert_eq!(
+            hash,
+            crate::ingest::compute_hash_from_bytes(content.as_bytes()),
+            "must be the exact same hashing indexed_files.content_hash uses, so a \
+             caller can round-trip it into edit_document's expected_hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_document_with_a_stale_expected_hash_is_rejected_before_touching_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        let original = "---\ntitle: Old\ntype: guide\n---\n# Old body\n";
+        std::fs::write(sub.join("edit-me.md"), original).unwrap();
+
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        // A hash of some OTHER content — as if the caller read the document at an
+        // earlier revision.
+        let stale_hash = crate::ingest::compute_hash_from_bytes(b"not the current content");
+
+        let result = server
+            .edit_document(Parameters(EditDocumentParams {
+                path: "docs/edit-me.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some("---\ntitle: New\ntype: guide\n---\n# New body\n".to_string()),
+                message: None,
+                expected_hash: Some(stale_hash),
+            }))
+            .await;
+
+        let err = result.expect_err("a stale expected_hash must be rejected");
+        assert!(
+            err.message.contains("changed since you read it"),
+            "expected an explicit stale-read message, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("get_document"),
+            "expected guidance to re-read via get_document, got: {}",
+            err.message
+        );
+
+        // Rejected before any write: the file on disk must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(sub.join("edit-me.md")).unwrap(),
+            original,
+            "a stale expected_hash must fail before the file is touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_document_with_a_matching_expected_hash_proceeds_to_a_synced_write() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let correct_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
+        let new_content =
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
+
+        let result = server
+            .edit_document(Parameters(EditDocumentParams {
+                path: "edit-me.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some(new_content.to_string()),
+                message: None,
+                expected_hash: Some(correct_hash),
+            }))
+            .await;
+
+        let result = result.expect("a correct expected_hash must not block the edit");
+        assert_eq!(
+            outcome_of(&result.structured_content),
+            Some("synced"),
+            "got: {:?}",
+            result
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
+            new_content
+        );
     }
 
     // -----------------------------------------------------------------------
