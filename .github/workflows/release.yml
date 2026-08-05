@@ -34,6 +34,14 @@ jobs:
           echo "short_sha=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Using image tag: ${TAG}"
 
+          # Also expose a tag keyed to THIS commit on master. The tag above is the
+          # PR head SHA, because CI builds the image on the PR branch and this job
+          # only retags it — but that SHA does not appear anywhere in master's
+          # history, so `git log` gives you no way to find the image for a given
+          # master commit. That matters when a deploy needs rolling back: you know
+          # the master commit you want to return to, not the PR head it came from.
+          echo "merge_sha=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Login to container registry
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -49,8 +57,13 @@ jobs:
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Both tags point at the same manifest — no rebuild, no extra push of
+          # layers. The merge-sha tag is what makes a rollback target findable
+          # from master's history (see the version step for why the primary tag
+          # cannot serve that purpose).
           docker buildx imagetools create \
             --tag ${{ steps.image.outputs.name }}:latest \
+            --tag ${{ steps.image.outputs.name }}:${{ steps.version.outputs.merge_sha }} \
             "$IMAGE"
           echo "skipped=false" >> "$GITHUB_OUTPUT"
 
