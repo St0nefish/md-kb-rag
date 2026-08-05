@@ -269,6 +269,25 @@ pub async fn commit_and_sync(
         cmd
     };
 
+    // Helper: `git_cmd` plus the commit identity in the environment.
+    //
+    // EVERY git subcommand that creates a commit needs this, not just `commit`.
+    // `rebase` replays commits, so it needs a committer identity too — and it was
+    // previously invoked without one. In any environment lacking a global git config
+    // that fails with "Committer identity unknown", which the deployed container hits
+    // exactly: it runs as a non-root user with HOME=/tmp and no .gitconfig. It never
+    // surfaced in practice only because a fetch that fast-forwards replays nothing;
+    // the failure needs a genuine divergence, which is precisely the case this
+    // fetch→rebase→push sequence exists to handle.
+    let git_cmd_authored = |args: &[&str]| {
+        let mut cmd = git_cmd(args);
+        cmd.env("GIT_AUTHOR_NAME", author_name)
+            .env("GIT_AUTHOR_EMAIL", author_email)
+            .env("GIT_COMMITTER_NAME", author_name)
+            .env("GIT_COMMITTER_EMAIL", author_email);
+        cmd
+    };
+
     // --- git add -- <rel_path> ---
     let add_out = timeout(GIT_TIMEOUT, git_cmd(&["add", "--", rel_path]).output())
         .await
@@ -285,20 +304,7 @@ pub async fn commit_and_sync(
     // derive from user.* when not otherwise specified.
     let commit_out = timeout(
         GIT_TIMEOUT,
-        Command::new("git")
-            .args([
-                "-c",
-                &format!("safe.directory={}", data_path),
-                "commit",
-                "-m",
-                message,
-            ])
-            .env("GIT_AUTHOR_NAME", author_name)
-            .env("GIT_AUTHOR_EMAIL", author_email)
-            .env("GIT_COMMITTER_NAME", author_name)
-            .env("GIT_COMMITTER_EMAIL", author_email)
-            .current_dir(data_path)
-            .output(),
+        git_cmd_authored(&["commit", "-m", message]).output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git commit timed out after {:?}", GIT_TIMEOUT))?
@@ -341,17 +347,52 @@ pub async fn commit_and_sync(
         }
 
         // --- git rebase FETCH_HEAD ---
-        let rebase_out = timeout(GIT_TIMEOUT, git_cmd(&["rebase", "FETCH_HEAD"]).output())
-            .await
-            .map_err(|_| anyhow::anyhow!("git rebase timed out after {:?}", GIT_TIMEOUT))?
-            .context("Failed to spawn git rebase")?;
+        let rebase_out = timeout(
+            GIT_TIMEOUT,
+            git_cmd_authored(&["rebase", "FETCH_HEAD"]).output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("git rebase timed out after {:?}", GIT_TIMEOUT))?
+        .context("Failed to spawn git rebase")?;
         if !rebase_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&rebase_out.stderr));
+
+            // Establish whether this was a REAL conflict before aborting — once the
+            // rebase is aborted the unmerged paths are gone. `--diff-filter=U` lists
+            // exactly the files left in a conflicted state, which only a genuine
+            // content conflict produces.
+            //
+            // This previously labelled every rebase failure a "rebase conflict" on
+            // `rel_path` — the file the caller happened to be writing, which in a
+            // real conflict is usually not even the conflicting file. So an unrelated
+            // failure (e.g. "Committer identity unknown") was reported as a phantom
+            // conflict on an innocent file, sending you looking for a merge problem
+            // that never existed.
+            let conflicted = timeout(
+                GIT_TIMEOUT,
+                git_cmd(&["diff", "--name-only", "--diff-filter=U"]).output(),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+
             // Abort the rebase so the working tree is left clean at the local commit.
             let _ = git_cmd(&["rebase", "--abort"]).output().await;
+
+            if conflicted.is_empty() {
+                anyhow::bail!(
+                    "git rebase onto FETCH_HEAD failed with no conflicting files — \
+                     this is not a merge conflict. Rebase aborted. stderr: {}",
+                    stderr
+                );
+            }
             anyhow::bail!(
-                "rebase conflict: git rebase onto FETCH_HEAD failed ({}). Rebase aborted. stderr: {}",
-                rel_path,
+                "rebase conflict: git rebase onto FETCH_HEAD conflicted on {}. \
+                 Rebase aborted. stderr: {}",
+                conflicted.replace('\n', ", "),
                 stderr
             );
         }
@@ -968,6 +1009,31 @@ pub(crate) mod tests {
             vec![std::path::PathBuf::from("other.md")],
             "the rebase pulled in A's commit, which touched other.md — not mine.md, \
              which is B's own change and already known to the caller"
+        );
+
+        // A rebase REPLAYS commits, so it needs a committer identity of its own — the
+        // identity used for the original `git commit` does not carry over. `rebase`
+        // was previously invoked without one, which works on a developer machine with
+        // a global git config and fails everywhere else with "Committer identity
+        // unknown": CI, and the deployed container, which runs with HOME=/tmp and no
+        // .gitconfig.
+        //
+        // Asserting on the replayed commit's committer catches a regression in BOTH
+        // environments. Drop the identity again and a machine WITH a global config
+        // silently stamps the ambient developer identity here (this assertion fails),
+        // while a machine WITHOUT one fails the rebase outright (the unwrap above
+        // fails). Asserting only that the call succeeded would catch it in CI alone,
+        // and would pass locally while shipping the bug.
+        let committer = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%cn|%ce"])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&committer.stdout).trim(),
+            "test-bot|test-bot@localhost",
+            "the replayed commit must carry the committer identity commit_and_sync \
+             was given, not whatever git config the host happens to have"
         );
     }
 
