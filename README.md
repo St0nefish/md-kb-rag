@@ -97,29 +97,39 @@ md-kb-rag reproject-fields   # Rebuild document_fields from stored frontmatter (
 
 ## Configuration
 
-Config is loaded from `config.yaml` (or the path passed via `--config`). Every field has a sensible default, so the file is optional. Connection settings can be set via environment variables:
+Every setting has **exactly one source**. Settings needed at startup — connection wiring, model identity, and secrets — come from environment variables only. Runtime and tuning settings come from `config.yaml` (or the path passed via `--config`) only. Nothing is readable from both, so there is no precedence to reason about.
 
-**Direct field overrides** — the env var value is used as the config field value:
+**Environment only** — startup bindings, not settable in `config.yaml`:
 
-| Env Var | Config Path | Default (in compose) |
+| Env Var | Purpose | Default |
 |---|---|---|
-| `EMBEDDING_BASE_URL` | `embedding.base_url` | `http://embeddings:8080/v1` |
-| `EMBEDDING_MODEL` | `embedding.model` | `nomic-embed-text-v2-moe` |
-| `EMBEDDING_VECTOR_SIZE` | `embedding.vector_size` | `768` |
-| `EMBEDDING_API_KEY` | `embedding.api_key` | *(unset)* |
-| `QDRANT_URL` | `qdrant.url` | `http://qdrant:6334` |
+| `EMBEDDING_BASE_URL` | embeddings endpoint | *(required)* |
+| `EMBEDDING_MODEL` | embedding model | *(required)* |
+| `EMBEDDING_VECTOR_SIZE` | vector dimension | `768` |
+| `QDRANT_URL` | Qdrant gRPC endpoint | *(required)* |
+| `QDRANT_COLLECTION` | collection name | `knowledge-base` |
+| `RERANKING_BASE_URL` | reranker endpoint | *(required when reranking is on)* |
+| `RERANKING_MODEL` | reranker model | *(required when reranking is on)* |
+| `GIT_URL` | knowledge-base repo to clone/pull | *(unset — no git integration)* |
+| `GIT_BRANCH` | branch to track | `master` |
+| `DATA_PATH` | knowledge base + state DB location | `/data` |
+| `MCP_PORT` | listen port | `8001` |
 
-**Indirected secret env vars** — the config field names *which* env var holds the secret (not the value itself). You can rename the env var by changing the config field:
+Missing required env vars are named together in a single startup error rather than surfacing one per restart. An env var that is set but no longer honored logs a warning instead of being silently ignored.
 
-| Config Field | Default env var name | Default (in compose) |
-|---|---|---|
-| `webhook.secret_env` | `WEBHOOK_SECRET` | *(unset — webhook disabled)* |
-| `source.git_token_env` | `GIT_PULL_TOKEN` | *(unset — no auth for git fetch)* |
-| `mcp.bearer_token_env` | `MCP_BEARER_TOKEN` | *(required)* |
+**Indirected secret env vars** — the config field names *which* env var holds the secret, never the value itself:
+
+| Config Field | Default env var name |
+|---|---|
+| `webhook.secret_env` | `WEBHOOK_SECRET` |
+| `source.git_token_env` | `GIT_PULL_TOKEN` |
+| `mcp.bearer_token_env` | `MCP_BEARER_TOKEN` |
+| `embedding.api_key_env` | `EMBEDDING_API_KEY` |
+| `reranking.api_key_env` | `RERANKING_API_KEY` |
 
 For example, `webhook.secret_env: "WEBHOOK_SECRET"` tells the server to read the HMAC secret from the env var named `WEBHOOK_SECRET`. Change it in config if you want a different env var name.
 
-Env vars take priority over config file values. If neither is set for required fields (`embedding.base_url`, `embedding.model`, `qdrant.url`), the server exits with a clear error.
+Everything else — `search`, `reranking`, `chunking`, `indexing`, `validation`, `write`, `rate_limit`, `frontmatter`, `mcp.instructions` — lives in `config.yaml` only, and can be changed without a restart via [Config reload](#config-reload). Startup logs and `GET /status` report where every setting came from (env, yaml, or default).
 
 See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 
@@ -169,7 +179,7 @@ EMBEDDING_VECTOR_SIZE=1024
 MODEL_FILE=bge-large-en-v1.5-q8_0.gguf
 ```
 
-Or in `config.yaml` (env vars take priority if both are set).
+These are environment-only — `embedding.model` and `embedding.vector_size` are not settable in `config.yaml`. Changing either invalidates every vector already in the collection, so it requires a full reindex, not just a restart.
 
 | Model | `vector_size` | Notes |
 |---|---|---|
@@ -400,15 +410,16 @@ Declared fields get typed Qdrant payload indexes — integer/number/boolean fiel
 
 ## Observability
 
-Three HTTP endpoints, with different audiences and different auth:
+Four HTTP endpoints, with different audiences and different auth:
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `/health` | open | Liveness/readiness. Reports Qdrant and embedding-service reachability only. Returns 503 when either is down. |
 | `/status` | bearer | Full runtime state as JSON. |
 | `/metrics` | bearer | The same data in Prometheus text exposition format. |
+| `POST /admin/reload` | bearer | Re-read and re-validate `config.yaml` and swap it in, without a restart. See [Config reload](#config-reload). |
 
-`/status` and `/metrics` require the same bearer token as `/mcp` (`MCP_BEARER_TOKEN`), because unlike `/health` they enumerate tag vocabularies, area names and document counts — a readable sketch of the knowledge base's contents. Scrape them with an `authorization` stanza:
+`/status`, `/metrics`, and `/admin/reload` require the same bearer token as `/mcp` (`MCP_BEARER_TOKEN`), because unlike `/health` they enumerate tag vocabularies, area names and document counts (`/status`/`/metrics`) or can change how the write tools authenticate content and which webhook provider is trusted (`/admin/reload`) — none of that gets a weaker gate than `/mcp` itself. Scrape `/status`/`/metrics` with an `authorization` stanza:
 
 ```yaml
 scrape_configs:
@@ -435,6 +446,22 @@ If a backing store is unreachable, `/status` still answers — the failure is re
 Responses are cached for 5 seconds and collected single-flight. One request costs roughly two dozen SQLite queries plus a Qdrant round trip, and nothing about the answer changes meaningfully within that window — a scrape burst collapses into one refresh instead of a query storm.
 
 `documents_missing_metadata` can legitimately read negative, and is reported that way rather than clamped. It means the metadata index holds more documents than the state DB tracks, which orphan removal cannot produce on its own — the likely cause is a CLI `index` run interleaving with the server's, since the reindex lock only serializes within one process.
+
+### Config reload
+
+`POST /admin/reload` re-reads `config.yaml` from disk, re-validates it exactly the way startup does (same checks, same errors), and swaps it into the running server — no restart, no dropped connections. Every setting has exactly one legal source (see [Configuration](#configuration) above): ENV vars are for startup/secrets and are never re-read by a reload, so a reload always means the same thing — re-run the YAML side of config resolution and swap the result in.
+
+```bash
+curl -X POST -H "Authorization: Bearer $MCP_BEARER_TOKEN" http://localhost:8001/admin/reload
+```
+
+The response reports exactly what happened, bucketed by whether the change actually took effect:
+
+- **`applied`** — read fresh by the code that uses it (an MCP tool call, a webhook request, the reindex worker's next drain, a periodic timer's next tick), so the very next read observes the new value. `search.*`, `write.*`, `webhook.provider`, `indexing.include`/`exclude`, `frontmatter.*`, `validation.*`, `mcp.instructions`, and more fall here.
+- **`restart_required`** — baked into a value or service built once at server startup (the embedding client's `reqwest::Client` timeout, the MCP path-filter `GlobSet`, the rate limiter, anything security-critical like the bearer token or `allow_unauthenticated`). The swap updates what everything else sees, but this particular consumer keeps behaving exactly as it did before the reload.
+- **`reindex_required`** — `chunking.*`. The indexer reads the new value on its next run, but only for documents that run touches; existing Qdrant chunks keep the old boundaries. Run `md-kb-rag index --full` for a consistent corpus.
+
+A malformed or invalid `config.yaml` — bad YAML, a value that fails validation, a missing required env var — is rejected with a 400 and that error message, and the running config is left **completely untouched**, the same guarantee a failed restart on that file would give you. A successful reload also queues an immediate full reconcile, so indexing-observing changes reach the corpus on the reindex worker's very next wake rather than waiting for the periodic sweep.
 
 ### Logging
 

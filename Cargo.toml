@@ -75,3 +75,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 [dev-dependencies]
 tempfile = "3"
 tower = "0.5"
+# Only for tests: `#[tokio::test(start_paused = true)]` lets reindex.rs's retry/backoff
+# tests fast-forward through real `tokio::time::sleep` calls (backoff runs to several
+# minutes of wall-clock time at MAX_RETRY_ATTEMPTS) instead of actually waiting.
+tokio = { version = "1", features = ["test-util"] }

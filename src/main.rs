@@ -6,6 +6,8 @@ mod git;
 mod ingest;
 mod mcp;
 mod qdrant;
+mod reindex;
+mod reload;
 mod rerank;
 mod retrieval;
 mod schema;
@@ -158,10 +160,19 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::Config::load(Path::new(&cli.config))?;
+    // Log where every setting's value came from before doing anything else — this
+    // is what would have made a deployed `RERANKING_CANDIDATE_LIMIT` silently
+    // overriding YAML obvious immediately instead of requiring a source read.
+    cfg.provenance.log();
+    // Same idea, for a case provenance alone doesn't cover: a MISSING var, not a
+    // deprecated one. `GIT_URL` unset is legitimate (bind-mount-only deployments)
+    // but otherwise indistinguishable from a migration that dropped it by
+    // accident, so surface it explicitly rather than leaving it silent.
+    cfg.log_git_integration_status();
 
     match cli.command.unwrap_or(Commands::Serve) {
         Commands::Serve => {
-            server::run_server(cfg).await?;
+            server::run_server(cfg, PathBuf::from(&cli.config)).await?;
         }
         Commands::Index { full } => {
             // Ensure parent directory exists for state DB
@@ -170,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(parent)
                     .context("Failed to create directory for state DB")?;
             }
-            ingest::run_index(&cfg, full, status::Trigger::Cli).await?;
+            ingest::scan_and_index(&cfg, full, status::Trigger::Cli).await?;
         }
         Commands::Validate { strict } => {
             let data_path = Path::new(cfg.data_path());
@@ -596,6 +607,10 @@ mod tests {
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
             indexing: status::IndexStatus::new().snapshot(),
+            queue: crate::reindex::QueueSnapshot {
+                pending_paths: 0,
+                full_pending: false,
+            },
             store: StoreCounts {
                 indexed_files: Some(330),
                 documents_with_metadata: Some(330),
@@ -604,6 +619,7 @@ mod tests {
                 errors: vec![],
             },
             breakdown: vec![],
+            config: crate::config::ConfigProvenance::default(),
         }
     }
 

@@ -10,9 +10,16 @@ Your `config.yaml` has fields that no longer exist (e.g. `chunking.strategy`, `c
 
 **Fix:** Compare your config against [config.example.yaml](config.example.yaml) and remove any fields not present in the example.
 
-### `Missing required configuration` (embedding.base_url, embedding.model, qdrant.url)
+### `Missing required environment variable(s)` (EMBEDDING_BASE_URL, EMBEDDING_MODEL, QDRANT_URL)
 
-Running outside Docker without the required environment variables set. The error lists all missing fields at once.
+Running outside Docker without the required environment variables set. The error lists all missing vars at once, by bare env var name:
+
+```text
+Missing required environment variable(s):
+  - EMBEDDING_BASE_URL
+  - EMBEDDING_MODEL
+  - QDRANT_URL
+```
 
 **Fix:** Either run via `docker compose` (which wires env vars automatically) or export them manually:
 
@@ -30,7 +37,7 @@ The server refuses to start without an MCP bearer token (unless `mcp.allow_unaut
 
 ### `destination path '.' already exists and is not an empty directory`
 
-The auto-clone on startup found a non-empty `data_path` without a `.git` directory. This happens when files already exist in the volume (e.g. leftover data from a previous setup).
+The auto-clone on startup found a non-empty `DATA_PATH` without a `.git` directory. This happens when files already exist in the volume (e.g. leftover data from a previous setup).
 
 **Fix:** Remove the volume and let the auto-clone start fresh:
 
@@ -109,15 +116,15 @@ The HMAC secret in your Git forge doesn't match `WEBHOOK_SECRET`.
 
 ### 200 OK but no reindex happens
 
-The push was to a branch that doesn't match `source.branch`.
+The push was to a branch that doesn't match `GIT_BRANCH`.
 
-**Fix:** Check that the webhook fires on pushes to the branch configured in `source.branch` (default: `master`).
+**Fix:** Check that the webhook fires on pushes to the branch configured in `GIT_BRANCH` (default: `master`).
 
 ### Git fetch failed (500 Internal Server Error)
 
 The webhook verified successfully but the in-container `git fetch` or `git merge` failed. Common causes:
 
-- **Wrong `source.git_url`** — check the URL is correct and reachable from inside the container.
+- **Wrong `GIT_URL`** — check the URL is correct and reachable from inside the container.
 - **Bad or expired `GIT_PULL_TOKEN`** — for private HTTPS repos, the token needs read repository access for webhook pulls (and **write** access if you use the MCP write tools, which push commits back). Regenerate it in your forge's settings.
 - **SSH URL without keys** — SSH URLs bypass token injection, but the container needs SSH keys configured. For Docker deployments, HTTPS with a token is simpler.
 - **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. This usually means someone modified files directly in the bind-mounted directory. Using a named volume (recommended) avoids this by keeping the repo inaccessible from the host.
@@ -138,7 +145,7 @@ Your reverse proxy is redirecting HTTP to HTTPS, but the webhook is configured w
 
 ### Qdrant dimension mismatch after model change
 
-Changing the embedding model (or `vector_size`) makes existing vectors incompatible.
+Changing the embedding model (or `EMBEDDING_VECTOR_SIZE`) makes existing vectors incompatible.
 
 **Fix:** Run `md-kb-rag index --full` to drop and recreate the Qdrant collection with the new dimensions.
 
@@ -182,7 +189,7 @@ Indexing run complete discovered=42 indexed=5 skipped=36 invalid=0 empty=0 read_
 
 If a file you expected to be indexed shows up under `skipped`, its hash matches the last indexed version — it hasn't changed since the last run. If it shows under `invalid`, run `md-kb-rag validate` for details.
 
-`git fetch timed out after Xs` / `git merge timed out after Xs` (ERROR) — webhook-triggered git subprocess exceeded the 120-second timeout. Check that `source.git_url` is reachable from inside the container.
+`git fetch timed out after Xs` / `git merge timed out after Xs` (ERROR) — webhook-triggered git subprocess exceeded the 120-second timeout. Check that `GIT_URL` is reachable from inside the container.
 
 `Could not read mtime for '...', defaulting to 0` (WARN) — filesystem metadata was unavailable. The file is still indexed; `mtime` in the Qdrant payload will be `0`.
 

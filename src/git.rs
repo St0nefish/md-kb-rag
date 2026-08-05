@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::process::Command;
 use tokio::time::timeout;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Maximum time to wait for a git subprocess (clone) before treating it as
 /// hung and returning an error.
@@ -115,8 +115,133 @@ pub async fn ensure_repo(
     Ok(true)
 }
 
+/// Outcome of [`commit_and_sync`]: the resulting commit SHA, plus any paths pulled in
+/// by the rebase from commits other than the one this call just made.
+///
+/// `rebased_paths` comes from diffing `OLD..NEW`, where `OLD` is HEAD right after our
+/// own local commit (captured before the fetch) and `NEW` is HEAD after the rebase
+/// completes. That range necessarily excludes `rel_path` itself — the caller already
+/// knows about that one — and captures exactly the files touched by whatever the
+/// rebase pulled in from the remote, which also need reindexing. Empty when there was
+/// no remote to rebase onto (`git_url` is `None`) or the rebase was a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOutcome {
+    pub sha: String,
+    pub rebased_paths: Vec<std::path::PathBuf>,
+}
+
+/// Run `git rev-parse HEAD` in `data_path` and return the trimmed SHA.
+///
+/// `pub(crate)` so `webhook.rs` can compute its own before/after range around the
+/// fetch + ff-only merge it performs, the same way `commit_and_sync` does around its
+/// own fetch + rebase.
+pub(crate) async fn rev_parse_head(data_path: &str) -> anyhow::Result<String> {
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args([
+                "-c",
+                &format!("safe.directory={}", data_path),
+                "rev-parse",
+                "HEAD",
+            ])
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git rev-parse")?;
+
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git rev-parse HEAD failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Parse `git diff --name-status` output into the set of paths it touched.
+///
+/// Handles A(dded)/M(odified)/D(eleted) as a single path, and R(enamed)/C(opied) — which
+/// carry a similarity score suffix like `R100` and two tab-separated paths — as BOTH the
+/// old and new path, since both need reindexing (old: purge; new: index).
+fn parse_diff_name_status(output: &str) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let Some(status) = fields.next() else {
+            continue;
+        };
+        match status.chars().next() {
+            Some('A') | Some('M') | Some('D') => {
+                if let Some(path) = fields.next() {
+                    paths.push(std::path::PathBuf::from(path));
+                }
+            }
+            Some('R') | Some('C') => {
+                if let (Some(old), Some(new)) = (fields.next(), fields.next()) {
+                    paths.push(std::path::PathBuf::from(old));
+                    paths.push(std::path::PathBuf::from(new));
+                }
+            }
+            _ => {
+                warn!(
+                    "Unrecognized 'git diff --name-status' line, ignoring: {}",
+                    line
+                );
+            }
+        }
+    }
+    paths
+}
+
+/// `git diff --name-status -M old..new` in `data_path`, parsed into touched paths.
+/// Local git only — no network. `-M` forces rename detection so a pure rename is
+/// reported as `R`, not as a delete+add pair (which would still work — both paths end
+/// up in the result — but would cost the new path an unnecessary re-embed instead of
+/// letting `index_paths` see it as unchanged content under a new name... which it
+/// cannot, since content hashing does not know about the old path. Either way both
+/// paths are enqueued; `-M` is for a cleaner log line, not correctness here).
+pub(crate) async fn git_diff_name_status(
+    data_path: &str,
+    old: &str,
+    new: &str,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let range = format!("{old}..{new}");
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args([
+                "-c",
+                &format!("safe.directory={}", data_path),
+                "diff",
+                "--name-status",
+                "-M",
+                &range,
+            ])
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git diff timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git diff")?;
+
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git diff --name-status failed: {}", stderr);
+    }
+
+    Ok(parse_diff_name_status(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
 /// Stage `rel_path`, commit with `message`, then (if `git_url` is Some) fetch the
-/// remote branch, rebase the local branch onto it, and push. Returns the new commit SHA.
+/// remote branch, rebase the local branch onto it, and push. Returns the new commit
+/// SHA plus any paths pulled in by the rebase — see [`CommitOutcome`].
 ///
 /// `rel_path` is relative to `data_path`. `message` already includes any provenance trailer.
 /// If `git_url` is None, commit locally only (no fetch/rebase/push).
@@ -133,7 +258,7 @@ pub async fn commit_and_sync(
     message: &str,
     author_name: &str,
     author_email: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<CommitOutcome> {
     // Helper: build a base git command with safe.directory set and cwd pointing at data_path.
     // Returns (Command,) ready to have more args appended.
     let git_cmd = |args: &[&str]| {
@@ -141,6 +266,25 @@ pub async fn commit_and_sync(
         cmd.args(["-c", &format!("safe.directory={}", data_path)])
             .args(args)
             .current_dir(data_path);
+        cmd
+    };
+
+    // Helper: `git_cmd` plus the commit identity in the environment.
+    //
+    // EVERY git subcommand that creates a commit needs this, not just `commit`.
+    // `rebase` replays commits, so it needs a committer identity too — and it was
+    // previously invoked without one. In any environment lacking a global git config
+    // that fails with "Committer identity unknown", which the deployed container hits
+    // exactly: it runs as a non-root user with HOME=/tmp and no .gitconfig. It never
+    // surfaced in practice only because a fetch that fast-forwards replays nothing;
+    // the failure needs a genuine divergence, which is precisely the case this
+    // fetch→rebase→push sequence exists to handle.
+    let git_cmd_authored = |args: &[&str]| {
+        let mut cmd = git_cmd(args);
+        cmd.env("GIT_AUTHOR_NAME", author_name)
+            .env("GIT_AUTHOR_EMAIL", author_email)
+            .env("GIT_COMMITTER_NAME", author_name)
+            .env("GIT_COMMITTER_EMAIL", author_email);
         cmd
     };
 
@@ -160,20 +304,7 @@ pub async fn commit_and_sync(
     // derive from user.* when not otherwise specified.
     let commit_out = timeout(
         GIT_TIMEOUT,
-        Command::new("git")
-            .args([
-                "-c",
-                &format!("safe.directory={}", data_path),
-                "commit",
-                "-m",
-                message,
-            ])
-            .env("GIT_AUTHOR_NAME", author_name)
-            .env("GIT_AUTHOR_EMAIL", author_email)
-            .env("GIT_COMMITTER_NAME", author_name)
-            .env("GIT_COMMITTER_EMAIL", author_email)
-            .current_dir(data_path)
-            .output(),
+        git_cmd_authored(&["commit", "-m", message]).output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("git commit timed out after {:?}", GIT_TIMEOUT))?
@@ -183,11 +314,19 @@ pub async fn commit_and_sync(
         anyhow::bail!("git commit failed: {}", stderr);
     }
 
+    let mut rebased_paths: Vec<std::path::PathBuf> = Vec::new();
+
     if let Some(url) = git_url {
         let auth_url = match token {
             Some(t) if !t.is_empty() => inject_token_into_url(url, t),
             _ => url.to_string(),
         };
+
+        // Capture HEAD right after our own commit and before the fetch. Diffing this
+        // against HEAD once the rebase completes isolates exactly what the rebase
+        // pulled in from the remote — our own change is already on both sides of that
+        // range, so it is never double-reported here.
+        let old_head = rev_parse_head(data_path).await?;
 
         // --- git fetch --no-tags <auth_url> <branch> ---
         info!(
@@ -208,20 +347,64 @@ pub async fn commit_and_sync(
         }
 
         // --- git rebase FETCH_HEAD ---
-        let rebase_out = timeout(GIT_TIMEOUT, git_cmd(&["rebase", "FETCH_HEAD"]).output())
-            .await
-            .map_err(|_| anyhow::anyhow!("git rebase timed out after {:?}", GIT_TIMEOUT))?
-            .context("Failed to spawn git rebase")?;
+        let rebase_out = timeout(
+            GIT_TIMEOUT,
+            git_cmd_authored(&["rebase", "FETCH_HEAD"]).output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("git rebase timed out after {:?}", GIT_TIMEOUT))?
+        .context("Failed to spawn git rebase")?;
         if !rebase_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&rebase_out.stderr));
+
+            // Establish whether this was a REAL conflict before aborting — once the
+            // rebase is aborted the unmerged paths are gone. `--diff-filter=U` lists
+            // exactly the files left in a conflicted state, which only a genuine
+            // content conflict produces.
+            //
+            // This previously labelled every rebase failure a "rebase conflict" on
+            // `rel_path` — the file the caller happened to be writing, which in a
+            // real conflict is usually not even the conflicting file. So an unrelated
+            // failure (e.g. "Committer identity unknown") was reported as a phantom
+            // conflict on an innocent file, sending you looking for a merge problem
+            // that never existed.
+            let conflicted = timeout(
+                GIT_TIMEOUT,
+                git_cmd(&["diff", "--name-only", "--diff-filter=U"]).output(),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+
             // Abort the rebase so the working tree is left clean at the local commit.
             let _ = git_cmd(&["rebase", "--abort"]).output().await;
+
+            if conflicted.is_empty() {
+                anyhow::bail!(
+                    "git rebase onto FETCH_HEAD failed with no conflicting files — \
+                     this is not a merge conflict. Rebase aborted. stderr: {}",
+                    stderr
+                );
+            }
             anyhow::bail!(
-                "rebase conflict: git rebase onto FETCH_HEAD failed ({}). Rebase aborted. stderr: {}",
-                rel_path,
+                "rebase conflict: git rebase onto FETCH_HEAD conflicted on {}. \
+                 Rebase aborted. stderr: {}",
+                conflicted.replace('\n', ", "),
                 stderr
             );
         }
+
+        // Diff the rebase range now, before pushing — this is local-only (no network)
+        // and a push failure below should not prevent the caller from at least
+        // learning what changed locally, though in practice a push failure aborts the
+        // whole call anyway.
+        let new_head = rev_parse_head(data_path).await?;
+        rebased_paths = git_diff_name_status(data_path, &old_head, &new_head)
+            .await
+            .context("Failed to diff the rebase range")?;
 
         // --- git push <auth_url> HEAD:<branch> ---
         info!("Pushing to {} branch {}", redact_url(&auth_url), branch);
@@ -239,18 +422,8 @@ pub async fn commit_and_sync(
         }
     }
 
-    // --- git rev-parse HEAD ---
-    let rev_out = timeout(GIT_TIMEOUT, git_cmd(&["rev-parse", "HEAD"]).output())
-        .await
-        .map_err(|_| anyhow::anyhow!("git rev-parse timed out after {:?}", GIT_TIMEOUT))?
-        .context("Failed to spawn git rev-parse")?;
-    if !rev_out.status.success() {
-        let stderr = redact_url(&String::from_utf8_lossy(&rev_out.stderr));
-        anyhow::bail!("git rev-parse HEAD failed: {}", stderr);
-    }
-
-    let sha = String::from_utf8_lossy(&rev_out.stdout).trim().to_string();
-    Ok(sha)
+    let sha = rev_parse_head(data_path).await?;
+    Ok(CommitOutcome { sha, rebased_paths })
 }
 
 #[cfg(test)]
@@ -597,7 +770,7 @@ pub(crate) mod tests {
         // Write a new file into the working repo
         std::fs::write(work.path().join("notes.md"), "# Notes\nHello world").unwrap();
 
-        let sha = commit_and_sync(
+        let outcome = commit_and_sync(
             None,
             "main",
             work_path,
@@ -609,6 +782,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+        let sha = &outcome.sha;
 
         // SHA should be a 40-char hex string
         assert_eq!(sha.len(), 40, "Expected a 40-char SHA, got: {}", sha);
@@ -616,6 +790,10 @@ pub(crate) mod tests {
             sha.chars().all(|c| c.is_ascii_hexdigit()),
             "SHA should be hex: {}",
             sha
+        );
+        assert!(
+            outcome.rebased_paths.is_empty(),
+            "no git_url means no fetch/rebase, so nothing to report"
         );
 
         // The file should be committed (git show HEAD should include it)
@@ -652,7 +830,7 @@ pub(crate) mod tests {
         // Write a new file into the working repo
         std::fs::write(work.path().join("article.md"), "# Article\nContent here").unwrap();
 
-        let sha = commit_and_sync(
+        let outcome = commit_and_sync(
             Some(&bare_url),
             "main",
             work_path,
@@ -665,7 +843,16 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        assert_eq!(sha.len(), 40, "Expected a 40-char SHA, got: {}", sha);
+        assert_eq!(
+            outcome.sha.len(),
+            40,
+            "Expected a 40-char SHA, got: {}",
+            outcome.sha
+        );
+        assert!(
+            outcome.rebased_paths.is_empty(),
+            "nothing else landed on the remote between fetch and push"
+        );
 
         // Verify the commit made it to the bare remote by cloning it fresh
         let verify_dir = tempfile::TempDir::new().unwrap();
@@ -757,6 +944,134 @@ pub(crate) mod tests {
             err.starts_with("rebase conflict:"),
             "Error should start with 'rebase conflict:', got: {}",
             err
+        );
+    }
+
+    /// Two clones each add a different file and push in turn; the second push must
+    /// rebase in the first clone's commit, and `rebased_paths` must report the file
+    /// THAT commit touched — not the one this call is committing itself.
+    #[tokio::test]
+    async fn commit_and_sync_reports_paths_pulled_in_by_the_rebase() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+
+        // Clone A pushes first, adding other.md.
+        let work_a = clone_bare_repo(bare.path(), "main");
+        std::fs::write(work_a.path().join("other.md"), "from A").unwrap();
+        commit_and_sync(
+            Some(&bare_url),
+            "main",
+            work_a.path().to_str().unwrap(),
+            None,
+            "other.md",
+            "add other.md from A",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        // Clone B was cloned BEFORE A pushed (from the original bare state), so its
+        // own commit_and_sync call must fetch + rebase onto A's commit to push.
+        let work_b = clone_bare_repo(bare.path(), "main");
+        let log_out = std::process::Command::new("git")
+            .args(["log", "--format=%H", "-2"])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+        let commits: Vec<&str> = std::str::from_utf8(&log_out.stdout)
+            .unwrap()
+            .lines()
+            .collect();
+        let parent_sha = commits[1].trim();
+        std::process::Command::new("git")
+            .args(["reset", "--hard", parent_sha])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+
+        std::fs::write(work_b.path().join("mine.md"), "from B").unwrap();
+        let outcome = commit_and_sync(
+            Some(&bare_url),
+            "main",
+            work_b.path().to_str().unwrap(),
+            None,
+            "mine.md",
+            "add mine.md from B",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.rebased_paths,
+            vec![std::path::PathBuf::from("other.md")],
+            "the rebase pulled in A's commit, which touched other.md — not mine.md, \
+             which is B's own change and already known to the caller"
+        );
+
+        // A rebase REPLAYS commits, so it needs a committer identity of its own — the
+        // identity used for the original `git commit` does not carry over. `rebase`
+        // was previously invoked without one, which works on a developer machine with
+        // a global git config and fails everywhere else with "Committer identity
+        // unknown": CI, and the deployed container, which runs with HOME=/tmp and no
+        // .gitconfig.
+        //
+        // Asserting on the replayed commit's committer catches a regression in BOTH
+        // environments. Drop the identity again and a machine WITH a global config
+        // silently stamps the ambient developer identity here (this assertion fails),
+        // while a machine WITHOUT one fails the rebase outright (the unwrap above
+        // fails). Asserting only that the call succeeded would catch it in CI alone,
+        // and would pass locally while shipping the bug.
+        let committer = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%cn|%ce"])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&committer.stdout).trim(),
+            "test-bot|test-bot@localhost",
+            "the replayed commit must carry the committer identity commit_and_sync \
+             was given, not whatever git config the host happens to have"
+        );
+    }
+
+    #[test]
+    fn parse_diff_name_status_handles_add_modify_delete() {
+        let out = "A\tnew.md\nM\tchanged.md\nD\tgone.md\n";
+        let paths = parse_diff_name_status(out);
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("new.md"),
+                std::path::PathBuf::from("changed.md"),
+                std::path::PathBuf::from("gone.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_diff_name_status_enqueues_both_sides_of_a_rename() {
+        // Git reports renames with a similarity-score suffix on the status ("R100").
+        let out = "R100\told-name.md\tnew-name.md\n";
+        let paths = parse_diff_name_status(out);
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("old-name.md"),
+                std::path::PathBuf::from("new-name.md"),
+            ],
+            "both the old path (to purge) and the new path (to index) must be enqueued"
+        );
+    }
+
+    #[test]
+    fn parse_diff_name_status_ignores_blank_lines() {
+        let out = "A\tnew.md\n\n";
+        assert_eq!(
+            parse_diff_name_status(out),
+            vec![std::path::PathBuf::from("new.md")]
         );
     }
 }

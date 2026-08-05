@@ -1,15 +1,16 @@
 //! Runtime observability for the indexing pipeline.
 //!
-//! `run_index` computes everything worth knowing about a run — how many files it saw,
-//! how many it embedded, how many it refused — and used to log it and throw it away.
-//! Answering "is an index running, and how did the last one go?" then meant `docker exec`
-//! into the container and reading logs, which is the wrong shape for a service whose
-//! whole job is keeping an index in sync.
+//! `ingest::index_paths` computes everything worth knowing about a run — how many
+//! paths it saw, how many it embedded, how many it refused — and used to log it and
+//! throw it away. Answering "is an index running, and how did the last one go?" then
+//! meant `docker exec` into the container and reading logs, which is the wrong shape
+//! for a service whose whole job is keeping an index in sync.
 //!
 //! This module keeps that state in memory so `/status` and `/metrics` can answer in one
-//! call. It is deliberately process-global, mirroring [`crate::webhook::REINDEX_LOCK`]:
-//! indexing is already serialized per process by that lock, and threading a handle
-//! through five call sites and every test mock would buy nothing.
+//! call. It is deliberately process-global, mirroring [`crate::reindex::REINDEX_QUEUE`]:
+//! `index_paths` is the sole index mutator per process (the reindex worker is the only
+//! thing that calls it in `serve` mode), and threading a handle through every call site
+//! and every test mock would buy nothing.
 //!
 //! Nothing here is persisted. A restart resets the run history, which is correct — the
 //! interesting question is almost always "what has this process done", and the durable
@@ -68,17 +69,39 @@ impl RunMode {
 pub enum Trigger {
     /// `md-kb-rag index` from the command line.
     Cli,
-    /// The initial index after a fresh clone at server startup.
+    /// The initial full index after a fresh git clone, run synchronously before the
+    /// server starts serving — the one case with no worker to hand work to yet.
     Startup,
     /// A push notification from the knowledge base's git host.
+    ///
+    /// No longer set by `webhook.rs` directly — the webhook handler marks the pushed
+    /// commit range's paths dirty and returns; the reindex worker performs the actual
+    /// run, tagged `Worker`. Kept as a variant for API stability and because tests
+    /// still exercise the webhook's path-marking behavior under this name.
     Webhook,
     /// A `create_document` / `edit_document` / `delete_document` MCP call.
+    ///
+    /// Same caveat as `Webhook`: the write tools mark their paths dirty and return
+    /// immediately rather than calling into the indexer, so `Worker` is what actually
+    /// appears in `/status` for the resulting run.
     WriteTool,
+    /// The background reindex worker, draining the dirty-path queue (`src/reindex.rs`).
+    /// This is what performs almost every indexing run in a running server: writes,
+    /// webhooks, and both the startup and periodic reconcile sweeps all funnel through
+    /// here, which is why an MCP write call's latency is no longer coupled to embedding
+    /// time — the worker does that work out of band.
+    Worker,
 }
 
 impl Trigger {
     /// Every variant, so state-set metrics can emit a 0 for the inactive ones.
-    pub const ALL: [Self; 4] = [Self::Cli, Self::Startup, Self::Webhook, Self::WriteTool];
+    pub const ALL: [Self; 5] = [
+        Self::Cli,
+        Self::Startup,
+        Self::Webhook,
+        Self::WriteTool,
+        Self::Worker,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -86,6 +109,7 @@ impl Trigger {
             Self::Startup => "startup",
             Self::Webhook => "webhook",
             Self::WriteTool => "write_tool",
+            Self::Worker => "worker",
         }
     }
 }

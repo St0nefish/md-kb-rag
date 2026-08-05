@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate};
 
@@ -17,7 +16,7 @@ use crate::{
     config::ResolvedConfig,
     document_fields,
     embed::EmbedClient,
-    git, ingest,
+    git,
     qdrant::QdrantStore,
     rerank::RerankClient,
     retrieval::{
@@ -1011,59 +1010,26 @@ pub struct KbSearchServer {
     include_patterns: Arc<GlobSet>,
     /// Dynamic MCP server instructions, refreshed periodically with discovered metadata.
     instructions: Arc<RwLock<String>>,
-    /// Resolved config, needed by write tools (create_document, etc.).
-    config: Arc<ResolvedConfig>,
+    /// Live config handle. Every tool call fetches its own fresh snapshot via
+    /// [`Self::config`] rather than caching one at construction, so `POST
+    /// /admin/reload` is observed by the very next call — see that method's doc
+    /// comment for exactly which settings this makes dynamic.
+    config: crate::config::SharedConfig,
+    /// The shared, cached schema tree — built once at server startup and kept
+    /// current by the reindex worker (which rebuilds it before indexing any
+    /// dirty `.kb-schema.yaml`) and by `update_schema`'s own synchronous rebuild.
+    /// `get_schema`, `update_schema`, and the write path all read this instead of
+    /// re-walking the knowledge base on every call; see `schema::SharedSchemaCache`.
+    schema_cache: crate::schema::SharedSchemaCache,
     rerank_client: Option<Arc<RerankClient>>,
-    /// How long write tools wait for `REINDEX_LOCK` before skipping the index update.
-    /// Always [`crate::webhook::REINDEX_LOCK_TIMEOUT`] in production; tests shorten it so
-    /// they can exercise the timeout path without a 30-second sleep.
-    reindex_lock_timeout: Duration,
     /// Handle to the document metadata index, opened on first use and held for the
     /// process lifetime. Under WAL this reader coexists with the short-lived writer
-    /// pools that reindexing and delete cleanup open.
+    /// pools that the reindex worker and CLI open.
     ///
     /// Lazy rather than constructor-injected so building a server stays synchronous
     /// and infallible with respect to SQLite availability.
     state_db: Arc<tokio::sync::OnceCell<StateDb>>,
 }
-
-/// Acquire the shared reindex lock, giving up after `wait`.
-///
-/// Returns `None` if the lock could not be acquired in time. A webhook-triggered reindex
-/// can hold [`crate::webhook::REINDEX_LOCK`] for minutes, and the write tools only reach
-/// this point *after* the document has already been committed and pushed — so giving up
-/// and reporting a skipped index update beats blocking the tool call indefinitely.
-///
-/// `wait` is a parameter rather than being read from `REINDEX_LOCK_TIMEOUT` directly so
-/// tests can exercise the timeout path without a 30-second sleep.
-async fn acquire_reindex_lock(wait: Duration) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-    tokio::time::timeout(wait, Arc::clone(&crate::webhook::REINDEX_LOCK).lock_owned())
-        .await
-        .ok()
-}
-
-/// Warning appended to a write tool's *successful* output when the index update was skipped
-/// because [`acquire_reindex_lock`] timed out.
-///
-/// `consequence` spells out what the stale index means for this specific operation — it
-/// differs materially between a write (not yet searchable) and a delete (still searchable).
-fn reindex_skipped_warning(wait: Duration, consequence: &str) -> String {
-    format!(
-        "⚠️  Search index update was SKIPPED: a reindex is already in progress \
-         (waited {:?} for it to finish). The change is committed to git, so nothing is \
-         lost, but {} until the next reindex runs — another write, a webhook push, or a \
-         manual `index` run. This project has no periodic reindex timer.",
-        wait, consequence
-    )
-}
-
-/// `consequence` text for `create_document` / `edit_document`.
-const REINDEX_SKIPPED_WRITE: &str = "this document will not be searchable";
-
-/// `consequence` text for `delete_document`. The inverse of the write case: the purge did
-/// not happen, so the removed document's content is still live in the index.
-const REINDEX_SKIPPED_DELETE: &str = "the deleted document's content REMAINS in the search index and can still be \
-     returned by `search`";
 
 /// Build an include `GlobSet` for MCP path filtering, with a `**/*.md` fallback
 /// when no patterns are valid. Per-pattern parsing uses [`crate::ingest::parse_globs`]
@@ -1099,7 +1065,8 @@ impl KbSearchServer {
         data_path: PathBuf,
         include_patterns: &[String],
         instructions: Arc<RwLock<String>>,
-        config: Arc<ResolvedConfig>,
+        config: crate::config::SharedConfig,
+        schema_cache: crate::schema::SharedSchemaCache,
         rerank_client: Option<Arc<RerankClient>>,
     ) -> anyhow::Result<Self> {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
@@ -1110,24 +1077,28 @@ impl KbSearchServer {
             qdrant,
             collection,
             canonical_data_path,
+            // Compiled once from the config snapshot at construction time — a
+            // `POST /admin/reload` that changes `indexing.include` does NOT change
+            // what get_document accepts until a restart. See
+            // `reload.rs`'s "indexing.include (MCP get_document path filter)" entry.
             include_patterns: Arc::new(build_include_globset(include_patterns)),
             instructions,
             config,
+            schema_cache,
             rerank_client,
-            reindex_lock_timeout: crate::webhook::REINDEX_LOCK_TIMEOUT,
             state_db: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
-    /// Shorten the reindex-lock wait. Test-only: the timeout path is otherwise a
-    /// 30-second wall-clock wait, which would dominate the suite's runtime.
-    #[cfg(test)]
-    fn with_reindex_lock_timeout(mut self, wait: Duration) -> Self {
-        self.reindex_lock_timeout = wait;
-        self
+    /// A fresh snapshot of the live config — a lock acquisition plus an `Arc`
+    /// clone, mirroring `schema::load_shared`. Every tool call fetches its own
+    /// snapshot here rather than reading a value captured at construction, so a
+    /// `POST /admin/reload` swap is observed starting with the very next call.
+    fn config(&self) -> Arc<ResolvedConfig> {
+        crate::config::load_shared_config(&self.config)
     }
 
-    /// Write a non-document file into the KB, commit it, and reindex.
+    /// Write a non-document file into the KB, commit it, and queue a full reconcile.
     ///
     /// Used for `.kb-schema.yaml`, which is versioned and synced like a document but is
     /// not itself indexed. The write goes to a temp file and is renamed into place, so a
@@ -1138,7 +1109,7 @@ impl KbSearchServer {
         content: &str,
         commit_message: &str,
     ) -> Result<(), McpError> {
-        let config = &self.config;
+        let config = self.config();
 
         // Same resolver the document write tools use. Joining the data root with a
         // caller-supplied path is NOT sufficient on its own: the knowledge base is a
@@ -1199,22 +1170,14 @@ impl KbSearchServer {
             McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
         })?;
 
-        // A schema change revalidates its whole subtree via the schema fingerprint, so
-        // this reindex is doing real work rather than a no-op. As with document writes,
-        // a reindex we cannot start means a stale index, not lost content.
-        match acquire_reindex_lock(self.reindex_lock_timeout).await {
-            Some(_guard) => {
-                if let Err(e) =
-                    ingest::run_index(config, false, crate::status::Trigger::WriteTool).await
-                {
-                    error!("Reindex after schema update failed: {:#}", e);
-                }
-            }
-            None => warn!(
-                "Reindex after schema update skipped: REINDEX_LOCK still held after {:?}",
-                self.reindex_lock_timeout
-            ),
-        }
+        // A schema change revalidates its whole subtree via the schema fingerprint —
+        // any document under this scope can flip from valid to invalid or vice versa —
+        // and there is no cheap way to enumerate exactly which paths that touches
+        // without a walk. Rather than approximate it, mark a full reconcile: the
+        // worker will scan, and `index_paths`' existing schema-fingerprint check
+        // (unrelated to this reconcile's OWN full-walk vs scoped distinction) is what
+        // actually catches the affected documents once it re-reads them.
+        crate::reindex::mark_full();
 
         Ok(())
     }
@@ -1298,7 +1261,7 @@ impl KbSearchServer {
     async fn state_db(&self) -> anyhow::Result<&StateDb> {
         self.state_db
             .get_or_try_init(|| async {
-                let path = self.config.state_db_path();
+                let path = self.config().state_db_path();
                 StateDb::new(std::path::Path::new(&path))
                     .await
                     .with_context(|| format!("Failed to open state DB at {}", path))
@@ -1375,20 +1338,20 @@ impl KbSearchServer {
             .transpose()
             .map_err(|e| McpError::invalid_params(e, None))?;
 
+        // Fetched once per call so every field below — including
+        // reranking.candidate_limit — reflects the same live snapshot, rather than
+        // racing a concurrent `POST /admin/reload` mid-request.
+        let config = self.config();
         let explain = params.explain.unwrap_or(false);
         let opts = SearchOptions {
             limit,
-            min_score: params.min_score.or(self.config.search.min_score),
-            hybrid: self.config.search.hybrid,
-            rrf_candidates: self.config.search.rrf_candidates as u64,
+            min_score: params.min_score.or(config.search.min_score),
+            hybrid: config.search.hybrid,
+            rrf_candidates: config.search.rrf_candidates as u64,
             explain,
             modified_after,
             modified_before,
-            rerank_candidate_limit: self
-                .config
-                .reranking
-                .as_ref()
-                .map(|r| r.candidate_limit as u64),
+            rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
         };
 
         let results = retrieval::search(&self.deps(), &params.query, &filters, &opts)
@@ -1487,7 +1450,7 @@ impl KbSearchServer {
             ));
 
             if explain {
-                let mode = if self.config.search.hybrid {
+                let mode = if config.search.hybrid {
                     "hybrid RRF"
                 } else {
                     "dense cosine"
@@ -1553,7 +1516,11 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         let raw = params.path.clone().unwrap_or_default();
         let rel = normalize_scope_path(&raw)?;
-        let schemas = SchemaCache::build(&self.canonical_data_path, &self.config.frontmatter);
+        // Reads the shared, server-owned cache rather than walking the tree on every
+        // call — this tool is the one the server's own instructions tell agents to
+        // call before every write, so it needs to be cheap. See
+        // `KbSearchServer::schema_cache`'s doc comment for how it stays current.
+        let schemas = crate::schema::load_shared(&self.schema_cache);
 
         // A document path resolves via its parent; a directory resolves to itself. A
         // partial directory reference resolves like a partial document path does —
@@ -1690,7 +1657,12 @@ impl KbSearchServer {
         let requested = normalize_scope_path(params.path.as_deref().unwrap_or(""))?;
         let edit = build_schema_edit(&params)?;
 
-        let schemas = SchemaCache::build(&self.canonical_data_path, &self.config.frontmatter);
+        // Read the shared cache for the pre-edit view (casualty check, raw file
+        // lookup below). This does NOT need to be maximally fresh — worst case a
+        // concurrent change this call doesn't see yet is caught by the casualty
+        // check failing safe or by a subsequent call — but see the synchronous
+        // rebuild after the write below, which is NOT optional.
+        let schemas = crate::schema::load_shared(&self.schema_cache);
 
         // Resolve a partial reference against existing scopes, but fall back to the
         // literal path: creating a schema for a directory that has none yet is the
@@ -1784,6 +1756,38 @@ impl KbSearchServer {
 
         self.write_raw_file(&rel_file_str, &yaml, &commit_message)
             .await?;
+
+        // Rebuild the shared schema cache and swap it in SYNCHRONOUSLY — before this
+        // call returns, not merely "soon". `write_raw_file` already called
+        // `reindex::mark_full`, so the reindex worker will ALSO rebuild it, but that
+        // happens out of band on the worker's own schedule and cannot be relied on to
+        // win the race against whatever the calling agent does next. The scenario this
+        // guards against: an agent calls `update_schema` to permit a new value, then
+        // immediately calls `create_document`/`edit_document` relying on that new rule
+        // — if the write path read a stale cache, it would validate against the schema
+        // this very call just replaced and wrongly reject a now-valid document. Wrapped
+        // in `spawn_blocking` because the walk itself is blocking filesystem work, not
+        // because anything here needs to run off-thread for its own sake — `.await`ing
+        // it still makes this call return only once the rebuild has completed.
+        let rebuild_data_path = self.canonical_data_path.clone();
+        let rebuild_frontmatter = self.config().frontmatter.clone();
+        match tokio::task::spawn_blocking(move || {
+            SchemaCache::build(&rebuild_data_path, &rebuild_frontmatter)
+        })
+        .await
+        {
+            Ok(rebuilt) => crate::schema::store_shared(&self.schema_cache, rebuilt),
+            Err(e) => {
+                // A panic in the walk itself (not a normal error — `SchemaCache::build`
+                // has no fallible return). Leave the previous cache in place rather than
+                // fail the whole call: the write already succeeded and is committed: an
+                // agent's NEXT read/write may briefly see the pre-edit schema, which is
+                // the same staleness window this call exists to close, not a new one —
+                // failing here would not close it either, just add a spurious error on
+                // top of a successful write.
+                error!("Schema rebuild panicked after update_schema write: {e}");
+            }
+        }
 
         let mut text = format!("{summary}\nWrote {rel_file_str}.");
         if !casualties.is_empty() {
@@ -2013,7 +2017,9 @@ impl KbSearchServer {
         force_new: Option<bool>,
         operation: &str,
     ) -> Result<CallToolResult, McpError> {
-        let config = &self.config;
+        // One snapshot for the whole call, so a concurrent `POST /admin/reload`
+        // cannot mix old and new values across this method's several config reads.
+        let config = self.config();
 
         if new_content.len() > MAX_CONTENT_LEN {
             return Err(McpError::invalid_params(
@@ -2031,10 +2037,16 @@ impl KbSearchServer {
         //
         // The schema is resolved from the TARGET path's directory, so writing into
         // `lifestyle/kitchen/recipes/` is governed by that folder's rules regardless of
-        // where the caller has been reading. The cascade is rebuilt per write rather
-        // than cached: writes are infrequent, a tree walk is milliseconds, and a stale
-        // cache here would validate against rules the author just changed.
-        let schemas = SchemaCache::build(&self.canonical_data_path, &config.frontmatter);
+        // where the caller has been reading. This reads the shared, server-owned cache
+        // (`KbSearchServer::schema_cache`) rather than rebuilding: at knowledge-base
+        // scale a full tree walk on every write is no longer "a few milliseconds", and
+        // going through `update_schema` keeps this from going stale — that tool
+        // rebuilds and swaps the cache SYNCHRONOUSLY before it returns, specifically so
+        // a write immediately following a schema change is validated against the new
+        // rules rather than the ones it just replaced. A schema edited directly on the
+        // KB's git host (bypassing `update_schema`) is instead picked up by the reindex
+        // worker the next time it sees that `.kb-schema.yaml` dirty.
+        let schemas = crate::schema::load_shared(&self.schema_cache);
         if let Some(reason) = schemas.is_frozen(std::path::Path::new(rel_path)) {
             return Err(McpError::invalid_params(
                 format!(
@@ -2078,7 +2090,7 @@ impl KbSearchServer {
         // 2. Dedup gate: on create paths, check for near-duplicate existing documents.
         //    Gate runs only when: this is a create (not edit), dedup is enabled in
         //    config, and the caller has not set force_new = true.
-        if is_create && self.config.write.dedup_enabled && !matches!(force_new, Some(true)) {
+        if is_create && config.write.dedup_enabled && !matches!(force_new, Some(true)) {
             // Reuse the body already parsed during validation above rather than
             // re-deriving it here: that keeps the dedup query on exactly the
             // frontmatter-stripped basis the indexer embeds.
@@ -2086,11 +2098,7 @@ impl KbSearchServer {
                 .as_ref()
                 .map(|v| {
                     let description = v.frontmatter.get("description").and_then(|d| d.as_str());
-                    build_dedup_query(
-                        &v.body,
-                        description,
-                        self.config.chunking.prepend_description,
-                    )
+                    build_dedup_query(&v.body, description, config.chunking.prepend_description)
                 })
                 .unwrap_or_default();
 
@@ -2133,11 +2141,11 @@ impl KbSearchServer {
                             debug!(
                                 "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} \
                                  (threshold {:.2})",
-                                rel_path, path, score, self.config.write.dedup_threshold
+                                rel_path, path, score, config.write.dedup_threshold
                             );
                         }
-                        if let Some(hit) = dedup_verdict(top, self.config.write.dedup_threshold) {
-                            let threshold = self.config.write.dedup_threshold;
+                        if let Some(hit) = dedup_verdict(top, config.write.dedup_threshold) {
+                            let threshold = config.write.dedup_threshold;
                             return Err(McpError::invalid_params(
                                 format!(
                                     "A similar document already exists: '{}' \
@@ -2255,7 +2263,7 @@ impl KbSearchServer {
             .filter(|s| !s.is_empty());
 
         // 6. Commit and sync to remote
-        let commit_sha = git::commit_and_sync(
+        let commit_outcome = git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
             self.canonical_data_path.to_str().unwrap_or_default(),
@@ -2271,43 +2279,24 @@ impl KbSearchServer {
             McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
         })?;
 
-        // 7. Trigger incremental reindex (serialized against webhook reindexes).
-        //    The commit above already landed on the remote, so a reindex we cannot start
-        //    is a stale index, not a lost document — warn rather than fail the call.
-        let warning = match acquire_reindex_lock(self.reindex_lock_timeout).await {
-            Some(_guard) => {
-                ingest::run_index(config, false, crate::status::Trigger::WriteTool)
-                    .await
-                    .map_err(|e| {
-                        error!(
-                            "Reindex after write_document failed for '{}': {:#}",
-                            rel_path, e
-                        );
-                        McpError::internal_error(format!("Reindex failed: {}", e), None)
-                    })?;
-                None
-            }
-            None => {
-                warn!(
-                    "Reindex after write_document skipped for '{}': REINDEX_LOCK still held \
-                     after {:?}",
-                    rel_path, self.reindex_lock_timeout
-                );
-                Some(reindex_skipped_warning(
-                    self.reindex_lock_timeout,
-                    REINDEX_SKIPPED_WRITE,
-                ))
-            }
-        };
+        // 7. Mark this path — and anything the rebase pulled in from other commits —
+        //    dirty and return immediately. The reindex worker (src/reindex.rs) does
+        //    the actual chunk/embed/upsert work out of band; this call never blocks on
+        //    it, which is the whole point — embedding is far slower than an MCP
+        //    client's request timeout on a large document.
+        crate::reindex::mark_paths(
+            std::iter::once(std::path::PathBuf::from(rel_path))
+                .chain(commit_outcome.rebased_paths.iter().cloned()),
+        );
 
         // 8. Build unified diff and return success
         let action = if is_create { "Created" } else { "Edited" };
-        let summary = format!("{} '{}' (commit {})", action, rel_path, commit_sha);
+        let summary = format!(
+            "{} '{}' (commit {}). Indexing has been queued and will complete shortly.",
+            action, rel_path, commit_outcome.sha
+        );
         let diff = render_unified_diff(old_content, new_content, rel_path);
         let mut result_text = summary;
-        if let Some(warning) = warning {
-            result_text = format!("{}\n\n{}", result_text, warning);
-        }
         if !diff.is_empty() {
             result_text = format!("{}\n\n{}", result_text, diff);
         }
@@ -2315,7 +2304,9 @@ impl KbSearchServer {
     }
 
     #[tool(description = "Create a new document in the knowledge base. \
-        Writes the file, commits it to the git repository, and triggers an incremental reindex. \
+        Writes the file, commits it to the git repository, and queues it for indexing \
+        (indexing happens in the background; the document becomes searchable shortly \
+        after this call returns, not necessarily immediately). \
         The document must not already exist — use edit_document for existing files. \
         Content must include valid YAML frontmatter. \
         Required frontmatter fields and any fixed allowed values (e.g. for type/status) are \
@@ -2384,9 +2375,11 @@ impl KbSearchServer {
         YAML frontmatter. Required frontmatter fields and any fixed allowed values \
         (e.g. for type/status) are listed in this server's instructions.\n\
         \n\
-        In both modes the result is validated, committed, and an incremental reindex is \
-        triggered. The path is resolved like get_document: relative to the KB root, a unique \
-        basename, or absolute. The document must already exist — use create_document for new files.\n\
+        In both modes the result is validated, committed, and queued for indexing in the \
+        background (the change becomes searchable shortly after this call returns, not \
+        necessarily immediately). The path is resolved like get_document: relative to the KB \
+        root, a unique basename, or absolute. The document must already exist — use \
+        create_document for new files.\n\
         \n\
         SCOPE: this knowledge base holds durable reference knowledge only. NEVER append session \
         notes, task state, or other transient content to a document.")]
@@ -2480,8 +2473,10 @@ impl KbSearchServer {
 
     #[tool(description = "Delete a document from the knowledge base. \
         Removes the file from disk, commits the deletion to git with provenance trailers \
-        (just like create_document/edit_document), pushes the commit, and explicitly purges \
-        the document's vectors from the Qdrant search index and its state-DB row. \
+        (just like create_document/edit_document), pushes the commit, and queues removal of \
+        the document's vectors from the Qdrant search index and its state-DB row (this \
+        happens in the background; the document stops being searchable shortly after this \
+        call returns, not necessarily immediately). \
         The path resolves like get_document: relative to the KB root \
         (e.g. 'sysadmin/guide.md'), a unique basename, or absolute. \
         The document must already exist — use search to find the correct path. \
@@ -2490,7 +2485,7 @@ impl KbSearchServer {
         &self,
         Parameters(params): Parameters<DeleteDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
-        let config = &self.config;
+        let config = self.config();
 
         let raw = params.path.trim();
         if raw.is_empty() {
@@ -2566,7 +2561,7 @@ impl KbSearchServer {
             .ok()
             .filter(|s| !s.is_empty());
 
-        let commit_sha = git::commit_and_sync(
+        let commit_outcome = git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
             self.canonical_data_path.to_str().unwrap_or_default(),
@@ -2592,74 +2587,24 @@ impl KbSearchServer {
             )
         })?;
 
-        // 5 & 6. Purge from Qdrant and state DB under REINDEX_LOCK.
-        //    As in write_document, the deletion is already committed and pushed, so a lock
-        //    we cannot take means a stale index, not a failed delete — warn, do not fail.
-        let warning = if let Some(_guard) = acquire_reindex_lock(self.reindex_lock_timeout).await {
-            // Purge vectors from Qdrant.
-            self.qdrant
-                .delete_by_files(&self.collection, &[rel_path.as_str()])
-                .await
-                .map_err(|e| {
-                    error!("delete_by_files failed for '{}': {:#}", rel_path, e);
-                    McpError::internal_error(
-                        format!("Failed to purge document from search index: {}", e),
-                        None,
-                    )
-                })?;
+        // 5. Mark this path — and anything the rebase pulled in — dirty and return
+        //    immediately. The worker's scoped indexer purges a path's Qdrant points
+        //    and state rows itself once it re-checks and finds the file gone (the
+        //    missing-file branch of `ingest::index_paths`), so there is no separate
+        //    purge to do here anymore — this is "one reindex path" applied to deletes
+        //    too, not a special case.
+        crate::reindex::mark_paths(
+            std::iter::once(std::path::PathBuf::from(&rel_path))
+                .chain(commit_outcome.rebased_paths.iter().cloned()),
+        );
 
-            // Remove state-DB row so incremental reindex bookkeeping stays correct.
-            // Use a short-lived handle; SQLite WAL + REINDEX_LOCK serializes writers.
-            let db_path = config.state_db_path();
-            match StateDb::new(std::path::Path::new(&db_path)).await {
-                Ok(state) => {
-                    // Metadata first. Orphan detection reads `indexed_files`, so
-                    // clearing that row before the metadata would drop this path out of
-                    // detection permanently and strand the metadata with no sweep able
-                    // to find it again.
-                    // Gated, not merely ordered: clearing the bookkeeping row after a
-                    // failed metadata delete would drop this path out of
-                    // `indexed_files`-driven orphan detection permanently, stranding a
-                    // metadata row that no future sweep can find.
-                    if let Err(e) = state.delete_document(&rel_path).await {
-                        error!(
-                            "Failed to remove document metadata for '{}': {:#} — leaving \
-                             the state row so the next orphan sweep retries",
-                            rel_path, e
-                        );
-                    } else if let Err(e) = state.delete(&rel_path).await {
-                        // Non-fatal: a stale bookkeeping row makes the next incremental
-                        // reindex re-process the path, which succeeds because the file
-                        // is gone (orphan removal path). Log and continue.
-                        error!("Failed to remove state DB row for '{}': {:#}", rel_path, e);
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to open state DB for '{}' cleanup: {:#}",
-                        rel_path, e
-                    );
-                }
-            }
-            None
-        } else {
-            warn!(
-                "Index purge for deleted '{}' skipped: REINDEX_LOCK still held after {:?}",
-                rel_path, self.reindex_lock_timeout
-            );
-            Some(reindex_skipped_warning(
-                self.reindex_lock_timeout,
-                REINDEX_SKIPPED_DELETE,
-            ))
-        };
-
-        // 7. Return success with summary + diff of removed content.
-        let summary = format!("Deleted '{}' (commit {})", rel_path, commit_sha);
+        // 6. Return success with summary + diff of removed content.
+        let summary = format!(
+            "Deleted '{}' (commit {}). Index cleanup has been queued and will complete shortly.",
+            rel_path, commit_outcome.sha
+        );
         let diff = render_unified_diff(&old_content, "", &rel_path);
         let mut result_text = summary;
-        if let Some(warning) = warning {
-            result_text = format!("{}\n\n{}", result_text, warning);
-        }
         if !diff.is_empty() {
             result_text = format!("{}\n\n{}", result_text, diff);
         }
@@ -2698,7 +2643,7 @@ impl ServerHandler for KbSearchServer {
 #[cfg(test)]
 pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<ResolvedConfig> {
     Arc::new(ResolvedConfig {
-        source: crate::config::SourceConfig {
+        source: crate::config::ResolvedSourceConfig {
             git_url: None,
             branch: "master".into(),
             data_path: Some(data_path.to_string_lossy().into_owned()),
@@ -2713,6 +2658,8 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         },
         qdrant: crate::config::ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
@@ -2720,12 +2667,22 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
         },
         validation: crate::config::ValidationConfig::default(),
         webhook: crate::config::WebhookConfig::default(),
-        mcp: crate::config::McpConfig::default(),
+        mcp: crate::config::ResolvedMcpConfig::default(),
         rate_limit: crate::config::RateLimitConfig::default(),
         write: crate::config::WriteConfig::default(),
         search: crate::config::SearchConfig::default(),
         reranking: None,
+        provenance: Default::default(),
     })
+}
+
+/// An empty `SharedSchemaCache`, for tests that exercise a `KbSearchServer` but do
+/// not care about schema content (e.g. instructions plumbing, path validation).
+/// Tests that DO care build a real one from a temp dir's `.kb-schema.yaml` files —
+/// see `make_write_test_server` below.
+#[cfg(test)]
+pub(crate) fn empty_test_schema_cache() -> crate::schema::SharedSchemaCache {
+    Arc::new(RwLock::new(Arc::new(crate::schema::SchemaCache::default())))
 }
 
 #[cfg(test)]
@@ -3930,6 +3887,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -3940,7 +3899,8 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
-            make_test_resolved_config(tmp.path()),
+            crate::config::shared_config(make_test_resolved_config(tmp.path())),
+            empty_test_schema_cache(),
             None,
         )
         .unwrap();
@@ -3968,6 +3928,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
 
@@ -3978,7 +3940,8 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             Arc::clone(&instructions),
-            make_test_resolved_config(tmp.path()),
+            crate::config::shared_config(make_test_resolved_config(tmp.path())),
+            empty_test_schema_cache(),
             None,
         )
         .unwrap();
@@ -4099,6 +4062,8 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         let server = KbSearchServer::new(
@@ -4108,7 +4073,8 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
-            make_test_resolved_config(tmp.path()),
+            crate::config::shared_config(make_test_resolved_config(tmp.path())),
+            empty_test_schema_cache(),
             None,
         )
         .unwrap();
@@ -4144,9 +4110,18 @@ mod tests {
             api_key: None,
             vector_size: 768,
             batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
         };
         let embed = Arc::new(EmbedClient::new(&embed_config));
         let instructions = Arc::new(RwLock::new(String::new()));
+        // Built from whatever `.kb-schema.yaml` files already exist under `tmp` at
+        // this point — callers that need a test to see a schema written must write it
+        // before calling this, exactly as they already do for `write_schema_file`.
+        let canonical = tmp.path().canonicalize().unwrap();
+        let schema_cache: crate::schema::SharedSchemaCache = Arc::new(RwLock::new(Arc::new(
+            crate::schema::SchemaCache::build(&canonical, &config.frontmatter),
+        )));
         KbSearchServer::new(
             embed,
             qdrant,
@@ -4154,7 +4129,8 @@ mod tests {
             tmp.path().to_path_buf(),
             include_patterns,
             instructions,
-            config,
+            crate::config::shared_config(config),
+            schema_cache,
             None,
         )
         .unwrap()
@@ -4290,7 +4266,7 @@ mod tests {
 
         // Config with validation enabled requiring "title" field
         let config = Arc::new(ResolvedConfig {
-            source: crate::config::SourceConfig {
+            source: crate::config::ResolvedSourceConfig {
                 git_url: None,
                 branch: "master".into(),
                 data_path: Some(tmp.path().to_string_lossy().into_owned()),
@@ -4308,6 +4284,8 @@ mod tests {
                 api_key: None,
                 vector_size: 768,
                 batch_size: 32,
+                request_timeout_secs: 60,
+                batch_concurrency: 4,
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://localhost:6334".into(),
@@ -4319,11 +4297,12 @@ mod tests {
                 lint_command: None,
             },
             webhook: crate::config::WebhookConfig::default(),
-            mcp: crate::config::McpConfig::default(),
+            mcp: crate::config::ResolvedMcpConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             write: crate::config::WriteConfig::default(),
             search: crate::config::SearchConfig::default(),
             reranking: None,
+            provenance: Default::default(),
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
@@ -4538,7 +4517,7 @@ mod tests {
 
         // Config with dedup disabled.
         let config = Arc::new(ResolvedConfig {
-            source: crate::config::SourceConfig {
+            source: crate::config::ResolvedSourceConfig {
                 git_url: None,
                 branch: "master".into(),
                 data_path: Some(tmp.path().to_string_lossy().into_owned()),
@@ -4553,6 +4532,8 @@ mod tests {
                 api_key: None,
                 vector_size: 768,
                 batch_size: 32,
+                request_timeout_secs: 60,
+                batch_concurrency: 4,
             },
             qdrant: crate::config::ResolvedQdrantConfig {
                 url: "http://localhost:6334".into(),
@@ -4560,7 +4541,7 @@ mod tests {
             },
             validation: crate::config::ValidationConfig::default(),
             webhook: crate::config::WebhookConfig::default(),
-            mcp: crate::config::McpConfig::default(),
+            mcp: crate::config::ResolvedMcpConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             write: crate::config::WriteConfig {
                 dedup_enabled: false,
@@ -4570,6 +4551,7 @@ mod tests {
             },
             search: crate::config::SearchConfig::default(),
             reranking: None,
+            provenance: Default::default(),
         });
 
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
@@ -5130,118 +5112,137 @@ mod tests {
         assert_eq!(ts, 1_705_276_800, "offset datetime should convert to UTC");
     }
 
-    // --- REINDEX_LOCK timeout tests (issue #64) ---
+    // --- write tools queue instead of reindexing inline ---
     //
-    // These hold a process-global static lock while `cargo test` runs tests in parallel,
-    // so every hold is kept to tens of milliseconds to avoid starving other tests.
-
-    /// Short wait used to drive the timeout path without a real 30-second sleep.
-    const TEST_LOCK_WAIT: Duration = Duration::from_millis(50);
-
-    #[tokio::test]
-    async fn acquire_reindex_lock_returns_guard_when_free() {
-        let guard = acquire_reindex_lock(Duration::from_secs(5)).await;
-        assert!(
-            guard.is_some(),
-            "should acquire the lock when nothing else holds it"
-        );
-    }
-
-    #[tokio::test]
-    async fn acquire_reindex_lock_gives_up_when_held() {
-        let held = Arc::clone(&crate::webhook::REINDEX_LOCK).lock_owned().await;
-
-        let start = std::time::Instant::now();
-        let guard = acquire_reindex_lock(TEST_LOCK_WAIT).await;
-        let elapsed = start.elapsed();
-
-        drop(held);
-
-        assert!(
-            guard.is_none(),
-            "should give up rather than block while the lock is held"
-        );
-        // The point of the fix: bounded, not indefinite. A generous ceiling keeps this
-        // from flaking on a loaded CI runner while still catching a missing timeout.
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "should return promptly after the wait expires, took {:?}",
-            elapsed
-        );
-    }
-
-    #[test]
-    fn reindex_skipped_warning_states_commit_landed_and_consequence() {
-        let write = reindex_skipped_warning(Duration::from_secs(30), REINDEX_SKIPPED_WRITE);
-        assert!(
-            write.contains("committed to git"),
-            "must reassure the caller the write landed: {write}"
-        );
-        assert!(
-            write.contains("30s"),
-            "must state how long it waited: {write}"
-        );
-        assert!(
-            write.contains("not be searchable"),
-            "write variant must say the document is not yet searchable: {write}"
-        );
-
-        let delete = reindex_skipped_warning(Duration::from_secs(30), REINDEX_SKIPPED_DELETE);
-        assert!(
-            delete.contains("REMAINS in the search index"),
-            "delete variant must warn the content is still live in the index: {delete}"
-        );
-    }
+    // Before the async reindex worker, these tools awaited `ingest::run_index` inline
+    // and used `REINDEX_LOCK` to keep that from racing the webhook. Now they just mark
+    // paths dirty on `reindex::REINDEX_QUEUE` and return — which also means these tests
+    // no longer need a live Qdrant/embeddings service to reach that point, since
+    // nothing here calls into the indexer at all.
 
     /// Build a `KbSearchServer` backed by a real git working clone, so write tools get
-    /// past `commit_and_sync` and actually reach the reindex step.
+    /// past `commit_and_sync` and reach the point where they mark paths dirty.
     fn make_git_backed_server(
         work: &tempfile::TempDir,
     ) -> (KbSearchServer, Arc<crate::config::ResolvedConfig>) {
         let mut config = make_test_resolved_config(work.path());
         // Bypass the dedup gate: it would otherwise call out to a (nonexistent)
-        // embedding service before we ever reach the lock.
+        // embedding service before we ever reach the commit.
         Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
-        let server = make_write_test_server(work, &["**/*.md".to_string()], Arc::clone(&config))
-            .with_reindex_lock_timeout(TEST_LOCK_WAIT);
+        let server = make_write_test_server(work, &["**/*.md".to_string()], Arc::clone(&config));
         (server, config)
     }
 
     #[tokio::test]
-    async fn create_document_returns_warning_when_reindex_lock_held() {
+    async fn create_document_reports_queued_indexing_without_touching_the_indexer() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let (server, _config) = make_git_backed_server(&work);
 
-        let held = Arc::clone(&crate::webhook::REINDEX_LOCK).lock_owned().await;
+        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
 
         let result = server
             .create_document(Parameters(CreateDocumentParams {
-                path: "docs/locked.md".to_string(),
+                path: "docs/queued.md".to_string(),
                 content:
-                    "---\ntitle: Locked\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
+                    "---\ntitle: Queued\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
                         .to_string(),
                 message: None,
                 force_new: Some(true),
             }))
             .await;
 
-        drop(held);
-
-        let result = result.expect("write succeeded, so the tool must not report failure");
+        let result = result.expect("write must succeed even though nothing indexes it inline");
         let text = format!("{:?}", result.content);
         assert!(
-            text.contains("Created 'docs/locked.md'"),
-            "must still report the successful create: {text}"
+            text.contains("Created 'docs/queued.md'"),
+            "must report the successful create: {text}"
         );
         assert!(
-            text.contains("SKIPPED"),
-            "must warn that the index update was skipped: {text}"
+            text.contains("queued"),
+            "must tell the caller indexing is queued, not synchronous: {text}"
+        );
+        assert!(
+            !text.contains("SKIPPED"),
+            "the old skipped-index warning language must be gone: {text}"
+        );
+
+        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        assert!(
+            pending_after > pending_before,
+            "create_document must mark its path dirty on the queue"
+        );
+    }
+
+    /// The correctness case the synchronous rebuild in `update_schema` exists for:
+    /// an agent that widens a rule and then immediately writes against it must be
+    /// validated against the NEW schema, not whatever was cached when the server
+    /// started. If `update_schema` only marked a full reconcile (`mark_full`) and
+    /// left the refresh to the reindex worker, this would fail here, because
+    /// nothing in this test spawns that worker — exactly the regression this test
+    /// is meant to catch.
+    #[tokio::test]
+    async fn create_document_immediately_after_update_schema_validates_against_the_new_rules() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        // The schema baked into the server's cache at construction time below: only
+        // "active" is permitted yet.
+        write_schema_file(
+            &work,
+            "notes",
+            "fields:\n  status:\n    type: enum\n    values: [active]\n",
+        );
+        let (server, _config) = make_git_backed_server(&work);
+
+        // Sanity check that the OLD schema really does reject "beta" — otherwise the
+        // second half of this test would not be proving anything.
+        let rejected = server
+            .create_document(Parameters(CreateDocumentParams {
+                path: "notes/before.md".to_string(),
+                content: "---\ntitle: Before\nstatus: beta\n---\n\n# Body\n".to_string(),
+                message: None,
+                force_new: Some(true),
+            }))
+            .await;
+        assert!(
+            rejected.is_err(),
+            "sanity check failed: 'beta' must not be permitted before the schema \
+             change — got {rejected:?}"
+        );
+
+        // Widen the rule through the tool an agent would actually use.
+        server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "status".into(),
+                values: Some(vec!["beta".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .expect("update_schema must succeed against this git-backed harness");
+
+        // Same server, same cached schema handle, next call: must see the new rule.
+        let accepted = server
+            .create_document(Parameters(CreateDocumentParams {
+                path: "notes/after.md".to_string(),
+                content: "---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string(),
+                message: None,
+                force_new: Some(true),
+            }))
+            .await;
+        assert!(
+            accepted.is_ok(),
+            "the write immediately after update_schema must validate against the \
+             NEW schema, not a stale cached copy: {:?}",
+            accepted.err()
         );
     }
 
     #[tokio::test]
-    async fn delete_document_returns_warning_when_reindex_lock_held() {
+    async fn delete_document_reports_queued_cleanup_without_touching_the_indexer() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         std::fs::write(
@@ -5270,7 +5271,7 @@ mod tests {
             .unwrap();
         let (server, _config) = make_git_backed_server(&work);
 
-        let held = Arc::clone(&crate::webhook::REINDEX_LOCK).lock_owned().await;
+        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
 
         let result = server
             .delete_document(Parameters(DeleteDocumentParams {
@@ -5279,17 +5280,25 @@ mod tests {
             }))
             .await;
 
-        drop(held);
-
-        let result = result.expect("delete succeeded, so the tool must not report failure");
+        let result = result.expect("delete must succeed even though nothing purges it inline");
         let text = format!("{:?}", result.content);
         assert!(
             text.contains("Deleted 'doomed.md'"),
-            "must still report the successful delete: {text}"
+            "must report the successful delete: {text}"
         );
         assert!(
-            text.contains("REMAINS in the search index"),
-            "must warn the deleted content is still searchable: {text}"
+            text.contains("queued"),
+            "must tell the caller cleanup is queued, not synchronous: {text}"
+        );
+        assert!(
+            !text.contains("REMAINS in the search index"),
+            "the old skipped-purge warning language must be gone: {text}"
+        );
+
+        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        assert!(
+            pending_after > pending_before,
+            "delete_document must mark its path dirty on the queue rather than purging inline"
         );
     }
 }
