@@ -18,6 +18,20 @@ pub trait VectorStore: Send + Sync {
     async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()>;
     async fn delete_by_files(&self, collection: &str, file_paths: &[&str]) -> Result<()>;
     async fn delete_points_by_ids(&self, collection: &str, ids: Vec<String>) -> Result<()>;
+    /// Drop `collection` if it exists — `md-kb-rag index --full`'s destructive
+    /// rebuild step. In the trait (rather than only an inherent `QdrantStore`
+    /// method) so `ingest::index_paths_generic` can run this same call path against
+    /// a fake in tests.
+    async fn drop_collection(&self, collection: &str) -> Result<()>;
+    /// Create `collection` if it does not exist and ensure every payload index in
+    /// `indexed_fields` (plus the standing `mtime` range index). In the trait for
+    /// the same reason as `drop_collection` above.
+    async fn ensure_collection(
+        &self,
+        collection: &str,
+        vector_size: u64,
+        indexed_fields: &[IndexedField],
+    ) -> Result<()>;
 }
 
 pub trait RetrievalStore: Send + Sync {
@@ -517,6 +531,19 @@ impl VectorStore for QdrantStore {
     async fn delete_points_by_ids(&self, collection: &str, ids: Vec<String>) -> Result<()> {
         QdrantStore::delete_points_by_ids(self, collection, ids).await
     }
+
+    async fn drop_collection(&self, collection: &str) -> Result<()> {
+        QdrantStore::drop_collection(self, collection).await
+    }
+
+    async fn ensure_collection(
+        &self,
+        collection: &str,
+        vector_size: u64,
+        indexed_fields: &[IndexedField],
+    ) -> Result<()> {
+        QdrantStore::ensure_collection(self, collection, vector_size, indexed_fields).await
+    }
 }
 
 /// Thin delegation impls — each method calls the identically-named inherent method
@@ -910,6 +937,15 @@ mod tests {
     }
 
     /// Integration test: upsert a point, search, and verify payload is returned.
+    ///
+    /// Stays live-only — this exercises the actual wire round trip through a real
+    /// Qdrant server: named dense-vector upsert, `search_points` against the "dense"
+    /// vector, and struct/list/scalar payload values surviving protobuf encode and
+    /// decode. `qdrant_value_roundtrip` above already covers the JSON<->QdrantValue
+    /// conversion in isolation; what only a live server can additionally prove is
+    /// that the server itself stores and returns those values unchanged, which no
+    /// fake can stand in for without just re-asserting the conversion functions.
+    ///
     /// Requires a running Qdrant instance at localhost:6334.
     /// Run with: cargo test qdrant_search_returns_payload -- --ignored
     #[tokio::test]
@@ -985,6 +1021,14 @@ mod tests {
 
     /// Integration test: upsert points for multiple files, batch-delete by file paths,
     /// and verify the targeted points are removed while others remain.
+    ///
+    /// Stays live-only — the thing this proves is that Qdrant's own server-side
+    /// filter evaluation (`Condition::matches("file_path", values)` inside a real
+    /// `delete_points` call) actually matches and deletes the right points and
+    /// leaves everything else untouched. That is Qdrant's filter engine doing the
+    /// work, not code in this crate; a fake `VectorStore` would only prove the fake
+    /// implements the same filter logic correctly, not that Qdrant does.
+    ///
     /// Requires a running Qdrant instance at localhost:6334.
     /// Run with: cargo test delete_by_files_removes_matching -- --ignored
     #[tokio::test]
@@ -1091,65 +1135,47 @@ mod tests {
             .unwrap();
     }
 
-    /// Integration test: delete_by_files with empty slice is a no-op.
-    /// Requires a running Qdrant instance at localhost:6334.
-    /// Run with: cargo test delete_by_files_empty_is_noop -- --ignored
+    /// `upsert_points`, `delete_by_files`, and `delete_points_by_ids` each guard
+    /// their empty-input case with an early `return Ok(())` before touching the
+    /// client — the point of the old (`#[ignore]`d, live-Qdrant) version of this
+    /// test was to show that an empty `delete_by_files` call left an existing point
+    /// untouched. But that was only ever a roundabout way of checking the same
+    /// early return: nothing about "does the server leave a point alone" is in
+    /// question once the call never reaches the server at all.
+    ///
+    /// That early-return guarantee is directly, offline-checkable: point at a URL
+    /// nothing is listening on (`QdrantStore::new` never dials out — see
+    /// `index_paths_records_a_failed_run_in_the_global_status` in `ingest.rs` for
+    /// the same fact established the other way, via a real RPC failing) and confirm
+    /// each empty-input call still returns `Ok(())`. If any of the three guards were
+    /// ever removed, the call would instead try to reach the unreachable address and
+    /// this test would see a connection error instead.
     #[tokio::test]
-    #[ignore]
-    async fn delete_by_files_empty_is_noop() {
+    async fn empty_input_calls_are_no_ops_without_touching_qdrant() {
         let config = ResolvedQdrantConfig {
-            url: "http://localhost:6334".into(),
-            collection: "test-delete-by-files-empty".into(),
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
         };
         let store = QdrantStore::new(&config).unwrap();
 
-        let _ = store.client.delete_collection(&config.collection).await;
-
-        store
-            .ensure_collection(&config.collection, 4, &[])
-            .await
-            .unwrap();
-
-        let mut payload = HashMap::new();
-        payload.insert("file_path".into(), serde_json::json!("/data/a.md"));
-        let point = QdrantPoint {
-            id: "00000000-0000-0000-0000-000000000001".into(),
-            vector: vec![1.0, 0.0, 0.0, 0.0],
-            sparse: None,
-            payload,
-        };
-        store
-            .upsert_points(&config.collection, vec![point])
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Empty delete should be fine
-        store
-            .delete_by_files(&config.collection, &[])
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Point should still exist
-        let results = store
-            .search(
-                &config.collection,
-                vec![1.0, 0.0, 0.0, 0.0],
-                HashMap::new(),
-                10,
-            )
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-
-        store
-            .client
-            .delete_collection(&config.collection)
-            .await
-            .unwrap();
+        assert!(
+            store
+                .upsert_points(&config.collection, vec![])
+                .await
+                .is_ok(),
+            "empty upsert must short-circuit before any RPC"
+        );
+        assert!(
+            store.delete_by_files(&config.collection, &[]).await.is_ok(),
+            "empty delete_by_files must short-circuit before any RPC"
+        );
+        assert!(
+            store
+                .delete_points_by_ids(&config.collection, vec![])
+                .await
+                .is_ok(),
+            "empty delete_points_by_ids must short-circuit before any RPC"
+        );
     }
 
     fn make_string_facet_hit(value: &str, count: u64) -> FacetHit {
@@ -1230,6 +1256,16 @@ mod tests {
     }
 
     /// Integration test: upsert points with keyword fields, then fetch facet values.
+    ///
+    /// Stays live-only for the part that matters here: that Qdrant's facet
+    /// aggregation actually groups by distinct field value and that
+    /// `extract_facet_strings` (tested standalone above) is fed real `FacetHit`s
+    /// shaped the way the server actually returns them. The *other* half of what
+    /// this test used to check — that a failed facet query degrades to an empty
+    /// list instead of an error — needs no live server at all and is now covered
+    /// offline by `fetch_facet_values_degrades_to_empty_on_query_failure` below, so
+    /// it is no longer duplicated here.
+    ///
     /// Requires a running Qdrant instance at localhost:6334.
     /// Run with: cargo test facet_values_returns_distinct_strings -- --ignored
     #[tokio::test]
@@ -1292,18 +1328,38 @@ mod tests {
         assert!(values.contains(&"networking".to_string()));
         assert!(values.contains(&"docker".to_string()));
 
-        // Non-existent field returns empty (graceful degradation)
-        let empty = store
-            .fetch_facet_values(&config.collection, "nonexistent", 10)
-            .await
-            .unwrap();
-        assert!(empty.is_empty());
-
         store
             .client
             .delete_collection(&config.collection)
             .await
             .unwrap();
+    }
+
+    /// `fetch_facet_values` treats ANY facet-query failure as "no values" rather
+    /// than propagating the error (see the `Err(e) => { ...; return Ok(vec![]) }`
+    /// arm above) — not just an unindexed/nonexistent field on an otherwise healthy
+    /// collection, which is all a live server can exercise. Pointing at an
+    /// unreachable Qdrant instead proves the degradation covers the failure mode
+    /// that matters most in production: a facet lookup (e.g. for `/status` or a
+    /// `list_documents` filter hint) landing during a brief Qdrant outage must not
+    /// itself become a hard error.
+    #[tokio::test]
+    async fn fetch_facet_values_degrades_to_empty_on_query_failure() {
+        let config = ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let result = store
+            .fetch_facet_values(&config.collection, "domain", 10)
+            .await;
+
+        assert_eq!(
+            result.unwrap(),
+            Vec::<String>::new(),
+            "a facet query that can't reach Qdrant must degrade to empty, not error"
+        );
     }
 
     #[test]
