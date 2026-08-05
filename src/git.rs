@@ -239,6 +239,42 @@ pub(crate) async fn git_diff_name_status(
     )))
 }
 
+/// The outcome of a failed [`commit_and_sync`] call, split by whether a commit landed.
+///
+/// `commit_and_sync` runs five git operations in sequence — add, commit, fetch,
+/// rebase, push — and the two ways it can fail demand OPPOSITE recovery, so this is a
+/// hard enum rather than a flattened `anyhow::Error`:
+///
+/// - [`PreCommit`](Self::PreCommit): `git add` or `git commit` failed. HEAD is
+///   untouched — the attempted change exists only in the working tree (and possibly
+///   the index, if `add` succeeded but `commit` did not). A caller can safely discard
+///   it and report that nothing changed; that discarding is exactly what
+///   [`restore_from_head`] / [`unstage`] are for.
+/// - [`PostCommit`](Self::PostCommit): `git fetch`, `git rebase`, or `git push`
+///   failed, but the commit itself landed — HEAD already includes it. Discarding the
+///   working-tree change at this point would silently resurrect (on a delete) or
+///   revert (on a create/edit) content that is genuinely, durably gone/changed as far
+///   as the local repo is concerned. The only thing that failed is telling the remote
+///   about it, so the correct move is to leave it exactly as it is and report that the
+///   sync is pending.
+///
+/// Being a plain enum (not `anyhow::Error`) means there is no `?`-friendly blanket
+/// conversion into it — a caller has to name a variant to get at the underlying
+/// cause, which is what keeps the phase distinction from being silently discarded on
+/// the way past.
+#[derive(Debug, thiserror::Error)]
+pub enum CommitSyncError {
+    /// Nothing was committed. `redact_url` has already been applied to any git
+    /// stderr folded into the cause.
+    #[error("{0:#}")]
+    PreCommit(anyhow::Error),
+
+    /// `sha` is a real local commit — do not roll it back. `redact_url` has already
+    /// been applied to any git stderr folded into the cause.
+    #[error("commit {sha} landed locally but syncing to the remote failed: {source:#}")]
+    PostCommit { sha: String, source: anyhow::Error },
+}
+
 /// Stage `rel_path`, commit with `message`, then (if `git_url` is Some) fetch the
 /// remote branch, rebase the local branch onto it, and push. Returns the new commit
 /// SHA plus any paths pulled in by the rebase — see [`CommitOutcome`].
@@ -248,6 +284,10 @@ pub(crate) async fn git_diff_name_status(
 /// On a rebase conflict, abort the rebase (so the working tree is left clean at the local
 /// commit) and return an Err whose message clearly identifies it as a rebase/merge conflict
 /// on the file, distinct from other git failures.
+///
+/// The `Err` side distinguishes exactly where in that sequence things went wrong — see
+/// [`CommitSyncError`]. A caller that needs to roll back a failure must match on it
+/// rather than treat every failure the same way.
 #[allow(clippy::too_many_arguments)]
 pub async fn commit_and_sync(
     git_url: Option<&str>,
@@ -258,7 +298,7 @@ pub async fn commit_and_sync(
     message: &str,
     author_name: &str,
     author_email: &str,
-) -> anyhow::Result<CommitOutcome> {
+) -> Result<CommitOutcome, CommitSyncError> {
     // Helper: build a base git command with safe.directory set and cwd pointing at data_path.
     // Returns (Command,) ready to have more args appended.
     let git_cmd = |args: &[&str]| {
@@ -289,13 +329,23 @@ pub async fn commit_and_sync(
     };
 
     // --- git add -- <rel_path> ---
+    // Every failure from here through the end of `git commit` is PreCommit: HEAD has
+    // not moved, so a caller can discard whatever this left behind and be back to
+    // exactly where it started.
     let add_out = timeout(GIT_TIMEOUT, git_cmd(&["add", "--", rel_path]).output())
         .await
-        .map_err(|_| anyhow::anyhow!("git add timed out after {:?}", GIT_TIMEOUT))?
-        .context("Failed to spawn git add")?;
+        .map_err(|_| {
+            CommitSyncError::PreCommit(anyhow::anyhow!("git add timed out after {:?}", GIT_TIMEOUT))
+        })?
+        .map_err(|e| {
+            CommitSyncError::PreCommit(anyhow::Error::new(e).context("Failed to spawn git add"))
+        })?;
     if !add_out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&add_out.stderr));
-        anyhow::bail!("git add failed: {}", stderr);
+        return Err(CommitSyncError::PreCommit(anyhow::anyhow!(
+            "git add failed: {}",
+            stderr
+        )));
     }
 
     // --- git commit -m <message> ---
@@ -307,12 +357,37 @@ pub async fn commit_and_sync(
         git_cmd_authored(&["commit", "-m", message]).output(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("git commit timed out after {:?}", GIT_TIMEOUT))?
-    .context("Failed to spawn git commit")?;
+    .map_err(|_| {
+        CommitSyncError::PreCommit(anyhow::anyhow!(
+            "git commit timed out after {:?}",
+            GIT_TIMEOUT
+        ))
+    })?
+    .map_err(|e| {
+        CommitSyncError::PreCommit(anyhow::Error::new(e).context("Failed to spawn git commit"))
+    })?;
     if !commit_out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&commit_out.stderr));
-        anyhow::bail!("git commit failed: {}", stderr);
+        return Err(CommitSyncError::PreCommit(anyhow::anyhow!(
+            "git commit failed: {}",
+            stderr
+        )));
     }
+
+    // The commit has landed. Every failure from here on is PostCommit — HEAD already
+    // includes it, so `local_sha` (captured now, before anything else can touch HEAD)
+    // is a real, durable local commit no matter what the rest of this call does.
+    let local_sha = rev_parse_head(data_path).await.map_err(|e| {
+        // rev-parse HEAD failing immediately after a successful `git commit` would
+        // mean something is badly wrong with the repo itself, not with sync — but the
+        // commit above DID succeed, so this is still unambiguously post-commit. There
+        // is just no sha to attach to it.
+        CommitSyncError::PostCommit {
+            sha: "<unknown: rev-parse HEAD failed immediately after a successful commit>"
+                .to_string(),
+            source: e,
+        }
+    })?;
 
     let mut rebased_paths: Vec<std::path::PathBuf> = Vec::new();
 
@@ -322,11 +397,11 @@ pub async fn commit_and_sync(
             _ => url.to_string(),
         };
 
-        // Capture HEAD right after our own commit and before the fetch. Diffing this
-        // against HEAD once the rebase completes isolates exactly what the rebase
-        // pulled in from the remote — our own change is already on both sides of that
-        // range, so it is never double-reported here.
-        let old_head = rev_parse_head(data_path).await?;
+        // `local_sha` doubles as "HEAD right after our own commit and before the
+        // fetch". Diffing this against HEAD once the rebase completes isolates
+        // exactly what the rebase pulled in from the remote — our own change is
+        // already on both sides of that range, so it is never double-reported here.
+        let old_head = local_sha.clone();
 
         // --- git fetch --no-tags <auth_url> <branch> ---
         info!(
@@ -339,11 +414,20 @@ pub async fn commit_and_sync(
             git_cmd(&["fetch", "--no-tags", &auth_url, branch]).output(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("git fetch timed out after {:?}", GIT_TIMEOUT))?
-        .context("Failed to spawn git fetch")?;
+        .map_err(|_| CommitSyncError::PostCommit {
+            sha: local_sha.clone(),
+            source: anyhow::anyhow!("git fetch timed out after {:?}", GIT_TIMEOUT),
+        })?
+        .map_err(|e| CommitSyncError::PostCommit {
+            sha: local_sha.clone(),
+            source: anyhow::Error::new(e).context("Failed to spawn git fetch"),
+        })?;
         if !fetch_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&fetch_out.stderr));
-            anyhow::bail!("git fetch failed: {}", stderr);
+            return Err(CommitSyncError::PostCommit {
+                sha: local_sha.clone(),
+                source: anyhow::anyhow!("git fetch failed: {}", stderr),
+            });
         }
 
         // --- git rebase FETCH_HEAD ---
@@ -352,8 +436,14 @@ pub async fn commit_and_sync(
             git_cmd_authored(&["rebase", "FETCH_HEAD"]).output(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("git rebase timed out after {:?}", GIT_TIMEOUT))?
-        .context("Failed to spawn git rebase")?;
+        .map_err(|_| CommitSyncError::PostCommit {
+            sha: local_sha.clone(),
+            source: anyhow::anyhow!("git rebase timed out after {:?}", GIT_TIMEOUT),
+        })?
+        .map_err(|e| CommitSyncError::PostCommit {
+            sha: local_sha.clone(),
+            source: anyhow::Error::new(e).context("Failed to spawn git rebase"),
+        })?;
         if !rebase_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&rebase_out.stderr));
 
@@ -382,29 +472,46 @@ pub async fn commit_and_sync(
             // Abort the rebase so the working tree is left clean at the local commit.
             let _ = git_cmd(&["rebase", "--abort"]).output().await;
 
+            // Either way, our own commit (`local_sha`) is still there — the rebase
+            // touched nothing durable, it just couldn't finish. Still PostCommit.
             if conflicted.is_empty() {
-                anyhow::bail!(
-                    "git rebase onto FETCH_HEAD failed with no conflicting files — \
-                     this is not a merge conflict. Rebase aborted. stderr: {}",
-                    stderr
-                );
+                return Err(CommitSyncError::PostCommit {
+                    sha: local_sha.clone(),
+                    source: anyhow::anyhow!(
+                        "git rebase onto FETCH_HEAD failed with no conflicting files — \
+                         this is not a merge conflict. Rebase aborted. stderr: {}",
+                        stderr
+                    ),
+                });
             }
-            anyhow::bail!(
-                "rebase conflict: git rebase onto FETCH_HEAD conflicted on {}. \
-                 Rebase aborted. stderr: {}",
-                conflicted.replace('\n', ", "),
-                stderr
-            );
+            return Err(CommitSyncError::PostCommit {
+                sha: local_sha.clone(),
+                source: anyhow::anyhow!(
+                    "rebase conflict: git rebase onto FETCH_HEAD conflicted on {}. \
+                     Rebase aborted. stderr: {}",
+                    conflicted.replace('\n', ", "),
+                    stderr
+                ),
+            });
         }
 
         // Diff the rebase range now, before pushing — this is local-only (no network)
         // and a push failure below should not prevent the caller from at least
         // learning what changed locally, though in practice a push failure aborts the
         // whole call anyway.
-        let new_head = rev_parse_head(data_path).await?;
+        let new_head =
+            rev_parse_head(data_path)
+                .await
+                .map_err(|e| CommitSyncError::PostCommit {
+                    sha: local_sha.clone(),
+                    source: e,
+                })?;
         rebased_paths = git_diff_name_status(data_path, &old_head, &new_head)
             .await
-            .context("Failed to diff the rebase range")?;
+            .map_err(|e| CommitSyncError::PostCommit {
+                sha: local_sha.clone(),
+                source: e.context("Failed to diff the rebase range"),
+            })?;
 
         // --- git push <auth_url> HEAD:<branch> ---
         info!("Pushing to {} branch {}", redact_url(&auth_url), branch);
@@ -414,16 +521,119 @@ pub async fn commit_and_sync(
             git_cmd(&["push", &auth_url, &push_refspec]).output(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("git push timed out after {:?}", GIT_TIMEOUT))?
-        .context("Failed to spawn git push")?;
+        .map_err(|_| CommitSyncError::PostCommit {
+            sha: local_sha.clone(),
+            source: anyhow::anyhow!("git push timed out after {:?}", GIT_TIMEOUT),
+        })?
+        .map_err(|e| CommitSyncError::PostCommit {
+            sha: local_sha.clone(),
+            source: anyhow::Error::new(e).context("Failed to spawn git push"),
+        })?;
         if !push_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&push_out.stderr));
-            anyhow::bail!("git push failed: {}", stderr);
+            return Err(CommitSyncError::PostCommit {
+                sha: local_sha.clone(),
+                source: anyhow::anyhow!("git push failed: {}", stderr),
+            });
         }
+
+        // The rebase may have replayed our commit onto a new sha — read HEAD fresh
+        // for the success return rather than reusing `local_sha`.
+        let sha = rev_parse_head(data_path)
+            .await
+            .map_err(|e| CommitSyncError::PostCommit {
+                sha: local_sha.clone(),
+                source: e,
+            })?;
+        return Ok(CommitOutcome { sha, rebased_paths });
     }
 
-    let sha = rev_parse_head(data_path).await?;
-    Ok(CommitOutcome { sha, rebased_paths })
+    // No remote configured: `local_sha` is already the final answer.
+    Ok(CommitOutcome {
+        sha: local_sha,
+        rebased_paths,
+    })
+}
+
+/// Restore `rel_path`'s content in BOTH the index and the working tree to match HEAD,
+/// discarding any uncommitted change to it — a deletion, an overwrite, or a `git add`
+/// that got staged but never committed.
+///
+/// Only valid to call in response to [`CommitSyncError::PreCommit`]. HEAD has not
+/// moved in that case, so "match HEAD" really does mean "match how things were right
+/// before `commit_and_sync` was called." Calling this after a
+/// [`CommitSyncError::PostCommit`] would be wrong in the opposite direction: HEAD by
+/// then already includes the very change this would erase.
+///
+/// Requires `rel_path` to exist at HEAD — `git restore` fails on a pathspec it has no
+/// prior content for. That holds for a delete or an edit rollback (the path was
+/// already tracked, or it would not have been deletable/editable). It does NOT hold
+/// for a brand-new path whose first-ever commit failed before landing (`create_document`);
+/// use [`unstage`] for that case instead.
+pub async fn restore_from_head(data_path: &str, rel_path: &str) -> anyhow::Result<()> {
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args([
+                "-c",
+                &format!("safe.directory={}", data_path),
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                rel_path,
+            ])
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git restore timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git restore")?;
+
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "git restore --source=HEAD -- {} failed: {}",
+            rel_path,
+            stderr
+        );
+    }
+    Ok(())
+}
+
+/// Remove `rel_path` from the index without touching the working tree — i.e. undo
+/// whatever `git add` staged for it. A safe no-op (exit 0, not an error) if `rel_path`
+/// was never staged in the first place, which is what makes this usable
+/// unconditionally rather than only when the caller knows `git add` succeeded.
+///
+/// Used to roll back `create_document`'s pre-commit failures: the new file has no
+/// HEAD content to fall back to (`restore_from_head` would fail on it — see its
+/// doc), so the caller removes the file itself and calls this to make sure `git add`
+/// staging it doesn't silently ride along on some later, unrelated commit.
+pub async fn unstage(data_path: &str, rel_path: &str) -> anyhow::Result<()> {
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args([
+                "-c",
+                &format!("safe.directory={}", data_path),
+                "reset",
+                "--",
+                rel_path,
+            ])
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git reset timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git reset")?;
+
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git reset -- {} failed: {}", rel_path, stderr);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -938,12 +1148,18 @@ pub(crate) mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "Should fail due to rebase conflict");
-        let err = result.unwrap_err().to_string();
+        // A rebase conflict happens after B's own commit has already landed locally
+        // (fetch/rebase run after `git commit`), so this must be PostCommit, not
+        // PreCommit — B's commit is real and must not be treated as discardable.
+        let err = match result {
+            Err(CommitSyncError::PostCommit { source, .. }) => source,
+            other => panic!("expected CommitSyncError::PostCommit, got: {:?}", other),
+        };
+        let msg = err.to_string();
         assert!(
-            err.starts_with("rebase conflict:"),
+            msg.starts_with("rebase conflict:"),
             "Error should start with 'rebase conflict:', got: {}",
-            err
+            msg
         );
     }
 
@@ -1034,6 +1250,284 @@ pub(crate) mod tests {
             "test-bot|test-bot@localhost",
             "the replayed commit must carry the committer identity commit_and_sync \
              was given, not whatever git config the host happens to have"
+        );
+    }
+
+    // --- CommitSyncError phase-distinction tests ---
+
+    /// `git add` fails (the path was never written to disk) — nothing is committed,
+    /// and this must surface as `PreCommit`, with HEAD left exactly where it was.
+    #[tokio::test]
+    async fn commit_and_sync_precommit_failure_is_distinguishable_and_leaves_head_unchanged() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        let head_before = rev_parse_head(work_path).await.unwrap();
+
+        // "missing.md" was never written into the working tree, so `git add` has
+        // nothing to stage and fails before any commit is attempted.
+        let result = commit_and_sync(
+            None,
+            "main",
+            work_path,
+            None,
+            "missing.md",
+            "add missing.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+
+        match result {
+            Err(CommitSyncError::PreCommit(_)) => {}
+            other => panic!("expected CommitSyncError::PreCommit, got: {:?}", other),
+        }
+
+        let head_after = rev_parse_head(work_path).await.unwrap();
+        assert_eq!(
+            head_before, head_after,
+            "a PreCommit failure must not move HEAD"
+        );
+    }
+
+    /// The commit lands locally, but the remote is unreachable (fetch fails). This
+    /// must surface as `PostCommit` carrying the real local sha, and — the whole
+    /// point of the distinction — the commit must still be sitting in the local repo
+    /// afterward, not rolled back.
+    #[tokio::test]
+    async fn commit_and_sync_postcommit_failure_leaves_commit_in_place() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("article.md"), "content").unwrap();
+
+        let result = commit_and_sync(
+            // No such path — fetch fails immediately, no network required.
+            Some("/nonexistent/path/to/repo.git"),
+            "main",
+            work_path,
+            None,
+            "article.md",
+            "add article.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+
+        let sha = match result {
+            Err(CommitSyncError::PostCommit { sha, .. }) => sha,
+            other => panic!("expected CommitSyncError::PostCommit, got: {:?}", other),
+        };
+        assert_eq!(sha.len(), 40, "expected a 40-char SHA, got: {}", sha);
+
+        // The commit must actually be present in the local repo's history — a
+        // PostCommit failure must never be rolled back.
+        let show_out = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=", "HEAD"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let show_str = String::from_utf8_lossy(&show_out.stdout);
+        assert!(
+            show_str.contains("article.md"),
+            "the local commit must still exist after a post-commit sync failure, got: {}",
+            show_str
+        );
+        let head = rev_parse_head(work_path).await.unwrap();
+        assert_eq!(
+            head, sha,
+            "the sha attached to the error must match the real local HEAD"
+        );
+    }
+
+    /// A push failure must redact any token embedded in the remote URL from the
+    /// `PostCommit` error, exactly like the pre-existing clone/fetch paths.
+    #[tokio::test]
+    async fn commit_and_sync_postcommit_error_redacts_token() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("secret.md"), "content").unwrap();
+
+        let result = commit_and_sync(
+            Some("https://example.com/nonexistent/repo.git"),
+            "main",
+            work_path,
+            Some("super_secret_token"),
+            "secret.md",
+            "add secret.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+
+        let source = match result {
+            Err(CommitSyncError::PostCommit { source, .. }) => source,
+            other => panic!("expected CommitSyncError::PostCommit, got: {:?}", other),
+        };
+        let msg = format!("{:#}", source);
+        assert!(
+            !msg.contains("super_secret_token"),
+            "token must be redacted from the PostCommit cause: {}",
+            msg
+        );
+
+        // The enum's own Display must not leak it either — that's what a caller
+        // actually logs/returns.
+        let full = CommitSyncError::PostCommit {
+            sha: "deadbeef".to_string(),
+            source,
+        }
+        .to_string();
+        assert!(!full.contains("super_secret_token"));
+    }
+
+    // --- restore_from_head / unstage tests ---
+
+    /// `restore_from_head` is the rollback primitive for a PreCommit failure on an
+    /// existing, already-tracked path (the shape `delete_document` and
+    /// `edit_document` roll back). It must undo BOTH the working-tree change and
+    /// whatever `git add` staged for it.
+    #[tokio::test]
+    async fn restore_from_head_undoes_a_pending_delete() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        // README.md was committed by `create_bare_repo`'s initial commit, so it
+        // exists at HEAD — simulate `delete_document` staging its removal and then
+        // failing before `git commit` lands.
+        std::fs::remove_file(work.path().join("README.md")).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "--", "README.md"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        assert!(!work.path().join("README.md").exists());
+
+        restore_from_head(work_path, "README.md").await.unwrap();
+
+        assert!(
+            work.path().join("README.md").exists(),
+            "restore_from_head must bring the file back on disk"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("README.md")).unwrap(),
+            "# Test repo",
+            "restored content must match HEAD"
+        );
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "the index must also be back to matching HEAD (clean working tree)"
+        );
+    }
+
+    /// Same primitive, applied to `edit_document`'s rollback shape: content
+    /// overwritten in place (not staged), pre-commit failure, restore.
+    #[tokio::test]
+    async fn restore_from_head_undoes_a_pending_edit() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("README.md"), "clobbered content").unwrap();
+
+        restore_from_head(work_path, "README.md").await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("README.md")).unwrap(),
+            "# Test repo",
+            "restore_from_head must revert the working-tree edit to HEAD's content"
+        );
+    }
+
+    /// A path with no HEAD content at all (the shape of a failed brand-new
+    /// `create_document`) cannot be "restored to HEAD" — there is nothing there.
+    /// This must fail loudly rather than silently succeed, so a caller relying on it
+    /// for the wrong operation finds out immediately.
+    #[tokio::test]
+    async fn restore_from_head_fails_on_a_path_head_has_never_seen() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("brand-new.md"), "new content").unwrap();
+
+        let result = restore_from_head(work_path, "brand-new.md").await;
+        assert!(
+            result.is_err(),
+            "restoring a path HEAD never had must fail, not silently no-op"
+        );
+    }
+
+    /// `unstage` is the rollback primitive for `create_document`: a new file was
+    /// `git add`ed and then `git commit` failed. It must remove the index entry
+    /// without touching the working tree (the caller deletes that separately).
+    #[tokio::test]
+    async fn unstage_removes_a_staged_new_file_without_touching_the_worktree() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("newfile.md"), "new content").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "--", "newfile.md"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+
+        let status_before = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&status_before.stdout).trim(),
+            "A  newfile.md"
+        );
+
+        unstage(work_path, "newfile.md").await.unwrap();
+
+        let status_after = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&status_after.stdout).trim(),
+            "?? newfile.md",
+            "the file must be unstaged (back to untracked) but still on disk"
+        );
+        assert!(
+            work.path().join("newfile.md").exists(),
+            "unstage must not touch the working tree"
+        );
+    }
+
+    /// `unstage` must be safe to call even when `git add` itself was the step that
+    /// failed (nothing was ever staged) — `create_document`'s rollback calls it
+    /// unconditionally without knowing which of add/commit failed.
+    #[tokio::test]
+    async fn unstage_is_a_noop_when_nothing_was_ever_staged() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        // "never-staged.md" does not exist anywhere — not on disk, not in the index,
+        // not at HEAD.
+        let result = unstage(work_path, "never-staged.md").await;
+        assert!(
+            result.is_ok(),
+            "unstage must be a safe no-op for a path that was never staged, got: {:?}",
+            result
         );
     }
 
