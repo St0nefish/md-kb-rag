@@ -1055,6 +1055,28 @@ fn outcome_data(outcome: WriteOutcome) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "outcome": outcome.as_str() }))
 }
 
+/// Outcome of a `write_raw_file` call whose commit actually landed in local
+/// history. The two `WriteOutcome` *failure* variants (`FailedNoChange`,
+/// `FailedInconsistentState`) are deliberately NOT modeled here — `write_raw_file`
+/// reports those directly as `Err(McpError)` (via `outcome_data`), exactly like
+/// `write_document`/`delete_document` do, rather than folding every case into one
+/// return type.
+///
+/// `update_schema` (the only caller) matches on this to decide the `WriteOutcome`
+/// discriminant and message text to hand back to its own caller. The schema-cache
+/// rebuild and `reindex::mark_full` queuing happen identically for both variants
+/// inside `write_raw_file` itself — the commit is durable in local history either
+/// way, only the remote push status differs — so `update_schema` does not need to
+/// (and must not) branch on this to decide whether to do those.
+enum RawFileOutcome {
+    /// Committed and pushed.
+    Synced { sha: String },
+    /// Committed locally; the remote push failed. `cause` is the redacted,
+    /// already-`{:#}`-formatted `CommitSyncError` source, ready to interpolate
+    /// into a user-facing message.
+    CommittedPendingSync { sha: String, cause: String },
+}
+
 #[derive(Clone)]
 pub struct KbSearchServer {
     embed_client: Arc<EmbedClient>,
@@ -1157,13 +1179,31 @@ impl KbSearchServer {
     ///
     /// Used for `.kb-schema.yaml`, which is versioned and synced like a document but is
     /// not itself indexed. The write goes to a temp file and is renamed into place, so a
-    /// failure part-way cannot leave a half-written schema that would freeze the scope.
+    /// failure part-way through the *filesystem* write cannot leave a half-written
+    /// schema that would freeze the scope.
+    ///
+    /// `commit_and_sync` below has its own two-phase failure mode — see
+    /// `git::CommitSyncError` — and is rolled back exactly like `write_document`'s: a
+    /// `PreCommit` failure undoes the filesystem write (remove + `unstage` for a
+    /// brand-new schema file that has no HEAD content to fall back to;
+    /// `restore_from_head` for an overwrite of an existing, already-tracked one) and
+    /// reports `FailedNoChange`, or `FailedInconsistentState` if that rollback itself
+    /// fails. A `PostCommit` failure leaves the local commit in place — it is real —
+    /// and reports `CommittedPendingSync`.
+    ///
+    /// `reindex::mark_full` fires only once the commit has actually landed locally
+    /// (`Synced` or `CommittedPendingSync`), never on a rolled-back write: queuing a
+    /// full reconcile against a schema change that was never actually committed (or,
+    /// worse, against a filesystem/git state a failed rollback left inconsistent)
+    /// would be pointless at best and actively misleading at worst — the reconcile
+    /// would revalidate every document under the scope against content that is not,
+    /// in fact, what's in git history.
     async fn write_raw_file(
         &self,
         rel_path: &str,
         content: &str,
         commit_message: &str,
-    ) -> Result<(), McpError> {
+    ) -> Result<RawFileOutcome, McpError> {
         let config = self.config();
 
         // Same resolver the document write tools use. Joining the data root with a
@@ -1185,6 +1225,14 @@ impl KbSearchServer {
         // component is verified here.
         resolve_safe_write_path(&self.canonical_data_path, rel_path)
             .map_err(|e| McpError::invalid_params(format!("Invalid schema path: {}", e), None))?;
+
+        // Whether this call is creating `rel_path` for the first time or overwriting
+        // an existing, already-tracked one — determines which rollback primitive
+        // applies if `commit_and_sync` fails before landing (see the match below).
+        // Checked as late as possible, immediately before the write, to keep the
+        // TOCTOU window against a concurrent writer as small as the temp+rename
+        // strategy below allows.
+        let is_new = !abs_path.exists();
 
         // Unique per call, not merely per process: two concurrent requests inside one
         // server would otherwise share a temp path and silently clobber each other,
@@ -1209,10 +1257,19 @@ impl KbSearchServer {
             .ok()
             .filter(|s| !s.is_empty());
 
-        git::commit_and_sync(
+        // `commit_and_sync` distinguishes WHERE it failed — see `git::CommitSyncError`
+        // — and the two phases demand opposite handling, exactly as in
+        // `write_document`. A `PreCommit` failure means HEAD never moved, so the
+        // filesystem write above is rolled back and reported as "nothing changed". A
+        // `PostCommit` failure means the commit is a real, durable part of local
+        // history — rolling it back here would silently undo a schema change that
+        // genuinely happened, so it is left alone and reported as "committed, sync
+        // pending" instead.
+        let data_path_str = self.canonical_data_path.to_str().unwrap_or_default();
+        let commit_outcome = match git::commit_and_sync(
             config.source.git_url.as_deref(),
             &config.source.branch,
-            self.canonical_data_path.to_str().unwrap_or_default(),
+            data_path_str,
             token.as_deref(),
             rel_path,
             commit_message,
@@ -1220,10 +1277,88 @@ impl KbSearchServer {
             &config.write.commit_author_email,
         )
         .await
-        .map_err(|e| {
-            error!("commit_and_sync failed for '{}': {:#}", rel_path, e);
-            McpError::internal_error(format!("Git commit/sync failed: {}", e), None)
-        })?;
+        {
+            Ok(outcome) => outcome,
+
+            Err(git::CommitSyncError::PreCommit(source)) => {
+                error!(
+                    "commit_and_sync pre-commit failure writing schema '{}', rolling back: {:#}",
+                    rel_path, source
+                );
+
+                // For a brand-new schema file, there is no HEAD content to restore
+                // to — remove it from disk directly and unstage whatever `git add`
+                // staged. For an overwrite of an existing schema, HEAD already has
+                // the previous content, so restore it (this also un-stages any
+                // partial `git add`, in one step).
+                let rollback = if is_new {
+                    match tokio::fs::remove_file(&abs_path).await {
+                        Ok(()) => git::unstage(data_path_str, rel_path).await,
+                        Err(e) => Err(anyhow::Error::new(e)
+                            .context("Failed to remove newly-written schema file during rollback")),
+                    }
+                } else {
+                    git::restore_from_head(data_path_str, rel_path).await
+                };
+
+                return match rollback {
+                    Ok(()) => Err(McpError::internal_error(
+                        format!(
+                            "Schema at '{}' was NOT changed: git commit failed and the write \
+                             has been rolled back — nothing changed, safe to retry. \
+                             Cause: {:#}",
+                            rel_path, source
+                        ),
+                        outcome_data(WriteOutcome::FailedNoChange),
+                    )),
+                    // The rollback ITSELF failed — a third, worse state than either of
+                    // the above. The schema file may now be gone/changed on disk with
+                    // no corresponding commit, or the index may not match HEAD.
+                    // Report it distinctly and loudly rather than letting it
+                    // masquerade as a clean no-op.
+                    Err(rollback_err) => {
+                        error!(
+                            "Rollback FAILED after a pre-commit git failure writing schema \
+                             '{}': {:#}. Original cause: {:#}. Filesystem and git state may \
+                             now be inconsistent.",
+                            rel_path, rollback_err, source
+                        );
+                        Err(McpError::internal_error(
+                            format!(
+                                "Schema at '{}' is in an INCONSISTENT state: git commit \
+                                 failed AND the rollback attempt itself failed. The working \
+                                 tree may not match git history for this path — do not \
+                                 assume the schema change did or did not take effect. Manual \
+                                 inspection is required. Commit cause: {:#}. \
+                                 Rollback cause: {:#}",
+                                rel_path, source, rollback_err
+                            ),
+                            outcome_data(WriteOutcome::FailedInconsistentState),
+                        ))
+                    }
+                };
+            }
+
+            Err(git::CommitSyncError::PostCommit { sha, source }) => {
+                warn!(
+                    "commit_and_sync post-commit (sync) failure writing schema '{}', commit {} \
+                     stands uncorrected: {:#}",
+                    rel_path, sha, source
+                );
+
+                // The commit landed locally regardless of push status, so the schema
+                // change is real and durable as far as this clone's git history is
+                // concerned — queue the same full reconcile a clean success would.
+                // See this method's doc comment for why that reconcile must NOT run
+                // on the rolled-back (PreCommit) branch above but must here.
+                crate::reindex::mark_full();
+
+                return Ok(RawFileOutcome::CommittedPendingSync {
+                    sha,
+                    cause: format!("{:#}", source),
+                });
+            }
+        };
 
         // A schema change revalidates its whole subtree via the schema fingerprint —
         // any document under this scope can flip from valid to invalid or vice versa —
@@ -1234,7 +1369,9 @@ impl KbSearchServer {
         // actually catches the affected documents once it re-reads them.
         crate::reindex::mark_full();
 
-        Ok(())
+        Ok(RawFileOutcome::Synced {
+            sha: commit_outcome.sha,
+        })
     }
 
     /// Documents already under `rel_dir` that a candidate schema would reject.
@@ -1809,7 +1946,18 @@ impl KbSearchServer {
         let rel_file_str = rel_file.to_string_lossy().to_string();
         let commit_message = format!("schema: {summary} in {}", rel_dir.display());
 
-        self.write_raw_file(&rel_file_str, &yaml, &commit_message)
+        // `write_raw_file` rolls itself back on a pre-commit `commit_and_sync`
+        // failure and returns `Err` in that case (see its doc comment) — this `?`
+        // propagates that `Err` (with its `FailedNoChange`/`FailedInconsistentState`
+        // outcome data already attached) WITHOUT reaching the cache rebuild below.
+        // That is exactly what must happen: a rolled-back write means the schema on
+        // disk is unchanged (or, in the inconsistent-state case, of unknown
+        // trustworthiness), so rebuilding the shared cache from it here would either
+        // be a no-op at best or propagate bad state at worst. Only a call that
+        // actually landed a local commit — `Synced` or `CommittedPendingSync` —
+        // reaches the code below.
+        let write_outcome = self
+            .write_raw_file(&rel_file_str, &yaml, &commit_message)
             .await?;
 
         // Rebuild the shared schema cache and swap it in SYNCHRONOUSLY — before this
@@ -1824,6 +1972,11 @@ impl KbSearchServer {
         // in `spawn_blocking` because the walk itself is blocking filesystem work, not
         // because anything here needs to run off-thread for its own sake — `.await`ing
         // it still makes this call return only once the rebuild has completed.
+        //
+        // This runs for BOTH `RawFileOutcome` variants, not just `Synced`: a
+        // `CommittedPendingSync` write is still a real local commit — the new schema
+        // is genuinely in effect for this clone regardless of whether the push to the
+        // remote landed — so the cache must reflect it just the same.
         let rebuild_data_path = self.canonical_data_path.clone();
         let rebuild_frontmatter = self.config().frontmatter.clone();
         match tokio::task::spawn_blocking(move || {
@@ -1844,7 +1997,25 @@ impl KbSearchServer {
             }
         }
 
-        let mut text = format!("{summary}\nWrote {rel_file_str}.");
+        // Same `WriteOutcome` discriminant `write_document`/`delete_document` attach
+        // via `with_outcome` — not called directly here because this response also
+        // carries schema-specific fields (`summary`, `path`, `invalidated`) that
+        // `with_outcome` would clobber, but the discriminant string itself comes from
+        // the same enum, not a parallel literal.
+        let (outcome, mut text) = match write_outcome {
+            RawFileOutcome::Synced { sha } => (
+                WriteOutcome::Synced,
+                format!("{summary}\nWrote {rel_file_str} (commit {sha})."),
+            ),
+            RawFileOutcome::CommittedPendingSync { sha, cause } => (
+                WriteOutcome::CommittedPendingSync,
+                format!(
+                    "{summary}\nWrote {rel_file_str} (commit {sha}) — committed locally, but \
+                     the push to the remote failed: {cause}. It will sync on the next \
+                     successful write or manual intervention.",
+                ),
+            ),
+        };
         if !casualties.is_empty() {
             text.push_str(&format!(
                 "\n\nWARNING: {} existing document(s) now fail validation and will stop \
@@ -1856,6 +2027,7 @@ impl KbSearchServer {
 
         let mut result = CallToolResult::success(vec![Content::text(text)]);
         result.structured_content = Some(serde_json::json!({
+            "outcome": outcome.as_str(),
             "dry_run": false,
             "summary": summary,
             "path": rel_file_str,
@@ -1992,7 +2164,17 @@ impl KbSearchServer {
 
         debug!(path = %raw, "get_document called");
 
-        match retrieval::get_document(&self.deps(), raw).await {
+        // The fuzzy-basename fallback resolves against the SQLite metadata index
+        // rather than a Qdrant facet fetch, so the index has to be opened here.
+        // Only the fallback needs it — an exact path hit is served from disk and
+        // never touches this — but the resolve happens inside `get_document`, so
+        // it is passed unconditionally.
+        let index = self.state_db().await.map_err(|e| {
+            error!("get_document could not open the metadata index: {:#}", e);
+            McpError::internal_error(format!("Document index unavailable: {}", e), None)
+        })?;
+
+        match retrieval::get_document(&self.deps(), index, raw).await {
             Ok(doc) => {
                 debug!(path = %raw, "get_document served");
                 Ok(CallToolResult::success(vec![Content::text(doc.content)]))
@@ -3430,10 +3612,16 @@ mod tests {
 
     #[tokio::test]
     async fn update_schema_can_still_create_a_scope_that_does_not_exist_yet() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = schema_tool_server(&tmp);
+        // Needs a real git-backed harness (not `schema_tool_server`'s bare tempdir):
+        // `write_raw_file` now rolls a failed `commit_and_sync` back (see
+        // `write_raw_file`'s doc comment), so a harness where the git step can never
+        // succeed would have this call fail and its rollback remove the very file
+        // this test is checking for.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
 
-        let _ = server
+        server
             .update_schema(Parameters(UpdateSchemaParams {
                 path: Some("/brand/new".into()),
                 operation: "add_values".into(),
@@ -3443,10 +3631,11 @@ mod tests {
                 dry_run: None,
                 force: None,
             }))
-            .await;
+            .await
+            .expect("update_schema must succeed against this git-backed harness");
 
         assert!(
-            tmp.path()
+            work.path()
                 .join("brand/new")
                 .join(crate::schema::SCHEMA_FILE_NAME)
                 .exists(),
@@ -3569,8 +3758,14 @@ mod tests {
 
     #[tokio::test]
     async fn update_schema_accepts_a_change_that_breaks_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = schema_tool_server(&tmp);
+        // Git-backed harness — see the comment on
+        // `update_schema_can_still_create_a_scope_that_does_not_exist_yet` for why
+        // `schema_tool_server`'s bare tempdir no longer works for a write that must
+        // actually land: `write_raw_file` now rolls back a failed `commit_and_sync`
+        // instead of leaving the file behind.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
         seed_document(
             &server,
             "notes/a.md",
@@ -3578,9 +3773,7 @@ mod tests {
         )
         .await;
 
-        // Reaches the git step, which fails in this harness — but only AFTER the file
-        // has been written, which is what this test pins down.
-        let _ = server
+        server
             .update_schema(Parameters(UpdateSchemaParams {
                 path: Some("notes".into()),
                 operation: "add_values".into(),
@@ -3590,15 +3783,16 @@ mod tests {
                 dry_run: None,
                 force: None,
             }))
-            .await;
+            .await
+            .expect("a non-breaking change must succeed against this git-backed harness");
 
-        let written = tmp
+        let written = work
             .path()
             .join("notes")
             .join(crate::schema::SCHEMA_FILE_NAME);
         assert!(
             written.exists(),
-            "a non-breaking change must be written before the git step"
+            "a non-breaking change must be written and committed"
         );
         let yaml = std::fs::read_to_string(&written).unwrap();
         let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
@@ -3653,13 +3847,17 @@ mod tests {
 
     #[tokio::test]
     async fn update_schema_force_applies_despite_casualties() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = schema_tool_server(&tmp);
+        // Git-backed harness — see the comment on
+        // `update_schema_can_still_create_a_scope_that_does_not_exist_yet`: this test
+        // asserts the write survives, so the git step must actually succeed rather
+        // than trigger `write_raw_file`'s rollback.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
         seed_document(&server, "notes/a.md", serde_json::json!({ "title": "A" })).await;
 
-        // Reaches the git step and fails there, but only after writing — which is the
-        // point: force must not be blocked by the casualty check.
-        let _ = server
+        // The point of this test: force must not be blocked by the casualty check.
+        server
             .update_schema(Parameters(UpdateSchemaParams {
                 path: Some("notes".into()),
                 operation: "set_field".into(),
@@ -3669,10 +3867,11 @@ mod tests {
                 dry_run: None,
                 force: Some(true),
             }))
-            .await;
+            .await
+            .expect("force must succeed against this git-backed harness");
 
         assert!(
-            tmp.path()
+            work.path()
                 .join("notes")
                 .join(crate::schema::SCHEMA_FILE_NAME)
                 .exists(),
@@ -5880,5 +6079,287 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&show.stdout), new_content);
+    }
+
+    // -----------------------------------------------------------------------
+    // update_schema / write_raw_file — the same PreCommit/PostCommit rollback
+    // treatment as create_document/edit_document/delete_document above, applied to
+    // the one write path (`write_raw_file`, used only by `update_schema`) PR #93
+    // deferred. See `write_raw_file`'s doc comment for the rollback rules and
+    // `update_schema`'s comment above its call to it for why a rolled-back write
+    // must skip both the schema-cache rebuild and `reindex::mark_full`.
+    // -----------------------------------------------------------------------
+
+    /// `git_status`, filtered to drop the SQLite state-DB files (`state.db` plus its
+    /// `-shm`/`-wal` siblings). `update_schema`'s casualty check
+    /// (`documents_broken_by`) opens the metadata index on first use, which lazily
+    /// creates those files under `work` as an ordinary, expected side effect of
+    /// running the tool at all — unrelated to whether a `commit_and_sync` rollback
+    /// left the WRITE ITSELF clean. `create_document`/`edit_document`/
+    /// `delete_document`'s equivalent tests never touch the metadata index this way,
+    /// which is why their plain `git_status` assertions can stay exact.
+    fn git_status_ignoring_state_db(work: &tempfile::TempDir) -> String {
+        git_status(work)
+            .lines()
+            .filter(|line| {
+                let path = line.split_whitespace().last().unwrap_or("");
+                !path.starts_with("state.db")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn update_schema_precommit_failure_on_new_schema_rolls_it_back() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let head_before = head_sha(&work);
+
+        // No `.kb-schema.yaml` exists anywhere under `notes/` yet, so this write
+        // creates one from scratch — the `is_new` branch of `write_raw_file`'s
+        // rollback.
+        force_git_commit_to_fail(&work);
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["x".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await;
+
+        let err = result.expect_err("a rejected pre-commit hook must fail the schema write");
+        assert_eq!(
+            outcome_of(&err.data),
+            Some("failed_no_change"),
+            "got: {:?}",
+            err
+        );
+
+        assert!(
+            !work
+                .path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists(),
+            "the newly-written schema file must be removed on rollback — there is no \
+             HEAD content for a brand-new scope to fall back to"
+        );
+        assert_eq!(
+            head_before,
+            head_sha(&work),
+            "HEAD must not move on a rolled-back pre-commit failure"
+        );
+        assert_eq!(
+            git_status_ignoring_state_db(&work),
+            "",
+            "the aborted `git add` must be unstaged too — no leftover addition that \
+             could ride along on a later, unrelated commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_precommit_failure_on_existing_schema_restores_previous_content() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+
+        // Commit an existing schema for `notes/` BEFORE forcing commits to fail, so
+        // there is real HEAD content for the rollback to restore.
+        let original = "fields:\n  status:\n    type: enum\n    values: [active]\n";
+        write_schema_file(&work, "notes", original);
+        git_commit_all(
+            &work,
+            &format!("notes/{}", crate::schema::SCHEMA_FILE_NAME),
+            "add notes schema",
+        );
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        // Built AFTER the real commit above, so the cache actually knows about the
+        // existing `notes/` scope (needed for `update_schema` to resolve it and for
+        // `write_raw_file` to see the write as an overwrite, not a create).
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "status".into(),
+                values: Some(vec!["beta".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await;
+
+        let err = result.expect_err("a rejected pre-commit hook must fail the schema write");
+        assert_eq!(
+            outcome_of(&err.data),
+            Some("failed_no_change"),
+            "got: {:?}",
+            err
+        );
+
+        let written = work
+            .path()
+            .join("notes")
+            .join(crate::schema::SCHEMA_FILE_NAME);
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            original,
+            "the overwrite must be rolled back to the previous HEAD content, not left \
+             holding the new (uncommitted) schema"
+        );
+        assert_eq!(
+            head_before,
+            head_sha(&work),
+            "HEAD must not move on a rolled-back pre-commit failure"
+        );
+        assert_eq!(
+            git_status_ignoring_state_db(&work),
+            "",
+            "working tree must be clean after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_postcommit_failure_leaves_commit_and_reports_pending_sync() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+
+        let mut config = make_test_resolved_config(work.path());
+        {
+            let c = Arc::get_mut(&mut config).unwrap();
+            c.write.dedup_enabled = false;
+            // No such path — `git fetch` fails immediately, no network required, but
+            // only AFTER the schema write's `git add`/`git commit` have already
+            // succeeded locally.
+            c.source.git_url = Some("/nonexistent/path/to/repo.git".to_string());
+        }
+        let server = make_write_test_server(&work, &["**/*.md".to_string()], config);
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "status".into(),
+                values: Some(vec!["active".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await;
+
+        let result = result.expect("a post-commit sync failure must still report as success");
+        assert_eq!(
+            outcome_of(&result.structured_content),
+            Some("committed_pending_sync"),
+            "got: {:?}",
+            result
+        );
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("push") && text.contains("sync on the next successful write"),
+            "must explain the push failure and that sync is pending: {text}"
+        );
+
+        // The schema change IS a real local commit — the file stays written, and HEAD
+        // records it. None of this is rolled back just because the push failed.
+        let written = work
+            .path()
+            .join("notes")
+            .join(crate::schema::SCHEMA_FILE_NAME);
+        assert!(written.exists());
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&show.stdout).contains(crate::schema::SCHEMA_FILE_NAME),
+            "the schema commit must be present in local HEAD"
+        );
+
+        // The reasoning behind NOT rolling back a PostCommit failure only pays off if
+        // the shared schema cache was actually rebuilt from the new (committed)
+        // content despite the push failure — mirrors
+        // `create_document_immediately_after_update_schema_validates_against_the_new_rules`,
+        // but for the pending-sync outcome instead of a clean sync. If `update_schema`
+        // skipped the cache rebuild whenever the write wasn't a clean `Synced`, this
+        // next call would wrongly reject "beta" against the stale pre-change schema.
+        let accepted = server
+            .create_document(Parameters(CreateDocumentParams {
+                path: "notes/after.md".to_string(),
+                content: "---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string(),
+                message: None,
+                force_new: Some(true),
+            }))
+            .await;
+        assert!(
+            accepted.is_err(),
+            "sanity check: this call's OWN schema edit only added 'active', not \
+             'beta' — this must still be rejected, otherwise this test would not be \
+             distinguishing 'cache rebuilt' from 'no schema at all'"
+        );
+        let err_msg = format!("{:?}", accepted.err());
+        assert!(
+            err_msg.contains("beta"),
+            "must be rejected specifically for the 'beta' value, not some unrelated \
+             failure: {err_msg}"
+        );
+    }
+
+    /// When there is no git repository at all, `git add` fails (`PreCommit`) and the
+    /// rollback attempt (`git reset` via `unstage`) ALSO fails, since there is no
+    /// repo to reset anything in. This is the third, worse outcome: the schema file
+    /// is gone from disk with no corresponding commit anywhere. It must be reported
+    /// distinctly rather than masquerading as either a clean write or a clean no-op —
+    /// mirrors `delete_document_with_no_git_repo_reports_inconsistent_state`.
+    #[tokio::test]
+    async fn update_schema_rollback_failure_reports_inconsistent_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["x".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+            }))
+            .await;
+
+        let err = result.expect_err("writing a schema with no git repo must fail");
+        assert_eq!(
+            outcome_of(&err.data),
+            Some("failed_inconsistent_state"),
+            "got: {:?}",
+            err
+        );
+        assert!(
+            err.message.contains("INCONSISTENT"),
+            "the message must call out the inconsistent state loudly, got: {}",
+            err.message
+        );
+
+        // The remove succeeded (there is no repo to fail that part), but the
+        // subsequent `unstage` could not run against a nonexistent repo — that
+        // mismatch (file gone, no git awareness of it ever having existed) IS the
+        // inconsistent state being reported.
+        assert!(
+            !tmp.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
     }
 }

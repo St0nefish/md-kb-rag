@@ -413,7 +413,10 @@ async fn main() -> anyhow::Result<()> {
                 reranker: None,
             };
 
-            let doc = retrieval::get_document(&deps, &args.path)
+            // Backs the fuzzy-basename fallback (see the equivalent MCP handler).
+            let index = state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
+
+            let doc = retrieval::get_document(&deps, &index, &args.path)
                 .await
                 .map_err(|e| match e {
                     retrieval::GetDocumentError::Outside => {

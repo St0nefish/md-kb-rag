@@ -11,9 +11,6 @@ use crate::{
     state::{DocumentIndex, DocumentQuery, DocumentQueryResult},
 };
 
-/// Upper bound on the number of indexed file paths to fetch for fuzzy
-/// `get_document` resolution. Larger KBs will silently cap at this value.
-pub const MAX_INDEXED_PATHS_FOR_FUZZY: u64 = 10_000;
 /// How many "did you mean?" suggestions to include when no basename matches.
 pub const FUZZY_SUGGESTION_COUNT: usize = 3;
 
@@ -21,8 +18,11 @@ pub const FUZZY_SUGGESTION_COUNT: usize = 3;
 /// Dependencies for document listing.
 ///
 /// Deliberately separate from [`RetrievalDeps`] rather than a third generic parameter
-/// on it: `search` and `get_document` never touch the metadata index, and widening
-/// their deps struct would ripple through every construction site and mock.
+/// on it: `search` never touches the metadata index, and widening its deps struct
+/// would ripple through every construction site and mock that only ever searches.
+/// `get_document` also needs the metadata index (for its fuzzy fallback — see its own
+/// doc comment) but takes a bare `&D: DocumentIndex` parameter rather than this
+/// wrapper, for the same reason: it has no listing-shaped fields to bundle it with.
 pub struct DocumentIndexDeps<'a, D: DocumentIndex> {
     pub index: &'a D,
 }
@@ -394,8 +394,13 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
 /// On success returns `Document { path, content }`. On failure returns a
 /// structured `GetDocumentError` — callers are responsible for turning these
 /// into user-facing error strings.
-pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore>(
+///
+/// `document_index` backs the fuzzy fallback (see step 2 below) — the SQLite
+/// `documents` table, not Qdrant. See that step's comment for why, and for the
+/// consistency tradeoff that follows from the choice.
+pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>(
     deps: &RetrievalDeps<'_, E, Q>,
+    document_index: &D,
     raw: &str,
 ) -> Result<Document, GetDocumentError> {
     // 1. Try the literal path as given.
@@ -417,23 +422,35 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore>(
         Err(ResolveErr::Other(msg)) => return Err(GetDocumentError::Io(msg)),
     }
 
-    // 2. Fuzzy fallback: load every indexed path from Qdrant and look for a
-    //    basename match. Auto-resolve a unique match; otherwise produce a
-    //    helpful error.
-    let all_paths = deps
-        .qdrant
-        .fetch_facet_values(deps.collection, "file_path", MAX_INDEXED_PATHS_FOR_FUZZY)
-        .await
-        .unwrap_or_else(|e| {
-            warn!("Failed to fetch file_path facet for fuzzy lookup: {e:#}");
-            Vec::new()
-        });
-    if all_paths.len() as u64 == MAX_INDEXED_PATHS_FOR_FUZZY {
-        warn!(
-            cap = MAX_INDEXED_PATHS_FOR_FUZZY,
-            "fuzzy path resolver hit the cap; some paths may be missing from suggestions"
-        );
-    }
+    // 2. Fuzzy fallback: load every indexed path and look for a basename match.
+    //    Auto-resolve a unique match; otherwise produce a helpful error.
+    //
+    //    Sourced from the SQLite `documents` table rather than Qdrant's file_path
+    //    facet (the previous approach): `documents` already holds exactly this list
+    //    — one row per successfully indexed file, maintained by the same pipeline
+    //    that writes Qdrant (`ingest::index_paths_inner` / `remove_orphans`) — so a
+    //    local, indexed SELECT beats a network round trip to the vector store, needs
+    //    no arbitrary cap (the previous fetch capped at 10,000 and silently dropped
+    //    paths past it), and stays cheap as the corpus grows into the thousands.
+    //
+    //    Consistency: `documents` can transiently disagree with Qdrant across a
+    //    single indexing run's bookkeeping step. On create/update, Qdrant is written
+    //    first and `documents` second (`ingest::index_paths_inner`); a bookkeeping
+    //    failure between the two — logged, retried next run — leaves a freshly
+    //    indexed file searchable via Qdrant but briefly absent from `documents`, so a
+    //    typo'd path to a document indexed moments ago could momentarily miss a
+    //    fuzzy match. On delete, the order reverses (Qdrant points removed first,
+    //    then `documents`), so the previous Qdrant-facet approach had the mirror-image
+    //    race: a path could briefly still fuzzy-match in `documents` after its
+    //    content was already gone from Qdrant (the existing secondary-resolve-failure
+    //    handling below already covers that case). Either way the window is one
+    //    indexing run wide and self-heals on the next; `list_documents` already reads
+    //    from `documents` under the identical tradeoff, so this is consistent with
+    //    the rest of the codebase rather than a new risk.
+    let all_paths = document_index.all_paths().await.unwrap_or_else(|e| {
+        warn!("Failed to fetch indexed paths for fuzzy lookup: {e:#}");
+        Vec::new()
+    });
 
     let basename = Path::new(raw)
         .file_name()
@@ -796,7 +813,6 @@ mod tests {
     struct MockRetrievalStore {
         search_err: Option<String>,
         search_ok: Vec<SearchResult>,
-        facet_paths: Vec<String>,
         received_filters: std::sync::Mutex<Option<HashMap<String, serde_json::Value>>>,
         /// Sparse vector captured by `hybrid_search` (None until called).
         received_sparse: std::sync::Mutex<Option<(Vec<u32>, Vec<f32>)>>,
@@ -809,7 +825,6 @@ mod tests {
             Self {
                 search_err: None,
                 search_ok: results,
-                facet_paths: Vec::new(),
                 received_filters: std::sync::Mutex::new(None),
                 received_sparse: std::sync::Mutex::new(None),
                 last_call: std::sync::Mutex::new(None),
@@ -819,17 +834,6 @@ mod tests {
             Self {
                 search_err: Some(msg.to_string()),
                 search_ok: Vec::new(),
-                facet_paths: Vec::new(),
-                received_filters: std::sync::Mutex::new(None),
-                received_sparse: std::sync::Mutex::new(None),
-                last_call: std::sync::Mutex::new(None),
-            }
-        }
-        fn with_facet_paths(paths: Vec<String>) -> Self {
-            Self {
-                search_err: None,
-                search_ok: Vec::new(),
-                facet_paths: paths,
                 received_filters: std::sync::Mutex::new(None),
                 received_sparse: std::sync::Mutex::new(None),
                 last_call: std::sync::Mutex::new(None),
@@ -871,14 +875,42 @@ mod tests {
             }
             Ok(self.search_ok.clone())
         }
+    }
 
-        async fn fetch_facet_values(
+    /// `DocumentIndex` mock for `get_document`'s fuzzy-fallback tests. Only
+    /// `all_paths` is on that code path — `query_documents` backs `list_documents`
+    /// instead and is unused here, so it stubs out rather than duplicating
+    /// `state.rs`'s real query logic.
+    struct MockDocumentIndex {
+        paths: Vec<String>,
+        err: Option<String>,
+    }
+
+    impl MockDocumentIndex {
+        fn with_paths(paths: Vec<String>) -> Self {
+            Self { paths, err: None }
+        }
+        fn with_err(msg: &str) -> Self {
+            Self {
+                paths: Vec::new(),
+                err: Some(msg.to_string()),
+            }
+        }
+    }
+
+    impl DocumentIndex for MockDocumentIndex {
+        async fn query_documents(
             &self,
-            _collection: &str,
-            _field: &str,
-            _limit: u64,
-        ) -> anyhow::Result<Vec<String>> {
-            Ok(self.facet_paths.clone())
+            _query: &DocumentQuery,
+        ) -> anyhow::Result<DocumentQueryResult> {
+            unimplemented!("get_document's fuzzy fallback does not call query_documents")
+        }
+
+        async fn all_paths(&self) -> anyhow::Result<Vec<String>> {
+            if let Some(ref msg) = self.err {
+                anyhow::bail!("{}", msg);
+            }
+            Ok(self.paths.clone())
         }
     }
 
@@ -1260,10 +1292,11 @@ mod tests {
 
         let gs = make_md_globset();
         let embed = MockEmbedder::ok(vec![]);
-        let store = MockRetrievalStore::with_facet_paths(vec![]);
+        let store = MockRetrievalStore::with_results(vec![]);
         let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_paths(vec![]);
 
-        let doc = get_document(&deps, "docs/guide.md").await.unwrap();
+        let doc = get_document(&deps, &index, "docs/guide.md").await.unwrap();
         assert!(doc.content.contains("Content here."));
     }
 
@@ -1273,12 +1306,13 @@ mod tests {
         let data_path = tmp.path().canonicalize().unwrap();
         let gs = make_md_globset();
         let embed = MockEmbedder::ok(vec![]);
-        let store = MockRetrievalStore::with_facet_paths(vec![]);
+        let store = MockRetrievalStore::with_results(vec![]);
         let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_paths(vec![]);
 
         // /etc/hosts is a real file outside any tempdir
         if std::path::Path::new("/etc/hosts").exists() {
-            let result = get_document(&deps, "/etc/hosts").await;
+            let result = get_document(&deps, &index, "/etc/hosts").await;
             assert!(
                 matches!(result, Err(GetDocumentError::Outside)),
                 "absolute path outside data dir should return Outside"
@@ -1294,11 +1328,12 @@ mod tests {
 
         let gs = make_md_globset(); // only *.md
         let embed = MockEmbedder::ok(vec![]);
-        let store = MockRetrievalStore::with_facet_paths(vec![]);
+        let store = MockRetrievalStore::with_results(vec![]);
         let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_paths(vec![]);
 
         let txt_path = data_path.join("notes.txt").to_string_lossy().to_string();
-        let result = get_document(&deps, &txt_path).await;
+        let result = get_document(&deps, &index, &txt_path).await;
         assert!(
             matches!(result, Err(GetDocumentError::NotPermitted)),
             "non-.md file should return NotPermitted"
@@ -1315,11 +1350,12 @@ mod tests {
 
         let gs = make_md_globset();
         let embed = MockEmbedder::ok(vec![]);
-        // Facet returns the relative key — literal "foo.md" won't resolve, falls to fuzzy
-        let store = MockRetrievalStore::with_facet_paths(vec!["notes/foo.md".to_string()]);
+        let store = MockRetrievalStore::with_results(vec![]);
         let deps = make_deps(&embed, &store, &data_path, &gs);
+        // The index returns the relative key — literal "foo.md" won't resolve, falls to fuzzy
+        let index = MockDocumentIndex::with_paths(vec!["notes/foo.md".to_string()]);
 
-        let doc = get_document(&deps, "foo.md").await.unwrap();
+        let doc = get_document(&deps, &index, "foo.md").await.unwrap();
         assert!(doc.content.contains("Fuzzy content."));
     }
 
@@ -1330,16 +1366,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_path = tmp.path().canonicalize().unwrap();
 
-        // Relative keys as stored in the new index
-        let facet_paths = vec!["tacoma-2024.md".to_string(), "voron-trident.md".to_string()];
+        // Relative keys as stored in the documents table
+        let indexed_paths = vec!["tacoma-2024.md".to_string(), "voron-trident.md".to_string()];
 
         let gs = make_md_globset();
         let embed = MockEmbedder::ok(vec![]);
-        let store = MockRetrievalStore::with_facet_paths(facet_paths);
+        let store = MockRetrievalStore::with_results(vec![]);
         let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_paths(indexed_paths);
 
         // "tacoma-2025.md" doesn't exist anywhere — literal resolve: NotFound, fuzzy: 0 exact basename matches
-        let result = get_document(&deps, "tacoma-2025.md").await;
+        let result = get_document(&deps, &index, "tacoma-2025.md").await;
         match result {
             Err(GetDocumentError::NotFound { suggestions }) => {
                 assert!(!suggestions.is_empty(), "should have suggestions");
@@ -1370,15 +1407,16 @@ mod tests {
         let data_path = tmp.path().canonicalize().unwrap();
 
         // Two relative keys with the same basename
-        let facet_paths = vec!["a/notes.md".to_string(), "b/notes.md".to_string()];
+        let indexed_paths = vec!["a/notes.md".to_string(), "b/notes.md".to_string()];
 
         let gs = make_md_globset();
         let embed = MockEmbedder::ok(vec![]);
-        let store = MockRetrievalStore::with_facet_paths(facet_paths);
+        let store = MockRetrievalStore::with_results(vec![]);
         let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_paths(indexed_paths);
 
         // "notes.md" as basename — not on disk, so literal fails; fuzzy finds 2 exact matches
-        let result = get_document(&deps, "notes.md").await;
+        let result = get_document(&deps, &index, "notes.md").await;
         match result {
             Err(GetDocumentError::Ambiguous { matches }) => {
                 assert_eq!(matches.len(), 2, "should have 2 ambiguous matches");
@@ -1390,6 +1428,71 @@ mod tests {
                     Err(GetDocumentError::Outside) => "Outside",
                     Err(GetDocumentError::NotPermitted) => "NotPermitted",
                     Err(GetDocumentError::NotFound { .. }) => "NotFound",
+                    Err(GetDocumentError::Io(_)) => "Io",
+                    _ => "other",
+                }
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_document_fuzzy_finds_a_match_past_the_old_ten_thousand_cap() {
+        // Regression guard for #87: the Qdrant-facet fetch this replaced capped at
+        // MAX_INDEXED_PATHS_FOR_FUZZY (10,000) and silently dropped anything past it,
+        // so a document indexed "late" in facet order could never be fuzzy-matched.
+        // `documents` is queried directly with no such cap — assert a basename well
+        // past the old boundary still resolves.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().canonicalize().unwrap();
+        let target_dir = data_path.join("late");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("needle.md"), "# Needle\nFound it.").unwrap();
+
+        let mut paths: Vec<String> = (0..10_500).map(|i| format!("filler/{i}.md")).collect();
+        paths.push("late/needle.md".to_string());
+
+        let gs = make_md_globset();
+        let embed = MockEmbedder::ok(vec![]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_paths(paths);
+
+        let doc = get_document(&deps, &index, "needle.md")
+            .await
+            .expect("a basename past the old 10k cap must still resolve");
+        assert!(doc.content.contains("Found it."));
+    }
+
+    #[tokio::test]
+    async fn get_document_fuzzy_falls_back_gracefully_when_the_document_index_errors() {
+        // Regression guard for the store swap (#87): a query failure against
+        // `documents` must degrade to "not found, no suggestions" — same as an empty
+        // index — rather than propagating the error or panicking. Mirrors the old
+        // Qdrant-facet-fetch-failure behavior it replaces.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().canonicalize().unwrap();
+
+        let gs = make_md_globset();
+        let embed = MockEmbedder::ok(vec![]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_err("database is locked");
+
+        let result = get_document(&deps, &index, "missing.md").await;
+        match result {
+            Err(GetDocumentError::NotFound { suggestions }) => {
+                assert!(
+                    suggestions.is_empty(),
+                    "an unusable index has nothing to suggest from"
+                );
+            }
+            other => panic!(
+                "Expected NotFound, got: {}",
+                match other {
+                    Ok(_) => "Ok",
+                    Err(GetDocumentError::Outside) => "Outside",
+                    Err(GetDocumentError::NotPermitted) => "NotPermitted",
+                    Err(GetDocumentError::Ambiguous { .. }) => "Ambiguous",
                     Err(GetDocumentError::Io(_)) => "Io",
                     _ => "other",
                 }
