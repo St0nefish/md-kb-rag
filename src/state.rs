@@ -126,6 +126,14 @@ impl DocumentQueryResult {
 /// so retrieval can be tested against a mock without SQLite.
 pub trait DocumentIndex: Send + Sync {
     async fn query_documents(&self, query: &DocumentQuery) -> Result<DocumentQueryResult>;
+
+    /// Every indexed document's file path, unfiltered and unordered.
+    ///
+    /// Backs `retrieval::get_document`'s fuzzy fallback: basename matching and
+    /// "did you mean?" suggestions need the full path list, and `documents` already
+    /// holds exactly that — one row per successfully indexed file — so this is a
+    /// plain local `SELECT`, no cap and no round trip to the vector store required.
+    async fn all_paths(&self) -> Result<Vec<String>>;
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -334,6 +342,38 @@ impl StateDb {
         )
         .execute(&pool)
         .await?;
+
+        // `query_documents` supports ordering by mtime/title/indexed_at, each with a
+        // mandatory `d.file_path ASC` tiebreaker (ties are common: a batch reindex
+        // gives many rows the same mtime/indexed_at). Without an index shaped to match,
+        // SQLite must materialize and sort the whole filtered set before LIMIT/OFFSET
+        // can trim it — `CREATE INDEX IF NOT EXISTS` is already idempotent against an
+        // existing production database, same as the document_fields indexes below.
+        //
+        // A single ASC-ordered composite index does not cover DESC queries: SQLite can
+        // only satisfy an ORDER BY straight from an index when the whole key (including
+        // the tiebreaker) matches the index's declared direction, or is its exact
+        // reverse. `(col ASC, file_path ASC)` scanned backward yields `(col DESC,
+        // file_path DESC)` — not what these queries ask for, since the tiebreaker is
+        // always ASC. So each orderable column needs one index per direction; verified
+        // with `EXPLAIN QUERY PLAN` (see the `query_documents_order_by_uses_index`
+        // tests) that omitting either half still falls back to `USE TEMP B-TREE FOR
+        // ORDER BY`. `file_path` itself needs no such pair: it is the primary key, and
+        // a single-column index can satisfy both directions by scanning in reverse.
+        for (name, column) in [
+            ("idx_documents_mtime_asc", "mtime ASC"),
+            ("idx_documents_mtime_desc", "mtime DESC"),
+            ("idx_documents_title_asc", "title ASC"),
+            ("idx_documents_title_desc", "title DESC"),
+            ("idx_documents_indexed_at_asc", "indexed_at ASC"),
+            ("idx_documents_indexed_at_desc", "indexed_at DESC"),
+        ] {
+            sqlx::query(&format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON documents({column}, file_path ASC)"
+            ))
+            .execute(&pool)
+            .await?;
+        }
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS document_fields (
@@ -1066,6 +1106,13 @@ impl DocumentIndex for StateDb {
             documents,
             total: total.max(0) as u64,
         })
+    }
+
+    async fn all_paths(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT file_path FROM documents")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|(file_path,)| file_path).collect())
     }
 }
 
@@ -2019,6 +2066,98 @@ mod tests {
         }
     }
 
+    /// Rebuild the exact page query `query_documents` runs for a given `DocumentQuery`
+    /// — same `push_where`, same `ORDER BY` construction — prefixed with `EXPLAIN QUERY
+    /// PLAN`, and return the concatenated `detail` column of the plan.
+    ///
+    /// `query_documents` doesn't expose its SQL, so this mirrors it exactly rather than
+    /// re-deriving a plan from first principles: a mismatch here would mean the test
+    /// stopped testing what production runs, not that the index is wrong.
+    async fn explain_page_query(db: &StateDb, query: &DocumentQuery) -> String {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "EXPLAIN QUERY PLAN SELECT d.file_path, d.title, d.description, d.mtime, \
+             d.indexed_at, d.frontmatter FROM documents d",
+        );
+        StateDb::push_where(&mut builder, query);
+        builder.push(" ORDER BY ");
+        builder.push(query.order_by.column());
+        builder.push(if query.order_desc { " DESC" } else { " ASC" });
+        if query.order_by != OrderBy::Path {
+            builder.push(", d.file_path ASC");
+        }
+        builder.push(" LIMIT ");
+        builder.push_bind(query.limit as i64);
+        builder.push(" OFFSET ");
+        builder.push_bind(query.offset as i64);
+
+        // EXPLAIN QUERY PLAN rows are (id, parent, notused, detail).
+        let rows: Vec<(i64, i64, i64, String)> = builder
+            .build_query_as()
+            .fetch_all(db.pool_for_test())
+            .await
+            .unwrap();
+        rows.into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[tokio::test]
+    async fn query_documents_order_by_uses_an_index_not_a_temp_sort() {
+        // Regression for #90: every supported (order_by, order_desc) combination must
+        // be servable straight from an index. A plan containing "USE TEMP B-TREE" means
+        // SQLite is sorting the whole filtered set in memory before LIMIT/OFFSET can
+        // trim it — exactly the bug the new indexes exist to fix. Asserting this on the
+        // real planner output (rather than just asserting rows come back correct) is
+        // the point: a wrong-shaped or missing index still returns correct rows, just
+        // slowly, and a correctness-only test would never catch that regressing.
+        let (db, _dir) = seeded_db().await;
+
+        for order_by in [
+            OrderBy::Path,
+            OrderBy::Title,
+            OrderBy::Mtime,
+            OrderBy::IndexedAt,
+        ] {
+            for order_desc in [false, true] {
+                let query = DocumentQuery {
+                    order_by,
+                    order_desc,
+                    ..Default::default()
+                };
+                let plan = explain_page_query(&db, &query).await;
+                assert!(
+                    !plan.to_ascii_uppercase().contains("TEMP B-TREE"),
+                    "order_by={order_by:?} desc={order_desc} should be served by an \
+                     index without a temp-b-tree sort; plan: {plan}"
+                );
+                assert!(
+                    plan.to_ascii_uppercase().contains("INDEX"),
+                    "order_by={order_by:?} desc={order_desc} should scan via an index; \
+                     plan: {plan}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn query_documents_order_by_with_path_prefix_still_uses_an_index() {
+        // A filter alongside the ordering (the common real-world shape: "recent docs
+        // under sysadmin/") must not knock the planner off the ordering index either.
+        let (db, _dir) = seeded_db().await;
+        let query = DocumentQuery {
+            path_prefix: Some("kitchen/".into()),
+            order_by: OrderBy::Mtime,
+            order_desc: true,
+            ..Default::default()
+        };
+        let plan = explain_page_query(&db, &query).await;
+        assert!(
+            !plan.to_ascii_uppercase().contains("TEMP B-TREE"),
+            "filtered + ordered query should still avoid a temp-b-tree sort; plan: {plan}"
+        );
+    }
+
     #[tokio::test]
     async fn empty_any_of_matches_nothing_rather_than_everything() {
         let (db, _dir) = seeded_db().await;
@@ -2228,6 +2367,40 @@ mod tests {
         let result = db.query_documents(&DocumentQuery::default()).await.unwrap();
         assert_eq!(result.total, 3);
         assert!(!paths(&result).contains(&"sysadmin/zfs.md"));
+    }
+
+    #[tokio::test]
+    async fn all_paths_returns_every_indexed_document_path() {
+        // Backs `retrieval::get_document`'s fuzzy fallback (#87): it needs the
+        // complete, current path list, unfiltered and with no cap.
+        let (db, _dir) = seeded_db().await;
+        let mut result = db.all_paths().await.unwrap();
+        result.sort();
+        assert_eq!(
+            result,
+            vec![
+                "kitchen/recipes/chili.md",
+                "kitchen/recipes/congee.md",
+                "kitchen/recipes/stir_fry.md",
+                "sysadmin/zfs.md",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_paths_reflects_deletions() {
+        let (db, _dir) = seeded_db().await;
+        db.delete_document("sysadmin/zfs.md").await.unwrap();
+
+        let result = db.all_paths().await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(!result.contains(&"sysadmin/zfs.md".to_string()));
+    }
+
+    #[tokio::test]
+    async fn all_paths_on_an_empty_database_is_empty() {
+        let (db, _dir) = test_db().await;
+        assert!(db.all_paths().await.unwrap().is_empty());
     }
 
     #[tokio::test]

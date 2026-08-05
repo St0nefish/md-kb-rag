@@ -45,12 +45,6 @@ pub trait RetrievalStore: Send + Sync {
         rrf_candidates: u64,
         explain: bool,
     ) -> Result<Vec<SearchResult>>;
-    async fn fetch_facet_values(
-        &self,
-        collection: &str,
-        field: &str,
-        limit: u64,
-    ) -> Result<Vec<String>>;
 }
 
 pub struct QdrantStore {
@@ -560,15 +554,6 @@ impl RetrievalStore for QdrantStore {
             explain,
         )
         .await
-    }
-
-    async fn fetch_facet_values(
-        &self,
-        collection: &str,
-        field: &str,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        QdrantStore::fetch_facet_values(self, collection, field, limit).await
     }
 }
 
