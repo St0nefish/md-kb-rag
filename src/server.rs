@@ -1136,6 +1136,54 @@ async fn build_instructions(
     instructions
 }
 
+/// Periodic safety-net sweep loop: sleep for `indexing.reconcile_interval_secs`
+/// (read fresh from `shared_config` every iteration, not captured once outside the
+/// loop, so a `POST /admin/reload` that changes the interval governs the very next
+/// sleep this loop schedules — not just sleeps scheduled after a restart), then call
+/// `on_fire`.
+///
+/// `on_fire` is injected — production passes `reindex::mark_full` — so tests can
+/// observe exactly when and how often a firing happened without depending on
+/// `REINDEX_QUEUE`'s process-global, monotonic `full_pending` flag, which other
+/// tests elsewhere in the suite may already have set for the remaining life of the
+/// test binary.
+async fn reconcile_loop(shared_config: SharedConfig, ct: CancellationToken, on_fire: impl Fn()) {
+    loop {
+        // Read fresh every iteration (not captured once) so a reload's new
+        // interval governs the very next sleep this task schedules, not just
+        // sleeps scheduled after a restart.
+        let reconcile_secs = config::load_shared_config(&shared_config)
+            .indexing
+            .reconcile_interval_secs;
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(reconcile_secs)) => {}
+            () = ct.cancelled() => {
+                break;
+            }
+        }
+        debug!("Periodic reconcile sweep: marking a full reconcile");
+        on_fire();
+    }
+}
+
+/// Wait for any in-flight indexing run to finish, bounded by `SHUTDOWN_INDEX_WAIT`.
+///
+/// `is_indexing` is injected — production passes a closure reading
+/// `INDEX_STATUS.snapshot().indexing` — so tests can drive it from a local flag
+/// instead of the real process-global `INDEX_STATUS`, which other modules' own
+/// tests (`ingest.rs` in particular) churn throughout the suite.
+///
+/// Uses `tokio::time::Instant` rather than `std::time::Instant` for the deadline:
+/// the two behave identically against a real (unpaused) clock, but only the tokio
+/// variant lets a test reach the bound via `tokio::time::advance` under
+/// `#[tokio::test(start_paused = true)]` instead of an actual 30-second wait.
+async fn wait_for_indexing_to_settle(is_indexing: impl Fn() -> bool) {
+    let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_INDEX_WAIT;
+    while is_indexing() && tokio::time::Instant::now() < shutdown_deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf) -> Result<()> {
     let config = Arc::new(config);
     // The live handle `POST /admin/reload` swaps into. Every consumer built from
@@ -1265,24 +1313,11 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // `Notify`, independent of this timer.
     let reconcile_ct = ct.child_token();
     let reconcile_shared_config = Arc::clone(&shared_config);
-    tokio::spawn(async move {
-        loop {
-            // Read fresh every iteration (not captured once) so a reload's new
-            // interval governs the very next sleep this task schedules, not just
-            // sleeps scheduled after a restart.
-            let reconcile_secs = config::load_shared_config(&reconcile_shared_config)
-                .indexing
-                .reconcile_interval_secs;
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(reconcile_secs)) => {}
-                () = reconcile_ct.cancelled() => {
-                    break;
-                }
-            }
-            debug!("Periodic reconcile sweep: marking a full reconcile");
-            crate::reindex::mark_full();
-        }
-    });
+    tokio::spawn(reconcile_loop(
+        reconcile_shared_config,
+        reconcile_ct,
+        crate::reindex::mark_full,
+    ));
 
     tokio::spawn(async move {
         loop {
@@ -1568,12 +1603,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         // here as there was under `REINDEX_LOCK` — instead, poll the same
         // `INDEX_STATUS` the worker already keeps current, bounded so a genuinely
         // stuck run cannot hang shutdown forever.
-        let shutdown_deadline = std::time::Instant::now() + SHUTDOWN_INDEX_WAIT;
-        while crate::status::INDEX_STATUS.snapshot().indexing
-            && std::time::Instant::now() < shutdown_deadline
-        {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        wait_for_indexing_to_settle(|| crate::status::INDEX_STATUS.snapshot().indexing).await;
     })
     .await
     .context("Server error")?;
@@ -1585,6 +1615,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request, routing::get};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use tower::ServiceExt;
 
     // --- status & metrics ---
@@ -2088,6 +2119,403 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_actual_pending_reindex_queue_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config: config::shared_config(config),
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        // `REINDEX_QUEUE` is a process-global shared with every other test in the
+        // suite (mcp.rs's write-tool tests and webhook.rs's tests mark real paths on
+        // it too), and nothing ever drains it back down in this binary — so this can
+        // only assert a lower bound relative to a `before` snapshot, never an exact
+        // count. That is still enough to catch the regression this test exists for:
+        // `collect_status` returning a stale, default, or otherwise disconnected
+        // `QueueSnapshot` instead of `REINDEX_QUEUE.snapshot()`.
+        let before = crate::reindex::REINDEX_QUEUE.snapshot();
+        crate::reindex::mark_paths([std::path::PathBuf::from(
+            "status-reports-the-actual-pending-reindex-queue-state-marker.md",
+        )]);
+        crate::reindex::mark_full();
+
+        let status = collect_status(&state).await;
+
+        assert!(
+            status.queue.pending_paths > before.pending_paths,
+            "collect_status's queue field must reflect the path just marked: \
+             before={before:?}, got={:?}",
+            status.queue
+        );
+        assert!(
+            status.queue.full_pending,
+            "collect_status's queue field must reflect the pending full reconcile"
+        );
+    }
+
+    // --- admin: POST /admin/reload ---
+
+    fn admin_test_app(
+        bearer_token: Option<String>,
+        config_path: std::path::PathBuf,
+        shared_config: SharedConfig,
+    ) -> Router {
+        let auth_state = AuthState { bearer_token };
+        let admin_state = AdminState {
+            shared_config,
+            config_path: Arc::new(config_path),
+        };
+        Router::new()
+            .route("/admin/reload", axum::routing::post(reload_handler))
+            .with_state(admin_state)
+            .route_layer(middleware::from_fn_with_state(auth_state, bearer_auth))
+    }
+
+    // `reload_handler` calls `Config::load`, which reads the same process-global env
+    // vars (`EMBEDDING_BASE_URL`/`EMBEDDING_MODEL`/`QDRANT_URL`) other tests set and
+    // clear — the `ENV_MUTEX` guard has to stay held across the `oneshot().await`
+    // below, since that await is what actually drives `reload_handler`'s env read.
+    // `#[tokio::test]` defaults to the single-threaded `current_thread` runtime, so
+    // nothing else on this OS thread can attempt to lock `ENV_MUTEX` while this task
+    // is suspended; a concurrent test on another thread blocks on `.lock()` until
+    // this one finishes, which is the serialization this mutex exists to provide.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn admin_reload_requires_the_bearer_token_like_status_and_metrics() {
+        let _lock = crate::config::test_support::ENV_MUTEX.lock().unwrap();
+        crate::config::test_support::set_required_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(&config_path, "chunking:\n  max_chunk_size: 1000\n").unwrap();
+        let running = config::Config::load(&config_path).unwrap();
+        let shared = config::shared_config(Arc::new(running));
+
+        let app = admin_test_app(Some("secret".into()), config_path, shared);
+
+        // No token — same rejection as an unauthenticated /status request.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an admin endpoint reachable without a token is a security regression"
+        );
+
+        // Wrong token.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer wrong-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct token is let through to the handler.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a valid token must be let through"
+        );
+
+        crate::config::test_support::clear_required_env();
+    }
+
+    // See the comment on the sibling auth test above for why the guard must stay
+    // held across the `.await` here.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn admin_reload_rejects_a_malformed_config_and_leaves_the_running_config_untouched_over_http()
+     {
+        let _lock = crate::config::test_support::ENV_MUTEX.lock().unwrap();
+        crate::config::test_support::set_required_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(&config_path, "chunking:\n  max_chunk_size: 1234\n").unwrap();
+        let running = config::Config::load(&config_path).unwrap();
+        let shared = config::shared_config(Arc::new(running));
+
+        let app = admin_test_app(None, config_path.clone(), Arc::clone(&shared));
+
+        // target_chunk_size > max_chunk_size fails the same validation a restart on
+        // this file would hit — see reload.rs's equivalent unit-level test.
+        std::fs::write(
+            &config_path,
+            "chunking:\n  max_chunk_size: 100\n  target_chunk_size: 500\n",
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "rejected");
+        assert!(
+            json["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "the rejection reason must reach the caller: {json}"
+        );
+
+        let live = config::load_shared_config(&shared);
+        assert_eq!(
+            live.chunking.max_chunk_size, 1234,
+            "a rejected reload observed over HTTP must leave the running config \
+             completely untouched, not partially applied"
+        );
+
+        crate::config::test_support::clear_required_env();
+    }
+
+    // See the comment on `admin_reload_requires_the_bearer_token_like_status_and_metrics`
+    // above for why the guard must stay held across the `.await` here.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn admin_reload_serializes_the_diff_report_into_the_response_body() {
+        let _lock = crate::config::test_support::ENV_MUTEX.lock().unwrap();
+        crate::config::test_support::set_required_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(&config_path, "search:\n  hybrid: true\n").unwrap();
+        let running = config::Config::load(&config_path).unwrap();
+        let shared = config::shared_config(Arc::new(running));
+
+        let app = admin_test_app(None, config_path.clone(), Arc::clone(&shared));
+
+        std::fs::write(&config_path, "search:\n  hybrid: false\n").unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "reloaded");
+        assert_eq!(json["changed"], true);
+        let applied = json["report"]["applied"]
+            .as_array()
+            .expect("report.applied must be present and be an array");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["setting"], "search.hybrid");
+        assert_eq!(applied[0]["old"], "true");
+        assert_eq!(applied[0]["new"], "false");
+
+        let live = config::load_shared_config(&shared);
+        assert!(
+            !live.search.hybrid,
+            "the swap reported in the body must have actually taken effect"
+        );
+
+        crate::config::test_support::clear_required_env();
+    }
+
+    // --- reconcile_loop ---
+
+    /// A config whose `indexing.reconcile_interval_secs` is `secs`, otherwise the
+    /// same minimal shape `status_config` builds.
+    fn reconcile_config(dir: &std::path::Path, secs: u64) -> SharedConfig {
+        let mut config = status_config(dir);
+        Arc::make_mut(&mut config).indexing.reconcile_interval_secs = secs;
+        config::shared_config(config)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_loop_fires_only_after_the_configured_interval_elapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = reconcile_config(dir.path(), 5);
+        let ct = CancellationToken::new();
+        let fires = Arc::new(AtomicU32::new(0));
+        let fires_for_closure = Arc::clone(&fires);
+
+        let handle = tokio::spawn(reconcile_loop(shared, ct.child_token(), move || {
+            fires_for_closure.fetch_add(1, Ordering::SeqCst);
+        }));
+        // Let the spawned task run up to its first `.await` (registering its sleep
+        // timer against the *current* paused clock) before advancing time — without
+        // this, `advance` below can race the timer's registration.
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "must not fire before the configured interval elapses"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "must fire once the configured interval elapses"
+        );
+
+        ct.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_loop_honours_a_changed_interval_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = reconcile_config(dir.path(), 100);
+        let ct = CancellationToken::new();
+        let fires = Arc::new(AtomicU32::new(0));
+        let fires_for_closure = Arc::clone(&fires);
+        let shared_for_closure = Arc::clone(&shared);
+
+        // The swap happens from inside `on_fire`, so it lands strictly between the
+        // first firing and the loop's next config read — no timing race with the
+        // test's own `advance` calls below.
+        let handle = tokio::spawn(reconcile_loop(
+            Arc::clone(&shared),
+            ct.child_token(),
+            move || {
+                let n = fires_for_closure.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    let mut next = (*config::load_shared_config(&shared_for_closure)).clone();
+                    next.indexing.reconcile_interval_secs = 5;
+                    config::store_shared_config(&shared_for_closure, next);
+                }
+            },
+        ));
+        // See the sibling test above for why this yield must happen before the
+        // first `advance`.
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(100)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "first tick fires at the original 100s interval"
+        );
+
+        // If the loop had captured the interval once instead of re-reading it every
+        // iteration, this second tick would need another 100s and the assertion
+        // below would fail — this is precisely the regression this test exists for.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            2,
+            "a reload's new interval must govern the very next sleep, not just \
+             sleeps scheduled after a restart"
+        );
+
+        ct.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_loop_stops_firing_once_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = reconcile_config(dir.path(), 5);
+        let ct = CancellationToken::new();
+        let fires = Arc::new(AtomicU32::new(0));
+        let fires_for_closure = Arc::clone(&fires);
+
+        let handle = tokio::spawn(reconcile_loop(shared, ct.child_token(), move || {
+            fires_for_closure.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        ct.cancel();
+        // Give the task a chance to observe the cancellation and return.
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled loop must return promptly, not hang")
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "a cancelled loop must never fire"
+        );
+    }
+
+    // --- graceful shutdown: wait_for_indexing_to_settle ---
+
+    #[tokio::test]
+    async fn shutdown_wait_returns_immediately_when_nothing_is_indexing() {
+        let start = std::time::Instant::now();
+        wait_for_indexing_to_settle(|| false).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "must not wait at all when idle: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_wait_is_bounded_by_shutdown_index_wait_when_indexing_never_finishes() {
+        let start = tokio::time::Instant::now();
+        wait_for_indexing_to_settle(|| true).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= SHUTDOWN_INDEX_WAIT,
+            "must wait out the full bound before giving up: {elapsed:?}"
+        );
+        assert!(
+            elapsed < SHUTDOWN_INDEX_WAIT + Duration::from_millis(500),
+            "must not overrun the bound by more than about one poll interval: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_wait_returns_as_soon_as_indexing_clears_well_under_the_bound() {
+        let indexing = Arc::new(AtomicBool::new(true));
+        let indexing_for_task = Arc::clone(&indexing);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            indexing_for_task.store(false, Ordering::SeqCst);
+        });
+
+        let start = tokio::time::Instant::now();
+        wait_for_indexing_to_settle(|| indexing.load(Ordering::SeqCst)).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "must not return before indexing actually cleared: {elapsed:?}"
+        );
+        assert!(
+            elapsed < SHUTDOWN_INDEX_WAIT,
+            "must not wait out the full bound once indexing actually finished: {elapsed:?}"
+        );
     }
 
     // --- top-level areas & indexed field union ---
