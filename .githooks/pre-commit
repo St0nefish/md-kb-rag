@@ -1,5 +1,13 @@
 #!/bin/sh
 # Pre-commit hook: auto-format and lint the Rust code staged for this commit.
+#
+# Every check below BLOCKS the commit when it fails. An earlier version ran the
+# same commands but ignored their exit codes, so a clippy failure printed a wall
+# of errors and then committed anyway. A check that cannot fail is not a check —
+# it just moves the discovery to CI, which is the latency this hook exists to
+# remove.
+#
+# Bypass with `git commit --no-verify` when you genuinely need to.
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "cargo not found, skipping fmt/clippy"
@@ -11,17 +19,28 @@ fi
 staged_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$')
 
 if [ -n "$staged_rs" ]; then
-    cargo fmt
+    if ! cargo fmt; then
+        echo "pre-commit: cargo fmt failed" >&2
+        exit 1
+    fi
 
     # Re-stage ONLY the files that were already staged (fmt may have rewritten
     # them). Never `git add` files that weren't staged — doing so would silently
     # pull unrelated working-tree changes into the commit.
     echo "$staged_rs" | xargs -r git add
 
-    cargo clippy -- -D warnings
+    # --all-targets lints test code too. Without it, lint failures in tests sail
+    # past this hook entirely and only surface in CI.
+    if ! cargo clippy --all-targets -- -D warnings; then
+        echo "pre-commit: cargo clippy failed — fix the warnings above, or bypass with --no-verify" >&2
+        exit 1
+    fi
 fi
 
 # Validate config.example.yaml parses if it was changed.
 if git diff --cached --name-only | grep -q 'config\.example\.yaml$'; then
-    cargo test -q -- config::tests::example_config_deserializes
+    if ! cargo test -q -- config::tests::example_config_deserializes; then
+        echo "pre-commit: config.example.yaml no longer deserializes" >&2
+        exit 1
+    fi
 fi
