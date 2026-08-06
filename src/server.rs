@@ -1030,9 +1030,6 @@ pub fn build_authoring_section(frontmatter: &FrontmatterConfig) -> String {
     s
 }
 
-/// Build MCP server instructions by combining config narrative with
-/// dynamically discovered filter values from Qdrant, then appending
-/// write-authoring guidance derived from the frontmatter schema.
 /// Top-level folder names, which are what the knowledge base's areas actually are now
 /// that `domain` is no longer a distinguished frontmatter field.
 fn top_level_areas(data_path: &Path) -> Vec<String> {
@@ -1052,6 +1049,18 @@ fn top_level_areas(data_path: &Path) -> Vec<String> {
     areas
 }
 
+/// Build MCP server instructions by combining config narrative with the discovered
+/// vocabulary for each root-level indexed field, then appending write-authoring
+/// guidance derived from the frontmatter schema.
+///
+/// Per field, a schema-declared closed set (`values:` on a `.kb-schema.yaml` field, or
+/// the legacy `config.yaml` `allowed` map — both surface as `FieldDef::values`, see
+/// `ResolvedSchema::from_config`) is *permitted*, whether or not it has been used yet;
+/// Qdrant facets only describe what's currently *in use*, which understates the
+/// permitted set and drifts as the corpus changes. So declared values win when a field
+/// has them, and facets are consulted only for fields with no declared set to fall back
+/// to (issue #77 — a permitted-but-unused value like `archived` must still be
+/// advertised, not silently hidden until something adopts it).
 async fn build_instructions(
     base: &str,
     qdrant: &QdrantStore,
@@ -1089,6 +1098,32 @@ async fn build_instructions(
         // a field name containing newlines injects text into every agent's system
         // prompt on the next refresh tick.
         let display_field = sanitize_facet_value(&field);
+
+        // Prefer the schema's declared permitted set over facets — see the function
+        // doc for why. Root-only lookup matches the "only root-level vocabularies are
+        // enumerated here" scoping above.
+        if let Some(values) = schemas
+            .root()
+            .fields
+            .get(field.as_str())
+            .and_then(|def| def.values.as_ref())
+            .filter(|values| !values.is_empty())
+        {
+            let mut display: Vec<String> = values.iter().map(|v| sanitize_facet_value(v)).collect();
+            display.sort();
+            display.dedup();
+            let overflow = display.len().saturating_sub(MAX_VALUES_PER_FIELD);
+            display.truncate(MAX_VALUES_PER_FIELD);
+            let mut joined = display.join(", ");
+            if overflow > 0 {
+                joined.push_str(&format!(" (+{overflow} more)"));
+            }
+            instructions.push_str(&format!("\nAvailable {display_field}: {joined}"));
+            continue;
+        }
+
+        // No declared closed set for this field, so facets — what's actually in use —
+        // are the only vocabulary available at all.
         let field = field.as_str();
         // Fetch one extra so we can detect when there are more than the cap.
         match qdrant
@@ -2588,6 +2623,61 @@ mod tests {
             named("prep").unwrap().kind,
             IndexKind::Integer,
             "a deep-scope declared type must reach the payload index"
+        );
+    }
+
+    // --- build_instructions vocabulary source (issue #77) ---
+
+    /// A schema-declared enum value that nothing has used yet must still be advertised.
+    /// Facets alone would hide `archived` here, since nothing in the (nonexistent)
+    /// corpus uses it — pointing Qdrant at a closed port makes that concrete: every
+    /// facet query gracefully degrades to empty (see
+    /// `fetch_facet_values_degrades_to_empty_on_query_failure` in `qdrant.rs`), so any
+    /// value that *does* show up in the instructions came from the schema, not Qdrant.
+    ///
+    /// `tags` carries no declared closed set, so it exercises the other branch: with
+    /// facets unreachable, it gets no "Available" line at all, rather than one
+    /// silently sourced from somewhere else.
+    #[tokio::test]
+    async fn build_instructions_advertises_declared_values_over_facets() {
+        let dir = tempfile::tempdir().unwrap();
+        let frontmatter = FrontmatterConfig {
+            indexed_fields: vec!["status".into(), "tags".into()],
+            allowed: std::collections::HashMap::from([(
+                "status".to_string(),
+                vec![
+                    "active".to_string(),
+                    "draft".to_string(),
+                    "archived".to_string(),
+                ],
+            )]),
+            ..Default::default()
+        };
+        let schemas = SchemaCache::build(dir.path(), &frontmatter);
+
+        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
+        })
+        .expect("client construction is lazy and must not require a live server");
+
+        let instructions = build_instructions(
+            "base",
+            &qdrant,
+            "unused",
+            dir.path(),
+            &schemas,
+            &frontmatter,
+        )
+        .await;
+
+        assert!(
+            instructions.contains("Available status: active, archived, draft"),
+            "declared-but-unused value 'archived' must still be advertised: {instructions}"
+        );
+        assert!(
+            !instructions.contains("Available tags"),
+            "an undeclared field falls back to facets, which are unreachable here: {instructions}"
         );
     }
 

@@ -89,6 +89,18 @@ pub struct RawFieldDef {
     #[serde(default, skip_serializing_if = "is_false")]
     pub indexed: bool,
     /// Closed set of permitted values, for `enum` and `list`.
+    ///
+    /// Enforcement strictness is keyed off `ty`, not off whether `values` is present,
+    /// and the two regimes are not equivalent: a field with `type: enum` is checked by
+    /// [`check_values`] (every scalar, of any JSON type, must canonicalize to a
+    /// permitted string); a field that sets `values` but leaves `ty` unset — which is
+    /// how every legacy `config.yaml` `allowed` entry arrives, via
+    /// [`ResolvedSchema::from_config`], but also any hand-written `.kb-schema.yaml`
+    /// field that forgets `type: enum` — is checked by [`check_values_lenient`]
+    /// instead, which exempts non-string, non-array values entirely. This is
+    /// deliberate (see both functions' docs), not an oversight: it preserves
+    /// pre-cascade validation outcomes for configs that never declared types. An
+    /// author who wants strict enforcement must write `type: enum` explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
     /// Union `values` with the inherited definition instead of replacing it. Everything
@@ -119,6 +131,8 @@ pub struct FieldDef {
     pub ty: Option<FieldType>,
     pub required: bool,
     pub indexed: bool,
+    /// See [`RawFieldDef::values`]: whether this is enforced strictly or leniently
+    /// depends on `ty`, and that split is deliberate.
     pub values: Option<Vec<String>>,
     pub default: Option<Value>,
     pub open: bool,
@@ -944,14 +958,21 @@ pub fn check_type(ty: FieldType, value: &Value) -> Result<(), String> {
     }
 }
 
-/// Check a value against a closed set of permitted values.
+/// Check a value against a closed set of permitted values, with pre-cascade semantics,
+/// for fields whose type was never declared.
 ///
 /// Arrays are checked element-wise, so a tag list satisfies the set when every tag does.
-/// Value checking with pre-cascade semantics, for fields whose type was never declared.
 ///
 /// The legacy `allowed` map only ever enforced against strings and the string elements
 /// of an array; numbers, booleans, and non-string elements were exempt. Preserving that
 /// exactly is what keeps a config-only deployment's validation outcomes unchanged.
+///
+/// This is the *lenient* counterpart to [`check_values`] — same `values` concept, two
+/// enforcement regimes. `validate::field_errors` is the dispatch point: it calls this
+/// function when `def.ty` is `None` and `check_values` when `def.ty` is `Some(_)`,
+/// regardless of which config surface (`config.yaml` `allowed` vs `.kb-schema.yaml`
+/// `values`) produced the field. The split is deliberate (see [`RawFieldDef::values`]
+/// for the full rationale) — do not converge these two functions.
 pub fn check_values_lenient(value: &Value, permitted: Option<&[String]>) -> Result<(), String> {
     let Some(permitted) = permitted else {
         return Ok(());
@@ -988,6 +1009,12 @@ pub fn check_values_lenient(value: &Value, permitted: Option<&[String]>) -> Resu
     }
 }
 
+/// Check a value against a closed set of permitted values, for a field with an
+/// explicitly declared type (`type: enum` or `type: list`).
+///
+/// Every scalar is canonicalized to text and compared, regardless of JSON type — unlike
+/// [`check_values_lenient`], nothing is exempt. See that function's doc for why the two
+/// differ and where the split is made.
 pub fn check_values(value: &Value, permitted: &[String]) -> Result<(), String> {
     let matches = |v: &Value| -> Result<(), String> {
         let as_text = crate::document_fields::canonical_text(v)
@@ -1620,5 +1647,24 @@ mod tests {
     fn value_sets_compare_booleans_and_numbers_by_canonical_text() {
         assert!(check_values(&json!(true), &["true".to_string()]).is_ok());
         assert!(check_values(&json!(5), &["5".to_string()]).is_ok());
+    }
+
+    /// Pins the deliberate divergence documented on `check_values_lenient` and
+    /// `RawFieldDef::values` (issue #77): a declared `type: enum` is strict about what
+    /// counts as a value at all, while an undeclared-type field with the same
+    /// `permitted` set waves non-string, non-array values through untouched. If either
+    /// function is ever changed to converge with the other, this fails.
+    #[test]
+    fn strict_and_lenient_checks_diverge_on_non_string_values_by_design() {
+        let permitted = vec!["true".to_string()];
+
+        assert!(
+            check_values(&json!(5), &permitted).is_err(),
+            "strict check rejects a number not in the permitted (text-compared) set"
+        );
+        assert!(
+            check_values_lenient(&json!(5), Some(&permitted)).is_ok(),
+            "lenient check exempts numbers entirely, matching pre-cascade `allowed` semantics"
+        );
     }
 }
