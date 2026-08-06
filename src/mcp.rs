@@ -27,7 +27,6 @@ use crate::{
     validate,
 };
 
-const MAX_SEARCH_LIMIT: u64 = 50;
 const MAX_QUERY_LEN: usize = 4096;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
@@ -108,8 +107,13 @@ pub(crate) fn dedup_search_opts() -> SearchOptions {
     }
 }
 
-fn resolve_limit(requested: Option<u64>) -> u64 {
-    requested.unwrap_or(10).min(MAX_SEARCH_LIMIT)
+/// Resolve a caller's requested `limit` against the configured default and ceiling.
+///
+/// An over-large request is clamped rather than rejected — a caller asking for more
+/// than the maximum gets the maximum, which is friendlier than an error and matches
+/// the historical behaviour when both values were hardcoded.
+fn resolve_limit(requested: Option<u64>, default_limit: u64, max_limit: u64) -> u64 {
+    requested.unwrap_or(default_limit).min(max_limit)
 }
 
 /// Parse an ISO 8601 date/datetime string to a Unix timestamp (seconds).
@@ -1623,7 +1627,12 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         validate_search_params(&params)?;
 
-        let limit = resolve_limit(params.limit);
+        let config = self.config();
+        let limit = resolve_limit(
+            params.limit,
+            config.search.default_limit,
+            config.search.max_limit,
+        );
 
         debug!(
             query = %&params.query.chars().take(100).collect::<String>(),
@@ -4290,23 +4299,29 @@ mod tests {
     }
 
     #[test]
-    fn default_limit_is_ten() {
-        assert_eq!(resolve_limit(None), 10);
+    fn omitted_limit_uses_the_configured_default() {
+        assert_eq!(resolve_limit(None, 10, 50), 10);
+        // The default is configurable, not baked in — a deployment that raised it
+        // must see its own value, not the historical 10.
+        assert_eq!(resolve_limit(None, 25, 50), 25);
     }
 
     #[test]
     fn requested_limit_within_max_is_preserved() {
-        assert_eq!(resolve_limit(Some(25)), 25);
+        assert_eq!(resolve_limit(Some(25), 10, 50), 25);
     }
 
     #[test]
-    fn requested_limit_above_max_is_clamped() {
-        assert_eq!(resolve_limit(Some(1_000_000)), MAX_SEARCH_LIMIT);
+    fn requested_limit_above_max_is_clamped_to_the_configured_max() {
+        assert_eq!(resolve_limit(Some(1_000_000), 10, 50), 50);
+        // Clamped to the CONFIGURED ceiling, not a hardcoded one: raising
+        // max_limit must actually raise what a caller can ask for.
+        assert_eq!(resolve_limit(Some(1_000_000), 10, 200), 200);
     }
 
     #[test]
     fn zero_limit_is_passed_through() {
-        assert_eq!(resolve_limit(Some(0)), 0);
+        assert_eq!(resolve_limit(Some(0), 10, 50), 0);
     }
 
     #[test]

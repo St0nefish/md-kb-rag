@@ -609,6 +609,18 @@ pub struct SearchConfig {
     /// that were never a monoculture in the first place.
     #[serde(default = "default_diversity_max_per_document")]
     pub diversity_max_per_document: Option<usize>,
+    /// Results returned when a caller does not specify `limit`.
+    #[serde(default = "default_search_limit")]
+    pub default_limit: u64,
+    /// Ceiling on `limit`. A larger request is clamped to this rather than
+    /// rejected, so a caller asking for more simply gets the maximum.
+    ///
+    /// This bounds MCP response size, not retrieval cost: candidate depth is
+    /// governed by `rrf_candidates` and `reranking.candidate_limit`, which are
+    /// unaffected by how many of those candidates are ultimately returned.
+    /// Raising it makes responses larger, not searches slower.
+    #[serde(default = "default_max_search_limit")]
+    pub max_limit: u64,
 }
 
 impl Default for SearchConfig {
@@ -618,6 +630,8 @@ impl Default for SearchConfig {
             rrf_candidates: default_rrf_candidates(),
             min_score: None,
             diversity_max_per_document: default_diversity_max_per_document(),
+            default_limit: default_search_limit(),
+            max_limit: default_max_search_limit(),
         }
     }
 }
@@ -628,6 +642,14 @@ fn default_rrf_candidates() -> usize {
 
 fn default_diversity_max_per_document() -> Option<usize> {
     Some(3)
+}
+
+fn default_search_limit() -> u64 {
+    10
+}
+
+fn default_max_search_limit() -> u64 {
+    50
 }
 
 /// Resolved embedding config — all required fields are guaranteed present.
@@ -1112,6 +1134,22 @@ impl Config {
         }
         if self.search.rrf_candidates == 0 {
             anyhow::bail!("search.rrf_candidates must be >= 1");
+        }
+        if self.search.max_limit == 0 {
+            anyhow::bail!("search.max_limit must be >= 1");
+        }
+        if self.search.default_limit == 0 {
+            anyhow::bail!("search.default_limit must be >= 1");
+        }
+        // Caught here rather than silently clamped: a default above the ceiling
+        // means every caller who omits `limit` gets the ceiling, so the default
+        // they configured never applies and nothing says so.
+        if self.search.default_limit > self.search.max_limit {
+            anyhow::bail!(
+                "search.default_limit ({}) must not exceed search.max_limit ({})",
+                self.search.default_limit,
+                self.search.max_limit
+            );
         }
         if self.search.diversity_max_per_document == Some(0) {
             anyhow::bail!(
@@ -1994,6 +2032,56 @@ mcp:
             err.to_string()
                 .contains("search.diversity_max_per_document must be >= 1"),
             "expected the diversity validation message, got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn search_limits_default_to_the_historical_hardcoded_values() {
+        let cfg = Config::from_str_raw("").unwrap();
+        assert_eq!(cfg.search.default_limit, 10);
+        assert_eq!(cfg.search.max_limit, 50);
+    }
+
+    #[test]
+    fn search_limits_round_trip_from_yaml() {
+        let yaml = "search:\n  default_limit: 25\n  max_limit: 200\n";
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.search.default_limit, 25);
+        assert_eq!(cfg.search.max_limit, 200);
+    }
+
+    #[test]
+    fn search_default_limit_above_max_limit_is_rejected_at_resolve() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        // Rejected rather than silently clamped: a default above the ceiling means
+        // every caller omitting `limit` gets the ceiling, so the configured default
+        // never applies and nothing would say so.
+        let yaml = "search:\n  default_limit: 100\n  max_limit: 50\n";
+        let err = Config::from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("search.default_limit (100) must not exceed search.max_limit (50)"),
+            "expected the default-exceeds-max message, got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn search_zero_limits_are_rejected_at_resolve() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("search:\n  max_limit: 0\n").unwrap_err();
+        assert!(
+            err.to_string().contains("search.max_limit must be >= 1"),
+            "expected the max_limit validation message, got: {err}"
+        );
+        let err = Config::from_str("search:\n  default_limit: 0\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("search.default_limit must be >= 1"),
+            "expected the default_limit validation message, got: {err}"
         );
         clear_required_env();
     }

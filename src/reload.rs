@@ -558,6 +558,26 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
              retrieval::search's per-document diversity cap).",
         );
     }
+    if old.search.default_limit != new.search.default_limit {
+        r.record(
+            ReloadEffect::Applied,
+            "search.default_limit",
+            d(&old.search.default_limit),
+            d(&new.search.default_limit),
+            "read fresh from the live config on every search call (mcp.rs \
+             resolve_limit) when the caller omits limit.",
+        );
+    }
+    if old.search.max_limit != new.search.max_limit {
+        r.record(
+            ReloadEffect::Applied,
+            "search.max_limit",
+            d(&old.search.max_limit),
+            d(&new.search.max_limit),
+            "read fresh from the live config on every search call (mcp.rs \
+             resolve_limit) as the ceiling a requested limit is clamped to.",
+        );
+    }
 
     // ── reranking ────────────────────────────────────────────────────────────
     if old.reranking.is_some() != new.reranking.is_some() {
