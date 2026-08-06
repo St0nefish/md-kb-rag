@@ -47,7 +47,9 @@ pub const SCHEMA_FILE_NAME: &str = ".kb-schema.yaml";
 const MAX_SCHEMA_FILE_BYTES: u64 = 256 * 1024;
 
 /// Declared type of a frontmatter field. Undeclared fields are not type-checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
     Text,
@@ -83,20 +85,36 @@ impl FieldType {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
+/// Placeholder inside a `values:` list that splices in the inherited value set at that
+/// position — see [`RawFieldDef::values`] and [`ResolvedSchema::merged_with`] for the
+/// full splicing/dedup rules. The `$` prefix is reserved: any other `$`-prefixed token
+/// in a `values:` list is a hard error rather than a literal value (see `validate_raw`),
+/// so a typo here can never silently degrade into "just another permitted tag."
+pub const VALUES_SENTINEL: &str = "$values";
 
 /// A field definition exactly as written in a `.kb-schema.yaml`.
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+///
+/// Also doubles as the shape the `update_schema` MCP tool advertises for `set_field`'s
+/// `definition` parameter (see `mcp::FieldDefinitionInput`), via a derived
+/// [`schemars::JsonSchema`] impl. `deny_unknown_fields` here becomes
+/// `additionalProperties: false` in that advertised schema, so a client's own
+/// validation — not just our runtime error — can catch a typo'd key.
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawFieldDef {
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub ty: Option<FieldType>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub required: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub indexed: bool,
+    /// `None` means "not declared here" and inherits the parent scope's `required`
+    /// (`false` if there is no parent definition either) — see
+    /// [`ResolvedSchema::merged_with`]. This is why the field is `Option<bool>` rather
+    /// than a plain `bool` defaulting to `false`: a plain bool cannot distinguish "the
+    /// author wrote `required: false`" from "the author said nothing," and per-attribute
+    /// inheritance needs that distinction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Same absent-means-inherit rule as `required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed: Option<bool>,
     /// Closed set of permitted values, for `enum` and `list`.
     ///
     /// Enforcement strictness is keyed off `ty`, not off whether `values` is present,
@@ -110,17 +128,29 @@ pub struct RawFieldDef {
     /// deliberate (see both functions' docs), not an oversight: it preserves
     /// pre-cascade validation outcomes for configs that never declared types. An
     /// author who wants strict enforcement must write `type: enum` explicitly.
+    ///
+    /// `None` here inherits the parent's `values` wholesale, same as every other
+    /// attribute. `Some(list)` **replaces** the parent's set outright unless `list`
+    /// contains the [`VALUES_SENTINEL`] placeholder (`$values`), which splices the
+    /// inherited set in at that position — see [`ResolvedSchema::merged_with`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
-    /// Union `values` with the inherited definition instead of replacing it. Everything
-    /// else on this definition still wins over the parent.
+    /// **Deprecated** alias for a leading [`VALUES_SENTINEL`]: `extend: true` behaves
+    /// exactly like writing `values: [$values, ...]` (see [`ResolvedSchema::merged_with`]
+    /// for the exact expansion), and using it logs a warning naming the offending schema
+    /// file. Kept only so schema files written before the sentinel existed keep parsing
+    /// and cascading correctly; new schemas should write `$values` directly.
+    /// `validate_raw` rejects declaring both on the same field — the two ways of saying
+    /// "inherit" must not be able to disagree about where the inherited values land.
     #[serde(default, skip_serializing_if = "is_false")]
     pub extend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
-    /// For `object`: whether undeclared child keys are permitted. Default yes.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub open: bool,
+    /// For `object`: whether undeclared child keys are permitted. `None` inherits the
+    /// parent's `open` (`true`, the same default a fresh top-level declaration gets,
+    /// when there is no parent definition either).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<bool>,
     /// Nested authoring sugar, flattened into dot-paths at parse time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<HashMap<String, RawFieldDef>>,
@@ -128,10 +158,6 @@ pub struct RawFieldDef {
 
 fn is_false(b: &bool) -> bool {
     !*b
-}
-
-fn is_true(b: &bool) -> bool {
-    *b
 }
 
 /// A merged field definition, keyed elsewhere by its dot-path.
@@ -148,15 +174,120 @@ pub struct FieldDef {
 }
 
 impl FieldDef {
-    fn from_raw(raw: &RawFieldDef) -> Self {
+    /// Merge one child scope's explicit declarations (`raw`) onto the definition it
+    /// inherits from its nearest ancestor (`inherited`, `None` when no ancestor scope
+    /// declares this field at all).
+    ///
+    /// Per-attribute inheritance: every attribute `raw` leaves unset (`None`) falls
+    /// through to `inherited`'s value for that attribute, and only defaults outright
+    /// (`false`/`true`/absent) when there is no inherited definition either. This is
+    /// the whole of [`ResolvedSchema::merged_with`]'s per-field logic — see that
+    /// function's doc for why, and [`Self::merge_values`] for the one attribute
+    /// (`values`) that has an in-band way to request a merge instead of a plain
+    /// override.
+    ///
+    /// `origin`/`path` are used only to attribute a `warn!` if `raw` uses the
+    /// deprecated `extend: true` or an unsatisfiable `$values` sentinel — they do not
+    /// affect the result.
+    fn merged(raw: &RawFieldDef, inherited: Option<&FieldDef>, origin: &str, path: &str) -> Self {
         Self {
-            ty: raw.ty,
-            required: raw.required,
-            indexed: raw.indexed,
-            values: raw.values.clone(),
-            default: raw.default.clone(),
-            open: raw.open,
+            ty: raw.ty.or(inherited.and_then(|f| f.ty)),
+            required: raw
+                .required
+                .unwrap_or(inherited.is_some_and(|f| f.required)),
+            indexed: raw.indexed.unwrap_or(inherited.is_some_and(|f| f.indexed)),
+            values: Self::merge_values(raw, inherited, origin, path),
+            default: raw
+                .default
+                .clone()
+                .or_else(|| inherited.and_then(|f| f.default.clone())),
+            open: raw.open.unwrap_or(inherited.is_none_or(|f| f.open)),
         }
+    }
+
+    /// Resolve `raw.values` against `inherited`'s value set.
+    ///
+    /// - `raw.values` is `None` (the field's `values` is never mentioned at all): plain
+    ///   per-attribute inheritance, same as every other attribute — take whatever the
+    ///   parent had, verbatim.
+    /// - `raw.values` is `Some(list)`: `list` **replaces** the inherited set outright
+    ///   — this is the default, deliberately, the same way a shell assignment
+    ///   `PATH=/only/this` replaces rather than extends — *unless* `list` contains
+    ///   [`VALUES_SENTINEL`] (`$values`), which splices the inherited set in at that
+    ///   exact position (`$PATH:/usr/local/bin` names where the inherited part goes).
+    ///   The result is deduplicated, keeping the first occurrence of each value, so a
+    ///   value listed both explicitly and inherited appears once.
+    /// - `raw.extend` (deprecated) is a shorthand for a leading sentinel: `extend: true`
+    ///   behaves exactly like `values: [$values, ...raw.values]`. `validate_raw` already
+    ///   rejects combining `extend: true` with an explicit `$values` in the same list,
+    ///   so at most one of these two paths ever contributes the sentinel.
+    fn merge_values(
+        raw: &RawFieldDef,
+        inherited: Option<&FieldDef>,
+        origin: &str,
+        path: &str,
+    ) -> Option<Vec<String>> {
+        let inherited_values = inherited.and_then(|f| f.values.as_deref());
+
+        let tokens: Vec<String> = if raw.extend {
+            warn!(
+                scope = %origin,
+                field = %path,
+                "'extend: true' is deprecated; write 'values: [{VALUES_SENTINEL}, ...]' \
+                 instead (see deploy/USAGE.md)"
+            );
+            std::iter::once(VALUES_SENTINEL.to_string())
+                .chain(raw.values.iter().flatten().cloned())
+                .collect()
+        } else {
+            match &raw.values {
+                Some(list) => list.clone(),
+                // Not mentioned at all: inherit the parent's set verbatim, no splicing
+                // involved.
+                None => return inherited_values.map(<[String]>::to_vec),
+            }
+        };
+
+        let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+        let push_dedup = |out: &mut Vec<String>, v: &str| {
+            if !out.iter().any(|existing| existing == v) {
+                out.push(v.to_string());
+            }
+        };
+        for token in &tokens {
+            if token == VALUES_SENTINEL {
+                match inherited_values {
+                    Some(values) if !values.is_empty() => {
+                        for v in values {
+                            push_dedup(&mut out, v);
+                        }
+                    }
+                    // Loud, not silent (see module docs on the project's general
+                    // stance): a sentinel with nothing to splice most often means the
+                    // author expected an ancestor to declare values for this field and
+                    // it doesn't (a typo'd path, a missing intermediate schema, etc).
+                    // Resolving to "no values contributed" here — rather than treating
+                    // the whole `values:` as absent — keeps the field CLOSED (nothing
+                    // permitted) instead of silently making it unconstrained, so a
+                    // document that sets this field fails validation immediately and
+                    // visibly instead of the check quietly stopping enforcement.
+                    _ => {
+                        warn!(
+                            scope = %origin,
+                            field = %path,
+                            "'{VALUES_SENTINEL}' has nothing to inherit here (no ancestor \
+                             scope declares values for this field); it contributes no \
+                             values, so any other literals in this list are the complete \
+                             permitted set — declare values on an ancestor, or drop the \
+                             sentinel if this list is meant to stand alone"
+                        );
+                    }
+                }
+            } else {
+                push_dedup(&mut out, token);
+            }
+        }
+        Some(out)
     }
 }
 
@@ -202,6 +333,48 @@ fn validate_raw(path: &str, raw: &RawFieldDef) -> Result<(), String> {
             format!("{ty:?}").to_lowercase()
         ));
     }
+
+    if let Some(values) = &raw.values {
+        // The `$` prefix is reserved for placeholders. An unrecognized `$`-prefixed
+        // token is always a mistake — usually a typo of `$values` — and must be a hard
+        // error here, not a literal value: silently accepting it as "just another
+        // permitted tag" is exactly the class of quiet failure this cascade otherwise
+        // goes out of its way to avoid (see the reserved-token note on
+        // [`VALUES_SENTINEL`]).
+        if let Some(bad) = values
+            .iter()
+            .find(|v| v.starts_with('$') && v.as_str() != VALUES_SENTINEL)
+        {
+            return Err(format!(
+                "field '{path}' has an unrecognized placeholder '{bad}' in its values \
+                 list; the only recognized '$'-prefixed token is '{VALUES_SENTINEL}'"
+            ));
+        }
+
+        let sentinel_count = values
+            .iter()
+            .filter(|v| v.as_str() == VALUES_SENTINEL)
+            .count();
+        if sentinel_count > 1 {
+            return Err(format!(
+                "field '{path}' lists '{VALUES_SENTINEL}' {sentinel_count} times; at \
+                 most one placeholder is allowed per values list"
+            ));
+        }
+
+        // `extend: true` is a deprecated alias for a leading `$values` (see
+        // `RawFieldDef::extend`); declaring both on the same field is ambiguous about
+        // where the inherited values land; refuse it and make the author pick one.
+        if raw.extend && sentinel_count > 0 {
+            return Err(format!(
+                "field '{path}' sets both 'extend: true' and a '{VALUES_SENTINEL}' \
+                 placeholder; 'extend' is a deprecated alias for a leading \
+                 '{VALUES_SENTINEL}', so combining them is ambiguous — use one or the \
+                 other, not both"
+            ));
+        }
+    }
+
     for (name, child) in raw.fields.iter().flatten() {
         validate_raw(&format!("{path}.{name}"), child)?;
     }
@@ -255,12 +428,18 @@ impl SchemaFile {
                     .entry(field.clone())
                     .or_insert_with(|| RawFieldDef {
                         ty: Some(FieldType::Enum),
-                        required: false,
-                        indexed: false,
+                        // Left unset rather than `Some(false)`/`Some(true)`: this
+                        // scope may not be the field's first declaration, and a brand
+                        // new definition created just to add a value must not clobber
+                        // whatever an ancestor scope already said about `required`,
+                        // `indexed`, or `open` for this field — see per-attribute
+                        // inheritance in `ResolvedSchema::merged_with`.
+                        required: None,
+                        indexed: None,
                         values: Some(Vec::new()),
                         extend: false,
                         default: None,
-                        open: true,
+                        open: None,
                         fields: None,
                     });
                 let existing = def.values.get_or_insert_with(Vec::new);
@@ -395,27 +574,32 @@ impl ResolvedSchema {
 
     /// Merge a child schema file onto this one.
     ///
-    /// The set of fields unions; a redefined field replaces its inherited definition
-    /// wholesale, except that `extend: true` unions `values` with the inherited set.
+    /// The set of fields unions. Merging is **per attribute**, not per field: a child
+    /// that redefines a field overrides only the attributes it explicitly writes
+    /// (`type`, `required`, `indexed`, `default`, `open`, `values`) — every attribute it
+    /// leaves unset still inherits from the parent's definition of that same field. A
+    /// child that writes `required: true` and nothing else, say, does not reset the
+    /// parent's `values` or `default` to nothing; it only tightens `required`.
+    ///
+    /// This is deliberately NOT the old rule (a redefinition replacing the whole
+    /// definition wholesale, `extend: true` as the sole opt-in to union `values`): that
+    /// rule silently discarded a parent's `required`/`indexed`/`default` the moment any
+    /// child so much as narrowed `values`, which is exactly the shape of footgun that
+    /// let a root-level `required: true` on `tags` go unenforced everywhere, since
+    /// every domain redeclared `tags` for its own `values` list. Per-attribute
+    /// inheritance means only fields whose redefinition genuinely intends to override a
+    /// given attribute do — see [`FieldDef::merged`] for the exact per-attribute rule.
+    ///
+    /// `values` is the one attribute with an in-band way to request a merge instead of
+    /// a plain override — see [`FieldDef::merge_values`] for the `$values` placeholder
+    /// and the deprecated `extend: true` alias for it.
     fn merged_with(&self, child: &SchemaFile, origin: &str) -> Self {
         let mut fields = self.fields.clone();
         let mut origins = self.origin.clone();
 
         for (path, raw) in child.flattened() {
-            let mut def = FieldDef::from_raw(&raw);
-
-            if raw.extend
-                && let Some(inherited) = self.fields.get(&path)
-                && let Some(inherited_values) = &inherited.values
-            {
-                let mut values = inherited_values.clone();
-                for value in def.values.iter().flatten() {
-                    if !values.contains(value) {
-                        values.push(value.clone());
-                    }
-                }
-                def.values = Some(values);
-            }
+            let inherited = self.fields.get(&path);
+            let def = FieldDef::merged(&raw, inherited, origin, &path);
 
             origins.insert(path.clone(), origin.to_string());
             fields.insert(path, def);
@@ -1183,7 +1367,13 @@ mod tests {
     }
 
     #[test]
-    fn redefinition_replaces_wholesale() {
+    fn redefinition_overrides_only_the_attributes_it_declares() {
+        // This is the exact footgun the per-attribute rewrite exists to close: the
+        // child only mentions `values` (and replaces it outright — no sentinel), so
+        // `type` and `required` must still come from the root. Under the old
+        // wholesale-replace rule this redefinition would silently drop `required`,
+        // which is why the live KB's root `tags: { required: true }` never actually
+        // applied anywhere — every domain redeclared `tags` for its own `values`.
         let dir = TempDir::new().unwrap();
         write_schema(
             dir.path(),
@@ -1193,21 +1383,272 @@ mod tests {
         write_schema(
             dir.path(),
             "scratch",
-            "fields:\n  status:\n    type: enum\n    values: [wip]\n",
+            "fields:\n  status:\n    values: [wip]\n",
         );
 
         let cache = SchemaCache::build(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("scratch/note.md"));
 
-        assert_eq!(schema.fields["status"].values, Some(vec!["wip".into()]));
+        assert_eq!(
+            schema.fields["status"].values,
+            Some(vec!["wip".into()]),
+            "values has no sentinel, so it replaces outright"
+        );
+        assert_eq!(
+            schema.fields["status"].ty,
+            Some(FieldType::Enum),
+            "type was never redeclared, so it still comes from the root"
+        );
         assert!(
-            !schema.fields["status"].required,
-            "the child definition replaces the parent's entirely"
+            schema.fields["status"].required,
+            "required was never redeclared, so it still comes from the root — the \
+             whole point of per-attribute inheritance"
         );
     }
 
     #[test]
-    fn extend_unions_values_but_child_wins_elsewhere() {
+    fn a_child_can_still_explicitly_override_an_inherited_attribute() {
+        // The other half of the same rule: an attribute the child DOES mention still
+        // wins, same as before. Per-attribute inheritance only changes what happens to
+        // attributes the child stays silent on.
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  status:\n    required: true\n");
+        write_schema(
+            dir.path(),
+            "scratch",
+            "fields:\n  status:\n    required: false\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("scratch/note.md"));
+
+        assert!(!schema.fields["status"].required);
+    }
+
+    #[test]
+    fn omitting_values_entirely_inherits_the_parents_set_verbatim() {
+        // A child that redeclares a DIFFERENT attribute and never mentions `values` at
+        // all inherits the parent's values set unchanged — ordinary per-attribute
+        // inheritance, no splicing involved (that's only for when `values` itself is
+        // redeclared).
+        let dir = TempDir::new().unwrap();
+        write_schema(
+            dir.path(),
+            "",
+            "fields:\n  status:\n    type: enum\n    values: [active, draft]\n",
+        );
+        write_schema(
+            dir.path(),
+            "scratch",
+            "fields:\n  status:\n    required: true\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("scratch/note.md"));
+
+        assert_eq!(
+            schema.fields["status"].values,
+            Some(vec!["active".into(), "draft".into()])
+        );
+        assert!(schema.fields["status"].required);
+    }
+
+    #[test]
+    fn per_attribute_inheritance_covers_every_attribute() {
+        // One field, every attribute set at the root, a child that overrides exactly
+        // one of them (`indexed`). Everything else — type, required, default, open —
+        // must survive untouched.
+        let dir = TempDir::new().unwrap();
+        write_schema(
+            dir.path(),
+            "",
+            "fields:\n  note:\n    type: object\n    open: false\n    required: true\n    \
+             indexed: false\n    default: {}\n",
+        );
+        write_schema(dir.path(), "child", "fields:\n  note:\n    indexed: true\n");
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("child/doc.md"));
+        let note = &schema.fields["note"];
+
+        assert_eq!(note.ty, Some(FieldType::Object), "type inherited");
+        assert!(note.required, "required inherited");
+        assert!(note.indexed, "indexed is the one attribute the child set");
+        assert!(!note.open, "open inherited");
+        assert!(note.default.is_some(), "default inherited");
+    }
+
+    #[test]
+    fn three_level_cascade_with_each_level_setting_a_different_attribute() {
+        // root -> domain -> subdirectory, each level touching only ONE attribute of
+        // the same field. The document under the subdirectory must see all three.
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  x:\n    required: true\n");
+        write_schema(dir.path(), "a", "fields:\n  x:\n    indexed: true\n");
+        write_schema(
+            dir.path(),
+            "a/b",
+            "fields:\n  x:\n    type: enum\n    values: [one, two]\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("a/b/doc.md"));
+        let x = &schema.fields["x"];
+
+        assert!(x.required, "from root");
+        assert!(x.indexed, "from the domain level");
+        assert_eq!(x.ty, Some(FieldType::Enum), "from the subdirectory");
+        assert_eq!(x.values, Some(vec!["one".into(), "two".into()]));
+    }
+
+    // -- $values sentinel -----------------------------------------------------
+
+    #[test]
+    fn values_replace_by_default_with_no_sentinel() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  tags:\n    values: [a, b]\n");
+        write_schema(dir.path(), "child", "fields:\n  tags:\n    values: [c]\n");
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("child/doc.md"));
+
+        assert_eq!(
+            schema.fields["tags"].values,
+            Some(vec!["c".into()]),
+            "no sentinel present, so the child's list replaces outright — the shell \
+             `PATH=/only/this` case"
+        );
+    }
+
+    #[test]
+    fn leading_sentinel_splices_inherited_values_first() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  tags:\n    values: [a, b]\n");
+        write_schema(
+            dir.path(),
+            "child",
+            "fields:\n  tags:\n    values: [$values, c]\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("child/doc.md"));
+
+        assert_eq!(
+            schema.fields["tags"].values,
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn trailing_sentinel_splices_inherited_values_last() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  tags:\n    values: [a, b]\n");
+        write_schema(
+            dir.path(),
+            "child",
+            "fields:\n  tags:\n    values: [c, $values]\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("child/doc.md"));
+
+        assert_eq!(
+            schema.fields["tags"].values,
+            Some(vec!["c".into(), "a".into(), "b".into()]),
+            "position is meaningful: the sentinel sits after 'c', so inherited values \
+             land after it too"
+        );
+    }
+
+    #[test]
+    fn splicing_deduplicates_keeping_first_occurrence_order() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  tags:\n    values: [a, b]\n");
+        write_schema(
+            dir.path(),
+            "child",
+            "fields:\n  tags:\n    values: [b, $values, c]\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("child/doc.md"));
+
+        assert_eq!(
+            schema.fields["tags"].values,
+            Some(vec!["b".into(), "a".into(), "c".into()]),
+            "'b' keeps its first (literal, pre-sentinel) position and is not repeated \
+             when the sentinel splices in the inherited set that also contains it"
+        );
+    }
+
+    #[test]
+    fn sentinel_with_nothing_inherited_resolves_to_only_the_literals() {
+        // No ancestor declares any values for this field at all. The sentinel
+        // contributes nothing (a loud warning is logged, but not asserted on here —
+        // see `merge_values`'s doc for why this degrades rather than hard-erroring),
+        // and any literal tokens still in the list are the complete permitted set.
+        let dir = TempDir::new().unwrap();
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let candidate: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$values, only]\n").unwrap();
+
+        let effective = cache
+            .resolve_with_candidate(Path::new("doc.md"), Path::new(""), &candidate)
+            .unwrap();
+
+        assert_eq!(effective.fields["tags"].values, Some(vec!["only".into()]));
+    }
+
+    #[test]
+    fn sentinel_alone_with_nothing_inherited_closes_the_field_rather_than_leaving_it_unconstrained()
+    {
+        // The sharper edge of the same case: NOTHING resolves (no inherited values, no
+        // other literals), so the field ends up `Some(vec![])` — permitting nothing —
+        // rather than `None` — permitting anything. An empty closed set fails loudly
+        // the moment a document sets the field; `None` would fail silently by not
+        // checking at all. See `merge_values`'s doc for the full reasoning.
+        let dir = TempDir::new().unwrap();
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let candidate: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$values]\n").unwrap();
+
+        let effective = cache
+            .resolve_with_candidate(Path::new("doc.md"), Path::new(""), &candidate)
+            .unwrap();
+
+        assert_eq!(effective.fields["tags"].values, Some(Vec::new()));
+    }
+
+    #[test]
+    fn multi_level_cascade_splices_against_the_immediately_inherited_set_not_the_root() {
+        // root -> domain -> subdirectory, each splicing in turn. The subdirectory's
+        // sentinel must resolve against the DOMAIN's already-merged set ([a, b]), not
+        // the root's raw set ([a]) — otherwise 'b' would silently disappear for any
+        // document two levels down.
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  tags:\n    values: [a]\n");
+        write_schema(
+            dir.path(),
+            "domain",
+            "fields:\n  tags:\n    values: [$values, b]\n",
+        );
+        write_schema(
+            dir.path(),
+            "domain/sub",
+            "fields:\n  tags:\n    values: [$values, c]\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let schema = cache.resolve_for(Path::new("domain/sub/doc.md"));
+
+        assert_eq!(
+            schema.fields["tags"].values,
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn deprecated_extend_true_behaves_like_a_leading_sentinel() {
         let dir = TempDir::new().unwrap();
         write_schema(
             dir.path(),
@@ -1222,14 +1663,59 @@ mod tests {
 
         let cache = SchemaCache::build(dir.path(), &empty_config());
         let schema = cache.resolve_for(Path::new("kitchen/chili.md"));
-        let values = schema.fields["tags"].values.clone().unwrap();
 
-        assert!(values.contains(&"reference".to_string()), "inherited kept");
-        assert!(values.contains(&"recipe".to_string()), "child added");
+        assert_eq!(
+            schema.fields["tags"].values,
+            Some(vec!["reference".into(), "guide".into(), "recipe".into()]),
+            "extend: true == a leading $values placeholder"
+        );
         assert!(
             schema.fields["tags"].required,
-            "extend only affects values; other attributes come from the child"
+            "extend only ever affected values; every other attribute follows the same \
+             per-attribute rule as always, and here the child explicitly sets it"
         );
+    }
+
+    #[test]
+    fn an_unrecognized_dollar_token_is_a_loud_parse_error() {
+        let file: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$typo, a]\n").unwrap();
+        let err = file.validate_self().unwrap_err();
+        assert!(err.contains("$typo"), "names the offending token: {err}");
+        assert!(err.contains("$values"), "names what IS recognized: {err}");
+    }
+
+    #[test]
+    fn more_than_one_sentinel_in_a_values_list_is_a_parse_error() {
+        let file: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  tags:\n    values: [$values, a, $values]\n")
+                .unwrap();
+        let err = file.validate_self().unwrap_err();
+        assert!(err.contains("tags"), "got: {err}");
+    }
+
+    #[test]
+    fn combining_extend_true_with_an_explicit_sentinel_is_a_parse_error() {
+        let file: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  tags:\n    extend: true\n    values: [$values, a]\n",
+        )
+        .unwrap();
+        let err = file.validate_self().unwrap_err();
+        assert!(err.contains("extend"), "got: {err}");
+        assert!(err.contains("$values"), "got: {err}");
+    }
+
+    #[test]
+    fn a_schema_using_the_unrecognized_token_freezes_its_scope() {
+        // The parse-time rejection above must actually reach the cascade build, not
+        // just the standalone validator — a broken schema freezes its subtree like any
+        // other invalid one.
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "bad", "fields:\n  tags:\n    values: [$oops]\n");
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+
+        assert!(cache.is_frozen(Path::new("bad/doc.md")).is_some());
     }
 
     #[test]
@@ -1597,7 +2083,13 @@ mod tests {
     }
 
     #[test]
-    fn a_deeper_scope_still_wins_for_the_field_it_redeclares() {
+    fn a_deeper_scope_still_wins_for_the_attribute_it_redeclares_but_inherits_the_rest() {
+        // `archive/` only ever redeclares `values` (no sentinel — a plain replace) and
+        // never mentions `required`. Under per-attribute inheritance that means
+        // `values` still wins locally, but `required` — set by this candidate edit at
+        // the root — reaches `archive/` anyway, since nothing there overrides it. This
+        // is the deliberate reversal from wholesale replacement: a descendant no
+        // longer needs to repeat every attribute it doesn't want to lose.
         let dir = TempDir::new().unwrap();
         write_schema(
             dir.path(),
@@ -1617,11 +2109,12 @@ mod tests {
         assert_eq!(
             effective.fields["status"].values,
             Some(vec!["archived".into()]),
-            "the descendant's redeclaration replaces the ancestor's wholesale"
+            "archive/'s own values (no sentinel) still replace the root's outright"
         );
         assert!(
-            !effective.fields["status"].required,
-            "wholesale replacement drops the ancestor's required flag too"
+            effective.fields["status"].required,
+            "required was never redeclared by archive/, so the root edit's `required: \
+             true` reaches it — the opposite of the old wholesale-replace behavior"
         );
     }
 
