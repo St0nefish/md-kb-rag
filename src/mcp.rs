@@ -3699,6 +3699,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_schema_root_ignores_config_frontmatter_once_a_root_file_exists() {
+        // A root .kb-schema.yaml declares `title`. config.yaml ALSO declares a
+        // required field (`legacy_field`) that the root file never mentions. Per issue
+        // #91's policy, a root schema file is authoritative for the KB root: config's
+        // `frontmatter` block must not still be contributing fields through
+        // get_schema, and every field it does report must be attributed to the root
+        // schema file, not "config.yaml".
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(&tmp, "", "fields:\n  title:\n    required: true\n");
+
+        let mut config = (*make_test_resolved_config(tmp.path())).clone();
+        config.frontmatter.required = vec!["legacy_field".into()];
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], Arc::new(config));
+
+        let result = server
+            .get_schema(Parameters(GetSchemaParams::default()))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        let fields = structured["fields"].as_array().unwrap();
+        let names: Vec<&str> = fields
+            .iter()
+            .map(|f| f["field"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            names.contains(&"title"),
+            "the root file's own field is reported"
+        );
+        assert!(
+            !names.contains(&"legacy_field"),
+            "a config-only field must not leak into the root once a root schema file exists"
+        );
+        for field in fields {
+            assert_eq!(
+                field["declared_in"],
+                serde_json::json!(".kb-schema.yaml"),
+                "every reported root field must be attributed to the root schema file, \
+                 not to config.yaml, once one exists"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn schema_tools_accept_a_leading_slash_as_the_kb_root() {
         let tmp = tempfile::tempdir().unwrap();
         write_schema_file(

@@ -91,18 +91,26 @@ indexing:
 
 
 # ----------------------------------------------------------------------------
-# frontmatter — YAML frontmatter schema and enforcement
+# frontmatter — DEPRECATED. YAML frontmatter schema and enforcement
 # ----------------------------------------------------------------------------
 # By default, no frontmatter rules are enforced. Files without frontmatter
 # are indexed normally. Configure this section to require specific fields
 # or expose metadata as filterable Qdrant payload fields.
 #
-# This block is now the IMPLICIT ROOT SCHEMA for the knowledge base. A
-# directory can override or extend it by adding a `.kb-schema.yaml` file,
-# which governs that directory and everything beneath it (cascading like
-# CLAUDE.md) — see the README for syntax, cascade/merge rules, and the
-# `get_schema` / `update_schema` MCP tools. With no `.kb-schema.yaml` files
-# anywhere, this block alone governs the whole tree, same as before.
+# DEPRECATED: this block is deployment config on the container host, not
+# part of the knowledge base's own git repo, so its rules don't travel with
+# the KB when it's cloned or served elsewhere. Prefer a root `.kb-schema.yaml`
+# committed to the knowledge base itself instead — same syntax used by every
+# subdirectory's `.kb-schema.yaml` (cascading like CLAUDE.md), see the README
+# for syntax, cascade/merge rules, and the `get_schema` / `update_schema` MCP
+# tools.
+#
+# This block is used ONLY when no root `.kb-schema.yaml` exists at all — every
+# index run logs a warning while that's the case. The moment a root
+# `.kb-schema.yaml` exists, it REPLACES this block outright (not a merge):
+# required/indexed_fields/defaults/allowed below stop applying unless the same
+# field is also declared in the root `.kb-schema.yaml` — and every index run
+# logs a warning about that too, so the switch is never silent.
 frontmatter:
 
   # Fields that MUST be present in every file's frontmatter. Files missing

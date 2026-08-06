@@ -88,6 +88,8 @@ chunking:
 
 Configure which frontmatter fields are required, which are indexed for filtering, and what defaults to apply.
 
+**This whole section describes the deprecated way to do it.** The `frontmatter` block below lives in `config.yaml`, which is deployment config on the container host — not part of the knowledge base's own git repo. Prefer a root `.kb-schema.yaml` (see [Directory Schemas](#directory-schemas-kb-schemayaml) below): it's the same mechanism every subdirectory already uses, it travels with the KB wherever it's cloned or served, and it's the one level `update_schema` can actually edit for you. `config.yaml`'s `frontmatter` block still works — it's consulted only when the knowledge base has no root `.kb-schema.yaml` at all — but every build logs a warning while it's in use, and once you add a root `.kb-schema.yaml`, this block stops applying (see [Backward compatibility and upgrade note](#backward-compatibility-and-upgrade-note)).
+
 ### Sample Config
 
 ```yaml
@@ -138,7 +140,7 @@ Run `md-kb-rag validate` to check all files without indexing — useful for CI o
 
 ## Directory Schemas (`.kb-schema.yaml`)
 
-The `frontmatter` block above is a single, global rule set. For a knowledge base where different folders need different fields — recipes need `planning.prep_minutes`, runbooks need `severity` — drop a `.kb-schema.yaml` file into a directory. It governs that directory and everything beneath it, cascading like `CLAUDE.md`.
+The `frontmatter` block above is the deprecated, single, global rule set. `.kb-schema.yaml` is the non-deprecated replacement, and it isn't limited to subdirectories — a `.kb-schema.yaml` at the knowledge-base root replaces `frontmatter` entirely (see [Root schema](#root-schema-kb-schemayaml-at-the-kb-root) below). For a knowledge base where different folders need different fields — recipes need `planning.prep_minutes`, runbooks need `severity` — drop a `.kb-schema.yaml` file into a directory. It governs that directory and everything beneath it, cascading like `CLAUDE.md`.
 
 ### Authoring
 
@@ -170,7 +172,7 @@ A field definition can't declare both a scalar `type` and nested `fields:` — a
 
 - The **set** of fields unions across levels; a field redefined at a deeper level **replaces** its inherited definition wholesale.
 - `extend: true` is the opt-out — it unions only `values` with the inherited set, everything else on the child definition still wins.
-- Top-level folder names are the KB's areas (this is also what `domain` is derived from — see [Sample Document](#sample-document) above); the MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is in `frontmatter.indexed_fields`.
+- Top-level folder names are the KB's areas (this is also what `domain` is derived from — see [Sample Document](#sample-document) above); the MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is indexed at the root — either via `frontmatter.indexed_fields` (deprecated fallback) or an `indexed: true` entry for `domain` in a root `.kb-schema.yaml`. `domain` isn't author-written frontmatter (see the note above), so if you migrate off `config.yaml`, remember to declare it explicitly — it does not carry over automatically.
 
 ### Freezing
 
@@ -180,9 +182,20 @@ A `.kb-schema.yaml` larger than 256 KB is rejected outright — it's never read 
 
 `md-kb-rag index --full` refuses to run at all while any scope is frozen, naming the offending directories: a full run drops and recreates the Qdrant collection, and a frozen scope's documents would be skipped during the rebuild — losing their vectors outright rather than merely leaving them stale. Fix the schema first, or keep making progress with an incremental `md-kb-rag index`, which is unaffected by scopes frozen elsewhere in the tree.
 
-### Backward compatibility and upgrade note
+### Root schema (`.kb-schema.yaml` at the KB root)
 
-With no `.kb-schema.yaml` files anywhere, the global `frontmatter` block continues to act as the implicit root schema — existing deployments keep working unchanged.
+Every level of the cascade — including the root — is a `.kb-schema.yaml`. A root schema file is authored exactly like any other: drop one at the top of the knowledge base and it governs every document that no deeper scope claims, the same as a `.kb-schema.yaml` in any subdirectory.
+
+**A root `.kb-schema.yaml`, when present, REPLACES `config.yaml`'s `frontmatter` block outright — it does not merge with it.** This is deliberate, not an oversight: a schema describes the knowledge base's own content rules, and once the KB carries its own root rules, they must not be silently blended with whatever `frontmatter` block the current deploying host's `config.yaml` happens to declare — that would mean the same KB validates differently depending on where it's hosted. So:
+
+- **No root `.kb-schema.yaml` anywhere** — `config.yaml`'s `frontmatter` block is used as the root schema, exactly as before. This is the deprecated fallback described above; it still fully works, but every index run logs a warning naming it.
+- **A root `.kb-schema.yaml` exists** — it is the entire root schema. Anything `config.yaml`'s `frontmatter` block still declares (`required`, `indexed_fields`, `defaults`, `allowed`) is ignored for root purposes unless the same field is *also* declared in the root `.kb-schema.yaml`. Every index run logs a warning naming this too, so the interaction is never silent.
+
+Either way, `get_schema` (omit `path` for the root) tells you exactly what's in effect and where each field came from — `.kb-schema.yaml` for a root schema file, `config.yaml` for the deprecated fallback.
+
+**Migrating an existing deployment:** translate `config.yaml`'s `frontmatter` block into `.kb-schema.yaml` field syntax (see [Authoring](#authoring) above) and commit it as `.kb-schema.yaml` at the knowledge-base root. Do this *before* or *at the same time as* removing anything from `config.yaml` — since the two don't merge, an incomplete root file written first (with the config block still present) can quietly narrow root's effective rules to only what the config block still contributes, until the root file catches up. `required` fields become `required: true`; `indexed_fields` become `indexed: true`; `defaults` become `default: <value>`; `allowed` becomes `values: [...]` **without** a `type:` — adding `type: enum` changes enforcement strictness (see [Authoring](#authoring) above) and is a separate decision, not a mechanical translation. If a subdirectory's own `.kb-schema.yaml` already redeclares a field the root also declares, double-check after migrating that the subdirectory's definition is still what you want — a deeper redefinition replaces its parent's wholesale, and merging config into a schema-file world can surface fields that were previously invisible to that redefinition.
+
+### Backward compatibility and upgrade note
 
 Under the hood, each indexed file now also tracks a `schema_hash` fingerprint (a new `indexed_files` column, added automatically via a guarded `ALTER TABLE ... ADD COLUMN` — no manual migration step). The incremental indexer skips a file only when both its content hash *and* schema fingerprint are unchanged, since editing a schema doesn't touch a document's bytes. Two practical consequences:
 
@@ -320,9 +333,20 @@ Without `GIT_URL`, you'll need an external process to update the bind-mounted di
 
 Organize your markdown files in a git repository. Subdirectories are fine — the indexer walks recursively. Add YAML frontmatter to each file with at least the fields you mark as required.
 
+Commit a `.kb-schema.yaml` at the repository root declaring those rules — see [Root schema](#root-schema-kb-schemayaml-at-the-kb-root) above. This is the preferred place for root-level frontmatter rules: it's part of the knowledge base's own repo, so it travels with it wherever the KB is cloned or served, and `update_schema` can edit it for you later.
+
+```yaml
+# .kb-schema.yaml — at the knowledge-base root
+fields:
+  title:       { type: text, required: true }
+  description: { type: text, required: true }
+  type:        { type: enum, required: true, indexed: true, values: [guide, reference, howto] }
+  tags:        { type: list, indexed: true }
+```
+
 ### 2. Create your config (optional)
 
-Skip this step if the default chunking and frontmatter settings work for your knowledge base. Otherwise, start from the [config.example.yaml](config.example.yaml) and customize:
+Skip this step if the default chunking settings work for your knowledge base. Otherwise, start from the [config.example.yaml](config.example.yaml) and customize:
 
 ```yaml
 # config.yaml — minimal production config
@@ -335,16 +359,14 @@ indexing:
     - "README.md"
     - "CLAUDE.md"
 
-frontmatter:
-  required: [title, description, type]
-  indexed_fields: [type, domain, tags]
-
 chunking:
   target_chunk_size: 1000
   max_chunk_size: 1500
 ```
 
 Point `GIT_URL` (and optionally `GIT_BRANCH`) at your knowledge base repo via environment variables — see step 3. All other sections (`embedding`, `mcp`, `webhook`) use defaults that work with the Docker Compose stack. Override only if you need different values.
+
+`config.yaml` still has a `frontmatter` block (see [config.example.yaml](config.example.yaml)) for deployments that haven't moved to a root `.kb-schema.yaml` yet — it's the deprecated fallback described in [Frontmatter Validation](#frontmatter-validation) above, not something a new deployment should reach for.
 
 **Changing `config.yaml` later:** most settings in this file can be applied to a
 running server without a restart — edit the file and call:
