@@ -441,6 +441,18 @@ search:
   # restore pre-#86 behaviour, where a single document may fill every slot.
   diversity_max_per_document: 3
 
+  # Results returned when a caller does not pass `limit`.
+  default_limit: 10
+
+  # Ceiling on `limit`. A larger request is clamped to this rather than
+  # rejected, so a caller asking for more simply gets the maximum.
+  #
+  # This bounds MCP response size, not retrieval cost — candidate depth is set
+  # by rrf_candidates and reranking.candidate_limit, which are unaffected by how
+  # many of those candidates get returned. Raising it makes responses larger,
+  # not searches slower. default_limit must not exceed it.
+  max_limit: 50
+
 
 # ----------------------------------------------------------------------------
 # reranking — cross-encoder reranking of search results
