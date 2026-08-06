@@ -135,7 +135,7 @@ See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 
 - **source** — Git URL (auto-cloned on first start) or bind-mount path for your knowledge base
 - **indexing** — Include/exclude glob patterns
-- **frontmatter** — Required fields, indexed fields, defaults, and `allowed` closed-set enums (enforced by `validate` and the write tools)
+- **frontmatter** *(deprecated)* — Required fields, indexed fields, defaults, and `allowed` closed-set enums (enforced by `validate` and the write tools); prefer a root `.kb-schema.yaml` instead — see [`.kb-schema.yaml` Directory Schemas](#kb-schemayaml-directory-schemas)
 - **chunking** — Markdown-aware splitting with configurable chunk size
 - **embedding** — OpenAI-compatible endpoint (works with llama.cpp, vLLM, etc.)
 - **qdrant** — Connection URL and collection name
@@ -354,9 +354,9 @@ The server also advertises **dynamic instructions** to connected clients: the co
 
 ## `.kb-schema.yaml` Directory Schemas
 
-A file named `.kb-schema.yaml` governs its directory and everything beneath it, cascading like `CLAUDE.md`. Where `frontmatter` in `config.yaml` used to be the one global rule set, per-directory schema files now let different parts of a knowledge base declare their own fields on top of (or instead of) that root.
+A file named `.kb-schema.yaml` governs its directory and everything beneath it, cascading like `CLAUDE.md` — including at the knowledge-base root. `frontmatter` in `config.yaml` used to be the *only* way to declare root-level rules; it's now a deprecated fallback (see [Backward compatibility](#backward-compatibility) below), and a root `.kb-schema.yaml` — authored with the exact same syntax as any other directory — is the preferred way to declare them, since it's part of the knowledge base's own git repo rather than deployment config on the container host.
 
-Top-level folder names are the KB's areas — this is also what `domain` is derived from (see the [`search`](#read) note above). The MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is listed in `frontmatter.indexed_fields`.
+Top-level folder names are the KB's areas — this is also what `domain` is derived from (see the [`search`](#read) note above). The MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is indexed at the root, whether via the deprecated `frontmatter.indexed_fields` or an `indexed: true` entry for `domain` in a root `.kb-schema.yaml`.
 
 ### Syntax
 
@@ -396,7 +396,9 @@ A `.kb-schema.yaml` over 256 KB is refused purely on file size — it's never re
 
 ### Backward compatibility
 
-With no `.kb-schema.yaml` files anywhere, the global `frontmatter` block in `config.yaml` acts as the implicit root schema — existing deployments keep working unchanged.
+`config.yaml`'s `frontmatter` block is a deprecated fallback for root-level rules, used only when no root `.kb-schema.yaml` exists anywhere — in that case, existing deployments keep working unchanged, though every index run logs a warning naming the fallback.
+
+The moment a root `.kb-schema.yaml` is added, it **replaces** `config.yaml`'s `frontmatter` block outright rather than merging with it: `required`/`indexed_fields`/`defaults`/`allowed` there stop applying unless the same field is also declared in the root `.kb-schema.yaml` (every index run also logs a warning about this, so the switch is never silent). This is deliberate — a schema describes the knowledge base's own content rules, and a KB that carries its own root `.kb-schema.yaml` must validate the same way regardless of which host's `config.yaml` happens to be serving it. `get_schema` (omit `path` for the root) always shows exactly what's in effect and where each field came from.
 
 ### Schema-change detection
 

@@ -13,6 +13,15 @@
 //!
 //! Deployments with no schema files keep working: the global `frontmatter` block in
 //! `config.yaml` becomes the implicit root schema via [`ResolvedSchema::from_config`].
+//! This is a **deprecated fallback**, though — a schema describes the knowledge base's
+//! own content rules, and `config.yaml` is deployment config that lives on the
+//! container host, not in the KB's git repo. A root `.kb-schema.yaml` is the
+//! non-deprecated way to declare root rules, and once one exists it is authoritative:
+//! it REPLACES the config-derived root outright rather than layering onto it, so a KB
+//! carries its root rules with it wherever it is cloned or served, independent of
+//! whatever `config.yaml` the deploying host happens to have. `config.yaml`'s
+//! `frontmatter` block is consulted only when no root `.kb-schema.yaml` exists at all
+//! — see [`SchemaCache::build`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -335,6 +344,8 @@ pub struct ResolvedSchema {
 impl ResolvedSchema {
     /// Adapt the global `frontmatter` config block into the implicit root schema.
     ///
+    /// **Deprecated fallback**, used only when the knowledge base has no root
+    /// `.kb-schema.yaml` of its own — see [`SchemaCache::build`] and the module docs.
     /// Lossless with respect to the pre-cascade behavior: `allowed` becomes `enum`
     /// fields, which still accept either a scalar or an array of scalars.
     pub fn from_config(config: &FrontmatterConfig) -> Self {
@@ -528,8 +539,17 @@ impl SchemaCache {
     ///
     /// One pass over the tree, not one per document: resolution afterwards is an
     /// in-memory prefix lookup that touches no filesystem.
+    ///
+    /// A root `.kb-schema.yaml` (governing directory `""`) is handled differently from
+    /// every other scope: instead of merging onto its nearest ancestor — which, at the
+    /// root, would mean merging onto the config-derived schema — it REPLACES the
+    /// config-derived root outright. Config-derived root rules apply only when no root
+    /// `.kb-schema.yaml` exists at all. See the module docs for why: the config block
+    /// is deployment config on the container host, and a KB that brings its own root
+    /// schema file must not have that schema silently blended with whatever
+    /// `frontmatter` block the current host's `config.yaml` happens to declare.
     pub fn build(data_path: &Path, fallback: &FrontmatterConfig) -> Self {
-        let root = ResolvedSchema::from_config(fallback);
+        let config_root = ResolvedSchema::from_config(fallback);
         let mut discovered: Vec<(PathBuf, PathBuf)> = Vec::new();
         collect_schema_files(data_path, data_path, &mut discovered);
 
@@ -548,6 +568,7 @@ impl SchemaCache {
         let mut scopes: Vec<(PathBuf, ResolvedSchema)> = Vec::new();
         let mut raw: BTreeMap<PathBuf, SchemaFile> = BTreeMap::new();
         let mut broken: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let mut root_file_found = false;
 
         for (rel_dir, abs_file) in discovered {
             let origin = rel_dir.join(SCHEMA_FILE_NAME).to_string_lossy().to_string();
@@ -575,8 +596,32 @@ impl SchemaCache {
 
             match parsed {
                 Ok(file) => {
-                    let parent = nearest_schema(&scopes, &rel_dir).unwrap_or(&root);
-                    let merged = parent.merged_with(&file, &origin);
+                    let is_root = rel_dir.as_os_str().is_empty();
+                    let merged = if is_root {
+                        root_file_found = true;
+                        if !config_root.fields.is_empty() {
+                            // Loud, not silent: config.yaml declares root rules that are
+                            // about to stop applying. This fires on every build (like
+                            // the "conflicting types" and "malformed schema" warnings
+                            // below), not once — a build runs on every write and every
+                            // reconcile sweep, so an operator tailing logs sees it
+                            // consistently rather than only at the one moment it first
+                            // became true.
+                            warn!(
+                                "a root {} exists at the knowledge-base root; config.yaml's \
+                                 `frontmatter` block no longer applies there — its \
+                                 required/indexed_fields/defaults/allowed entries are \
+                                 ignored unless the same fields are also declared in the \
+                                 root {}. Move anything still needed into it.",
+                                SCHEMA_FILE_NAME, SCHEMA_FILE_NAME
+                            );
+                        }
+                        // Replaces, not merges: an empty base, not `config_root`.
+                        ResolvedSchema::default().merged_with(&file, &origin)
+                    } else {
+                        let parent = nearest_schema(&scopes, &rel_dir).unwrap_or(&config_root);
+                        parent.merged_with(&file, &origin)
+                    };
                     debug!(scope = %rel_dir.display(), "loaded schema");
                     raw.insert(rel_dir.clone(), file);
                     scopes.push((rel_dir, merged));
@@ -592,6 +637,21 @@ impl SchemaCache {
             }
         }
 
+        if !root_file_found && !config_root.fields.is_empty() {
+            // The deprecated fallback: no root `.kb-schema.yaml` anywhere, so
+            // config.yaml's `frontmatter` block is standing in as the root schema.
+            // Still fully supported (see module docs), but this is the direction we
+            // want deployments to move away from — flag it every build, same as the
+            // "config overridden" warning above, so it stays visible for as long as it
+            // is true rather than only at startup.
+            warn!(
+                "no root {} found; falling back to the deprecated `frontmatter` block \
+                 in config.yaml for root-level rules. This still works, but a root {} \
+                 is the non-deprecated way to declare them — see deploy/USAGE.md.",
+                SCHEMA_FILE_NAME, SCHEMA_FILE_NAME
+            );
+        }
+
         // Longest paths last so prefix lookup can scan backwards for the deepest match,
         // with path as a stable tiebreaker among equal depths.
         scopes.sort_by(|(a, _), (b, _)| {
@@ -605,7 +665,7 @@ impl SchemaCache {
             scopes,
             raw,
             broken,
-            root,
+            root: config_root,
             root_path: data_path.to_path_buf(),
         }
     }
@@ -656,7 +716,20 @@ impl SchemaCache {
         }
         chain.sort_by_key(|(scope, _)| scope.components().count());
 
-        let mut resolved = self.root.clone();
+        // Mirrors `build`'s root policy: when a root `.kb-schema.yaml` governs this
+        // document — one already exists on disk, or this very edit is creating one —
+        // `chain` already contains an entry for `""` (real or candidate) that fully
+        // determines the root's fields, so starting from the config-derived root here
+        // would let config re-contaminate fields the root file doesn't mention. Only
+        // fall back to the config-derived root when no root schema file is in play at
+        // all — the same "root file present, if any, wins outright" rule `build` uses.
+        let root_governed =
+            self.raw.contains_key(Path::new("")) || edited_dir.as_os_str().is_empty();
+        let mut resolved = if root_governed {
+            ResolvedSchema::default()
+        } else {
+            self.root.clone()
+        };
         for (scope, file) in chain {
             let origin = scope.join(SCHEMA_FILE_NAME).to_string_lossy().to_string();
             resolved = resolved.merged_with(file, &origin);
@@ -684,7 +757,8 @@ impl SchemaCache {
         nearest_schema(&self.scopes, dir).unwrap_or(&self.root)
     }
 
-    /// The root (config-derived or root-file) schema.
+    /// The root schema: from a root `.kb-schema.yaml` when one exists, otherwise the
+    /// config-derived fallback. See [`SchemaCache::build`] for why these don't merge.
     pub fn root(&self) -> &ResolvedSchema {
         self.scopes
             .iter()
@@ -1273,6 +1347,124 @@ mod tests {
             "existing deployments keep working untouched"
         );
         assert_eq!(cache.broken_scopes().count(), 0);
+    }
+
+    #[test]
+    fn a_root_schema_file_replaces_the_config_root_instead_of_merging_with_it() {
+        // config.yaml declares two rules: `title` required, `legacy_only` indexed. A
+        // root `.kb-schema.yaml` exists and redeclares `title` but says nothing about
+        // `legacy_only`. Under the old (pre-issue-#91) behavior these merged, so
+        // `legacy_only` would still show up, config-sourced, in the resolved root. The
+        // whole point of this change is that it must not: once a root schema file
+        // exists, it is authoritative and config.yaml's block stops applying.
+        let dir = TempDir::new().unwrap();
+        write_schema(
+            dir.path(),
+            "",
+            "fields:\n  title:\n    type: text\n    required: true\n",
+        );
+        let config = FrontmatterConfig {
+            required: vec!["title".into()],
+            indexed_fields: vec!["legacy_only".into()],
+            ..Default::default()
+        };
+
+        let cache = SchemaCache::build(dir.path(), &config);
+        let root = cache.root();
+
+        assert!(
+            root.fields["title"].required,
+            "the root file's own rule applies"
+        );
+        assert!(
+            !root.fields.contains_key("legacy_only"),
+            "a config-only field must NOT leak into the root once a root schema file \
+             exists — that would mean the KB's validation rules depend on whichever \
+             config.yaml the deploying host happens to have"
+        );
+    }
+
+    #[test]
+    fn a_root_schema_files_override_reaches_subdirectories_not_the_config_leftover() {
+        // Subdirectories inherit from the root scope. That inherited root must be the
+        // REPLACED (root-file-only) schema, not a config-merged one — otherwise a
+        // config-only field would reach every document in the tree via inheritance
+        // even though the root schema itself no longer reports it.
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "", "fields:\n  title:\n    required: true\n");
+        fs::create_dir_all(dir.path().join("food")).unwrap();
+        let config = FrontmatterConfig {
+            indexed_fields: vec!["legacy_only".into()],
+            ..Default::default()
+        };
+
+        let cache = SchemaCache::build(dir.path(), &config);
+        let resolved = cache.resolve_for(Path::new("food/chili.md"));
+
+        assert!(
+            resolved.fields["title"].required,
+            "root rule still cascades"
+        );
+        assert!(
+            !resolved.fields.contains_key("legacy_only"),
+            "the config leftover must not reach subdirectories through inheritance either"
+        );
+    }
+
+    #[test]
+    fn resolve_with_candidate_replaces_config_when_creating_a_root_schema_file() {
+        // update_schema's dry-run path (`resolve_with_candidate`) must apply the same
+        // override policy as `build`: proposing a brand-new root `.kb-schema.yaml`
+        // must not silently keep enforcing whatever config.yaml declared but the
+        // candidate omits.
+        let dir = TempDir::new().unwrap();
+        let config = FrontmatterConfig {
+            required: vec!["legacy_required".into()],
+            ..Default::default()
+        };
+        let cache = SchemaCache::build(dir.path(), &config);
+
+        let candidate: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  title:\n    required: true\n").unwrap();
+        let effective = cache
+            .resolve_with_candidate(Path::new("doc.md"), Path::new(""), &candidate)
+            .expect("root always governs a root-level document");
+
+        assert!(effective.fields["title"].required);
+        assert!(
+            !effective.fields.contains_key("legacy_required"),
+            "the candidate root file replaces config, so a field only config declares \
+             must not appear as still-enforced in the dry run"
+        );
+    }
+
+    #[test]
+    fn resolve_with_candidate_still_falls_back_to_config_with_no_root_file_in_play() {
+        // The other half of the same policy: editing a NON-root scope while no root
+        // schema file exists anywhere must still fall back to the config-derived root
+        // for fields the edit itself doesn't touch — the deprecated fallback keeps
+        // working until a root file actually shows up.
+        let dir = TempDir::new().unwrap();
+        let config = FrontmatterConfig {
+            required: vec!["title".into()],
+            ..Default::default()
+        };
+        let cache = SchemaCache::build(dir.path(), &config);
+
+        let candidate: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  cook_minutes:\n    type: integer\n").unwrap();
+        let effective = cache
+            .resolve_with_candidate(Path::new("food/chili.md"), Path::new("food"), &candidate)
+            .expect("food/ covers this document");
+
+        assert!(
+            effective.fields["title"].required,
+            "no root schema file exists, so the config fallback must still reach this document"
+        );
+        assert_eq!(
+            effective.fields["cook_minutes"].ty,
+            Some(FieldType::Integer)
+        );
     }
 
     // -- broken schemas -----------------------------------------------------
