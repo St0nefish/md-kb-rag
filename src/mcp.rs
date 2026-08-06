@@ -101,6 +101,10 @@ pub(crate) fn dedup_search_opts() -> SearchOptions {
         modified_after: None,
         modified_before: None,
         rerank_candidate_limit: None,
+        // The dedup gate wants the single closest existing chunk, full stop — not
+        // a diversified page of results (limit: 1 above makes a per-document cap
+        // moot anyway, but this keeps intent explicit rather than accidental).
+        diversity_max_per_document: None,
     }
 }
 
@@ -1663,6 +1667,7 @@ impl KbSearchServer {
             modified_after,
             modified_before,
             rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
+            diversity_max_per_document: config.search.diversity_max_per_document,
         };
 
         let results = retrieval::search(&self.deps(), &params.query, &filters, &opts)

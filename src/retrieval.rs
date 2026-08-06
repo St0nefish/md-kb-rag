@@ -73,6 +73,95 @@ pub struct SearchOptions {
     /// When reranking is enabled, the number of candidates to fetch before reranking.
     /// Ignored when `reranker` is None on RetrievalDeps.
     pub rerank_candidate_limit: Option<u64>,
+    /// Per-document cap on the final result set — see [`apply_diversity_cap`] and
+    /// the diversity-cap block in [`search`] for the full funnel-placement
+    /// reasoning. `None` disables diversity (a single document may fill every
+    /// slot, matching pre-#86 behaviour). Sourced from
+    /// `search.diversity_max_per_document`.
+    pub diversity_max_per_document: Option<usize>,
+}
+
+/// How much more generous the *pre-rerank* candidate cap is than the *final*
+/// result cap (`diversity_max_per_document`), when both a reranker and diversity
+/// are active.
+///
+/// The pre-rerank pass operates on RRF/dense-fused order — a materially weaker
+/// relevance signal than the cross-encoder about to run — so capping it down to
+/// the same tight number as the final cap risks discarding a document's true
+/// best chunk before reranking ever gets a chance to identify it (fusion order
+/// and true relevance order are not the same thing; that's the entire reason a
+/// reranker exists). Multiplying the final cap by a generous factor keeps that
+/// risk low while still doing real work: it trims a document that has,
+/// implausibly, tens of chunks in the top of the fused pool down to a bounded
+/// number before they're all sent to a paid, latency-bound reranker call — most
+/// of which could never survive the final cap regardless of their rerank score.
+const PRERANK_DIVERSITY_MULTIPLIER: usize = 4;
+
+/// Apply a per-document cap to an already-ranked (best-first) result list,
+/// dropping entries once a document (identified by its `file_path` payload
+/// field) has contributed `max_per_document` results. Preserves relative order
+/// of everything kept, so a lower-ranked chunk from an under-represented
+/// document naturally backfills the slot a capped chunk would have occupied.
+///
+/// A result with no `file_path` in its payload is never capped — this should
+/// not happen for real indexed chunks (`file_path` is always written by
+/// `ingest.rs`), and treating an absent grouping key as "always distinct" is
+/// safer than either dropping such a result or silently grouping unrelated
+/// results together under an empty-string key.
+fn apply_diversity_cap(
+    mut results: Vec<SearchResult>,
+    max_per_document: usize,
+) -> Vec<SearchResult> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    results.retain(
+        |r| match r.payload.get("file_path").and_then(|v| v.as_str()) {
+            Some(file_path) => {
+                let count = counts.entry(file_path.to_string()).or_insert(0);
+                if *count < max_per_document {
+                    *count += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        },
+    );
+    results
+}
+
+/// Same capping rule as [`apply_diversity_cap`], applied instead to the
+/// post-rerank `(original_index_into_results, relevance_score)` pairs, which
+/// are already sorted best-first by cross-encoder score. `results` is the
+/// pre-rerank candidate pool the indices were computed against — used here only
+/// to look up each candidate's `file_path` for grouping.
+fn cap_reranked_by_document(
+    indexed: Vec<(usize, f32)>,
+    results: &[SearchResult],
+    max_per_document: usize,
+) -> Vec<(usize, f32)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    indexed
+        .into_iter()
+        .filter(|(orig_i, _)| {
+            match results
+                .get(*orig_i)
+                .and_then(|r| r.payload.get("file_path"))
+                .and_then(|v| v.as_str())
+            {
+                Some(file_path) => {
+                    let count = counts.entry(file_path.to_string()).or_insert(0);
+                    if *count < max_per_document {
+                        *count += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => true,
+            }
+        })
+        .collect()
 }
 
 /// A successfully retrieved document.
@@ -323,6 +412,26 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
     }
 
     if let Some(reranker) = deps.reranker {
+        // Diversity, pass 1 of 2 — generous pre-rerank cap on the candidate pool.
+        // See `PRERANK_DIVERSITY_MULTIPLIER`'s doc comment for why this uses a
+        // looser number than the final cap rather than the same one: fusion order
+        // is not relevance order, so capping tightly here (before the
+        // cross-encoder runs) risks throwing away a document's true best chunk.
+        // What this DOES do is stop an implausibly over-represented document from
+        // burning the entire (paid, latency-bound) reranker call on chunks that
+        // could never survive the final cap regardless of their rerank score.
+        //
+        // This only trims *within* whatever Qdrant already returned (bounded by
+        // `rerank_candidate_limit` / `rrf_candidates`) — it cannot recover a
+        // different document's chunks that Qdrant dropped before this function
+        // ever saw them. That earlier stage is a recall problem, tuned separately
+        // via `search.rrf_candidates` / `reranking.candidate_limit`, not something
+        // a post-hoc diversity pass can fix.
+        if let Some(max_per_document) = opts.diversity_max_per_document {
+            let prerank_cap = max_per_document.saturating_mul(PRERANK_DIVERSITY_MULTIPLIER);
+            results = apply_diversity_cap(results, prerank_cap);
+        }
+
         // When explain is requested, snapshot pre-rerank scores keyed by index
         // so we can attach them to each result after reranking updates the score.
         let pre_rerank_scores: Option<Vec<f32>> = if opts.explain {
@@ -344,6 +453,9 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
         let docs: Vec<&str> = docs_with_indices.iter().map(|(_, s)| *s).collect();
         let top_k = opts.limit as usize;
         if docs.is_empty() {
+            if let Some(max_per_document) = opts.diversity_max_per_document {
+                results = apply_diversity_cap(results, max_per_document);
+            }
             results.truncate(top_k);
             return Ok(results);
         }
@@ -354,6 +466,17 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
                     .map(|r| (docs_with_indices[r.index].0, r.relevance_score))
                     .collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Diversity, pass 2 of 2 — the real, user-tunable cap, applied to
+                // the cross-encoder's own ranking (the best relevance signal
+                // available) and BEFORE truncating to `top_k`. Order matters here:
+                // capping before truncation lets the next-best chunk from an
+                // under-represented document backfill the slot a capped chunk
+                // would have taken, rather than just shrinking the result count.
+                if let Some(max_per_document) = opts.diversity_max_per_document {
+                    indexed = cap_reranked_by_document(indexed, &results, max_per_document);
+                }
+
                 results = indexed
                     .into_iter()
                     .take(top_k)
@@ -372,10 +495,23 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
             }
             Err(e) => {
                 warn!("Reranker unavailable, falling back to fused order: {e:#}");
+                // Fused order stands in for a relevance ranking here, same as the
+                // no-reranker branch below — cap it the same way before truncating.
+                if let Some(max_per_document) = opts.diversity_max_per_document {
+                    results = apply_diversity_cap(results, max_per_document);
+                }
                 results.truncate(top_k);
             }
         }
     } else {
+        // No reranker: the fused (hybrid) or dense-cosine order IS the relevance
+        // ranking, so the diversity cap applies directly to it, before truncating
+        // to the caller's requested `limit` — same backfill reasoning as pass 2
+        // above (capping pre-truncation lets a lower-ranked, under-represented
+        // document's chunk fill the slot a capped chunk would have taken).
+        if let Some(max_per_document) = opts.diversity_max_per_document {
+            results = apply_diversity_cap(results, max_per_document);
+        }
         results.truncate(opts.limit as usize);
     }
 
@@ -734,6 +870,104 @@ mod tests {
         assert_eq!(filtered.len(), 3);
     }
 
+    // ------------------------------------------------------------------
+    // diversity cap tests (pure, no network) — issue #86
+    // ------------------------------------------------------------------
+
+    fn make_result_for(file_path: &str, score: f32) -> SearchResult {
+        let mut r = make_search_result(score);
+        r.payload
+            .insert("file_path".into(), serde_json::json!(file_path));
+        r
+    }
+
+    fn file_paths_of(results: &[SearchResult]) -> Vec<&str> {
+        results
+            .iter()
+            .map(|r| r.payload.get("file_path").and_then(|v| v.as_str()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn apply_diversity_cap_limits_one_document_monopolizing() {
+        // 5 chunks all from doc A, ranked best-first, plus 2 from doc B behind them.
+        let results = vec![
+            make_result_for("a.md", 0.9),
+            make_result_for("a.md", 0.85),
+            make_result_for("a.md", 0.8),
+            make_result_for("a.md", 0.75),
+            make_result_for("a.md", 0.7),
+            make_result_for("b.md", 0.65),
+            make_result_for("b.md", 0.6),
+        ];
+        let capped = apply_diversity_cap(results, 2);
+        let a_count = file_paths_of(&capped)
+            .into_iter()
+            .filter(|p| *p == "a.md")
+            .count();
+        assert_eq!(a_count, 2, "doc A must not exceed the cap");
+        assert_eq!(
+            file_paths_of(&capped),
+            vec!["a.md", "a.md", "b.md", "b.md"],
+            "doc B's chunks must backfill the slots doc A lost, preserving relative order"
+        );
+    }
+
+    #[test]
+    fn apply_diversity_cap_preserves_legitimate_multi_chunk_relevance() {
+        // 3 chunks from the same document, all genuinely top-ranked (e.g. three
+        // sections of one guide that all answer the query) — a cap >= 3 must keep
+        // all of them, not collapse to a single result.
+        let results = vec![
+            make_result_for("guide.md", 0.95),
+            make_result_for("guide.md", 0.9),
+            make_result_for("guide.md", 0.85),
+            make_result_for("other.md", 0.5),
+        ];
+        let capped = apply_diversity_cap(results, 3);
+        assert_eq!(
+            file_paths_of(&capped),
+            vec!["guide.md", "guide.md", "guide.md", "other.md"],
+            "a cap >= actual count must not drop any legitimately top-ranked chunk"
+        );
+    }
+
+    #[test]
+    fn apply_diversity_cap_missing_file_path_is_never_capped() {
+        let mut no_path = make_search_result(0.5);
+        no_path.payload.remove("file_path");
+        let results = vec![
+            make_result_for("a.md", 0.9),
+            make_result_for("a.md", 0.8),
+            no_path,
+        ];
+        let capped = apply_diversity_cap(results, 1);
+        assert_eq!(
+            capped.len(),
+            2,
+            "a.md capped to 1, plus the un-groupable result always kept"
+        );
+    }
+
+    #[test]
+    fn cap_reranked_by_document_backfills_like_apply_diversity_cap() {
+        let results = vec![
+            make_result_for("a.md", 0.5), // index 0
+            make_result_for("a.md", 0.5), // index 1
+            make_result_for("a.md", 0.5), // index 2
+            make_result_for("b.md", 0.5), // index 3
+        ];
+        // Post-rerank order: a.md x3 ahead of b.md, matching a cross-encoder that
+        // (correctly, in this synthetic case) still finds doc A most relevant.
+        let indexed = vec![(0, 9.0), (1, 8.0), (2, 7.0), (3, 6.0)];
+        let capped = cap_reranked_by_document(indexed, &results, 2);
+        assert_eq!(
+            capped,
+            vec![(0, 9.0), (1, 8.0), (3, 6.0)],
+            "third a.md candidate dropped, b.md candidate survives in rank order"
+        );
+    }
+
     #[test]
     fn resolve_within_data_enforces_boundaries() {
         let tmp = tempfile::tempdir().unwrap();
@@ -946,6 +1180,11 @@ mod tests {
             modified_after: None,
             modified_before: None,
             rerank_candidate_limit: None,
+            // Off by default in this shared test fixture, even though the shipped
+            // config default is `Some(3)` — existing tests built on `default_opts()`
+            // predate diversity and assert on undiversified result sets. The
+            // diversity-specific tests below opt in explicitly instead.
+            diversity_max_per_document: None,
         }
     }
 
@@ -1146,6 +1385,156 @@ mod tests {
         .await
         .unwrap();
         assert!(returned.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // diversity cap, end-to-end through search() — issue #86
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn search_diversity_caps_one_document_without_reranker() {
+        // One document supplies every candidate but two; without a cap it would
+        // occupy the entire result page and crowd the other document out.
+        let results = vec![
+            make_result_for("prolific.md", 0.99),
+            make_result_for("prolific.md", 0.98),
+            make_result_for("prolific.md", 0.97),
+            make_result_for("prolific.md", 0.96),
+            make_result_for("prolific.md", 0.95),
+            make_result_for("quiet.md", 0.5),
+        ];
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 3,
+            diversity_max_per_document: Some(2),
+            ..default_opts()
+        };
+        let returned = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            file_paths_of(&returned),
+            vec!["prolific.md", "prolific.md", "quiet.md"],
+            "the cap must free a slot for the other document instead of \
+             letting prolific.md fill the whole 3-result page"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_diversity_disabled_lets_one_document_monopolize() {
+        // Same corpus as above, but the knob is off (None) — this is the
+        // regression guard for the disable path: results must revert to the
+        // pre-#86 behaviour where one document can fill every slot.
+        let results = vec![
+            make_result_for("prolific.md", 0.99),
+            make_result_for("prolific.md", 0.98),
+            make_result_for("prolific.md", 0.97),
+            make_result_for("quiet.md", 0.5),
+        ];
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 3,
+            diversity_max_per_document: None,
+            ..default_opts()
+        };
+        let returned = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            file_paths_of(&returned),
+            vec!["prolific.md", "prolific.md", "prolific.md"],
+            "diversity_max_per_document: None must disable capping entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_diversity_preserves_line_ranges() {
+        // The cap must not lose or reorder the line_start/line_end payload
+        // fields callers use to locate the relevant region within a document.
+        let mut r0 = make_result_for("a.md", 0.9);
+        r0.payload
+            .insert("line_start".into(), serde_json::json!(10));
+        r0.payload.insert("line_end".into(), serde_json::json!(20));
+        let mut r1 = make_result_for("a.md", 0.8);
+        r1.payload
+            .insert("line_start".into(), serde_json::json!(30));
+        r1.payload.insert("line_end".into(), serde_json::json!(40));
+        let mut r2 = make_result_for("a.md", 0.7);
+        r2.payload
+            .insert("line_start".into(), serde_json::json!(50));
+        r2.payload.insert("line_end".into(), serde_json::json!(60));
+
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(vec![r0, r1, r2]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 10,
+            diversity_max_per_document: Some(2),
+            ..default_opts()
+        };
+        let returned = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(returned.len(), 2, "capped to 2 of the 3 a.md chunks");
+        let get_lines = |r: &SearchResult| {
+            (
+                r.payload.get("line_start").and_then(|v| v.as_i64()),
+                r.payload.get("line_end").and_then(|v| v.as_i64()),
+            )
+        };
+        assert_eq!(
+            get_lines(&returned[0]),
+            (Some(10), Some(20)),
+            "surviving chunk's own line range must be untouched by capping"
+        );
+        assert_eq!(
+            get_lines(&returned[1]),
+            (Some(30), Some(40)),
+            "surviving chunk's own line range must be untouched by capping"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1642,6 +2031,77 @@ mod tests {
             results[0].payload.get("content").and_then(|v| v.as_str()),
             Some("doc A"),
             "on reranker failure, should return fused order"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_diversity_backfills_after_reranking() {
+        // Pre-rerank (fused) order: b.md ranks best, the 4 a.md chunks trail it.
+        // MockReranker fully reverses whatever order it receives, so the
+        // cross-encoder ends up judging all 4 a.md chunks more relevant than
+        // b.md's, pushing them to the top of the REranked order. The final cap
+        // must still hold against that reranked order: only 2 of a.md's chunks
+        // may survive, and b.md backfills the freed slot rather than the page
+        // just shrinking to 2 results. This is the two-stage design's core
+        // claim — the cap acts on the cross-encoder's ranking, not the weaker
+        // pre-rerank signal.
+        let mut b1 = make_search_result(0.5);
+        b1.payload
+            .insert("file_path".into(), serde_json::json!("b.md"));
+        b1.payload.insert("content".into(), serde_json::json!("b1"));
+        let make_a = |content: &str| {
+            let mut r = make_search_result(0.4);
+            r.payload
+                .insert("file_path".into(), serde_json::json!("a.md"));
+            r.payload
+                .insert("content".into(), serde_json::json!(content));
+            r
+        };
+        let store = MockRetrievalStore::with_results(vec![
+            b1,
+            make_a("a1"),
+            make_a("a2"),
+            make_a("a3"),
+            make_a("a4"),
+        ]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 3,
+            diversity_max_per_document: Some(2),
+            rerank_candidate_limit: None,
+            ..default_opts()
+        };
+
+        let results = search(
+            &deps,
+            "q",
+            &SearchFilters {
+                domain: None,
+                r#type: None,
+                tags: None,
+            },
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            file_paths_of(&results),
+            vec!["a.md", "a.md", "b.md"],
+            "post-rerank cap must trim a.md to 2 and backfill with b.md instead \
+             of the page shrinking to 2 results"
         );
     }
 

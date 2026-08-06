@@ -409,6 +409,38 @@ search:
   # Higher values improve recall at the cost of query latency.
   rrf_candidates: 50
 
+  # Per-document result diversity (issue #86): the maximum number of chunks
+  # from a single document allowed to occupy the final result set. Without
+  # this, one long document with many indexed chunks can occupy several slots
+  # of the reranker candidate pool AND several slots of the final results,
+  # crowding out every other document — and this gets worse, unevenly, as a
+  # document accumulates chunks over time.
+  #
+  # The cap is applied to the BEST relevance signal available for a given
+  # query — the cross-encoder's ranking when reranking is enabled, otherwise
+  # the fused (hybrid) or dense-cosine order — immediately before truncating
+  # to the requested result count. Capping happens before that truncation, not
+  # after, so a lower-ranked chunk from an under-represented document
+  # backfills the slot a capped chunk would have taken, rather than the page
+  # just shrinking. When reranking is enabled, a second, more generous cap
+  # (4x this value) is also applied to the candidate pool BEFORE reranking —
+  # not to recover documents Qdrant already dropped (that's a recall problem,
+  # tuned via rrf_candidates / reranking.candidate_limit above and below, not
+  # something a post-hoc diversity pass can fix), but to stop an implausibly
+  # over-represented document from burning the entire reranker call on chunks
+  # that could never survive the final cap anyway.
+  #
+  # 3 is a deliberately conservative default: it stops full monopolization
+  # (issue #86's reported symptom) while still preserving legitimate
+  # multi-chunk relevance — e.g. three different sections of one guide that
+  # all genuinely answer the query — up to that count. Tune against your own
+  # corpus; a very long single-document knowledge base may want a higher
+  # value, a corpus of many short documents may want a lower one.
+  #
+  # Set to `null` (or remove the line) to disable diversity entirely and
+  # restore pre-#86 behaviour, where a single document may fill every slot.
+  diversity_max_per_document: 3
+
 
 # ----------------------------------------------------------------------------
 # reranking — cross-encoder reranking of search results

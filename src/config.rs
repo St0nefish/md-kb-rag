@@ -591,6 +591,24 @@ pub struct SearchConfig {
     /// Note: RRF scores are ~0.01–0.03 — set accordingly when hybrid is true.
     #[serde(default)]
     pub min_score: Option<f32>,
+    /// Per-document result diversity: the maximum number of chunks from a single
+    /// document allowed to occupy the final result set (see `retrieval::search`'s
+    /// diversity-cap comment for the full funnel-placement reasoning). Chunks
+    /// beyond the cap are dropped in favor of the next-best chunk from a
+    /// different document, so this bounds monopolization without discarding a
+    /// document's top N chunks when several genuinely are the best answer.
+    ///
+    /// `None` disables diversity entirely, restoring historical behaviour (a
+    /// single document may fill every result slot) — same `Option` convention
+    /// as `min_score` above: set explicit `null` in YAML to opt out. Defaults to
+    /// `Some(3)` rather than `None`: issue #86 established that one prolific
+    /// document silently crowding out the rest of the corpus is a real,
+    /// observed failure mode, so diversity ships on by default with a value
+    /// conservative enough (3 of a default 10-result page) to preserve
+    /// legitimate multi-chunk relevance without obviously degrading results
+    /// that were never a monoculture in the first place.
+    #[serde(default = "default_diversity_max_per_document")]
+    pub diversity_max_per_document: Option<usize>,
 }
 
 impl Default for SearchConfig {
@@ -599,12 +617,17 @@ impl Default for SearchConfig {
             hybrid: true,
             rrf_candidates: default_rrf_candidates(),
             min_score: None,
+            diversity_max_per_document: default_diversity_max_per_document(),
         }
     }
 }
 
 fn default_rrf_candidates() -> usize {
     50
+}
+
+fn default_diversity_max_per_document() -> Option<usize> {
+    Some(3)
 }
 
 /// Resolved embedding config — all required fields are guaranteed present.
@@ -746,6 +769,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("search.hybrid", "search"),
     ("search.rrf_candidates", "search"),
     ("search.min_score", "search"),
+    ("search.diversity_max_per_document", "search"),
     ("reranking.enabled", "reranking"),
     ("reranking.candidate_limit", "reranking"),
     ("reranking.api_key_env", "reranking"),
@@ -1088,6 +1112,11 @@ impl Config {
         }
         if self.search.rrf_candidates == 0 {
             anyhow::bail!("search.rrf_candidates must be >= 1");
+        }
+        if self.search.diversity_max_per_document == Some(0) {
+            anyhow::bail!(
+                "search.diversity_max_per_document must be >= 1, or null to disable diversity"
+            );
         }
         if self.mcp.metadata_refresh_secs < 10 {
             anyhow::bail!("mcp.metadata_refresh_secs must be >= 10");
@@ -1926,14 +1955,47 @@ mcp:
         // Verify search section round-trips from the example config
         assert!(cfg.search.hybrid);
         assert_eq!(cfg.search.rrf_candidates, 50);
+        assert_eq!(cfg.search.diversity_max_per_document, Some(3));
     }
 
     #[test]
     fn search_config_defaults() {
-        // A config with no `search` section gets hybrid=true, rrf_candidates=50.
+        // A config with no `search` section gets hybrid=true, rrf_candidates=50,
+        // diversity_max_per_document=Some(3) — issue #86's default-on diversity cap.
         let cfg = Config::from_str_raw("{}").unwrap();
         assert!(cfg.search.hybrid);
         assert_eq!(cfg.search.rrf_candidates, 50);
+        assert_eq!(cfg.search.diversity_max_per_document, Some(3));
+    }
+
+    #[test]
+    fn search_config_diversity_explicit_null_disables() {
+        // The same Option convention as search.min_score: an explicit `null`
+        // overrides the non-None default and disables the feature.
+        let yaml = "search:\n  diversity_max_per_document: null\n";
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.search.diversity_max_per_document, None);
+    }
+
+    #[test]
+    fn search_config_diversity_custom_value() {
+        let yaml = "search:\n  diversity_max_per_document: 7\n";
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.search.diversity_max_per_document, Some(7));
+    }
+
+    #[test]
+    fn search_config_diversity_zero_rejected_at_resolve() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let yaml = "search:\n  diversity_max_per_document: 0\n";
+        let err = Config::from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("search.diversity_max_per_document must be >= 1"),
+            "expected the diversity validation message, got: {err}"
+        );
+        clear_required_env();
     }
 
     #[test]
