@@ -1020,13 +1020,44 @@ async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bo
         .context("Failed to ensure git repository")?;
     }
 
+    // Constructed here — the only place this whole call path ever builds a *live*
+    // Qdrant/embedding client — and handed to `index_paths_generic` behind the
+    // `VectorStore`/`EmbedStore` traits it already accepts for
+    // `upsert_pending`/`remove_orphans`. Both constructions are pure local setup (no
+    // I/O), so moving `EmbedClient::new` here from its old spot later in the function
+    // changes nothing observable. Everything past this point runs generically over
+    // those traits, so it can be driven by fakes in tests with no live service — see
+    // `index_paths_generic`'s doc comment.
+    let store = QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?;
+    let embedder = EmbedClient::new(&config.embedding);
+
+    index_paths_generic(config, paths, force, run_start, &embedder, &store).await
+}
+
+/// The indexing pipeline body, generic over the embedding/vector-store dependencies
+/// so it can be exercised with fakes — no live Qdrant or embedding service required —
+/// while still being the exact code production runs. [`index_paths_inner`] is the
+/// only production caller: it constructs the real `EmbedClient`/`QdrantStore` and
+/// passes them straight in, so this split changes nothing about what `serve`'s
+/// worker or the `index` CLI actually do — it only adds a second entry point for
+/// tests to call with fakes instead of live services.
+///
+/// `run_start` is threaded in as a parameter rather than started internally so the
+/// elapsed time in the closing summary log still covers `index_paths_inner`'s
+/// git-sync step, exactly as it did before this function existed.
+async fn index_paths_generic<E: EmbedStore, Q: VectorStore>(
+    config: &ResolvedConfig,
+    paths: &[PathBuf],
+    force: bool,
+    run_start: std::time::Instant,
+    embedder: &E,
+    store: &Q,
+) -> Result<()> {
     // ── Infrastructure ──────────────────────────────────────────────────────
     let db_path = config.state_db_path();
     let state = StateDb::new(Path::new(&db_path))
         .await
         .context("Failed to open state DB")?;
-
-    let store = QdrantStore::new(&config.qdrant).context("Failed to connect to Qdrant")?;
 
     let collection = &config.qdrant.collection;
     let vector_size = config.embedding.vector_size;
@@ -1102,8 +1133,6 @@ async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bo
     if force {
         state.clear().await.context("Failed to clear state DB")?;
     }
-
-    let embedder = EmbedClient::new(&config.embedding);
 
     INDEX_STATUS.set_files_total(paths.len() as u64);
 
@@ -1223,7 +1252,7 @@ async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bo
     if !pending.is_empty() {
         INDEX_STATUS.set_phase(Phase::Embedding);
         info!("Embedding chunks for {} changed file(s)…", pending_count);
-        upsert_pending(&pending, &embedder, &store, &state, collection).await?;
+        upsert_pending(&pending, embedder, store, &state, collection).await?;
     }
 
     // ── Backfill metadata for unchanged files ────────────────────────────────
@@ -1242,7 +1271,7 @@ async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bo
     if !missing.is_empty() {
         INDEX_STATUS.set_phase(Phase::RemovingOrphans);
         info!("Removing {} missing file(s) from index", missing.len());
-        remove_orphans(&missing, &store, &state, collection).await?;
+        remove_orphans(&missing, store, &state, collection).await?;
     }
 
     // ── Summary ──────────────────────────────────────────────────────────────
@@ -1445,6 +1474,128 @@ mod tests {
         assert!(
             snap.last_success_unix.is_none(),
             "a failing run must not stamp a success timestamp"
+        );
+    }
+
+    // -- index_paths_generic ---------------------------------------------------
+    //
+    // `index_paths_inner` (the production caller) constructs a real `QdrantStore`
+    // and `EmbedClient` and hands them straight to `index_paths_generic` — this is
+    // the injection point issue #84 asked for. These tests call the generic
+    // function directly with fakes, exercising the real per-path routing logic with
+    // no live Qdrant or embedding service.
+    //
+    // `expected_schema_hash` and `open_scan_test_db`, defined below for
+    // `scan_for_dirty`'s tests, are reused here — same config, same on-disk state
+    // DB, same "what schema hash would the pipeline itself compute" helper.
+
+    /// A changed (new) file, an unchanged file, and a missing (orphaned) file, in one
+    /// run — the exact three-way split `process_file`'s `FileOutcome` and this
+    /// function's per-path loop exist to make. If a path were ever misrouted — an
+    /// unchanged file re-embedded, a changed file skipped, or a missing file left
+    /// untouched instead of purged — this catches it directly: the fake
+    /// embedder/store only ever see the one file that should actually be
+    /// (re)embedded, and the state DB ends up with exactly the expected
+    /// insert/retain/delete outcome for each of the three.
+    #[tokio::test]
+    async fn index_paths_generic_routes_changed_unchanged_and_missing_correctly() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        std::fs::write(dir.path().join("changed.md"), "# Changed\n\nNew content.").unwrap();
+        let unchanged_content = "# Unchanged\n\nSame as last run.";
+        std::fs::write(dir.path().join("unchanged.md"), unchanged_content).unwrap();
+        // "missing.md" deliberately has no file on disk — it exists only as a state
+        // row, simulating a file deleted since the last run.
+
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+        let unchanged_hash = compute_hash_from_bytes(unchanged_content.as_bytes());
+
+        let state = open_scan_test_db(&config).await;
+        let mut fm = HashMap::new();
+        fm.insert("title".into(), serde_json::json!("Unchanged"));
+        state
+            .upsert("unchanged.md", &unchanged_hash, 1, &schema_hash, 0, 0)
+            .await
+            .unwrap();
+        state
+            .upsert_document_metadata("unchanged.md", &fm, 0, &unchanged_hash, 1)
+            .await
+            .unwrap();
+        state
+            .upsert("missing.md", "stale-hash", 1, &schema_hash, 0, 0)
+            .await
+            .unwrap();
+        state
+            .upsert_document_metadata("missing.md", &HashMap::new(), 0, "stale-hash", 1)
+            .await
+            .unwrap();
+        assert_eq!(state.document_count().await.unwrap(), 2);
+
+        let paths = vec![
+            PathBuf::from("changed.md"),
+            PathBuf::from("unchanged.md"),
+            PathBuf::from("missing.md"),
+        ];
+        // Exactly 1 embedding: "changed.md" is the only file expected to produce a
+        // chunk to embed. If routing ever sent a second file's text through, the
+        // embedding-count mismatch check in `upsert_pending` would itself fail the
+        // run — a second, independent signal on top of the assertions below.
+        let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        // Only the changed file was embedded and upserted. Scoped so the
+        // `MutexGuard` is dropped before the `.await`s below.
+        {
+            let points = store.upserted_points.lock().unwrap();
+            assert_eq!(
+                points.len(),
+                1,
+                "only the changed file should produce points"
+            );
+            assert_eq!(
+                points[0].payload.get("file_path").and_then(|v| v.as_str()),
+                Some("changed.md"),
+                "the unchanged file must not have been re-embedded"
+            );
+        }
+
+        // Only the missing file was purged.
+        let deletes = store.delete_by_files_calls.lock().unwrap().clone();
+        assert_eq!(deletes.len(), 1, "exactly one orphan-removal batch");
+        assert_eq!(deletes[0], vec!["missing.md".to_string()]);
+
+        // State DB reflects the outcome: changed.md now tracked, unchanged.md
+        // untouched, missing.md gone.
+        assert!(
+            state.get("changed.md").await.unwrap().is_some(),
+            "changed.md must now be tracked"
+        );
+        let unchanged_entry = state.get("unchanged.md").await.unwrap().unwrap();
+        assert_eq!(
+            unchanged_entry.content_hash, unchanged_hash,
+            "unchanged.md's row must be untouched"
+        );
+        assert!(
+            state.get("missing.md").await.unwrap().is_none(),
+            "missing.md's row must be purged"
+        );
+        assert_eq!(
+            state.document_count().await.unwrap(),
+            2,
+            "changed.md + unchanged.md remain; missing.md's metadata is gone"
         );
     }
 
@@ -2440,6 +2591,22 @@ mod tests {
         async fn delete_points_by_ids(&self, _collection: &str, _ids: Vec<String>) -> Result<()> {
             Ok(())
         }
+
+        // Neither collection-lifecycle method is exercised by the tests that use
+        // this mock (they drive `upsert_pending`/`remove_orphans` directly, not the
+        // full `index_paths_generic` pipeline) — no-op stubs to satisfy the trait.
+        async fn drop_collection(&self, _collection: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_collection(
+            &self,
+            _collection: &str,
+            _vector_size: u64,
+            _indexed_fields: &[crate::qdrant::IndexedField],
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     struct TrackingMockVectorStore {
@@ -2448,6 +2615,11 @@ mod tests {
         upsert_result: Mutex<Result<()>>,
         upsert_called: Mutex<bool>,
         upserted_points: Mutex<Vec<crate::qdrant::QdrantPoint>>,
+        /// Number of `ensure_collection` calls seen — used by
+        /// `index_paths_generic` tests to confirm the collection is (re)ensured
+        /// exactly once per run, without needing a real Qdrant to ensure.
+        ensure_collection_calls: Mutex<usize>,
+        drop_collection_calls: Mutex<usize>,
     }
 
     impl TrackingMockVectorStore {
@@ -2458,6 +2630,8 @@ mod tests {
                 upsert_result: Mutex::new(Ok(())),
                 upsert_called: Mutex::new(false),
                 upserted_points: Mutex::new(Vec::new()),
+                ensure_collection_calls: Mutex::new(0),
+                drop_collection_calls: Mutex::new(0),
             }
         }
     }
@@ -2490,6 +2664,21 @@ mod tests {
 
         async fn delete_points_by_ids(&self, _collection: &str, ids: Vec<String>) -> Result<()> {
             self.deleted_ids.lock().unwrap().extend(ids);
+            Ok(())
+        }
+
+        async fn drop_collection(&self, _collection: &str) -> Result<()> {
+            *self.drop_collection_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        async fn ensure_collection(
+            &self,
+            _collection: &str,
+            _vector_size: u64,
+            _indexed_fields: &[crate::qdrant::IndexedField],
+        ) -> Result<()> {
+            *self.ensure_collection_calls.lock().unwrap() += 1;
             Ok(())
         }
     }
@@ -2792,6 +2981,64 @@ mod tests {
 
         let deleted_ids = store.deleted_ids.lock().unwrap().clone();
         assert!(deleted_ids.is_empty(), "no tail trim when file grew");
+    }
+
+    /// Every upserted point's ID must be keyed off its OWN file and chunk index —
+    /// not some other file's, and not a position in a flattened, cross-file
+    /// sequence. `upsert_pending` flattens every pending file's chunk texts into one
+    /// `all_texts` vector before embedding, then walks `pending` again zipped with
+    /// `file_boundaries` to reconstruct which embeddings belong to which file. If
+    /// that reconstruction ever mispaired a file with the wrong slice — an
+    /// off-by-one in the boundary zip, or generating IDs from the chunk's position
+    /// in the flattened batch instead of `chunk.index` — the resulting points would
+    /// upsert under IDs belonging to a *different* document: silently shadowing
+    /// whatever was there and leaving the real document's true chunks unreachable.
+    /// Two files, each with its own 2-chunk `make_pending`, makes that failure mode
+    /// directly observable per point rather than only in aggregate.
+    #[tokio::test]
+    async fn upsert_pending_assigns_point_ids_keyed_by_own_file_and_chunk_index() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        let pending = vec![
+            make_pending("data/first.md", 2, 0),
+            make_pending("data/second.md", 2, 0),
+        ];
+        // 4 chunks total across the two files, in flattened order.
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]; 4]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        assert!(result.is_ok());
+
+        let points = store.upserted_points.lock().unwrap();
+        assert_eq!(points.len(), 4);
+
+        for pf in &pending {
+            for chunk in &pf.chunks {
+                let expected_id = make_point_id(&pf.file_path, chunk.index);
+                let matching = points.iter().find(|p| p.id == expected_id);
+                let point = matching.unwrap_or_else(|| {
+                    panic!(
+                        "no upserted point with id {expected_id} for {}#{}",
+                        pf.file_path, chunk.index
+                    )
+                });
+                assert_eq!(
+                    point.payload.get("file_path").and_then(|v| v.as_str()),
+                    Some(pf.file_path.as_str()),
+                    "point {expected_id} carries the wrong file's payload"
+                );
+                assert_eq!(
+                    point
+                        .payload
+                        .get("chunk_index")
+                        .and_then(serde_json::Value::as_u64),
+                    Some(chunk.index as u64),
+                    "point {expected_id} carries the wrong chunk_index"
+                );
+            }
+        }
     }
 
     #[test]

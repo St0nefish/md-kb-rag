@@ -23,6 +23,13 @@ pub struct FieldError {
     pub got: Option<String>,
     /// The set of allowed values, populated for `rule == "allowed_value"`.
     pub expected: Option<Vec<String>>,
+    /// Which schema file declared the violated rule — a `.kb-schema.yaml` path
+    /// relative to the KB root, or `"config.yaml"` for the legacy global config.
+    /// `None` for non-schema rules (`"lint"`, `"io"`). The cascade means the rule
+    /// may come from an ancestor directory rather than the document's own, so a
+    /// caller cannot fix what it cannot locate — this is also embedded in
+    /// `message`, matching the same field `get_schema` reports as `declared_in`.
+    pub schema_origin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +77,27 @@ pub async fn validate_file(
 ) -> anyhow::Result<(ValidationResult, Option<ValidatedFile>)> {
     let content = tokio::fs::read_to_string(path).await?;
     validate_content(path, &content, schema, validation).await
+}
+
+/// Which schema file declared `field`'s rule, formatted both as a bracketed message
+/// suffix and as the bare (sanitized) origin string for `FieldError::schema_origin`.
+///
+/// The cascade means the rule enforced against a document in `a/b/c.md` may come from
+/// `a/.kb-schema.yaml`, `a/b/.kb-schema.yaml`, or the implicit root schema — naming it
+/// is the difference between a caller that can go fix the right file and one that has
+/// to guess. Sanitized the same way `get_schema`'s `declared_in` is: schema paths
+/// originate in directory names from a synced git repo and are reflected straight into
+/// an error a caller reads, so they get the same control-character/length treatment as
+/// any other knowledge-base-controlled string reaching an agent.
+fn origin_suffix(schema: &ResolvedSchema, field: &str) -> (Option<String>, String) {
+    match schema.origin.get(field) {
+        Some(origin) => {
+            let clean = crate::server::sanitize_facet_value(origin);
+            let suffix = format!(" [declared in {clean}]");
+            (Some(clean), suffix)
+        }
+        None => (None, String::new()),
+    }
 }
 
 /// Render a value compactly for an error message, without dumping a whole document.
@@ -151,12 +179,14 @@ pub fn validate_frontmatter(
 
         if absent || empty_string {
             if def.required {
+                let (schema_origin, suffix) = origin_suffix(schema, field);
                 field_errors.push(FieldError {
                     field: field.clone(),
                     rule: "required".into(),
-                    message: format!("Missing required frontmatter field: '{}'", field),
+                    message: format!("Missing required frontmatter field: '{}'{}", field, suffix),
                     got: None,
                     expected: None,
+                    schema_origin,
                 });
             }
             if absent {
@@ -174,12 +204,14 @@ pub fn validate_frontmatter(
 
         if let Some(ty) = def.ty {
             if let Err(reason) = schema::check_type(ty, value) {
+                let (schema_origin, suffix) = origin_suffix(schema, field);
                 field_errors.push(FieldError {
                     field: field.clone(),
                     rule: "type_mismatch".into(),
-                    message: format!("field '{}': {}", field, reason),
+                    message: format!("field '{}': {}{}", field, reason, suffix),
                     got: Some(compact_value(value)),
                     expected: None,
+                    schema_origin,
                 });
                 // A wrong-typed value cannot be meaningfully checked against a value
                 // set or an object's key list.
@@ -190,6 +222,9 @@ pub fn validate_frontmatter(
                 && !def.open
                 && let Some(map) = value.as_object()
             {
+                // The rule lives on the parent object field (e.g. `planning`), not the
+                // undeclared child key (`planning.typo_key`) — look origin up by that.
+                let (schema_origin, suffix) = origin_suffix(schema, field);
                 for key in map.keys() {
                     let child = format!("{}.{}", field, key);
                     if !schema.fields.contains_key(&child) {
@@ -197,11 +232,12 @@ pub fn validate_frontmatter(
                             field: child.clone(),
                             rule: "closed_object".into(),
                             message: format!(
-                                "field '{}' is not declared, and '{}' does not allow undeclared keys",
-                                child, field
+                                "field '{}' is not declared, and '{}' does not allow undeclared keys{}",
+                                child, field, suffix
                             ),
                             got: None,
                             expected: None,
+                            schema_origin: schema_origin.clone(),
                         });
                     }
                 }
@@ -222,12 +258,14 @@ pub fn validate_frontmatter(
         if let Some(permitted) = &def.values
             && let Err(reason) = value_check
         {
+            let (schema_origin, suffix) = origin_suffix(schema, field);
             field_errors.push(FieldError {
                 field: field.clone(),
                 rule: "allowed_value".into(),
-                message: format!("field '{}': {}", field, reason),
+                message: format!("field '{}': {}{}", field, reason, suffix),
                 got: Some(compact_value(value)),
                 expected: Some(permitted.clone()),
+                schema_origin,
             });
         }
     }
@@ -279,6 +317,8 @@ pub async fn validate_content(
                     message: msg,
                     got: None,
                     expected: None,
+                    // Not a schema rule — nothing in .kb-schema.yaml to point at.
+                    schema_origin: None,
                 });
             }
             Err(e) => {
@@ -288,6 +328,7 @@ pub async fn validate_content(
                     message: format!("Failed to run lint command: {}", e),
                     got: None,
                     expected: None,
+                    schema_origin: None,
                 });
             }
             _ => {}
@@ -339,6 +380,7 @@ pub async fn validate_all(
                         message: msg.clone(),
                         got: None,
                         expected: None,
+                        schema_origin: None,
                     };
                     let result = ValidationResult {
                         file_path: file.to_string_lossy().to_string(),
@@ -902,5 +944,134 @@ mod tests {
         }
         // errors and field_errors must have the same length
         assert_eq!(result.errors.len(), result.field_errors.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema-origin provenance (issue #76): a caller must be able to locate the
+    // schema file that imposed a violated rule, not just what the rule was.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn required_field_error_names_its_declaring_schema() {
+        // The legacy config-only cascade root is a synthetic schema whose origin is
+        // always "config.yaml" (see `ResolvedSchema::from_config`).
+        let content = "---\ntitle: Test\n---\nBody"; // missing 'type'
+        let f = write_temp(content);
+        let (result, _) = validate_file(
+            f.path(),
+            &as_schema(&default_fm_config()),
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+
+        let fe = result
+            .field_errors
+            .iter()
+            .find(|e| e.field == "type" && e.rule == "required")
+            .expect("expected a required-field error for 'type'");
+        assert_eq!(fe.schema_origin.as_deref(), Some("config.yaml"));
+        assert!(
+            fe.message.contains("[declared in config.yaml]"),
+            "expected the message to name the declaring schema, got: {}",
+            fe.message
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_value_error_names_the_cascaded_schema_file_not_the_root() {
+        // A field redeclared by a directory-level .kb-schema.yaml must report THAT
+        // file, not the root the cascade started from — the whole point of provenance
+        // is that a deeper scope can override a shallower one's rule.
+        let schema: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  status:\n    type: enum\n    values: [archived]\n")
+                .unwrap();
+        let resolved =
+            ResolvedSchema::default().merged_with_for_test(&schema, "food/.kb-schema.yaml");
+
+        let (result, _) = validate_content(
+            Path::new("food/d.md"),
+            "---\nstatus: draft\n---\nBody",
+            &resolved,
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+
+        let fe = result
+            .field_errors
+            .iter()
+            .find(|e| e.field == "status" && e.rule == "allowed_value")
+            .expect("expected an allowed_value error for 'status'");
+        assert_eq!(fe.schema_origin.as_deref(), Some("food/.kb-schema.yaml"));
+        assert!(
+            fe.message.contains("[declared in food/.kb-schema.yaml]"),
+            "got: {}",
+            fe.message
+        );
+        // The permitted set must still be listed too — origin is additive, not a
+        // replacement for the existing "allowed: ..." detail.
+        assert!(
+            fe.expected
+                .as_ref()
+                .unwrap()
+                .contains(&"archived".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_object_error_is_attributed_to_the_parent_fields_origin() {
+        // The undeclared key is `planning.typo_key`, which never appears in
+        // `schema.origin` itself — the rule ("no undeclared keys") belongs to the
+        // parent object field `planning`, so provenance must be looked up under that
+        // key, not the synthesized child path.
+        let schema: SchemaFile = serde_yaml_ng::from_str(
+            "fields:\n  planning:\n    type: object\n    open: false\n    fields:\n      effort:\n        type: text\n",
+        )
+        .unwrap();
+        let resolved = ResolvedSchema::default().merged_with_for_test(&schema, "s");
+
+        let (result, _) = validate_content(
+            Path::new("d.md"),
+            "---\nplanning:\n  effort: low\n  typo_key: x\n---\nBody",
+            &resolved,
+            &default_val_config(),
+        )
+        .await
+        .unwrap();
+
+        let fe = result
+            .field_errors
+            .iter()
+            .find(|e| e.rule == "closed_object")
+            .expect("expected a closed_object error");
+        assert_eq!(fe.field, "planning.typo_key");
+        assert_eq!(
+            fe.schema_origin.as_deref(),
+            Some("s"),
+            "origin must come from the parent field 'planning', not the child path"
+        );
+    }
+
+    #[tokio::test]
+    async fn lint_and_io_errors_have_no_schema_origin() {
+        // Neither failure mode comes from a frontmatter rule, so there is no schema
+        // file to point at — `schema_origin` must stay `None` rather than fabricate one.
+        let content = "---\ntitle: Test\ntype: guide\n---\nBody";
+        let f = write_temp(content);
+        let val_config = ValidationConfig {
+            enabled: true,
+            strict: false,
+            lint_command: Some(vec!["false".into()]),
+        };
+        let (result, _) = validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
+            .await
+            .unwrap();
+        let fe = result
+            .field_errors
+            .iter()
+            .find(|e| e.rule == "lint")
+            .expect("expected a lint error");
+        assert!(fe.schema_origin.is_none());
     }
 }
