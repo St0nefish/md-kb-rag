@@ -548,6 +548,16 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
              as the default when the caller does not pass their own min_score.",
         );
     }
+    if old.search.diversity_max_per_document != new.search.diversity_max_per_document {
+        r.record(
+            ReloadEffect::Applied,
+            "search.diversity_max_per_document",
+            d(&old.search.diversity_max_per_document),
+            d(&new.search.diversity_max_per_document),
+            "read fresh from the live config on every search call (mcp.rs search, \
+             retrieval::search's per-document diversity cap).",
+        );
+    }
 
     // ── reranking ────────────────────────────────────────────────────────────
     if old.reranking.is_some() != new.reranking.is_some() {

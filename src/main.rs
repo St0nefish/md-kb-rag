@@ -373,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
                 modified_after,
                 modified_before,
                 rerank_candidate_limit: cfg.reranking.as_ref().map(|r| r.candidate_limit as u64),
+                diversity_max_per_document: cfg.search.diversity_max_per_document,
             };
 
             let results = retrieval::search(&deps, &args.query, &filters, &opts)
