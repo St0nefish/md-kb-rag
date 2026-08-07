@@ -2442,7 +2442,8 @@ impl KbSearchServer {
         Accepts paths relative to the knowledge base root (e.g. \
         'lifestyle/vehicles/foo.md', as returned by the `search` tool) or just \
         the basename if it's unique across the index. Returns the complete \
-        markdown including frontmatter. \
+        markdown including frontmatter, in both the text content and \
+        structured_content.content. \
         structured_content.content_hash is a SHA-256 hex digest of the returned \
         content — pass it as edit_document's expected_hash to guard against editing \
         stale content."
@@ -2484,10 +2485,19 @@ impl KbSearchServer {
                 // content, so a caller can round-trip it straight into edit_document's
                 // expected_hash without this project introducing a second hash scheme.
                 let content_hash = crate::ingest::compute_hash_from_bytes(doc.content.as_bytes());
+                // structured_content must mirror the text block: MCP clients that
+                // prefer structuredContent render ONLY it, so a hash-only payload
+                // makes the document invisible to them (observed in practice).
+                let structured = serde_json::json!({
+                    "path": retrieval::relative_to_data(
+                        &doc.path.to_string_lossy(),
+                        &self.canonical_data_path,
+                    ),
+                    "content": &doc.content,
+                    "content_hash": content_hash,
+                });
                 let mut result = CallToolResult::success(vec![Content::text(doc.content)]);
-                result.structured_content = Some(serde_json::json!({
-                    "content_hash": content_hash
-                }));
+                result.structured_content = Some(structured);
                 Ok(result)
             }
             Err(GetDocumentError::Outside) => {
@@ -6319,6 +6329,14 @@ mod tests {
             "must be the exact same hashing indexed_files.content_hash uses, so a \
              caller can round-trip it into edit_document's expected_hash"
         );
+        assert_eq!(
+            structured["content"].as_str(),
+            Some(content),
+            "structured_content must carry the full document: clients that prefer \
+             structuredContent render only it, so a hash-only payload hides the \
+             document entirely"
+        );
+        assert_eq!(structured["path"].as_str(), Some("docs/guide.md"));
     }
 
     #[tokio::test]
