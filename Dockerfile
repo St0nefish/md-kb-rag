@@ -15,6 +15,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Build real binary
 COPY src/ src/
 COPY migrations/ migrations/
+COPY assets/ assets/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=md-rag-target,target=/build/target \
     touch src/main.rs && cargo build --release && \
