@@ -223,7 +223,11 @@
   function updateModeBadge() {
     if (!els.modeBadge) return;
     els.modeBadge.textContent = mode === "create" ? "NEW" : "EDIT";
-    els.modeBadge.style.background = mode === "create" ? "#059669" : "#2563eb";
+    // Theme-aware via CSS (--accent-success / --accent tokens in viz.css)
+    // rather than an inline hex background, so the badge follows
+    // prefers-color-scheme instead of being pinned to the light palette.
+    els.modeBadge.classList.toggle("mode-create", mode === "create");
+    els.modeBadge.classList.toggle("mode-edit", mode !== "create");
   }
 
   async function onPathBlur() {
