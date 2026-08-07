@@ -41,11 +41,111 @@
  *     every marked.parse() call before the result is assigned to
  *     innerHTML. Not part of the OKF original, which never rendered
  *     untrusted markdown to live HTML at view time.
+ *   - The Cytoscape canvas is drawn from a JS style array, which can't
+ *     read the CSS custom properties viz.css's light/dark palette is
+ *     built on. `themeColors()`/`buildStyle()` supply the handful of
+ *     canvas-relevant colors (node label/border, default edge color) for
+ *     whichever mode `prefers-color-scheme` currently reports, and a
+ *     `change` listener on that media query re-applies the style to the
+ *     live `cy` instance so the graph repaints if the OS theme flips
+ *     while the page is open. Not part of the OKF original, which had no
+ *     dark mode.
  */
 (function () {
   "use strict";
 
   const SEARCH_DEBOUNCE_MS = 300;
+
+  const darkMq = window.matchMedia("(prefers-color-scheme: dark)");
+
+  /** Canvas-relevant colors Cytoscape's style JSON can't pull from CSS
+   * custom properties. Mirrors viz.css's --text/--border/--border-strong
+   * tokens; the accent colors (selection highlight, search-hit ring) stay
+   * identical in both modes, so they're inlined directly in buildStyle()
+   * rather than threaded through here. */
+  function themeColors() {
+    return darkMq.matches
+      ? { nodeLabel: "#e2e8f0", nodeBorder: "#e2e8f0", edgeLine: "#475569" }
+      : { nodeLabel: "#0f172a", nodeBorder: "#0f172a", edgeLine: "#cbd5e1" };
+  }
+
+  function buildStyle() {
+    const t = themeColors();
+    return [
+      {
+        selector: "node",
+        style: {
+          "background-color": "data(color)",
+          "label": "data(label)",
+          "color": t.nodeLabel,
+          "font-size": 11,
+          "text-valign": "bottom",
+          "text-margin-y": 4,
+          "text-wrap": "wrap",
+          "text-max-width": 120,
+          "width": "data(size)",
+          "height": "data(size)",
+          "border-width": 1,
+          "border-color": t.nodeBorder,
+        },
+      },
+      {
+        selector: 'node[status = "archived"]',
+        style: {
+          "opacity": 0.55,
+        },
+      },
+      {
+        selector: "node:selected",
+        style: {
+          "border-width": 3,
+          "border-color": "#f59e0b",
+        },
+      },
+      {
+        selector: "edge",
+        style: {
+          "width": 1.5,
+          "line-color": t.edgeLine,
+          "target-arrow-color": t.edgeLine,
+          "target-arrow-shape": "triangle",
+          "curve-style": "bezier",
+          "arrow-scale": 0.9,
+          "line-style": "solid",
+          "opacity": 1,
+        },
+      },
+      {
+        selector: 'edge[kind = "semantic"]',
+        style: {
+          "line-style": "dashed",
+          "target-arrow-shape": "none",
+          "opacity": "mapData(score, 0, 1, 0.15, 0.65)",
+        },
+      },
+      {
+        selector: "edge:selected",
+        style: {
+          "line-color": "#f59e0b",
+          "target-arrow-color": "#f59e0b",
+          "width": 2.5,
+        },
+      },
+      {
+        selector: ".dim",
+        style: { "opacity": 0.15 },
+      },
+      {
+        selector: ".search-hit",
+        style: {
+          "border-width": 4,
+          "border-color": "#0ea5e9",
+          "border-style": "solid",
+          "z-index": 999,
+        },
+      },
+    ];
+  }
 
   let cy = null;
   let nodeIndex = {};
@@ -88,82 +188,17 @@
     cy = cytoscape({
       container: graphEl,
       elements: [...(bundle.nodes || []), ...(bundle.edges || [])],
-      style: [
-        {
-          selector: "node",
-          style: {
-            "background-color": "data(color)",
-            "label": "data(label)",
-            "color": "#0f172a",
-            "font-size": 11,
-            "text-valign": "bottom",
-            "text-margin-y": 4,
-            "text-wrap": "wrap",
-            "text-max-width": 120,
-            "width": "data(size)",
-            "height": "data(size)",
-            "border-width": 1,
-            "border-color": "#0f172a",
-          },
-        },
-        {
-          selector: 'node[status = "archived"]',
-          style: {
-            "opacity": 0.55,
-          },
-        },
-        {
-          selector: "node:selected",
-          style: {
-            "border-width": 3,
-            "border-color": "#f59e0b",
-          },
-        },
-        {
-          selector: "edge",
-          style: {
-            "width": 1.5,
-            "line-color": "#cbd5e1",
-            "target-arrow-color": "#cbd5e1",
-            "target-arrow-shape": "triangle",
-            "curve-style": "bezier",
-            "arrow-scale": 0.9,
-            "line-style": "solid",
-            "opacity": 1,
-          },
-        },
-        {
-          selector: 'edge[kind = "semantic"]',
-          style: {
-            "line-style": "dashed",
-            "target-arrow-shape": "none",
-            "opacity": "mapData(score, 0, 1, 0.15, 0.65)",
-          },
-        },
-        {
-          selector: "edge:selected",
-          style: {
-            "line-color": "#f59e0b",
-            "target-arrow-color": "#f59e0b",
-            "width": 2.5,
-          },
-        },
-        {
-          selector: ".dim",
-          style: { "opacity": 0.15 },
-        },
-        {
-          selector: ".search-hit",
-          style: {
-            "border-width": 4,
-            "border-color": "#0ea5e9",
-            "border-style": "solid",
-            "z-index": 999,
-          },
-        },
-      ],
+      style: buildStyle(),
       layout: { name: "cose", animate: false, padding: 30 },
       wheelSensitivity: 0.2,
+    });
+
+    // Repaint the canvas (label/border/edge colors) if the OS/browser
+    // theme flips while the page is open — CSS handles the rest of the
+    // page via var(--token) cascades, but Cytoscape's style is a JS
+    // object snapshot that has to be explicitly rebuilt and reapplied.
+    darkMq.addEventListener("change", () => {
+      if (cy) cy.style(buildStyle());
     });
 
     cy.on("tap", "node", (evt) => {
