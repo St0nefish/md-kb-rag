@@ -1626,6 +1626,7 @@ dependencies = [
  "qdrant-client",
  "reqwest",
  "rmcp",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml_ng",

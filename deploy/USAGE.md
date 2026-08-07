@@ -154,8 +154,7 @@ fields:
       effort:       { type: enum, values: [low, medium, high], indexed: true }
   tags:
     type: list
-    extend: true          # union values with the inherited definition instead of replacing
-    values: [dinner, quick]
+    values: [$values, dinner, quick]   # inherited values, then these — see below
 ```
 
 Nested authoring (as above) and flat dot-paths (`planning.prep_minutes:`) are equivalent — nesting is sugar flattened at parse time.
@@ -170,9 +169,31 @@ A field definition can't declare both a scalar `type` and nested `fields:` — a
 
 ### Cascade and merge rules
 
-- The **set** of fields unions across levels; a field redefined at a deeper level **replaces** its inherited definition wholesale.
-- `extend: true` is the opt-out — it unions only `values` with the inherited set, everything else on the child definition still wins.
+- The **set** of fields unions across levels.
+- **Merging is per attribute, not per field.** A field redefined at a deeper level overrides only the attributes it explicitly writes (`type`, `required`, `indexed`, `default`, `open`, `values`) — every attribute it leaves unwritten still inherits from the nearest ancestor that declared this same field. A `recipes/` scope that writes only `values: [recipe]` for `type` does not reset that field's `required`/`indexed`/`default` to nothing; it only changes `values`. This is deliberate: the previous rule (a redefinition replacing the whole definition wholesale) meant a deeper scope narrowing one attribute silently discarded every other attribute the root had set for that field, with nothing reported — a real footgun for a field like `tags` that nearly every domain redeclares just to set its own `values`.
+- **`values` is the one attribute with an in-band way to request a merge instead of a plain override**, via a `$values` placeholder inside the list — see below. Every other attribute either inherits wholesale (unwritten) or overrides wholesale (written); there is no partial merge for them.
 - Top-level folder names are the KB's areas (this is also what `domain` is derived from — see [Sample Document](#sample-document) above); the MCP server's dynamic instructions list them from a directory read, in addition to any `Available domain: ...` facet it advertises when `domain` is indexed at the root — either via `frontmatter.indexed_fields` (deprecated fallback) or an `indexed: true` entry for `domain` in a root `.kb-schema.yaml`. `domain` isn't author-written frontmatter (see the note above), so if you migrate off `config.yaml`, remember to declare it explicitly — it does not carry over automatically.
+
+#### The `$values` placeholder
+
+Closed value sets (`type: enum`, or `type: list` with `values:`) have a merge mode of their own, because "replace" and "extend" are both legitimate things to want from a deeper scope and only the author knows which. The model is the shell `PATH` idiom:
+
+```sh
+PATH=$PATH:/usr/local/bin     # inherit, then add
+PATH=/only/this                # replace outright
+```
+
+```yaml
+values: [$values, one, two]    # inherit, then add
+values: [one, two]             # replace outright
+```
+
+- **Omitting `$values` replaces the inherited set outright — this is the default**, the same way `PATH=/only/this` clobbers rather than extends. There is no implicit merging; a `values:` list you write is the complete set unless you say otherwise.
+- **`$values` inside the list splices the inherited set in at that exact position.** Position is meaningful, same as `$PATH` in a shell assignment: `[$values, one, two]` puts inherited values first, `[one, two, $values]` puts them last, `[one, $values, two]` puts them in the middle.
+- The result is **deduplicated**, keeping each value's first occurrence — a value listed both explicitly and inherited appears once.
+- `$` is a reserved prefix inside a `values:` list. Any other `$`-prefixed token (`$value`, `$parent`, a typo of `$values`) is a hard parse error naming the offending token, never a silently-accepted literal value — a typo here degrading into "just another permitted tag" is exactly the kind of quiet failure this project avoids elsewhere.
+- **`$values` with nothing to inherit** (no ancestor scope declares any `values` for this field, or there is no ancestor definition at all) resolves to contributing *no* values — a loud warning is logged naming the scope and field — rather than silently falling back to "no values declared at all." The field ends up with whatever literal values remain in the list (or a totally empty, closed set if the sentinel was the only token), not an unconstrained one: an empty closed set fails the moment a document sets the field, which is a visible, immediate signal that something upstream is missing; treating the whole `values:` declaration as absent would instead silently stop enforcing the field at all. Declare `values` on an ancestor, or drop the sentinel, to clear the warning.
+- **`extend: true` is deprecated** — it was the mechanism before `$values` existed, and is kept only so schema files written before this change keep parsing and cascading identically. `extend: true` behaves exactly like a leading `$values` (`values: [$values, ...]`); using it logs a warning naming the schema file. New schemas should write `$values` directly. Declaring both `extend: true` and an explicit `$values` on the same field is a parse error — the two ways of saying "inherit" must not be able to disagree about where the inherited values land.
 
 ### Freezing
 
@@ -193,7 +214,7 @@ Every level of the cascade — including the root — is a `.kb-schema.yaml`. A 
 
 Either way, `get_schema` (omit `path` for the root) tells you exactly what's in effect and where each field came from — `.kb-schema.yaml` for a root schema file, `config.yaml` for the deprecated fallback.
 
-**Migrating an existing deployment:** translate `config.yaml`'s `frontmatter` block into `.kb-schema.yaml` field syntax (see [Authoring](#authoring) above) and commit it as `.kb-schema.yaml` at the knowledge-base root. Do this *before* or *at the same time as* removing anything from `config.yaml` — since the two don't merge, an incomplete root file written first (with the config block still present) can quietly narrow root's effective rules to only what the config block still contributes, until the root file catches up. `required` fields become `required: true`; `indexed_fields` become `indexed: true`; `defaults` become `default: <value>`; `allowed` becomes `values: [...]` **without** a `type:` — adding `type: enum` changes enforcement strictness (see [Authoring](#authoring) above) and is a separate decision, not a mechanical translation. If a subdirectory's own `.kb-schema.yaml` already redeclares a field the root also declares, double-check after migrating that the subdirectory's definition is still what you want — a deeper redefinition replaces its parent's wholesale, and merging config into a schema-file world can surface fields that were previously invisible to that redefinition.
+**Migrating an existing deployment:** translate `config.yaml`'s `frontmatter` block into `.kb-schema.yaml` field syntax (see [Authoring](#authoring) above) and commit it as `.kb-schema.yaml` at the knowledge-base root. Do this *before* or *at the same time as* removing anything from `config.yaml` — since the two don't merge, an incomplete root file written first (with the config block still present) can quietly narrow root's effective rules to only what the config block still contributes, until the root file catches up. `required` fields become `required: true`; `indexed_fields` become `indexed: true`; `defaults` become `default: <value>`; `allowed` becomes `values: [...]` **without** a `type:` — adding `type: enum` changes enforcement strictness (see [Authoring](#authoring) above) and is a separate decision, not a mechanical translation. If a subdirectory's own `.kb-schema.yaml` already redeclares a field the root also declares, double-check after migrating that the subdirectory's definition is still what you want — merging is per attribute (see [Cascade and merge rules](#cascade-and-merge-rules) above), so any attribute the subdirectory's redefinition never mentioned will start inheriting whatever the new root file says about it, even though it did not before the root file existed.
 
 ### Backward compatibility and upgrade note
 

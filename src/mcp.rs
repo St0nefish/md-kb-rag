@@ -194,6 +194,109 @@ fn normalize_scope_path(raw: &str) -> Result<std::path::PathBuf, McpError> {
     Ok(candidate)
 }
 
+/// Keys a `set_field` definition accepts, kept in one place so every error that names
+/// them — and the parameter's own doc comment — say exactly the same thing.
+const FIELD_DEFINITION_KEYS: &str =
+    "`type`, `required`, `indexed`, `values`, `extend`, `default`, `open`";
+
+/// A `set_field` definition as delivered by an MCP client.
+///
+/// The `update_schema` tool schema advertises this parameter as the plain JSON object
+/// described by [`crate::schema::RawFieldDef`] — the same shape a `.kb-schema.yaml`
+/// entry uses. That's a deliberate fix: `serde_json::Value` (the old type here) produces
+/// no `type` constraint at all in the advertised schema, and at least one real MCP
+/// client responded to that ambiguity by sending the definition as a JSON-encoded
+/// *string* instead of an object, which the old handler rejected with an error naming a
+/// Rust struct the caller has no way to act on.
+///
+/// This type's [`Deserialize`](serde::Deserialize) impl still tolerates that string
+/// form as a runtime fallback — some clients stringify nested-object arguments
+/// regardless of what the schema says — but the *advertised* schema is not widened to
+/// document it: a `oneOf: [object, string]` schema would just reopen the same
+/// ambiguity for clients that DO read it. A conforming client only ever needs to send
+/// the object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDefinitionInput(pub crate::schema::RawFieldDef);
+
+impl<'de> serde::Deserialize<'de> for FieldDefinitionInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_field_definition(value)
+            .map(FieldDefinitionInput)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+// Delegate schema generation to `RawFieldDef`'s own derived `JsonSchema` impl rather
+// than hand-duplicating its fields here, so the advertised shape and the accepted shape
+// can never drift apart. This is what actually fixes the bug: the tool schema now
+// advertises a real object with named, typed properties instead of `{}`.
+impl schemars::JsonSchema for FieldDefinitionInput {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        crate::schema::RawFieldDef::schema_name()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        crate::schema::RawFieldDef::schema_id()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::schema::RawFieldDef::json_schema(generator)
+    }
+}
+
+/// Parse a `set_field` definition from JSON: a JSON object directly, or (see
+/// [`FieldDefinitionInput`]) a string containing one. Every error names the expected
+/// shape in caller-facing terms — never a bare Rust type name, which means nothing to
+/// an MCP client on the other end of the wire.
+fn parse_field_definition(value: serde_json::Value) -> Result<crate::schema::RawFieldDef, String> {
+    use serde_json::Value;
+
+    let object = match value {
+        Value::Object(_) => value,
+        Value::String(s) => match serde_json::from_str::<Value>(&s) {
+            Ok(parsed @ Value::Object(_)) => parsed,
+            Ok(other) => return Err(definition_shape_error(&other)),
+            Err(e) => {
+                return Err(format!(
+                    "field definition must be a JSON object with keys \
+                     {FIELD_DEFINITION_KEYS} (mirroring a .kb-schema.yaml entry). A JSON \
+                     string containing that object is also accepted, but this string is \
+                     not valid JSON: {e}"
+                ));
+            }
+        },
+        other => return Err(definition_shape_error(&other)),
+    };
+
+    serde_json::from_value(object).map_err(|e| format!("invalid field definition: {e}"))
+}
+
+/// Build the "wrong shape entirely" error for [`parse_field_definition`], naming what
+/// was actually received without echoing its (possibly large) content.
+fn definition_shape_error(value: &serde_json::Value) -> String {
+    format!(
+        "field definition must be a JSON object with keys {FIELD_DEFINITION_KEYS} \
+         (mirroring a .kb-schema.yaml entry), got {}",
+        json_value_kind(value)
+    )
+}
+
+/// Describe a JSON value's kind in a few words, for error messages.
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// Turn tool parameters into a typed schema edit.
 fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::SchemaEdit, McpError> {
     use crate::schema::SchemaEdit;
@@ -225,13 +328,20 @@ fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::Schem
             )));
         }
     }
-    if let Some(definition) = &params.definition
-        && definition.to_string().len() > MAX_SCHEMA_DEFINITION_LEN
-    {
-        return Err(invalid(format!(
-            "field definition too large (max {} bytes)",
-            MAX_SCHEMA_DEFINITION_LEN
-        )));
+    if let Some(definition) = &params.definition {
+        // Measured on the parsed-and-reserialized form rather than whatever bytes the
+        // client happened to send: that's what actually gets committed to the schema
+        // file (via `SchemaFile::to_yaml`), and it makes the cap apply identically
+        // whether the definition arrived as an object or as the string fallback.
+        let size = serde_json::to_string(&definition.0)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if size > MAX_SCHEMA_DEFINITION_LEN {
+            return Err(invalid(format!(
+                "field definition too large (max {} bytes)",
+                MAX_SCHEMA_DEFINITION_LEN
+            )));
+        }
     }
 
     let values = || -> Result<Vec<String>, McpError> {
@@ -257,15 +367,16 @@ fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::Schem
             values: values()?,
         }),
         "set_field" => {
+            // Parsing already happened when the tool call's arguments were
+            // deserialized into `UpdateSchemaParams` (see `FieldDefinitionInput`), so
+            // there's nothing left to do here but unwrap it.
             let definition = params
                 .definition
                 .clone()
                 .ok_or_else(|| invalid("'set_field' requires a definition".into()))?;
-            let parsed = serde_json::from_value(definition)
-                .map_err(|e| invalid(format!("invalid field definition: {e}")))?;
             Ok(SchemaEdit::SetField {
                 field: params.field.clone(),
-                definition: Box::new(parsed),
+                definition: Box::new(definition.0),
             })
         }
         "remove_field" => Ok(SchemaEdit::RemoveField {
@@ -780,10 +891,14 @@ pub struct UpdateSchemaParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
 
-    /// Field definition, for `set_field`. Accepts the same keys as a `.kb-schema.yaml`
-    /// entry: `type`, `required`, `indexed`, `values`, `extend`, `default`, `open`.
+    /// Field definition, for `set_field`: a JSON object with the same keys as a
+    /// `.kb-schema.yaml` entry — `type`, `required`, `indexed`, `values`, `extend`,
+    /// `default`, `open` — all optional. As a fallback for clients that stringify
+    /// nested-object arguments, a JSON string containing that same object is also
+    /// accepted, though the object form is what this schema describes and what a
+    /// conforming client should send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub definition: Option<serde_json::Value>,
+    pub definition: Option<FieldDefinitionInput>,
 
     /// Report what the change would do without writing anything, including which
     /// existing documents it would invalidate. Never refuses — it always succeeds and
@@ -3509,6 +3624,15 @@ mod tests {
         }
     }
 
+    /// Build a `set_field` definition the way a real MCP client's JSON arrives: through
+    /// `FieldDefinitionInput`'s own `Deserialize` impl, not by constructing
+    /// `RawFieldDef` directly. Fixtures here are expected to be valid; use
+    /// `serde_json::from_value::<FieldDefinitionInput>` directly in tests that assert on
+    /// a parse failure.
+    fn definition(json: serde_json::Value) -> FieldDefinitionInput {
+        serde_json::from_value(json).expect("test fixture must be a valid definition")
+    }
+
     #[test]
     fn add_values_requires_a_non_empty_list() {
         let mut params = update_params("add_values", "tags");
@@ -3530,28 +3654,150 @@ mod tests {
     }
 
     #[test]
+    fn update_schema_definition_advertises_as_a_typed_object() {
+        // This is the regression test for the actual bug: `definition` used to be typed
+        // `serde_json::Value`, which schemars turns into an unconstrained `{}` schema —
+        // no `type` keyword, no listed properties, nothing telling a client this must be
+        // an object. A client with no other signal is then free to encode the value
+        // however it likes, including as a JSON-encoded string, which is exactly what
+        // happened in practice (see `FieldDefinitionInput`'s doc comment).
+        let schema = schemars::schema_for!(UpdateSchemaParams);
+        let root = schema.as_value();
+
+        let definition_schema = &root["properties"]["definition"];
+        // `Option<FieldDefinitionInput>` becomes `anyOf: [<real schema>, {"type": "null"}]`;
+        // find the non-null branch.
+        let object_schema = definition_schema["anyOf"]
+            .as_array()
+            .expect("definition must offer a typed alternative, not a bare {}")
+            .iter()
+            .find(|branch| branch["type"] != serde_json::json!("null"))
+            .expect("definition must have a non-null branch");
+
+        // schemars refs the RawFieldDef schema into `$defs` rather than inlining it;
+        // resolve it so the assertions below see the real shape.
+        let resolved = match object_schema["$ref"].as_str() {
+            Some(reference) => &root["$defs"][reference.rsplit('/').next().unwrap()],
+            None => object_schema,
+        };
+
+        assert_eq!(
+            resolved["type"],
+            serde_json::json!("object"),
+            "definition must advertise as an object, got: {resolved}"
+        );
+        assert_eq!(
+            resolved["additionalProperties"],
+            serde_json::json!(false),
+            "an unknown key must be rejected by a conforming client's own schema \
+             validation too, not just our runtime check, got: {resolved}"
+        );
+        for key in [
+            "type", "required", "indexed", "values", "extend", "default", "open",
+        ] {
+            assert!(
+                !resolved["properties"][key].is_null(),
+                "definition schema is missing documented key '{key}': {resolved}"
+            );
+        }
+    }
+
+    #[test]
     fn set_field_parses_a_definition() {
         let mut params = update_params("set_field", "planning.prep_minutes");
-        params.definition = Some(serde_json::json!({ "type": "integer", "indexed": true }));
+        params.definition = Some(definition(
+            serde_json::json!({ "type": "integer", "indexed": true }),
+        ));
 
         match build_schema_edit(&params).unwrap() {
             crate::schema::SchemaEdit::SetField { field, definition } => {
                 assert_eq!(field, "planning.prep_minutes");
                 assert_eq!(definition.ty, Some(crate::schema::FieldType::Integer));
-                assert!(definition.indexed);
+                assert_eq!(definition.indexed, Some(true));
             }
             other => panic!("expected SetField, got {other:?}"),
         }
     }
 
     #[test]
-    fn set_field_rejects_an_unknown_key() {
-        let mut params = update_params("set_field", "tags");
-        params.definition = Some(serde_json::json!({ "typ": "integer" }));
+    fn set_field_accepts_a_json_encoded_string_as_a_fallback() {
+        // At least one real MCP client sends nested-object tool arguments as a
+        // JSON-encoded string rather than an object, regardless of what the tool
+        // schema advertises. `FieldDefinitionInput` tolerates that as a fallback.
+        let mut params = update_params("set_field", "planning.prep_minutes");
+        params.definition = Some(definition(serde_json::Value::String(
+            r#"{"type":"integer","indexed":true}"#.to_string(),
+        )));
+
+        match build_schema_edit(&params).unwrap() {
+            crate::schema::SchemaEdit::SetField { field, definition } => {
+                assert_eq!(field, "planning.prep_minutes");
+                assert_eq!(definition.ty, Some(crate::schema::FieldType::Integer));
+                assert_eq!(definition.indexed, Some(true));
+            }
+            other => panic!("expected SetField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_field_rejects_a_string_that_is_not_valid_json() {
+        let err = serde_json::from_value::<FieldDefinitionInput>(serde_json::Value::String(
+            "not json at all".to_string(),
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
         assert!(
-            build_schema_edit(&params).is_err(),
-            "a typo'd key must not be silently dropped"
+            msg.contains("not valid JSON"),
+            "expected a message explaining the string wasn't parseable JSON, got: {msg}"
         );
+    }
+
+    #[test]
+    fn set_field_rejects_a_json_array_naming_the_expected_shape() {
+        let err =
+            serde_json::from_value::<FieldDefinitionInput>(serde_json::json!(["type", "integer"]))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("JSON object"),
+            "expected the error to name the expected shape, got: {msg}"
+        );
+        assert!(
+            !msg.contains("RawFieldDef"),
+            "a Rust type name is meaningless to an MCP client, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn set_field_rejects_an_unknown_key() {
+        let err =
+            serde_json::from_value::<FieldDefinitionInput>(serde_json::json!({ "typ": "integer" }))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typ"),
+            "a typo'd key must be named in the error, not just silently dropped: {msg}"
+        );
+        assert!(
+            !msg.contains("RawFieldDef"),
+            "a Rust type name is meaningless to an MCP client, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn update_schema_params_reject_a_misspelled_definition_key() {
+        // The same check, but through the exact path a real tool call takes: the whole
+        // `UpdateSchemaParams` deserialized from one JSON blob, the way rmcp's
+        // `Parameters<T>` extractor does it.
+        let err = serde_json::from_value::<UpdateSchemaParams>(serde_json::json!({
+            "operation": "set_field",
+            "field": "tags",
+            "definition": { "typ": "integer" },
+        }))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("typ"), "got: {msg}");
+        assert!(!msg.contains("RawFieldDef"), "got: {msg}");
     }
 
     #[test]
@@ -3916,7 +4162,7 @@ mod tests {
                 operation: "set_field".into(),
                 field: "status".into(),
                 values: None,
-                definition: Some(serde_json::json!({ "required": true })),
+                definition: Some(definition(serde_json::json!({ "required": true }))),
                 dry_run: Some(true),
                 force: None,
             }))
@@ -3951,7 +4197,7 @@ mod tests {
                 operation: "set_field".into(),
                 field: "status".into(),
                 values: None,
-                definition: Some(serde_json::json!({ "required": true })),
+                definition: Some(definition(serde_json::json!({ "required": true }))),
                 dry_run: None,
                 force: None,
             }))
@@ -4039,9 +4285,9 @@ mod tests {
                 operation: "set_field".into(),
                 field: "status".into(),
                 values: Some(vec!["active".into()]),
-                definition: Some(
+                definition: Some(definition(
                     serde_json::json!({ "type": "enum", "values": ["active"], "required": true }),
-                ),
+                )),
                 dry_run: Some(true),
                 force: None,
             }))
@@ -4076,7 +4322,7 @@ mod tests {
                 operation: "set_field".into(),
                 field: "status".into(),
                 values: None,
-                definition: Some(serde_json::json!({ "required": true })),
+                definition: Some(definition(serde_json::json!({ "required": true }))),
                 dry_run: None,
                 force: Some(true),
             }))
@@ -4106,10 +4352,10 @@ mod tests {
                 operation: "set_field".into(),
                 field: "planning".into(),
                 values: None,
-                definition: Some(serde_json::json!({
+                definition: Some(definition(serde_json::json!({
                     "type": "integer",
                     "fields": { "prep": { "type": "integer" } }
-                })),
+                }))),
                 dry_run: None,
                 force: None,
             }))

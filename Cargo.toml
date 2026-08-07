@@ -33,6 +33,12 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 serde_json = "1"
 
+# JSON Schema generation for MCP-facing types that live outside src/mcp.rs (e.g.
+# schema.rs's RawFieldDef, advertised as the `update_schema` `definition` parameter).
+# Pinned to the same major version rmcp pulls in via its own `schemars` re-export, so
+# both refer to the same JsonSchema trait rather than two incompatible copies.
+schemars = "1"
+
 # SQLite state DB
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "derive"] }
 
