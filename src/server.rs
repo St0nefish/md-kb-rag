@@ -1426,6 +1426,27 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         .as_ref()
         .map(|r| Arc::new(RerankClient::new(r)));
 
+    // Shared with `StatusState` further down (its own `state_db` field) — the UI
+    // and status endpoints must not each lazily open their own connection pool
+    // onto the same SQLite file.
+    let shared_state_db = Arc::new(tokio::sync::OnceCell::new());
+
+    // Web UI state — shares the embed client, Qdrant store, schema cache, and (see
+    // `shared_state_db` just above) state DB pool with the MCP server.
+    // Unauthenticated by design: this deployment sits behind Authentik via
+    // Traefik, and `/health` is the existing open-route precedent.
+    let ui_state = crate::web::UiState::new(
+        Arc::clone(&shared_config),
+        Arc::clone(&qdrant),
+        Arc::clone(&embed_client),
+        config.qdrant.collection.clone(),
+        instructions_data_path.clone(),
+        &include_patterns,
+        rerank_for_mcp.clone(),
+        Arc::clone(&shared_schema_cache),
+        Arc::clone(&shared_state_db),
+    );
+
     // Build the handler once and clone it per request. In stateless mode the factory
     // runs on every POST rather than once per session, and `KbSearchServer::new`
     // canonicalizes the data path (a syscall), compiles the include globset, and
@@ -1534,7 +1555,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     let status_state = StatusState {
         config: Arc::clone(&shared_config),
         qdrant: Arc::clone(&qdrant),
-        state_db: Arc::new(tokio::sync::OnceCell::new()),
+        state_db: Arc::clone(&shared_state_db),
         cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let status_router = Router::new()
@@ -1571,7 +1592,11 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         )
         .merge(status_router)
         .merge(admin_router)
-        .merge(mcp_router);
+        .merge(mcp_router)
+        // Merged BEFORE the `GovernorLayer` wrap below, same as every other route,
+        // so rate limiting applies to the UI/API routes too. No bearer-auth layer —
+        // see `web.rs`'s module doc for why these routes are deliberately open.
+        .merge(crate::web::ui_router(ui_state));
 
     if let Some(secret) = webhook_secret {
         let webhook_state = WebhookState {
@@ -1607,6 +1632,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     info!("  MCP endpoint: /mcp");
     info!("  Status endpoints: /status (JSON), /metrics (Prometheus)");
     info!("  Admin endpoint: POST /admin/reload (re-reads config.yaml without a restart)");
+    info!("  Web UI: / (unauthenticated — see web.rs's module doc)");
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -1878,6 +1904,7 @@ mod tests {
             write: Default::default(),
             search: Default::default(),
             reranking: None,
+            ui: Default::default(),
             provenance: Default::default(),
         })
     }
@@ -2906,10 +2933,17 @@ mod tests {
                 .finish()
                 .unwrap(),
         );
-        // Mirror production topology: base route, then merge a second router, then apply rate limit
+        // Mirror production topology: base route, then merge a second router, then
+        // merge a third standing in for the UI router (production's `run_server`
+        // merges `web::ui_router` the same way, at the same point relative to the
+        // `GovernorLayer` wrap below), then apply rate limit.
         let base = Router::new().route("/base", get(|| async { "ok" }));
         let extra = Router::new().route("/webhook", get(|| async { "ok" }));
-        let app = base.merge(extra).layer(GovernorLayer::new(governor_conf));
+        let ui = Router::new().route("/", get(|| async { "ok" }));
+        let app = base
+            .merge(extra)
+            .merge(ui)
+            .layer(GovernorLayer::new(governor_conf));
 
         // Exhaust burst on /base
         for _ in 0..2 {
@@ -2929,6 +2963,39 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // And so must `/` — the UI's index route, sharing the same IP's exhausted
+        // burst — proving the governor wraps it too, not just the pre-existing routes.
+        let req = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "9.9.9.9")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// `/` must exist once the UI router is part of the assembled app — the plain
+    /// existence check `run_server`'s real router assembly doesn't otherwise get a
+    /// dedicated test for at this layer (the full server-assembly test lives in
+    /// `web.rs`'s own router-level tests, which exercise `web::ui_router` directly
+    /// against a real `UiState`).
+    #[tokio::test]
+    async fn ui_root_route_exists_alongside_the_other_top_level_routers() {
+        let health = Router::new().route("/health", get(|| async { "ok" }));
+        let ui = Router::new().route("/", get(|| async { "ui" }));
+        let app = health.merge(ui);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -32,6 +32,8 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub reranking: RerankingConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 /// `source` — YAML side. Every setting is either a secret name-indirection field
@@ -652,6 +654,52 @@ fn default_max_search_limit() -> u64 {
     50
 }
 
+/// `ui` — pure YAML tuning knobs for the knowledge-base web UI (issue #53). No
+/// secrets, no bootstrap wiring, so unlike `source`/`embedding` there is no
+/// env-only split and no `Resolved*` counterpart: the parsed struct is copied
+/// straight onto `ResolvedConfig`, same as `rate_limit` and `search`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub semantic_edges: SemanticEdgesConfig,
+}
+
+/// Precomputed semantic (kNN) graph edges shown alongside markdown-link edges
+/// in the web UI's graph view. Off by default: computing them costs a Qdrant
+/// `recommend` query per indexed document on every run.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticEdgesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Number of nearest-neighbor edges to keep per document (after dedup and
+    /// the `min_score` filter), highest score first.
+    #[serde(default = "default_semantic_edges_k")]
+    pub k: u64,
+    /// Minimum cosine similarity for a neighbor to be kept as an edge.
+    #[serde(default = "default_semantic_edges_min_score")]
+    pub min_score: f32,
+}
+
+impl Default for SemanticEdgesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            k: default_semantic_edges_k(),
+            min_score: default_semantic_edges_min_score(),
+        }
+    }
+}
+
+fn default_semantic_edges_k() -> u64 {
+    5
+}
+
+fn default_semantic_edges_min_score() -> f32 {
+    0.6
+}
+
 /// Resolved embedding config — all required fields are guaranteed present.
 #[derive(Debug, Clone)]
 pub struct ResolvedEmbeddingConfig {
@@ -795,6 +843,9 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("reranking.enabled", "reranking"),
     ("reranking.candidate_limit", "reranking"),
     ("reranking.api_key_env", "reranking"),
+    ("ui.semantic_edges.enabled", "ui"),
+    ("ui.semantic_edges.k", "ui"),
+    ("ui.semantic_edges.min_score", "ui"),
 ];
 
 /// Every top-level section name [`YAML_ONLY_SETTINGS`] can point at. Used to filter
@@ -814,6 +865,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "write",
     "search",
     "reranking",
+    "ui",
 ];
 
 /// Top-level YAML section keys actually present in `content`, intersected with
@@ -852,6 +904,7 @@ pub struct ResolvedConfig {
     pub write: WriteConfig,
     pub search: SearchConfig,
     pub reranking: Option<ResolvedRerankingConfig>,
+    pub ui: UiConfig,
     /// Where every resolved setting's value came from — see [`ConfigProvenance`].
     pub provenance: ConfigProvenance,
 }
@@ -1162,6 +1215,12 @@ impl Config {
         if self.indexing.reconcile_interval_secs == 0 {
             anyhow::bail!("indexing.reconcile_interval_secs must be >= 1");
         }
+        if self.ui.semantic_edges.k == 0 {
+            anyhow::bail!("ui.semantic_edges.k must be >= 1");
+        }
+        if !(0.0..=1.0).contains(&self.ui.semantic_edges.min_score) {
+            anyhow::bail!("ui.semantic_edges.min_score must be between 0.0 and 1.0");
+        }
 
         // Validate required env vars — named all at once, not one at a time, so a
         // fresh deployment finds every missing var on the first failed start
@@ -1255,6 +1314,7 @@ impl Config {
             } else {
                 None
             },
+            ui: self.ui,
             provenance: ConfigProvenance(
                 provenance
                     .into_iter()
@@ -1841,6 +1901,7 @@ mcp:
             write: WriteConfig::default(),
             search: SearchConfig::default(),
             reranking: None,
+            ui: UiConfig::default(),
             provenance: ConfigProvenance::default(),
         };
 
@@ -2495,6 +2556,133 @@ reranking:
         set_required_env();
         let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
         assert!(cfg.reranking.is_none());
+        clear_required_env();
+    }
+
+    // ── ui.semantic_edges ────────────────────────────────────────────────────────
+
+    #[test]
+    fn ui_semantic_edges_config_defaults() {
+        // A config with no `ui` section at all: off by default, k=5, min_score=0.6.
+        let cfg = Config::from_str_raw("{}").unwrap();
+        assert!(!cfg.ui.semantic_edges.enabled);
+        assert_eq!(cfg.ui.semantic_edges.k, 5);
+        assert_eq!(cfg.ui.semantic_edges.min_score, 0.6);
+    }
+
+    #[test]
+    fn ui_semantic_edges_config_round_trips_from_yaml() {
+        let yaml = r#"
+ui:
+  semantic_edges:
+    enabled: true
+    k: 8
+    min_score: 0.75
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert!(cfg.ui.semantic_edges.enabled);
+        assert_eq!(cfg.ui.semantic_edges.k, 8);
+        assert_eq!(cfg.ui.semantic_edges.min_score, 0.75);
+    }
+
+    #[test]
+    fn ui_semantic_edges_config_partial_uses_defaults_for_missing() {
+        // Only `enabled` specified — k and min_score fall back to their defaults.
+        let yaml = "ui:\n  semantic_edges:\n    enabled: true\n";
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert!(cfg.ui.semantic_edges.enabled);
+        assert_eq!(cfg.ui.semantic_edges.k, 5);
+        assert_eq!(cfg.ui.semantic_edges.min_score, 0.6);
+    }
+
+    #[test]
+    fn ui_semantic_edges_resolves_end_to_end() {
+        // Full round trip through `resolve()`, not just deserialization — proves
+        // the section survives into `ResolvedConfig` (the `ui: self.ui` copy).
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let yaml = "ui:\n  semantic_edges:\n    enabled: true\n    k: 3\n    min_score: 0.9\n";
+        let cfg = Config::from_str(yaml).unwrap();
+        assert!(cfg.ui.semantic_edges.enabled);
+        assert_eq!(cfg.ui.semantic_edges.k, 3);
+        assert_eq!(cfg.ui.semantic_edges.min_score, 0.9);
+        clear_required_env();
+    }
+
+    #[test]
+    fn ui_semantic_edges_unknown_field_is_rejected() {
+        let yaml = "ui:\n  semantic_edges:\n    bogus: true\n";
+        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown field under ui.semantic_edges should be rejected"
+        );
+
+        let yaml_top = "ui:\n  bogus: true\n";
+        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml_top);
+        assert!(result.is_err(), "unknown field under ui should be rejected");
+    }
+
+    #[test]
+    fn ui_semantic_edges_zero_k_is_rejected_at_resolve() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("ui:\n  semantic_edges:\n    k: 0\n").unwrap_err();
+        assert!(
+            err.to_string().contains("ui.semantic_edges.k must be >= 1"),
+            "expected the k validation message, got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn ui_semantic_edges_out_of_range_min_score_is_rejected_at_resolve() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let err = Config::from_str("ui:\n  semantic_edges:\n    min_score: 1.5\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ui.semantic_edges.min_score must be between 0.0 and 1.0"),
+            "expected the min_score validation message, got: {err}"
+        );
+        let err = Config::from_str("ui:\n  semantic_edges:\n    min_score: -0.1\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ui.semantic_edges.min_score must be between 0.0 and 1.0"),
+            "expected the min_score validation message, got: {err}"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn ui_semantic_edges_provenance_reports_default_when_absent() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::load(Path::new("/nonexistent/config.yaml")).unwrap();
+        assert_eq!(
+            cfg.provenance.0.get("ui.semantic_edges.enabled"),
+            Some(&SettingSource::Default)
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn ui_semantic_edges_provenance_reports_yaml_when_section_present_in_loaded_file() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let dir = std::env::temp_dir().join("md-kb-rag-test-provenance-ui");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        std::fs::write(&config_path, "ui:\n  semantic_edges:\n    enabled: true\n").unwrap();
+
+        let cfg = Config::load(&config_path).unwrap();
+        assert_eq!(
+            cfg.provenance.0.get("ui.semantic_edges.enabled"),
+            Some(&SettingSource::Yaml)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
         clear_required_env();
     }
 

@@ -16,7 +16,9 @@ mod sparse;
 mod state;
 mod status;
 mod validate;
+mod web;
 mod webhook;
+mod write;
 
 use std::path::{Path, PathBuf};
 

@@ -404,6 +404,37 @@ impl StateDb {
         .execute(&pool)
         .await?;
 
+        // Edges for the KB web UI's graph view: markdown links extracted at ingest
+        // (`kind = 'markdown'`) and semantic kNN neighbors precomputed at index time
+        // (`kind = 'semantic'`, carrying a similarity `score`). No `REFERENCES ...
+        // documents(file_path)` / `ON DELETE CASCADE` here — unlike document_fields,
+        // a link's target need not exist yet (or ever) as a `documents` row: a link may
+        // point at a file that hasn't been indexed yet, or one that was renamed out from
+        // under it; the graph handler drops dangling edges at read time instead. Rows
+        // are removed explicitly via `delete_links_for` (called from `delete_document`)
+        // and replaced wholesale per (source_path, kind) via `replace_links`.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS document_links (
+                source_path TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                kind        TEXT NOT NULL DEFAULT 'markdown',
+                score       REAL,
+                PRIMARY KEY (source_path, target_path, kind)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Purging a renamed/deleted file's rows (`delete_links_for`) needs the reverse
+        // lookup — "what points at this target" — which the primary key (source-first)
+        // does not serve.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_document_links_target
+             ON document_links(target_path)",
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self { pool })
     }
 
@@ -651,14 +682,119 @@ impl StateDb {
         Ok(())
     }
 
-    /// Remove a document's metadata. Projection rows cascade via the foreign key.
+    /// Remove a document's metadata. Projection rows cascade via the foreign key;
+    /// `document_links` does not (its targets may not be `documents` rows at all), so
+    /// its outgoing edges are cleared explicitly here.
     pub async fn delete_document(&self, file_path: &str) -> Result<()> {
         sqlx::query("DELETE FROM documents WHERE file_path = ?")
             .bind(file_path)
             .execute(&self.pool)
             .await?;
 
+        self.delete_links_for(file_path).await?;
+
         Ok(())
+    }
+
+    /// Replace every `document_links` row for `(source_path, kind)` with `targets`.
+    ///
+    /// Scoped to `kind` rather than the whole `source_path`, so refreshing one edge
+    /// kind (e.g. recomputed semantic neighbors) never touches the other (markdown
+    /// links extracted from the same file's body). Runs as delete-then-insert inside a
+    /// transaction so a reader never observes a partially-replaced edge set.
+    pub async fn replace_links(
+        &self,
+        source_path: &str,
+        kind: &str,
+        targets: &[(String, Option<f64>)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM document_links WHERE source_path = ? AND kind = ?")
+            .bind(source_path)
+            .bind(kind)
+            .execute(&mut *tx)
+            .await?;
+
+        for (target_path, score) in targets {
+            sqlx::query(
+                "INSERT OR IGNORE INTO document_links (source_path, target_path, kind, score)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(source_path)
+            .bind(target_path)
+            .bind(kind)
+            .bind(score)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Every edge in the graph, unfiltered: (source_path, target_path, kind, score).
+    ///
+    /// Backs `GET /api/graph`, which filters dangling edges (targets not among the
+    /// current node set) itself — this is a plain unlimited read, same rationale as
+    /// [`DocumentIndex::all_paths`].
+    pub async fn all_links(&self) -> Result<Vec<(String, String, String, Option<f64>)>> {
+        let rows: Vec<(String, String, String, Option<f64>)> =
+            sqlx::query_as("SELECT source_path, target_path, kind, score FROM document_links")
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(rows)
+    }
+
+    /// Remove every edge originating from `path`, in either direction of kind.
+    ///
+    /// Called when a document is deleted/purged (from [`Self::delete_document`]) so a
+    /// removed file's outgoing links do not linger. Deliberately does not also delete
+    /// edges where `path` is the *target* — those become dangling edges that
+    /// `GET /api/graph` drops at read time, which is the same self-healing behavior a
+    /// renamed target gets, rather than a special case here.
+    pub async fn delete_links_for(&self, path: &str) -> Result<()> {
+        sqlx::query("DELETE FROM document_links WHERE source_path = ?")
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Every document's summary metadata, unfiltered, unpaged, ordered by path.
+    ///
+    /// Backs `GET /api/graph`'s node listing, which needs every document in one shot —
+    /// unlike [`DocumentIndex::query_documents`], which is built around a caller-facing
+    /// `limit`/`offset` page. Same row shape and frontmatter-parsing behavior (a
+    /// malformed frontmatter JSON blob degrades to an empty object rather than failing
+    /// the whole listing) as `query_documents`'s mapping.
+    pub async fn all_document_summaries(&self) -> Result<Vec<DocumentSummary>> {
+        let rows: Vec<DocumentRow> = sqlx::query_as(
+            "SELECT file_path, title, description, mtime, indexed_at, frontmatter
+             FROM documents ORDER BY file_path",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(file_path, title, description, mtime, indexed_at, frontmatter_json)| {
+                    let frontmatter: Value = serde_json::from_str(&frontmatter_json)
+                        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+                    DocumentSummary {
+                        file_path,
+                        title,
+                        description,
+                        mtime,
+                        indexed_at,
+                        frontmatter,
+                    }
+                },
+            )
+            .collect())
     }
 
     /// Content hash of every document that has metadata, keyed by path.
@@ -2814,5 +2950,224 @@ mod tests {
     async fn get_document_hashes_many_empty_input_returns_empty_map() {
         let (db, _dir) = test_db().await;
         assert!(db.get_document_hashes_many(&[]).await.unwrap().is_empty());
+    }
+
+    // -- document_links --------------------------------------------------------
+
+    #[tokio::test]
+    async fn replace_links_round_trip() {
+        let (db, _dir) = test_db().await;
+        db.replace_links(
+            "a.md",
+            "markdown",
+            &[("b.md".to_string(), None), ("c.md".to_string(), None)],
+        )
+        .await
+        .unwrap();
+
+        let mut links = db.all_links().await.unwrap();
+        links.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+        assert_eq!(
+            links,
+            vec![
+                (
+                    "a.md".to_string(),
+                    "b.md".to_string(),
+                    "markdown".to_string(),
+                    None
+                ),
+                (
+                    "a.md".to_string(),
+                    "c.md".to_string(),
+                    "markdown".to_string(),
+                    None
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_links_carries_score() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "semantic", &[("b.md".to_string(), Some(0.87))])
+            .await
+            .unwrap();
+
+        let links = db.all_links().await.unwrap();
+        assert_eq!(
+            links,
+            vec![(
+                "a.md".to_string(),
+                "b.md".to_string(),
+                "semantic".to_string(),
+                Some(0.87)
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_links_overwrites_prior_call_for_same_source_and_kind() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("old.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("a.md", "markdown", &[("new.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let links = db.all_links().await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1, "new.md");
+    }
+
+    #[tokio::test]
+    async fn replace_links_is_scoped_to_kind() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("md-target.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links(
+            "a.md",
+            "semantic",
+            &[("sem-target.md".to_string(), Some(0.9))],
+        )
+        .await
+        .unwrap();
+
+        // Replacing the semantic edges must not disturb the markdown edges for the
+        // same source.
+        db.replace_links(
+            "a.md",
+            "semantic",
+            &[("sem-target-2.md".to_string(), Some(0.5))],
+        )
+        .await
+        .unwrap();
+
+        let mut links = db.all_links().await.unwrap();
+        links.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+        assert_eq!(
+            links,
+            vec![
+                (
+                    "a.md".to_string(),
+                    "md-target.md".to_string(),
+                    "markdown".to_string(),
+                    None
+                ),
+                (
+                    "a.md".to_string(),
+                    "sem-target-2.md".to_string(),
+                    "semantic".to_string(),
+                    Some(0.5)
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_links_empty_targets_clears_existing() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("b.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("a.md", "markdown", &[]).await.unwrap();
+
+        assert!(db.all_links().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_links_for_removes_outgoing_edges_only() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("b.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("c.md", "markdown", &[("a.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        db.delete_links_for("a.md").await.unwrap();
+
+        let links = db.all_links().await.unwrap();
+        assert_eq!(
+            links,
+            vec![(
+                "c.md".to_string(),
+                "a.md".to_string(),
+                "markdown".to_string(),
+                None
+            )],
+            "incoming edges (a.md as target) must survive; only a.md's outgoing edges are removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_also_clears_outgoing_links() {
+        let (db, _dir) = test_db().await;
+        db.upsert_document_metadata("a.md", &recipe_frontmatter(), 1700, "h1", 1)
+            .await
+            .unwrap();
+        db.replace_links("a.md", "markdown", &[("b.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        db.delete_document("a.md").await.unwrap();
+
+        assert!(db.all_links().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_document_summaries_returns_every_row_unpaged() {
+        let (db, _dir) = test_db().await;
+        let entries: Vec<(String, String)> = (0..150)
+            .map(|i| (format!("doc-{i:03}.md"), format!("hash-{i}")))
+            .collect();
+        bulk_insert_documents(&db, &entries).await;
+
+        let summaries = db.all_document_summaries().await.unwrap();
+
+        assert_eq!(
+            summaries.len(),
+            150,
+            "all_document_summaries must not apply a hidden limit"
+        );
+        // ORDER BY file_path, ascending.
+        assert_eq!(summaries[0].file_path, "doc-000.md");
+        assert_eq!(summaries[149].file_path, "doc-149.md");
+    }
+
+    #[tokio::test]
+    async fn all_document_summaries_degrades_malformed_frontmatter() {
+        let (db, _dir) = test_db().await;
+        sqlx::query(
+            "INSERT INTO documents
+                (file_path, title, description, frontmatter, mtime, content_hash, chunk_count, indexed_at)
+             VALUES ('bad.md', NULL, NULL, 'not valid json{{', 0, 'h', 0, datetime('now'))",
+        )
+        .execute(db.pool_for_test())
+        .await
+        .unwrap();
+
+        let summaries = db.all_document_summaries().await.unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].frontmatter,
+            Value::Object(serde_json::Map::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn all_document_summaries_maps_fields_from_upsert() {
+        let (db, _dir) = test_db().await;
+        db.upsert_document_metadata("r.md", &recipe_frontmatter(), 1700, "h1", 2)
+            .await
+            .unwrap();
+
+        let summaries = db.all_document_summaries().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].file_path, "r.md");
+        assert_eq!(summaries[0].mtime, 1700);
+        assert!(summaries[0].frontmatter.is_object());
     }
 }

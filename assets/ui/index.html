@@ -1,0 +1,144 @@
+<!--
+  Adapted from Google's Open Knowledge Format (OKF) reference viewer
+  (reference_agent/bundle/templates/viz.html), licensed under the
+  Apache License, Version 2.0. See LICENSE-okf.md in this directory
+  for the full license text and a summary of what changed.
+
+  Changes from the original: cytoscape/marked are loaded from local
+  vendored copies instead of a CDN (DOMPurify is a further addition not
+  present in the OKF original — see below); the viz.css/js "__PLACEHOLDER__"
+  templating (this file was originally filled in by a Python
+  generator, one static HTML file per bundle) is gone in favor of
+  plain external <link>/<script> tags, since this page is served
+  as-is by the app and fetches its data live; the window.BUNDLE_NAME/
+  window.BUNDLE inline-data injection block is removed for the same
+  reason — see viz.js's api/graph fetch; detail panel fields (Resource,
+  Sources, Generated, Verified) that don't exist in this project's
+  frontmatter schema were replaced with ones that do (Domain, Modified).
+
+  In-browser editing (not part of the original OKF viewer) was added on
+  top: Edit/Delete buttons on the detail panel, a "New document" button
+  in the header, and an editor overlay (textarea + live marked.js
+  preview + a schema-hints panel) driven by assets/edit.js against
+  api/doc and api/schema. See edit.js's header comment for the save/
+  create/delete flow.
+
+  DOMPurify is vendored (assets/dompurify.min.js) and loaded before
+  viz.js so that every marked.parse() output — the detail panel body
+  and the editor's preview pane — is sanitized before it is assigned to
+  innerHTML. See viz.js's window.KBViz.renderMarkdown helper. See
+  LICENSE-okf.md for DOMPurify's license note (it is not part of the
+  OKF-derived code and is dual Apache-2.0/MPL-2.0 licensed).
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Knowledge Base Viewer</title>
+<link rel="stylesheet" href="assets/viz.css">
+</head>
+<body>
+<header>
+  <div class="title">
+    <strong>Knowledge Base</strong>
+    <span class="muted">graph viewer</span>
+  </div>
+  <div class="controls">
+    <input id="search" type="search" placeholder="Search title / id / tag">
+    <select id="filter-type">
+      <option value="">All types</option>
+    </select>
+    <select id="layout">
+      <option value="cose">cose (force)</option>
+      <option value="concentric">concentric</option>
+      <option value="breadthfirst">breadth-first</option>
+      <option value="circle">circle</option>
+      <option value="grid">grid</option>
+    </select>
+    <button id="reset">Reset view</button>
+    <button id="new-doc-btn" class="btn btn-primary">New document</button>
+  </div>
+</header>
+
+<main>
+  <section id="graph">
+    <div id="graph-loading">Loading graph…</div>
+    <div id="graph-error" hidden></div>
+  </section>
+  <section id="detail">
+    <div id="detail-empty" class="muted">Click a node to see its details.</div>
+    <article id="detail-content" hidden>
+      <header class="detail-header">
+        <div class="detail-actions">
+          <button id="edit-btn" class="btn">Edit</button>
+          <button id="delete-btn" class="btn btn-danger">Delete</button>
+        </div>
+        <span class="type-chip" id="detail-type"></span>
+        <h1 id="detail-title"></h1>
+        <div class="muted" id="detail-id"></div>
+      </header>
+      <div class="badges" id="detail-badges"></div>
+      <dl class="frontmatter">
+        <dt>Description</dt><dd id="detail-description"></dd>
+        <dt>Domain</dt><dd id="detail-domain"></dd>
+        <dt>Tags</dt><dd id="detail-tags"></dd>
+        <dt>Modified</dt><dd id="detail-mtime"></dd>
+      </dl>
+      <hr>
+      <div id="detail-body"></div>
+      <section id="detail-backlinks" hidden>
+        <h2>Cited by</h2>
+        <ul id="backlinks-list"></ul>
+      </section>
+    </article>
+  </section>
+</main>
+
+<div id="editor-overlay" hidden>
+  <div id="editor-modal">
+    <header id="editor-toolbar">
+      <div id="editor-path-wrap">
+        <label for="editor-path" class="muted">Path</label>
+        <input id="editor-path" type="text" placeholder="domain/subdir/file.md" spellcheck="false">
+      </div>
+      <div class="editor-toolbar-status">
+        <span id="editor-mode-badge" class="type-chip"></span>
+        <span id="editor-status" class="muted"></span>
+      </div>
+      <div class="editor-actions">
+        <button id="editor-save" class="btn btn-primary">Save</button>
+        <button id="editor-cancel" class="btn">Cancel</button>
+      </div>
+    </header>
+    <div id="editor-errors" hidden></div>
+    <div id="editor-body">
+      <aside id="editor-schema">
+        <h2>Schema</h2>
+        <div id="editor-schema-content" class="muted">Loading…</div>
+      </aside>
+      <div id="editor-source">
+        <textarea id="editor-textarea" spellcheck="false" placeholder="Raw markdown content, including the frontmatter block."></textarea>
+      </div>
+      <div id="editor-preview"></div>
+    </div>
+  </div>
+</div>
+
+<div id="confirm-overlay" hidden>
+  <div id="confirm-modal">
+    <p id="confirm-message"></p>
+    <div class="confirm-actions">
+      <button id="confirm-cancel" class="btn">Cancel</button>
+      <button id="confirm-ok" class="btn btn-danger">Delete</button>
+    </div>
+  </div>
+</div>
+
+<script src="assets/cytoscape.min.js"></script>
+<script src="assets/marked.min.js"></script>
+<script src="assets/dompurify.min.js"></script>
+<script src="assets/viz.js"></script>
+<script src="assets/edit.js"></script>
+</body>
+</html>

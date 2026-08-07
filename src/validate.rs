@@ -32,7 +32,7 @@ pub struct FieldError {
     pub schema_origin: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ValidationResult {
     pub file_path: String,
     pub valid: bool,

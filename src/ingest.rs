@@ -3,15 +3,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use qdrant_client::qdrant::{Condition, Filter};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     chunk,
-    config::{IndexingConfig, ResolvedConfig},
+    config::{IndexingConfig, ResolvedConfig, SemanticEdgesConfig},
     embed::{EmbedClient, EmbedStore},
-    qdrant::{IndexedField, QdrantPoint, QdrantStore, VectorStore},
+    qdrant::{IndexedField, QdrantPoint, QdrantStore, SearchResult, VectorStore},
     schema::{ResolvedSchema, SchemaCache},
     state::{IndexedFile, StateDb},
     status::{INDEX_STATUS, Phase, RunMode, Trigger},
@@ -218,6 +219,10 @@ struct PendingFile {
     file_path: String,
     frontmatter: HashMap<String, serde_json::Value>,
     chunks: Vec<chunk::Chunk>,
+    /// Document body with frontmatter stripped — kept alongside the already-chunked
+    /// text so `upsert_pending` can extract outgoing markdown links (`extract_markdown_links`)
+    /// from the whole document in one pass rather than reassembling it from chunks.
+    body: String,
     /// Content hash of the file on disk.
     hash: String,
     /// Number of chunks from the previous index run (0 for new files).
@@ -311,6 +316,7 @@ async fn process_file(
                     file_path,
                     frontmatter: validated.frontmatter,
                     chunks,
+                    body: validated.body,
                     hash,
                     old_chunk_count,
                     mtime,
@@ -365,6 +371,7 @@ async fn process_file(
             file_path,
             frontmatter,
             chunks,
+            body,
             hash,
             old_chunk_count,
             mtime,
@@ -525,6 +532,26 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
             continue;
         }
 
+        // Refresh this file's outgoing markdown-link edges. Non-fatal: a failure here
+        // leaves the previous run's edges in place (stale, not wrong-shaped) rather
+        // than blocking the state/metadata bookkeeping above that already succeeded,
+        // and it self-heals the next time this file is (re)indexed.
+        let link_targets: Vec<(String, Option<f64>)> =
+            extract_markdown_links(&pf.body, &pf.file_path)
+                .into_iter()
+                .map(|target| (target, None))
+                .collect();
+        if let Err(e) = state
+            .replace_links(&pf.file_path, "markdown", &link_targets)
+            .await
+        {
+            warn!(
+                file = %pf.file_path,
+                "Failed to update markdown links (non-fatal, will self-heal next run): {:#}",
+                e
+            );
+        }
+
         // Per-file at debug: on a full reindex this fires once per document, which
         // drowns the progress and summary lines that actually answer "is it working?".
         // The aggregate below carries the same information for a whole batch.
@@ -546,6 +573,132 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Semantic edge precompute (web UI graph view, issue #53)
+// ---------------------------------------------------------------------------
+
+/// Doc-level nearest-neighbor lookup behind the UI's precomputed semantic edges.
+///
+/// A trait — not a direct call to the inherent `QdrantStore::recommend_by_point_id`
+/// — for the same reason `VectorStore`/`EmbedStore` above are traits:
+/// `update_semantic_edges` runs against a fake in tests, with no live Qdrant service
+/// required.
+trait NeighborStore: Send + Sync {
+    async fn recommend_by_point_id(
+        &self,
+        collection: &str,
+        point_id: &str,
+        limit: u64,
+        filter: Option<Filter>,
+    ) -> Result<Vec<SearchResult>>;
+}
+
+/// Thin delegation impl — calls the identically-named inherent method on
+/// `QdrantStore`, same pattern as its `VectorStore`/`RetrievalStore` impls in
+/// `qdrant.rs`.
+impl NeighborStore for QdrantStore {
+    async fn recommend_by_point_id(
+        &self,
+        collection: &str,
+        point_id: &str,
+        limit: u64,
+        filter: Option<Filter>,
+    ) -> Result<Vec<SearchResult>> {
+        QdrantStore::recommend_by_point_id(self, collection, point_id, limit, filter).await
+    }
+}
+
+/// Precompute each `pending` file's outgoing semantic (kNN) edges for the web UI
+/// graph view. No-ops immediately when `cfg.enabled` is false (the default —
+/// computing these costs a Qdrant `recommend` query per indexed document on every
+/// run, see `config.rs`), so callers do not need to check the flag themselves.
+///
+/// Doc-level kNN reuses each file's deterministic first-chunk point id
+/// (`make_point_id(path, 0)`, see above) as the query vector, and excludes the
+/// source file's own chunks via a `file_path` filter. Because that query still
+/// searches every chunk in the collection, multiple hits can come back from the same
+/// neighbor document — those are deduped locally, keeping each target's best score,
+/// before `min_score` and top-`k` are applied.
+///
+/// Only ever called for `pending` — the files actually (re)indexed this run — so
+/// semantics match `upsert_pending`'s markdown-link refresh: incremental, and never
+/// triggered when there is nothing to index (an empty `pending`, which also covers
+/// the fully-offline case: a failed embed/upsert would already have returned via `?`
+/// before `pending` ever reaches this function).
+///
+/// Non-fatal per file: a failed lookup or bookkeeping write leaves the previous run's
+/// semantic edges in place (stale, not wrong-shaped) and repairs itself the next time
+/// the file is reindexed — same policy as the markdown-link refresh.
+async fn update_semantic_edges<N: NeighborStore>(
+    pending: &[PendingFile],
+    neighbors: &N,
+    state: &StateDb,
+    collection: &str,
+    cfg: &SemanticEdgesConfig,
+) {
+    if !cfg.enabled {
+        return;
+    }
+
+    for pf in pending {
+        let point_id = make_point_id(&pf.file_path, 0);
+        let exclude_self =
+            Filter::must_not([Condition::matches("file_path", pf.file_path.clone())]);
+
+        let hits = match neighbors
+            .recommend_by_point_id(collection, &point_id, cfg.k, Some(exclude_self))
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                warn!(
+                    file = %pf.file_path,
+                    "Failed to compute semantic neighbors (non-fatal, will retry next run): {:#}",
+                    e
+                );
+                continue;
+            }
+        };
+
+        // Dedupe by target file, keeping the best score seen for each. Also drop the
+        // source file itself defensively: the `must_not` filter above is the real
+        // exclusion, this is a second, filter-independent guard so an incomplete
+        // filter can never make a document recommend itself.
+        let mut best: HashMap<String, f32> = HashMap::new();
+        for hit in &hits {
+            let Some(target) = hit.payload.get("file_path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if target == pf.file_path || hit.score < cfg.min_score {
+                continue;
+            }
+            best.entry(target.to_string())
+                .and_modify(|s| *s = s.max(hit.score))
+                .or_insert(hit.score);
+        }
+
+        let mut ranked: Vec<(String, f32)> = best.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ranked.truncate(cfg.k as usize);
+
+        let targets: Vec<(String, Option<f64>)> = ranked
+            .into_iter()
+            .map(|(target, score)| (target, Some(score as f64)))
+            .collect();
+
+        if let Err(e) = state
+            .replace_links(&pf.file_path, "semantic", &targets)
+            .await
+        {
+            warn!(
+                file = %pf.file_path,
+                "Failed to update semantic links (non-fatal, will self-heal next run): {:#}",
+                e
+            );
+        }
+    }
 }
 
 /// Remove orphaned files (deleted from disk but still in the index).
@@ -649,6 +802,227 @@ pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Markdown link extraction (feeds the `document_links` graph)
+// ---------------------------------------------------------------------------
+
+/// Extract every local markdown-to-markdown link `[label](target)` from `body`,
+/// resolved to repo-relative paths anchored at `source_rel_path`'s directory.
+///
+/// What counts as a link edge, deliberately narrow:
+/// - Only the inline form `[label](target)`. **Reference-style links
+///   (`[label][ref]` plus a separate `[ref]: target` definition) are NOT supported** —
+///   nothing here tracks reference definitions, so they are silently ignored rather
+///   than partially resolved.
+/// - Images (`![alt](target)`) are skipped entirely — an image is not a document
+///   reference.
+/// - Anything inside a fenced code block (`` ``` `` or `~~~`, tracked the same
+///   line-oriented way `chunk::split_sections` tracks fences for headings) or an
+///   inline code span (`` `...` ``) is skipped — link syntax shown as a prose example
+///   is not a real link.
+/// - A trailing `#fragment` is stripped before the target is judged, and an
+///   anchor-only target (nothing left after stripping) is dropped.
+/// - External targets (`http://`, `https://`, `mailto:`, protocol-relative `//...`),
+///   absolute paths (`/...`), and anything not ending in `.md` are dropped — this
+///   graph only connects markdown documents to each other by relative path.
+/// - `./` and `../` are resolved against `source_rel_path`'s directory; a target that
+///   would climb above the knowledge-base root is rejected outright (dropped) rather
+///   than clamped, since clamping could silently collide with an unrelated document.
+/// - Results are deduped, preserving first-seen order — linking the same target twice
+///   produces one edge.
+pub(crate) fn extract_markdown_links(body: &str, source_rel_path: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    let mut in_fence = false;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        for raw_target in raw_link_targets_in_line(line) {
+            if let Some(resolved) = resolve_link_target(&raw_target, source_rel_path)
+                && seen.insert(resolved.clone())
+            {
+                out.push(resolved);
+            }
+        }
+    }
+
+    out
+}
+
+/// Scan one non-fenced line for inline `[label](target)` links, returning each raw
+/// (unresolved, unfiltered) target string found. Handles the two things that would
+/// otherwise produce false positives on a single line: image syntax (`![...](...)`)
+/// and inline code spans (`` `...` ``) — both are skipped without being scanned for
+/// links.
+fn raw_link_targets_in_line(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut targets = Vec::new();
+    let mut i = 0usize;
+    let mut in_code = false;
+    let mut code_run_len = 0usize;
+
+    while i < chars.len() {
+        // A backtick run opens or closes an inline code span. Per CommonMark, only a
+        // run of the SAME length closes one already open — a lone backtick inside a
+        // double-backtick span stays part of the code.
+        if chars[i] == '`' {
+            let start = i;
+            while i < chars.len() && chars[i] == '`' {
+                i += 1;
+            }
+            let run_len = i - start;
+            if !in_code {
+                in_code = true;
+                code_run_len = run_len;
+            } else if run_len == code_run_len {
+                in_code = false;
+            }
+            continue;
+        }
+
+        if in_code {
+            i += 1;
+            continue;
+        }
+
+        // Image: skip the whole `![...](...)` construct, extracting nothing from it.
+        if chars[i] == '!' && chars.get(i + 1) == Some(&'[') {
+            i = match find_link_parens(&chars, i + 1) {
+                Some((_, _, after)) => after,
+                None => i + 1,
+            };
+            continue;
+        }
+
+        if chars[i] == '['
+            && let Some((target_start, target_end, after)) = find_link_parens(&chars, i)
+        {
+            targets.push(chars[target_start..target_end].iter().collect());
+            i = after;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    targets
+}
+
+/// Given `chars[bracket] == '['`, look for the `]` closing the bracketed label (no
+/// nested-bracket support — link/image labels are plain text in practice) and, if a
+/// `(` immediately follows it, the parenthesized target after that (parens balanced,
+/// so a target containing a literal `(`/`)` still resolves correctly).
+///
+/// Returns `(target_start, target_end, index_after_closing_paren)` as char indices,
+/// with `target_end` exclusive — or `None` if `bracket` is not actually the start of
+/// an inline link (a bare `[`, or reference-style `[label][ref]`, both of which look
+/// identical to this point).
+fn find_link_parens(chars: &[char], bracket: usize) -> Option<(usize, usize, usize)> {
+    let mut j = bracket + 1;
+    while j < chars.len() && chars[j] != ']' {
+        j += 1;
+    }
+    if j >= chars.len() {
+        return None; // Unterminated label.
+    }
+    if chars.get(j + 1) != Some(&'(') {
+        return None; // Not immediately followed by a target — not this parser's job.
+    }
+
+    let target_start = j + 2;
+    let mut depth = 1i32;
+    let mut k = target_start;
+    while k < chars.len() {
+        match chars[k] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((target_start, k, k + 1));
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None // Unterminated target.
+}
+
+/// Judge and resolve one raw link target against `source_rel_path`'s directory.
+/// Returns `None` for anything [`extract_markdown_links`]'s doc comment says to drop.
+fn resolve_link_target(raw_target: &str, source_rel_path: &str) -> Option<String> {
+    let target = raw_target.trim();
+
+    // Strip an optional ` "title"` / ` 'title'` suffix (CommonMark link title) — take
+    // everything before the first whitespace as the actual target.
+    let target = match target.find(char::is_whitespace) {
+        Some(idx) => &target[..idx],
+        None => target,
+    };
+
+    // Strip a trailing #fragment.
+    let target = match target.find('#') {
+        Some(idx) => &target[..idx],
+        None => target,
+    };
+
+    if target.is_empty() {
+        return None;
+    }
+
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || target.starts_with('/')
+    {
+        return None;
+    }
+
+    if !target.ends_with(".md") {
+        return None;
+    }
+
+    resolve_relative_md_path(target, source_rel_path)
+}
+
+/// Join `target` (a `.md`-relative path, possibly containing `./`/`../`) onto
+/// `source_rel_path`'s directory and normalize the result component-by-component —
+/// no filesystem access, since neither path need exist on disk in the same shape the
+/// index sees it. Returns `None` if a `..` climbs above the knowledge-base root.
+fn resolve_relative_md_path(target: &str, source_rel_path: &str) -> Option<String> {
+    let mut stack: Vec<&str> = source_rel_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.split('/').filter(|c| !c.is_empty()).collect())
+        .unwrap_or_default();
+
+    for comp in target.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                // `?` on `Option<&str>` propagates `None` — i.e. rejects the whole
+                // target — the moment a `..` would climb above the knowledge-base root.
+                stack.pop()?;
+            }
+            other => stack.push(other),
+        }
+    }
+
+    if stack.is_empty() {
+        None
+    } else {
+        Some(stack.join("/"))
+    }
+}
+
 /// Payload fields to index, unioning the schema tree with the legacy config list.
 ///
 /// `config.effective_indexed_fields()` still contributes `file_path`, which is not a
@@ -690,7 +1064,7 @@ async fn backfill_document_metadata(
 
         let hash = compute_hash_from_bytes(content.as_bytes());
         let schema = schemas.resolve_for(Path::new(rel_key));
-        let (frontmatter, _body) = validate::parse_frontmatter(&content, schema);
+        let (frontmatter, body) = validate::parse_frontmatter(&content, schema);
         let frontmatter = with_derived_domain(&frontmatter, rel_key);
         let mtime = file_mtime(path, rel_key).await;
         let chunk_count = indexed.get(rel_key).map(|e| e.chunk_count).unwrap_or(0);
@@ -701,6 +1075,26 @@ async fn backfill_document_metadata(
         {
             Ok(()) => filled += 1,
             Err(e) => warn!("Metadata backfill failed for '{}': {:#}", rel_key, e),
+        }
+
+        // Refresh this file's outgoing markdown-link edges too — the incremental path
+        // (`upsert_pending`) does this per changed file, but a file the backfill visits
+        // is by definition unchanged, so without this an existing deployment's edge
+        // graph stays incomplete until content churns or an operator runs `index
+        // --full`. Same non-fatal, self-healing policy as `upsert_pending`.
+        let link_targets: Vec<(String, Option<f64>)> = extract_markdown_links(&body, rel_key)
+            .into_iter()
+            .map(|target| (target, None))
+            .collect();
+        if let Err(e) = state
+            .replace_links(rel_key, "markdown", &link_targets)
+            .await
+        {
+            warn!(
+                file = %rel_key,
+                "Metadata backfill: failed to update markdown links (non-fatal, will self-heal next run): {:#}",
+                e
+            );
         }
     }
 
@@ -1045,7 +1439,7 @@ async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bo
 /// `run_start` is threaded in as a parameter rather than started internally so the
 /// elapsed time in the closing summary log still covers `index_paths_inner`'s
 /// git-sync step, exactly as it did before this function existed.
-async fn index_paths_generic<E: EmbedStore, Q: VectorStore>(
+async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     config: &ResolvedConfig,
     paths: &[PathBuf],
     force: bool,
@@ -1253,6 +1647,17 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore>(
         INDEX_STATUS.set_phase(Phase::Embedding);
         info!("Embedding chunks for {} changed file(s)…", pending_count);
         upsert_pending(&pending, embedder, store, &state, collection).await?;
+
+        // Precompute semantic (kNN) edges for the web UI graph view. No-ops when
+        // `ui.semantic_edges` is disabled (the default) — see `update_semantic_edges`.
+        update_semantic_edges(
+            &pending,
+            store,
+            &state,
+            collection,
+            &config.ui.semantic_edges,
+        )
+        .await;
     }
 
     // ── Backfill metadata for unchanged files ────────────────────────────────
@@ -1433,6 +1838,7 @@ mod tests {
             write: Default::default(),
             search: Default::default(),
             reranking: None,
+            ui: Default::default(),
             provenance: Default::default(),
         }
     }
@@ -1597,6 +2003,236 @@ mod tests {
             2,
             "changed.md + unchanged.md remain; missing.md's metadata is gone"
         );
+    }
+
+    /// The one link-extraction test at the `index_paths_generic` level: proves
+    /// `upsert_pending` actually calls `state.replace_links` with the outgoing
+    /// markdown edges extracted from a real indexed file's body — not just that the
+    /// pure parser produces the right list in isolation (see
+    /// `extract_markdown_links_cases` below for that).
+    #[tokio::test]
+    async fn index_paths_generic_wires_markdown_links_into_state() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(
+            dir.path().join("docs/a.md"),
+            "# A\n\nSee [B](./b.md) and [top](../top.md).\n",
+        )
+        .unwrap();
+
+        let state = open_scan_test_db(&config).await;
+        let paths = vec![PathBuf::from("docs/a.md")];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let mut links = state.all_links().await.unwrap();
+        links.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            links,
+            vec![
+                (
+                    "docs/a.md".to_string(),
+                    "docs/b.md".to_string(),
+                    "markdown".to_string(),
+                    None
+                ),
+                (
+                    "docs/a.md".to_string(),
+                    "top.md".to_string(),
+                    "markdown".to_string(),
+                    None
+                ),
+            ]
+        );
+    }
+
+    /// Re-indexing a file whose links changed must REPLACE the prior edge set, not
+    /// accumulate alongside it — otherwise a removed link would leave a stale edge in
+    /// the graph forever.
+    #[tokio::test]
+    async fn index_paths_generic_replaces_markdown_links_on_reindex() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        let path = dir.path().join("a.md");
+
+        std::fs::write(&path, "[Old](old.md)").unwrap();
+        let state = open_scan_test_db(&config).await;
+        let paths = vec![PathBuf::from("a.md")];
+
+        index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![vec![1.0]]),
+            &TrackingMockVectorStore::all_ok(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.all_links().await.unwrap(),
+            vec![(
+                "a.md".to_string(),
+                "old.md".to_string(),
+                "markdown".to_string(),
+                None
+            )]
+        );
+
+        // Change the file's content (and therefore its hash) so the second run
+        // actually reprocesses it instead of hitting the unchanged-skip path.
+        std::fs::write(&path, "[New](new.md)").unwrap();
+        index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &MockEmbedClient::ok(vec![vec![1.0]]),
+            &TrackingMockVectorStore::all_ok(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state.all_links().await.unwrap(),
+            vec![(
+                "a.md".to_string(),
+                "new.md".to_string(),
+                "markdown".to_string(),
+                None
+            )],
+            "the old.md edge must be gone, not accumulated alongside new.md"
+        );
+    }
+
+    // -- extract_markdown_links -------------------------------------------------
+    //
+    // Table-driven: each case is (name, body, source_rel_path, expected resolved
+    // targets in order). Adding a new case is a one-line addition to the table, not a
+    // new test function.
+    #[test]
+    fn extract_markdown_links_cases() {
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            (
+                "plain sibling link",
+                "See [Guide](guide.md) for details.",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "./ resolves relative to the source file's own directory",
+                "[Guide](./guide.md)",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "../ climbs to the parent directory",
+                "[Top](../top.md)",
+                "docs/sub/page.md",
+                &["docs/top.md"],
+            ),
+            (
+                "a trailing #fragment is stripped before judging the target",
+                "[Section](guide.md#installation)",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "an anchor-only target has nothing left to link and is dropped",
+                "[Here](#top)",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "images are skipped, not treated as document links",
+                "![diagram](diagram.md)",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "external links are skipped (http, mailto, protocol-relative)",
+                "[a](https://x.com/x.md) [b](mailto:a@b.com) [c](//host/x.md)",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "non-.md targets are skipped",
+                "[Image](diagram.png) and [Site](index.html)",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "an absolute path is skipped",
+                "[Abs](/etc/passwd.md)",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "links inside a ``` fenced code block are not real links",
+                "```md\n[Guide](guide.md)\n```",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "links inside a ~~~ fenced code block are not real links",
+                "~~~md\n[Guide](guide.md)\n~~~",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "links inside an inline code span are not real links",
+                "Use `[Guide](guide.md)` literally.",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "reference-style links are NOT supported: [label][ref] has no (target) \
+                 immediately after the label, and no [ref]: definition is ever tracked, \
+                 so both lines here are silently ignored rather than partially resolved",
+                "[Guide][ref]\n\n[ref]: guide.md",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "duplicate links to the same resolved target are deduped, first-seen order",
+                "[A](guide.md) [B](./guide.md) [C](other.md)",
+                "docs/page.md",
+                &["docs/guide.md", "docs/other.md"],
+            ),
+            (
+                "an escape attempt above the knowledge-base root is rejected",
+                "[Escape](../../secret.md)",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "a root-level source file resolves against an empty directory",
+                "[Guide](guide.md)",
+                "page.md",
+                &["guide.md"],
+            ),
+        ];
+
+        for (name, body, source, expected) in cases {
+            let got = extract_markdown_links(body, source);
+            let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(got, expected, "case failed: {name}");
+        }
     }
 
     // -- scan_for_dirty -------------------------------------------------------
@@ -1945,6 +2581,54 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(chunk_count, 3);
+
+        drop(db_dir);
+    }
+
+    #[tokio::test]
+    async fn backfill_populates_markdown_links_for_unchanged_files() {
+        // Reproduces a KB indexed before markdown-link extraction existed: the file's
+        // indexed_files row is already there, but document_links has never seen it.
+        // Backfill (the incremental path's counterpart for unchanged files) must fill
+        // in the same edges `upsert_pending` would have written for a changed file.
+        let (db, db_dir) = backfill_test_db().await;
+        let kb = TempDir::new().unwrap();
+        let recipes_dir = kb.path().join("recipes");
+        std::fs::create_dir_all(&recipes_dir).unwrap();
+        let path = recipes_dir.join("chili.md");
+        std::fs::write(
+            &path,
+            "---\ntitle: Chili\n---\n\nSee [prep](./prep.md) and [sides](../sides/beans.md).",
+        )
+        .unwrap();
+
+        db.upsert("recipes/chili.md", "stale-hash", 1, "", 0, 0)
+            .await
+            .unwrap();
+        assert!(
+            db.all_links().await.unwrap().is_empty(),
+            "precondition: no links rows exist before backfill runs"
+        );
+
+        let queue = vec![("recipes/chili.md".to_string(), path)];
+        let filled =
+            backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas()).await;
+        assert_eq!(filled, 1);
+
+        let links = db.all_links().await.unwrap();
+        let targets: Vec<&str> = links
+            .iter()
+            .filter(|(source, _, kind, _)| source == "recipes/chili.md" && kind == "markdown")
+            .map(|(_, target, _, _)| target.as_str())
+            .collect();
+        assert!(
+            targets.contains(&"recipes/prep.md"),
+            "expected recipes/prep.md among {targets:?}"
+        );
+        assert!(
+            targets.contains(&"sides/beans.md"),
+            "expected sides/beans.md among {targets:?}"
+        );
 
         drop(db_dir);
     }
@@ -2683,6 +3367,22 @@ mod tests {
         }
     }
 
+    // `index_paths_generic` requires `Q: VectorStore + NeighborStore` since
+    // `update_semantic_edges` runs in the same call path. None of the
+    // `index_paths_generic` tests above enable `ui.semantic_edges`, so this is
+    // never actually called — it exists only to satisfy the trait bound.
+    impl NeighborStore for TrackingMockVectorStore {
+        async fn recommend_by_point_id(
+            &self,
+            _collection: &str,
+            _point_id: &str,
+            _limit: u64,
+            _filter: Option<Filter>,
+        ) -> Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+    }
+
     async fn test_state_db(dir: &TempDir) -> StateDb {
         let db_path = dir.path().join("state.db");
         StateDb::new(&db_path).await.unwrap()
@@ -2702,6 +3402,7 @@ mod tests {
             file_path: file_path.to_string(),
             frontmatter: HashMap::new(),
             chunks,
+            body: String::new(),
             hash: "abc123".to_string(),
             old_chunk_count,
             mtime: 1_700_000_000,
@@ -3039,6 +3740,211 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- update_semantic_edges -------------------------------------------------
+
+    /// Canned-response `NeighborStore` for `update_semantic_edges` tests — returns
+    /// the same fixed hit list for every call regardless of collection/point
+    /// id/limit/filter, so tests only need to shape the hits, not the request.
+    struct FakeNeighborStore {
+        hits: Vec<SearchResult>,
+    }
+
+    impl NeighborStore for FakeNeighborStore {
+        async fn recommend_by_point_id(
+            &self,
+            _collection: &str,
+            _point_id: &str,
+            _limit: u64,
+            _filter: Option<Filter>,
+        ) -> Result<Vec<SearchResult>> {
+            Ok(self.hits.clone())
+        }
+    }
+
+    /// A canned neighbor hit carrying just the `file_path` payload field
+    /// `update_semantic_edges` reads.
+    fn neighbor_hit(file_path: &str, score: f32) -> SearchResult {
+        let mut payload = HashMap::new();
+        payload.insert(
+            "file_path".to_string(),
+            serde_json::Value::String(file_path.to_string()),
+        );
+        SearchResult {
+            score,
+            pre_rerank_score: None,
+            dense_score: Some(score),
+            sparse_score: None,
+            payload,
+        }
+    }
+
+    fn semantic_edges_cfg(enabled: bool, k: u64, min_score: f32) -> SemanticEdgesConfig {
+        SemanticEdgesConfig {
+            enabled,
+            k,
+            min_score,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_semantic_edges_writes_replace_links_with_scores() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+        let pending = vec![make_pending("a.md", 1, 0)];
+        let neighbors = FakeNeighborStore {
+            hits: vec![neighbor_hit("b.md", 0.9), neighbor_hit("c.md", 0.7)],
+        };
+        let cfg = semantic_edges_cfg(true, 5, 0.6);
+
+        update_semantic_edges(&pending, &neighbors, &state, "col", &cfg).await;
+
+        let mut links = state.all_links().await.unwrap();
+        links.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            links,
+            vec![
+                (
+                    "a.md".to_string(),
+                    "b.md".to_string(),
+                    "semantic".to_string(),
+                    Some(0.9_f32 as f64)
+                ),
+                (
+                    "a.md".to_string(),
+                    "c.md".to_string(),
+                    "semantic".to_string(),
+                    Some(0.7_f32 as f64)
+                ),
+            ]
+        );
+    }
+
+    /// Even though the `must_not` filter on `file_path` is the real exclusion
+    /// mechanism (see `qdrant.rs`), a fake store — like this test's — has no reason
+    /// to honor it, so this proves `update_semantic_edges` also drops a self-hit
+    /// defensively on its own.
+    #[tokio::test]
+    async fn update_semantic_edges_excludes_self_hit() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+        let pending = vec![make_pending("a.md", 1, 0)];
+        let neighbors = FakeNeighborStore {
+            hits: vec![neighbor_hit("a.md", 0.99), neighbor_hit("b.md", 0.8)],
+        };
+        let cfg = semantic_edges_cfg(true, 5, 0.6);
+
+        update_semantic_edges(&pending, &neighbors, &state, "col", &cfg).await;
+
+        let links = state.all_links().await.unwrap();
+        assert_eq!(
+            links,
+            vec![(
+                "a.md".to_string(),
+                "b.md".to_string(),
+                "semantic".to_string(),
+                Some(0.8_f32 as f64)
+            )],
+            "a.md must never be recommended as its own neighbor"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_semantic_edges_filters_below_min_score() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+        let pending = vec![make_pending("a.md", 1, 0)];
+        let neighbors = FakeNeighborStore {
+            hits: vec![neighbor_hit("b.md", 0.9), neighbor_hit("c.md", 0.4)],
+        };
+        let cfg = semantic_edges_cfg(true, 5, 0.6);
+
+        update_semantic_edges(&pending, &neighbors, &state, "col", &cfg).await;
+
+        let links = state.all_links().await.unwrap();
+        assert_eq!(
+            links,
+            vec![(
+                "a.md".to_string(),
+                "b.md".to_string(),
+                "semantic".to_string(),
+                Some(0.9_f32 as f64)
+            )],
+            "c.md scored 0.4, below the 0.6 min_score threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_semantic_edges_truncates_to_top_k() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+        let pending = vec![make_pending("a.md", 1, 0)];
+        let neighbors = FakeNeighborStore {
+            hits: vec![
+                neighbor_hit("b.md", 0.9),
+                neighbor_hit("c.md", 0.8),
+                neighbor_hit("d.md", 0.7),
+            ],
+        };
+        let cfg = semantic_edges_cfg(true, 2, 0.0);
+
+        update_semantic_edges(&pending, &neighbors, &state, "col", &cfg).await;
+
+        let links = state.all_links().await.unwrap();
+        let targets: Vec<&str> = links.iter().map(|l| l.1.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["b.md", "c.md"],
+            "only the top 2 by score should survive k=2"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_semantic_edges_disabled_short_circuits() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+        let pending = vec![make_pending("a.md", 1, 0)];
+        let neighbors = FakeNeighborStore {
+            hits: vec![neighbor_hit("b.md", 0.9)],
+        };
+        let cfg = semantic_edges_cfg(false, 5, 0.6);
+
+        update_semantic_edges(&pending, &neighbors, &state, "col", &cfg).await;
+
+        assert!(
+            state.all_links().await.unwrap().is_empty(),
+            "disabled config must not write any semantic links"
+        );
+    }
+
+    /// A failed neighbor lookup for one file must not abort the batch or propagate
+    /// an error — the caller (`index_paths_generic`) does not (and must not have to)
+    /// handle a `Result` from this function.
+    #[tokio::test]
+    async fn update_semantic_edges_lookup_failure_is_non_fatal() {
+        struct FailingNeighborStore;
+        impl NeighborStore for FailingNeighborStore {
+            async fn recommend_by_point_id(
+                &self,
+                _collection: &str,
+                _point_id: &str,
+                _limit: u64,
+                _filter: Option<Filter>,
+            ) -> Result<Vec<SearchResult>> {
+                anyhow::bail!("qdrant unreachable")
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+        let pending = vec![make_pending("a.md", 1, 0)];
+        let cfg = semantic_edges_cfg(true, 5, 0.6);
+
+        // Must not panic; must leave no links behind for a lookup that never succeeded.
+        update_semantic_edges(&pending, &FailingNeighborStore, &state, "col", &cfg).await;
+
+        assert!(state.all_links().await.unwrap().is_empty());
     }
 
     #[test]
