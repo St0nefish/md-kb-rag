@@ -501,6 +501,7 @@ mod tests {
             write: Default::default(),
             search: Default::default(),
             reranking: None,
+            ui: Default::default(),
             provenance: Default::default(),
         })
     }

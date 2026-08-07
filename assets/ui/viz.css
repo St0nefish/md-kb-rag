@@ -1,0 +1,386 @@
+/*
+ * Adapted from Google's Open Knowledge Format (OKF) reference viewer
+ * (reference_agent/bundle/static/viz.css), licensed under the Apache
+ * License, Version 2.0. See LICENSE-okf.md in this directory for the
+ * full license text and a summary of what changed.
+ *
+ * Changes from the original: status badge classes updated to match this
+ * knowledge base's status vocabulary (active/archived/draft) instead of
+ * OKF's (stable/draft/deprecated); trust-tier/stale/sources/generated/
+ * verified styling removed (those frontmatter fields don't exist in this
+ * KB's schema — see viz.js for the corresponding metadata panel changes).
+ *
+ * Additions on top (not part of the original OKF stylesheet): generic
+ * `.btn`/`.btn-primary`/`.btn-danger` button styles, `.detail-actions`
+ * for the Edit/Delete buttons, and the editor overlay / confirm-dialog
+ * styling for assets/edit.js's in-browser editing UI.
+ */
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  color: #0f172a;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: #fff;
+  border-bottom: 1px solid #e2e8f0;
+  flex-shrink: 0;
+}
+.title strong { font-size: 16px; margin-right: 8px; }
+.muted { color: #64748b; font-size: 12px; }
+.controls { display: flex; gap: 8px; align-items: center; }
+.controls input, .controls select, .controls button {
+  font-size: 13px;
+  padding: 5px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #fff;
+}
+.controls input { width: 220px; }
+.controls button { cursor: pointer; background: #f1f5f9; }
+.controls button:hover { background: #e2e8f0; }
+
+main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+#graph {
+  flex: 1 1 60%;
+  background: #fff;
+  border-right: 1px solid #e2e8f0;
+  min-width: 0;
+  position: relative;
+}
+#graph-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 13px;
+}
+#graph-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 13px;
+  padding: 24px;
+  text-align: center;
+}
+#detail {
+  flex: 0 0 40%;
+  overflow-y: auto;
+  padding: 18px 22px;
+  background: #fff;
+}
+#detail-empty {
+  text-align: center;
+  margin-top: 40px;
+}
+
+.detail-header { margin-bottom: 12px; }
+.detail-header h1 {
+  font-size: 18px;
+  margin: 4px 0 2px;
+  font-weight: 600;
+}
+.type-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  background: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+dl.frontmatter {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  row-gap: 4px;
+  column-gap: 12px;
+  margin: 8px 0 12px;
+  font-size: 13px;
+}
+dl.frontmatter dt {
+  color: #64748b;
+  font-weight: 500;
+}
+dl.frontmatter dd { margin: 0; }
+dl.frontmatter a { color: #2563eb; word-break: break-all; }
+
+.tag {
+  display: inline-block;
+  padding: 1px 6px;
+  margin: 0 4px 2px 0;
+  border-radius: 4px;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 11px;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 4px;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+.badge.status-active { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
+.badge.status-draft { background: #fefce8; color: #a16207; border-color: #fde68a; }
+.badge.status-archived { background: #f1f5f9; color: #64748b; border-color: #cbd5e1; text-decoration: line-through; }
+
+.sources-list { padding-left: 18px; margin: 0; }
+.sources-list li { margin: 1px 0; }
+
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 14px 0; }
+
+#detail-body { font-size: 13px; line-height: 1.55; }
+#detail-body h1 {
+  font-size: 16px; margin: 18px 0 6px;
+  padding-bottom: 4px; border-bottom: 1px solid #e2e8f0;
+}
+#detail-body h2 { font-size: 14px; margin: 14px 0 4px; }
+#detail-body h3 { font-size: 13px; margin: 12px 0 4px; }
+#detail-body p { margin: 6px 0; }
+#detail-body code {
+  background: #f1f5f9;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+#detail-body pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+#detail-body pre code { background: transparent; color: inherit; padding: 0; }
+#detail-body ul, #detail-body ol { padding-left: 22px; margin: 6px 0; }
+#detail-body li { margin: 2px 0; }
+#detail-body table { border-collapse: collapse; margin: 8px 0; }
+#detail-body th, #detail-body td {
+  border: 1px solid #e2e8f0; padding: 4px 8px; font-size: 12px;
+}
+#detail-body a.internal { color: #2563eb; cursor: pointer; }
+#detail-body a.external { color: #2563eb; }
+
+#detail-backlinks { margin-top: 18px; }
+#detail-backlinks h2 { font-size: 13px; color: #64748b; margin-bottom: 6px; }
+#detail-backlinks ul { padding-left: 18px; }
+#detail-backlinks a { color: #2563eb; cursor: pointer; }
+
+/* ---------------------------------------------------------------------
+ * Editing UI (assets/edit.js) — not part of the original OKF viewer.
+ * ------------------------------------------------------------------- */
+
+.btn {
+  font-size: 12px;
+  padding: 5px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #f1f5f9;
+  color: #0f172a;
+  cursor: pointer;
+}
+.btn:hover { background: #e2e8f0; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.btn-primary:hover { background: #1d4ed8; }
+.btn-danger { background: #fff; border-color: #fecaca; color: #b91c1c; }
+.btn-danger:hover { background: #fef2f2; }
+
+.detail-header { position: relative; }
+.detail-actions {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  gap: 6px;
+}
+
+#editor-overlay, #confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+#editor-modal {
+  width: min(1100px, 94vw);
+  height: min(760px, 92vh);
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.35);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  flex-shrink: 0;
+}
+#editor-path-wrap { display: flex; flex-direction: column; gap: 2px; }
+#editor-path-wrap label { font-size: 11px; }
+#editor-path {
+  font-size: 13px;
+  padding: 5px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  min-width: 320px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+#editor-path[readonly] { background: #f1f5f9; color: #475569; }
+.editor-toolbar-status { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
+#editor-mode-badge { background: #94a3b8; }
+#editor-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#editor-status.status-ok { color: #047857; }
+#editor-status.status-err { color: #b91c1c; }
+.editor-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+#editor-errors {
+  margin: 0;
+  padding: 10px 16px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 12px;
+  border-bottom: 1px solid #fecaca;
+  max-height: 160px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+#editor-errors p { margin: 0 0 4px; font-weight: 600; }
+#editor-errors ul { margin: 4px 0 0; padding-left: 18px; }
+#editor-errors li { margin: 2px 0; }
+#editor-errors code { background: #fee2e2; padding: 0 3px; border-radius: 3px; }
+#editor-errors button {
+  margin-top: 8px;
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid #fca5a5;
+  border-radius: 4px;
+  background: #fff;
+  color: #b91c1c;
+  cursor: pointer;
+}
+
+#editor-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+#editor-schema {
+  flex: 0 0 210px;
+  border-right: 1px solid #e2e8f0;
+  padding: 10px 12px;
+  overflow-y: auto;
+  font-size: 12px;
+  background: #f8fafc;
+}
+#editor-schema h2 {
+  font-size: 11px;
+  margin: 0 0 8px;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.schema-field { margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px dashed #e2e8f0; }
+.schema-field:last-child { border-bottom: none; }
+.schema-field-name { font-weight: 600; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.schema-field-name .req { color: #b91c1c; margin-left: 2px; }
+.schema-field-type { color: #64748b; margin-left: 4px; }
+.schema-field-values { margin-top: 3px; color: #475569; }
+.schema-field-values span {
+  display: inline-block;
+  background: #e2e8f0;
+  border-radius: 3px;
+  padding: 0 4px;
+  margin: 1px 2px 0 0;
+}
+
+#editor-source { flex: 1 1 50%; min-width: 0; display: flex; }
+#editor-textarea {
+  flex: 1;
+  border: none;
+  resize: none;
+  padding: 12px 14px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  outline: none;
+  border-right: 1px solid #e2e8f0;
+}
+#editor-preview {
+  flex: 1 1 50%;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 12px 16px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+#editor-preview h1 { font-size: 16px; margin: 18px 0 6px; padding-bottom: 4px; border-bottom: 1px solid #e2e8f0; }
+#editor-preview h2 { font-size: 14px; margin: 14px 0 4px; }
+#editor-preview h3 { font-size: 13px; margin: 12px 0 4px; }
+#editor-preview p { margin: 6px 0; }
+#editor-preview code {
+  background: #f1f5f9;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+#editor-preview pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+#editor-preview pre code { background: transparent; color: inherit; padding: 0; }
+#editor-preview ul, #editor-preview ol { padding-left: 22px; margin: 6px 0; }
+
+#confirm-modal {
+  width: min(420px, 90vw);
+  background: #fff;
+  border-radius: 8px;
+  padding: 20px;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.35);
+}
+#confirm-message { margin: 0 0 16px; font-size: 14px; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }

@@ -290,6 +290,28 @@ fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<
     Ok(conditions)
 }
 
+/// Build the `QueryPoints` request for [`QdrantStore::recommend_by_point_id`].
+///
+/// Pulled out as a pure function (mirroring `build_conditions` above) so the
+/// request shape — named `dense` vector, nearest-to-an-existing-point query,
+/// limit, and optional filter — is unit-testable without a live Qdrant server.
+fn build_recommend_query(
+    collection: &str,
+    point_id: &str,
+    limit: u64,
+    filter: Option<Filter>,
+) -> QueryPointsBuilder {
+    let mut builder = QueryPointsBuilder::new(collection)
+        .query(Query::new_nearest(VectorInput::new_id(point_id)))
+        .using("dense")
+        .limit(limit)
+        .with_payload(true);
+    if let Some(filter) = filter {
+        builder = builder.filter(filter);
+    }
+    builder
+}
+
 impl QdrantStore {
     pub fn new(config: &ResolvedQdrantConfig) -> Result<Self> {
         let client = Qdrant::from_url(&config.url)
@@ -829,6 +851,47 @@ impl QdrantStore {
                 payload: a.payload,
             })
             .collect())
+    }
+
+    /// Doc-level k-NN via the Query API, using an existing point's stored vector as
+    /// the query instead of a caller-supplied embedding — Qdrant resolves `point_id`
+    /// server-side and searches the named `dense` vector for its nearest neighbors.
+    ///
+    /// Used to precompute the UI's semantic edges: callers pass the deterministic
+    /// first-chunk point id for a document (`make_point_id(file_path, 0)`, see
+    /// `ingest.rs`), so the neighbors returned are the nearest *documents* by their
+    /// opening chunk's dense embedding. `filter`, when given, is applied the same
+    /// way `search`'s conditions are — the typical use is excluding the source
+    /// document's own chunks via a `file_path` `must_not` condition so a document
+    /// never recommends itself.
+    pub async fn recommend_by_point_id(
+        &self,
+        collection: &str,
+        point_id: &str,
+        limit: u64,
+        filter: Option<Filter>,
+    ) -> Result<Vec<SearchResult>> {
+        let builder = build_recommend_query(collection, point_id, limit, filter);
+
+        let response = self
+            .client
+            .query(builder)
+            .await
+            .context("Failed to run recommend-by-point-id query")?;
+
+        let results = response
+            .result
+            .into_iter()
+            .map(|scored| SearchResult {
+                score: scored.score,
+                pre_rerank_score: None,
+                dense_score: Some(scored.score),
+                sparse_score: None,
+                payload: qdrant_payload_to_json(&scored.payload),
+            })
+            .collect();
+
+        Ok(results)
     }
 
     pub async fn health_check(&self) -> Result<()> {
@@ -1439,5 +1502,159 @@ mod tests {
             "expected non-string error, got: {}",
             err
         );
+    }
+
+    /// `build_recommend_query` (the pure request-builder behind
+    /// `recommend_by_point_id`) must target the named `dense` vector with a
+    /// nearest-to-existing-point query keyed by the given point id, and carry the
+    /// requested limit and payload flag through unmodified.
+    #[test]
+    fn recommend_query_targets_dense_vector_by_point_id() {
+        use qdrant_client::qdrant::{point_id::PointIdOptions, query::Variant, vector_input};
+
+        let request =
+            build_recommend_query("kb", "00000000-0000-0000-0000-000000000042", 7, None).build();
+
+        assert_eq!(request.collection_name, "kb");
+        assert_eq!(request.using.as_deref(), Some("dense"));
+        assert_eq!(request.limit, Some(7));
+        assert!(request.filter.is_none());
+        assert_eq!(
+            request.with_payload,
+            Some(qdrant_client::qdrant::WithPayloadSelector {
+                selector_options: Some(
+                    qdrant_client::qdrant::with_payload_selector::SelectorOptions::Enable(true)
+                ),
+            })
+        );
+
+        let query = request.query.expect("query must be set");
+        let Some(Variant::Nearest(vector_input)) = query.variant else {
+            panic!("expected a Nearest query variant, got {:?}", query.variant);
+        };
+        let Some(vector_input::Variant::Id(point_id)) = vector_input.variant else {
+            panic!("expected the Nearest query to target a point id");
+        };
+        assert_eq!(
+            point_id.point_id_options,
+            Some(PointIdOptions::Uuid(
+                "00000000-0000-0000-0000-000000000042".to_string()
+            ))
+        );
+    }
+
+    /// When a filter is supplied (the caller's typical use: excluding the source
+    /// document's own chunks by `file_path`), it must be carried into the request
+    /// unmodified rather than dropped or merged into some other condition.
+    #[test]
+    fn recommend_query_carries_supplied_filter() {
+        let filter =
+            Filter::must_not([Condition::matches("file_path", "docs/self.md".to_string())]);
+        let request = build_recommend_query("kb", "some-point-id", 5, Some(filter.clone())).build();
+
+        assert_eq!(request.filter, Some(filter));
+    }
+
+    /// A missing filter must leave the request filter-free — a `None` here means
+    /// Qdrant returns neighbors from the whole collection, so this must not
+    /// silently default to some other implicit condition.
+    #[test]
+    fn recommend_query_without_filter_is_unfiltered() {
+        let request = build_recommend_query("kb", "some-point-id", 5, None).build();
+        assert!(request.filter.is_none());
+    }
+
+    /// Integration test: upsert several documents' first-chunk points, then confirm
+    /// `recommend_by_point_id` returns the nearest neighbor by the named `dense`
+    /// vector and that an excluding filter removes the source document itself.
+    ///
+    /// Stays live-only — what this proves is that Qdrant's server-side point-id
+    /// resolution (`VectorInput::new_id`, i.e. "look up this point's own vector and
+    /// use it as the query") actually works end to end, plus that a `must_not`
+    /// filter is honored by the Query API for this query shape. Neither is
+    /// something a fake can stand in for: it's Qdrant's own vector-lookup-by-id
+    /// behavior under test, not code in this crate.
+    ///
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test recommend_by_point_id_finds_nearest_neighbor -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn recommend_by_point_id_finds_nearest_neighbor() {
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test-recommend-by-point-id".into(),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        let vector_size = 4;
+        store
+            .ensure_collection(
+                &config.collection,
+                vector_size,
+                &[IndexedField::keyword("file_path")],
+            )
+            .await
+            .unwrap();
+
+        let make_point = |id: &str, file: &str, vec: Vec<f32>| {
+            let mut payload = HashMap::new();
+            payload.insert("file_path".into(), serde_json::json!(file));
+            QdrantPoint {
+                id: id.into(),
+                vector: vec,
+                sparse: None,
+                payload,
+            }
+        };
+
+        // "a" and "b" are near-identical vectors (should recommend each other);
+        // "c" is orthogonal and should not show up as a's nearest neighbor.
+        let point_a = "00000000-0000-0000-0000-0000000000a1";
+        let point_b = "00000000-0000-0000-0000-0000000000b1";
+        let point_c = "00000000-0000-0000-0000-0000000000c1";
+        let points = vec![
+            make_point(point_a, "/data/a.md", vec![1.0, 0.0, 0.0, 0.0]),
+            make_point(point_b, "/data/b.md", vec![0.99, 0.01, 0.0, 0.0]),
+            make_point(point_c, "/data/c.md", vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        store
+            .upsert_points(&config.collection, points)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Unfiltered: a's own point is the nearest match to itself.
+        let results = store
+            .recommend_by_point_id(&config.collection, point_a, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].payload.get("file_path").and_then(|v| v.as_str()),
+            Some("/data/a.md"),
+        );
+
+        // Excluding a's own file, the nearest neighbor is b, not c.
+        let exclude_self =
+            Filter::must_not([Condition::matches("file_path", "/data/a.md".to_string())]);
+        let results = store
+            .recommend_by_point_id(&config.collection, point_a, 1, Some(exclude_self))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].payload.get("file_path").and_then(|v| v.as_str()),
+            Some("/data/b.md"),
+            "nearest neighbor excluding self should be b, not the orthogonal c"
+        );
+
+        store
+            .client
+            .delete_collection(&config.collection)
+            .await
+            .unwrap();
     }
 }

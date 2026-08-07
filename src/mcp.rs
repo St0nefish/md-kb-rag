@@ -25,6 +25,7 @@ use crate::{
     schema::SchemaCache,
     state::{DocumentIndex, DocumentQuery, FieldFilter, OrderBy, StateDb},
     validate,
+    write::{WriteDeps, WriteError, WriteOutcome as CoreWriteOutcome, WriteRequest, WriteSuccess},
 };
 
 const MAX_QUERY_LEN: usize = 4096;
@@ -33,79 +34,6 @@ const MAX_FILTER_STR_LEN: usize = 256;
 const MAX_TAG_COUNT: usize = 20;
 const MAX_TAG_LEN: usize = 256;
 const MAX_CONTENT_LEN: usize = 512 * 1024; // 512 KB
-
-/// Maximum number of characters from the new document's content used to build
-/// the dedup query text. Keeps the embedding request within typical token limits
-/// (most embedding models cap at ~512–8192 tokens; 2000 chars ≈ 400–500 tokens).
-const DEDUP_QUERY_CHAR_LIMIT: usize = 2000;
-
-/// A near-duplicate found during dedup gate evaluation.
-#[derive(Debug, Clone)]
-pub struct DuplicateHit {
-    pub file_path: String,
-    pub score: f32,
-}
-
-/// Pure decision function: given the closest match from Qdrant (if any) and a
-/// threshold, decide whether to refuse the write. Returns `Some(DuplicateHit)`
-/// when the write should be blocked, `None` when it is safe to proceed.
-///
-/// This is factored out so it can be unit-tested without a live Qdrant/embedder.
-pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<DuplicateHit> {
-    match top {
-        Some((path, score)) if score >= threshold => Some(DuplicateHit {
-            file_path: path,
-            score,
-        }),
-        _ => None,
-    }
-}
-
-/// Build the dedup query text on the same textual basis the indexer uses, then
-/// truncate it to `DEDUP_QUERY_CHAR_LIMIT`.
-///
-/// This must stay aligned with `chunk::chunk_markdown`: every indexed chunk is
-/// prefixed with its document's own `description` when
-/// `chunking.prepend_description` is set, so a dedup query built without that
-/// prefix would be compared against a different textual basis than the
-/// candidates it is scored against.
-pub(crate) fn build_dedup_query(
-    body: &str,
-    description: Option<&str>,
-    prepend_description: bool,
-) -> String {
-    let assembled = match (prepend_description, description) {
-        (true, Some(desc)) => format!("{}\n\n{}", desc, body),
-        _ => body.to_string(),
-    };
-    assembled.chars().take(DEDUP_QUERY_CHAR_LIMIT).collect()
-}
-
-/// Search options for the dedup gate.
-///
-/// Deliberately pinned to dense-only rather than inheriting `search.hybrid`, so
-/// the returned score is a cosine similarity comparable to
-/// `write.dedup_threshold`. Hybrid RRF scores top out around 0.03 — against a
-/// cosine threshold like the 0.80 default the gate could never fire — and a
-/// cross-encoder relevance score is not a similarity at all, so reranking is
-/// also kept out of this path (see the `reranker: None` at the call site).
-pub(crate) fn dedup_search_opts() -> SearchOptions {
-    SearchOptions {
-        limit: 1,
-        min_score: None,
-        hybrid: false,
-        // Unused in the dense-only path, which performs no RRF fusion.
-        rrf_candidates: 0,
-        explain: false,
-        modified_after: None,
-        modified_before: None,
-        rerank_candidate_limit: None,
-        // The dedup gate wants the single closest existing chunk, full stop — not
-        // a diversified page of results (limit: 1 above makes a per-document cap
-        // moot anyway, but this keeps intent explicit rather than accidental).
-        diversity_max_per_document: None,
-    }
-}
 
 /// Resolve a caller's requested `limit` against the configured default and ceiling.
 ///
@@ -150,8 +78,6 @@ const MAX_SCHEMA_DEFINITION_LEN: usize = 8 * 1024;
 const MAX_REPORTED_VALUES: usize = 200;
 /// Cap on fields echoed back per scope by `get_schema`.
 const MAX_REPORTED_FIELDS: usize = 500;
-/// Cap on a caller-supplied commit message.
-const MAX_COMMIT_MESSAGE_LEN: usize = 1000;
 
 /// Normalize a caller-supplied scope path into a safe KB-relative directory.
 ///
@@ -418,30 +344,6 @@ fn resolve_scope_reference(
             None,
         )),
     }
-}
-
-/// Reject a caller-supplied commit message that git or the log would mangle.
-fn validate_commit_message(message: Option<&str>) -> Result<(), McpError> {
-    let Some(msg) = message else {
-        return Ok(());
-    };
-    if msg.contains('\n') {
-        return Err(McpError::invalid_params(
-            "commit message must not contain newlines".to_string(),
-            None,
-        ));
-    }
-    if msg.len() > MAX_COMMIT_MESSAGE_LEN {
-        return Err(McpError::invalid_params(
-            format!(
-                "commit message too long ({} chars); maximum is {}",
-                msg.len(),
-                MAX_COMMIT_MESSAGE_LEN
-            ),
-            None,
-        ));
-    }
-    Ok(())
 }
 
 /// Strip control characters and cap length anywhere inside a value echoed back to an
@@ -728,81 +630,6 @@ fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
         }
     }
     Ok(())
-}
-
-/// Validate that `rel_path` is safe to write inside `data_root`, returning the
-/// absolute target path on success or an error string on failure.
-///
-/// Checks performed (in order):
-/// 1. Reject absolute paths.
-/// 2. Reject any `..` component.
-/// 3. Lexical `starts_with` check on the joined abs path.
-/// 4. Canonicalize the deepest *existing* ancestor of the target; verify it
-///    still `starts_with` the canonical data_root. This catches a symlinked
-///    ancestor directory that resolves to a location outside data_root.
-pub fn resolve_safe_write_path(data_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
-    // A leading `/` means "the knowledge-base root", not a filesystem path — callers
-    // have no way to know where the KB lives inside the container, so treating `/x.md`
-    // and `x.md` as the same location is the only reading that makes sense here.
-    let rel_path = crate::retrieval::kb_root_relative(rel_path);
-    let requested = Path::new(rel_path);
-    if requested.is_absolute() {
-        return Err("path must be relative to the knowledge base root".to_string());
-    }
-
-    // 2. Reject any `..` component.
-    for component in requested.components() {
-        if component == std::path::Component::ParentDir {
-            return Err("path must not contain '..' components".to_string());
-        }
-    }
-
-    let abs_path = data_root.join(rel_path);
-
-    // 3. Lexical starts_with check.
-    if !abs_path.starts_with(data_root) {
-        return Err("path escapes the knowledge base root".to_string());
-    }
-
-    // 4. Canonical-ancestor check: canonicalize data_root, then walk up from
-    //    abs_path to find the deepest ancestor that actually exists on disk,
-    //    canonicalize it, and confirm it still sits under canonical data_root.
-    let canonical_root = data_root.canonicalize().map_err(|e| {
-        format!(
-            "cannot canonicalize data root '{}': {}",
-            data_root.display(),
-            e
-        )
-    })?;
-
-    // Walk from abs_path upward until we find an existing ancestor.
-    let mut candidate = abs_path.as_path();
-    let existing_ancestor = loop {
-        if candidate.exists() {
-            break candidate;
-        }
-        match candidate.parent() {
-            Some(p) => candidate = p,
-            None => {
-                // No ancestor exists at all (shouldn't happen since data_root must exist).
-                break data_root;
-            }
-        }
-    };
-
-    let canonical_ancestor = existing_ancestor.canonicalize().map_err(|e| {
-        format!(
-            "cannot canonicalize ancestor '{}': {}",
-            existing_ancestor.display(),
-            e
-        )
-    })?;
-
-    if !canonical_ancestor.starts_with(&canonical_root) {
-        return Err("path escapes the knowledge base root (symlink detected)".to_string());
-    }
-
-    Ok(abs_path)
 }
 
 /// Parameters for the `get_document` tool.
@@ -1209,39 +1036,6 @@ pub fn apply_surgical(
     }
 }
 
-/// Render a unified diff between `old` and `new` content, labelled with
-/// `a/<relpath>` and `b/<relpath>`. Returns an empty string if there is no
-/// diff (shouldn't happen for a real change).
-pub fn render_unified_diff(old: &str, new: &str, relpath: &str) -> String {
-    use similar::TextDiff;
-    let diff = TextDiff::from_lines(old, new);
-    diff.unified_diff()
-        .context_radius(3)
-        .header(&format!("a/{relpath}"), &format!("b/{relpath}"))
-        .to_string()
-}
-
-/// Build a commit message with git trailers identifying the tool and operation.
-///
-/// The resulting message has the form:
-/// ```text
-/// <subject line>
-///
-/// Tool: md-kb-rag
-/// Operation: <operation>
-/// ```
-///
-/// `user_subject` is the caller-supplied commit message (if any). When absent,
-/// `default_subject` is used. The trailer block is always appended after a blank line.
-pub fn build_commit_message(
-    user_subject: Option<&str>,
-    default_subject: &str,
-    operation: &str,
-) -> String {
-    let subject = user_subject.unwrap_or(default_subject);
-    format!("{}\n\nTool: md-kb-rag\nOperation: {}", subject, operation)
-}
-
 /// The definitive, machine-readable outcome of a write tool call
 /// (`create_document`/`edit_document`/`delete_document`), exposed via
 /// `CallToolResult::structured_content` under the `"outcome"` key so a caller can
@@ -1295,6 +1089,262 @@ fn with_outcome(mut result: CallToolResult, outcome: WriteOutcome) -> CallToolRe
 /// (`ErrorData::data`), not just on success.
 fn outcome_data(outcome: WriteOutcome) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "outcome": outcome.as_str() }))
+}
+
+/// Map a successful `write::write_document` result (create or edit) onto this
+/// tool surface's `CallToolResult`, preserving the exact text and
+/// `structured_content` shape the existing create/edit tests pin down.
+fn create_edit_success_to_result(
+    success: WriteSuccess,
+    rel_path: &str,
+    is_create: bool,
+) -> CallToolResult {
+    let action = if is_create { "Created" } else { "Edited" };
+    match success.outcome {
+        CoreWriteOutcome::Synced => {
+            let summary = format!(
+                "{} '{}' (commit {}). Indexing has been queued and will complete shortly.",
+                action, rel_path, success.sha
+            );
+            let mut result_text = summary;
+            if !success.diff.is_empty() {
+                result_text = format!("{}\n\n{}", result_text, success.diff);
+            }
+            with_outcome(
+                CallToolResult::success(vec![Content::text(result_text)]),
+                WriteOutcome::Synced,
+            )
+        }
+        CoreWriteOutcome::CommittedPendingSync => {
+            let cause = success
+                .sync_failure_cause
+                .as_deref()
+                .unwrap_or("unknown error");
+            let summary = format!(
+                "{} '{}' (commit {}) — committed locally, but the push to the remote \
+                 failed: {}. It will sync on the next successful write or manual \
+                 intervention. Indexing has been queued from the local copy.",
+                action, rel_path, success.sha, cause
+            );
+            let mut result_text = summary;
+            if !success.diff.is_empty() {
+                result_text = format!("{}\n\n{}", result_text, success.diff);
+            }
+            with_outcome(
+                CallToolResult::success(vec![Content::text(result_text)]),
+                WriteOutcome::CommittedPendingSync,
+            )
+        }
+    }
+}
+
+/// Map a `write::write_document` failure (create or edit) onto this tool
+/// surface's `McpError`, preserving the exact text/data shapes the existing
+/// create/edit tests pin down.
+///
+/// `canonical_data_path` is used only to reconstruct the absolute path for the
+/// `AlreadyExists` race (see that arm's comment) — every other arm reports
+/// against `rel_path`, matching what the tool surface's other errors already do.
+fn create_edit_error_to_mcp_error(
+    err: WriteError,
+    rel_path: &str,
+    is_create: bool,
+    canonical_data_path: &Path,
+) -> McpError {
+    match err {
+        WriteError::Frozen { reason } => McpError::invalid_params(
+            format!(
+                "Cannot write '{}': the schema governing this directory is invalid ({}). \
+                 Fix {} before writing here.",
+                rel_path,
+                reason,
+                crate::schema::SCHEMA_FILE_NAME
+            ),
+            None,
+        ),
+        WriteError::Validation { result } => McpError::invalid_params(
+            format!(
+                "frontmatter validation failed for '{}': {}",
+                rel_path,
+                result.errors.join("; ")
+            ),
+            Some(serde_json::json!({ "field_errors": result.field_errors })),
+        ),
+        WriteError::DedupHit {
+            duplicate_of,
+            similarity,
+            threshold,
+        } => McpError::invalid_params(
+            format!(
+                "A similar document already exists: '{}' \
+                 (similarity {:.2} ≥ threshold {:.2}). \
+                 Edit it with edit_document, or pass \
+                 force_new=true to create a new document anyway.",
+                duplicate_of, similarity, threshold
+            ),
+            Some(serde_json::json!({
+                "duplicate_of": duplicate_of,
+                "similarity": similarity,
+                "threshold": threshold,
+            })),
+        ),
+        WriteError::InvalidCommitMessage { reason } => McpError::invalid_params(reason, None),
+        WriteError::UnsafePath { msg } => McpError::invalid_params(msg, None),
+        // Same text MCP callers already saw for this failure before
+        // `WriteError::Internal` existed to split it out of `UnsafePath` — see
+        // that variant's doc comment. MCP is a trusted surface, so unlike
+        // `web.rs` (which maps this to a generic message) this stays verbatim.
+        WriteError::Internal { msg } => McpError::invalid_params(msg, None),
+        // This is the TOCTOU race path: `create_document`'s own pre-check
+        // (`abs_path.exists()`) already passed, so the file was created between
+        // that check and `write::write_document`'s `create_new` open. Restored to
+        // the pre-`write.rs`-extraction wording, which reported the absolute
+        // filesystem path rather than the repo-relative one — reconstructed here
+        // via `resolve_safe_write_path` since `WriteError::AlreadyExists` itself
+        // carries no path (kept a unit variant so `web.rs`'s exhaustive match
+        // needs no change to accommodate this).
+        WriteError::AlreadyExists => {
+            let abs_path = crate::write::resolve_safe_write_path(canonical_data_path, rel_path)
+                .unwrap_or_else(|_| {
+                    canonical_data_path.join(crate::retrieval::kb_root_relative(rel_path))
+                });
+            McpError::invalid_params(
+                format!(
+                    "File '{}' already exists; use edit_document to modify it",
+                    abs_path.display()
+                ),
+                None,
+            )
+        }
+        WriteError::NotFound => {
+            McpError::invalid_params(format!("File '{}' does not exist", rel_path), None)
+        }
+        WriteError::StaleHash { expected, actual } => McpError::invalid_params(
+            format!(
+                "'{}' has changed since you read it: expected content_hash '{}' \
+                 but the current document hash is '{}'. Re-read it with \
+                 get_document and reapply your edit against the current content.",
+                rel_path, expected, actual
+            ),
+            None,
+        ),
+        WriteError::PreCommitFailed {
+            rolled_back: true,
+            msg,
+        } => McpError::internal_error(
+            format!(
+                "'{}' was not {}: git commit failed and the attempted change has \
+                 been rolled back — nothing changed, safe to retry. Cause: {}",
+                rel_path,
+                if is_create { "created" } else { "edited" },
+                msg
+            ),
+            outcome_data(WriteOutcome::FailedNoChange),
+        ),
+        WriteError::PreCommitFailed {
+            rolled_back: false,
+            msg,
+        } => McpError::internal_error(
+            format!(
+                "'{}' is in an INCONSISTENT state: git commit failed AND the \
+                 rollback attempt itself failed. The working tree may not \
+                 match git history for this path — do not assume this \
+                 operation did or did not take effect. Manual inspection is \
+                 required. {}",
+                rel_path, msg
+            ),
+            outcome_data(WriteOutcome::FailedInconsistentState),
+        ),
+        WriteError::Io { msg } => McpError::internal_error(msg, None),
+    }
+}
+
+/// Map a successful `write::delete_document` result onto this tool surface's
+/// `CallToolResult`, preserving the exact text/`structured_content` shape the
+/// existing delete tests pin down.
+fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolResult {
+    match success.outcome {
+        CoreWriteOutcome::Synced => {
+            let summary = format!(
+                "Deleted '{}' (commit {}). Index cleanup has been queued and will complete shortly.",
+                rel_path, success.sha
+            );
+            let mut result_text = summary;
+            if !success.diff.is_empty() {
+                result_text = format!("{}\n\n{}", result_text, success.diff);
+            }
+            with_outcome(
+                CallToolResult::success(vec![Content::text(result_text)]),
+                WriteOutcome::Synced,
+            )
+        }
+        CoreWriteOutcome::CommittedPendingSync => {
+            let cause = success
+                .sync_failure_cause
+                .as_deref()
+                .unwrap_or("unknown error");
+            let summary = format!(
+                "Deleted '{}' (commit {}) — committed locally, but the push to the remote \
+                 failed: {}. It will sync on the next successful write or manual \
+                 intervention. Index cleanup has been queued from the local copy.",
+                rel_path, success.sha, cause
+            );
+            let mut result_text = summary;
+            if !success.diff.is_empty() {
+                result_text = format!("{}\n\n{}", result_text, success.diff);
+            }
+            with_outcome(
+                CallToolResult::success(vec![Content::text(result_text)]),
+                WriteOutcome::CommittedPendingSync,
+            )
+        }
+    }
+}
+
+/// Map a `write::delete_document` failure onto this tool surface's `McpError`,
+/// preserving the exact text/data shapes the existing delete tests pin down.
+fn delete_error_to_mcp_error(err: WriteError, rel_path: &str) -> McpError {
+    match err {
+        WriteError::InvalidCommitMessage { reason } => McpError::invalid_params(reason, None),
+        WriteError::UnsafePath { msg } => McpError::invalid_params(msg, None),
+        // See `create_edit_error_to_mcp_error`'s identical arm: same text MCP
+        // callers already saw before `WriteError::Internal` existed.
+        WriteError::Internal { msg } => McpError::invalid_params(msg, None),
+        WriteError::NotFound => {
+            McpError::invalid_params(format!("document does not exist: '{}'", rel_path), None)
+        }
+        WriteError::PreCommitFailed {
+            rolled_back: true,
+            msg,
+        } => McpError::internal_error(
+            format!(
+                "'{}' was NOT deleted: git commit failed and the file has been \
+                 restored from HEAD — nothing changed, safe to retry. \
+                 Cause: {}",
+                rel_path, msg
+            ),
+            outcome_data(WriteOutcome::FailedNoChange),
+        ),
+        WriteError::PreCommitFailed {
+            rolled_back: false,
+            msg,
+        } => McpError::internal_error(
+            format!(
+                "'{}' is in an INCONSISTENT state: git commit failed AND the \
+                 attempt to restore the file from HEAD also failed. The file is \
+                 gone from disk but was never committed as deleted — do not \
+                 assume it exists or that the deletion is durable. Manual \
+                 inspection is required. {}",
+                rel_path, msg
+            ),
+            outcome_data(WriteOutcome::FailedInconsistentState),
+        ),
+        WriteError::Io { msg } => McpError::internal_error(msg, None),
+        // `write::delete_document` never produces these — they are create/edit-only
+        // failure modes (schema-frozen check, frontmatter validation, the dedup
+        // gate, and create-vs-exists) that the delete pipeline doesn't run.
+        other => McpError::internal_error(format!("unexpected write error: {:?}", other), None),
+    }
 }
 
 /// Outcome of a `write_raw_file` call whose commit actually landed in local
@@ -1452,8 +1502,10 @@ impl KbSearchServer {
         // caller-supplied path is NOT sufficient on its own: the knowledge base is a
         // synced git repo, and git materializes tracked symlinks on checkout, so a
         // hostile upstream commit could otherwise redirect this write outside the KB.
-        let abs_path = resolve_safe_write_path(&self.canonical_data_path, rel_path)
-            .map_err(|e| McpError::invalid_params(format!("Invalid schema path: {}", e), None))?;
+        let abs_path = crate::write::resolve_safe_write_path(&self.canonical_data_path, rel_path)
+            .map_err(|e| {
+            McpError::invalid_params(format!("Invalid schema path: {}", e), None)
+        })?;
 
         if let Some(parent) = abs_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -1465,7 +1517,7 @@ impl KbSearchServer {
         // Re-check after creating the directory: `resolve_safe_write_path` can only
         // canonicalize ancestors that existed at the time, so a newly created path
         // component is verified here.
-        resolve_safe_write_path(&self.canonical_data_path, rel_path)
+        crate::write::resolve_safe_write_path(&self.canonical_data_path, rel_path)
             .map_err(|e| McpError::invalid_params(format!("Invalid schema path: {}", e), None))?;
 
         // Whether this call is creating `rel_path` for the first time or overwriting
@@ -2484,9 +2536,14 @@ impl KbSearchServer {
 
     /// Shared pipeline for create_document and edit_document.
     ///
+    /// Thin adapter over `write::write_document`: builds `WriteDeps`/`WriteRequest`
+    /// from this server's fields and the current config snapshot, then maps the
+    /// structured `WriteSuccess`/`WriteError` back onto this tool surface's exact
+    /// `CallToolResult`/`McpError` shapes (see `create_edit_success_to_result` /
+    /// `create_edit_error_to_mcp_error`).
+    ///
     /// Callers are responsible for resolving paths and computing old/new content
-    /// before calling this. This function handles validation, optional dedup
-    /// gating (create only), filesystem write, git commit, reindex, and diff output.
+    /// before calling this — see `write::WriteRequest`'s doc comment.
     ///
     /// * `old_content` – empty string for create; existing file bytes for edit.
     /// * `new_content` – the content to write (already computed by caller).
@@ -2496,11 +2553,6 @@ impl KbSearchServer {
     /// * `default_verb`– verb for the default commit message, e.g. `"add"` or `"update"`.
     /// * `force_new`   – when `Some(true)`, bypasses the dedup gate on create paths.
     /// * `operation`   – label for the `Operation:` git trailer, e.g. `"create_document"`.
-    ///
-    /// The absolute path is deliberately NOT a parameter: it is re-resolved from
-    /// `rel_path` immediately before each filesystem action, so a path validated by the
-    /// caller cannot go stale across the validation and dedup awaits in between.
-    /// Callers still resolve it themselves for their own existence checks.
     #[allow(clippy::too_many_arguments)]
     async fn write_document(
         &self,
@@ -2528,376 +2580,53 @@ impl KbSearchServer {
             ));
         }
 
-        // 1. Validate new_content before writing (catches frontmatter errors in
-        //    both full-replace and surgical edits before touching the filesystem).
-        //
-        // The schema is resolved from the TARGET path's directory, so writing into
-        // `lifestyle/kitchen/recipes/` is governed by that folder's rules regardless of
-        // where the caller has been reading. This reads the shared, server-owned cache
-        // (`KbSearchServer::schema_cache`) rather than rebuilding: at knowledge-base
-        // scale a full tree walk on every write is no longer "a few milliseconds", and
-        // going through `update_schema` keeps this from going stale — that tool
-        // rebuilds and swaps the cache SYNCHRONOUSLY before it returns, specifically so
-        // a write immediately following a schema change is validated against the new
-        // rules rather than the ones it just replaced. A schema edited directly on the
-        // KB's git host (bypassing `update_schema`) is instead picked up by the reindex
-        // worker the next time it sees that `.kb-schema.yaml` dirty.
-        let schemas = crate::schema::load_shared(&self.schema_cache);
-        if let Some(reason) = schemas.is_frozen(std::path::Path::new(rel_path)) {
-            return Err(McpError::invalid_params(
-                format!(
-                    "Cannot write '{}': the schema governing this directory is invalid ({}). \
-                     Fix {} before writing here.",
-                    rel_path,
-                    reason,
-                    crate::schema::SCHEMA_FILE_NAME
-                ),
-                None,
-            ));
-        }
-        let schema = schemas.resolve_for(std::path::Path::new(rel_path));
-
-        let (validation_result, validated) = validate::validate_content(
-            std::path::Path::new(rel_path),
-            new_content,
-            schema,
-            &config.validation,
-        )
-        .await
-        .map_err(|e| {
-            error!("Validation error for '{}': {:#}", rel_path, e);
-            McpError::internal_error(format!("Failed to validate content: {}", e), None)
-        })?;
-
-        if !validation_result.valid {
-            let data = Some(serde_json::json!({
-                "field_errors": validation_result.field_errors
-            }));
-            return Err(McpError::invalid_params(
-                format!(
-                    "frontmatter validation failed for '{}': {}",
-                    rel_path,
-                    validation_result.errors.join("; ")
-                ),
-                data,
-            ));
-        }
-
-        // 2. Dedup gate: on create paths, check for near-duplicate existing documents.
-        //    Gate runs only when: this is a create (not edit), dedup is enabled in
-        //    config, and the caller has not set force_new = true.
-        if is_create && config.write.dedup_enabled && !matches!(force_new, Some(true)) {
-            // Reuse the body already parsed during validation above rather than
-            // re-deriving it here: that keeps the dedup query on exactly the
-            // frontmatter-stripped basis the indexer embeds.
-            let query_text = validated
-                .as_ref()
-                .map(|v| {
-                    let description = v.frontmatter.get("description").and_then(|d| d.as_str());
-                    build_dedup_query(&v.body, description, config.chunking.prepend_description)
-                })
-                .unwrap_or_default();
-
-            if query_text.trim().is_empty() {
-                warn!(
-                    "Dedup gate skipped for '{}': no body text to compare",
-                    rel_path
-                );
-            } else {
-                let empty_filters = SearchFilters {
-                    domain: None,
-                    r#type: None,
-                    tags: None,
-                };
-                // Detach the reranker: `dedup_threshold` is a cosine similarity,
-                // and a cross-encoder relevance score is not comparable to it.
-                let dedup_deps = RetrievalDeps {
-                    reranker: None,
-                    ..self.deps()
-                };
-                match retrieval::search(
-                    &dedup_deps,
-                    &query_text,
-                    &empty_filters,
-                    &dedup_search_opts(),
-                )
-                .await
-                {
-                    Ok(results) => {
-                        let top = results.into_iter().next().map(|r| {
-                            let path = r
-                                .payload
-                                .get("file_path")
-                                .and_then(|v| v.as_str())
-                                .map(|p| retrieval::relative_to_data(p, &self.canonical_data_path))
-                                .unwrap_or_default();
-                            (path, r.score)
-                        });
-                        if let Some((path, score)) = top.as_ref() {
-                            debug!(
-                                "Dedup gate for '{}': nearest '{}' at dense cosine {:.4} \
-                                 (threshold {:.2})",
-                                rel_path, path, score, config.write.dedup_threshold
-                            );
-                        }
-                        if let Some(hit) = dedup_verdict(top, config.write.dedup_threshold) {
-                            let threshold = config.write.dedup_threshold;
-                            return Err(McpError::invalid_params(
-                                format!(
-                                    "A similar document already exists: '{}' \
-                                     (similarity {:.2} ≥ threshold {:.2}). \
-                                     Edit it with edit_document, or pass \
-                                     force_new=true to create a new document anyway.",
-                                    hit.file_path, hit.score, threshold
-                                ),
-                                Some(serde_json::json!({
-                                    "duplicate_of": hit.file_path,
-                                    "similarity": hit.score,
-                                    "threshold": threshold,
-                                })),
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Dedup search failed for '{}' (proceeding with write): {:#?}",
-                            rel_path, e
-                        );
-                    }
-                }
-            }
-        }
-
-        // 3. Create parent directories and write the file
-        // Validate the commit message BEFORE touching the filesystem. Rejecting it
-        // afterwards would leave the file written but never committed, and the index
-        // purge that follows a successful commit would never run.
-        validate_commit_message(message)?;
-
-        // Resolve fresh before creating directories too. The caller's resolution
-        // happened before schema validation and a Qdrant dedup query — a wide window in
-        // which a concurrent git sync could swap a component for a symlink, which would
-        // otherwise let create_dir_all materialize real directories outside the KB.
-        let abs_path =
-            &resolve_safe_write_path(&self.canonical_data_path, rel_path).map_err(|e| {
-                error!(
-                    "Path check failed before creating directories for '{}': {}",
-                    rel_path, e
-                );
-                McpError::invalid_params(format!("Invalid path: {}", e), None)
-            })?;
-
-        if let Some(parent) = abs_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                error!(
-                    "Failed to create parent directories for '{}': {}",
-                    abs_path.display(),
-                    e
-                );
-                McpError::internal_error(
-                    format!("Failed to create parent directories: {}", e),
-                    None,
-                )
-            })?;
-        }
-
-        // Re-verify immediately before writing. The initial resolution could only
-        // canonicalize ancestors that existed at the time, and the work between then
-        // and here — schema validation, an embedding call, a Qdrant dedup query — is a
-        // wide window in which a concurrent git sync could swap a path component for a
-        // symlink. Checking afterwards would only report an escape that already
-        // happened; the verified path is what we write to.
-        let abs_path =
-            &resolve_safe_write_path(&self.canonical_data_path, rel_path).map_err(|e| {
-                error!("Path check failed before writing '{}': {}", rel_path, e);
-                McpError::invalid_params(format!("Invalid path: {}", e), None)
-            })?;
-
-        if is_create {
-            use tokio::io::AsyncWriteExt as _;
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(abs_path)
-                .await
-                .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
-                        McpError::invalid_params(
-                            format!(
-                                "File '{}' already exists; use edit_document to modify it",
-                                abs_path.display()
-                            ),
-                            None,
-                        )
-                    } else {
-                        error!("Failed to create file '{}': {}", abs_path.display(), e);
-                        McpError::internal_error(format!("Failed to create file: {}", e), None)
-                    }
-                })?;
-            file.write_all(new_content.as_bytes()).await.map_err(|e| {
-                error!("Failed to write file '{}': {}", abs_path.display(), e);
-                McpError::internal_error(format!("Failed to write file: {}", e), None)
-            })?;
-        } else {
-            tokio::fs::write(abs_path, new_content.as_bytes())
-                .await
-                .map_err(|e| {
-                    error!("Failed to write file '{}': {}", abs_path.display(), e);
-                    McpError::internal_error(format!("Failed to write file: {}", e), None)
-                })?;
-        }
-
-        let commit_message = build_commit_message(
-            message,
-            &format!("docs: {} {}", default_verb, rel_path),
-            operation,
-        );
-
-        // 5. Resolve git token
         let token = std::env::var(&config.source.git_token_env)
             .ok()
             .filter(|s| !s.is_empty());
 
-        // 6. Commit and sync to remote.
-        //
-        // `commit_and_sync` distinguishes WHERE it failed — see `git::CommitSyncError`
-        // — and the two phases demand opposite handling. A `PreCommit` failure means
-        // HEAD never moved, so the file write above (already on disk, not yet
-        // committed) is rolled back and reported as "nothing changed". A `PostCommit`
-        // failure means the commit is a real, durable part of local history — rolling
-        // it back here would silently undo work that genuinely happened, so it is
-        // left alone and reported as "committed, sync pending" instead.
-        let data_path_str = self.canonical_data_path.to_str().unwrap_or_default();
-        let commit_outcome = match git::commit_and_sync(
-            config.source.git_url.as_deref(),
-            &config.source.branch,
-            data_path_str,
-            token.as_deref(),
-            rel_path,
-            &commit_message,
-            &config.write.commit_author_name,
-            &config.write.commit_author_email,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-
-            Err(git::CommitSyncError::PreCommit(source)) => {
-                error!(
-                    "commit_and_sync pre-commit failure for '{}', rolling back: {:#}",
-                    rel_path, source
-                );
-
-                // For a create, there is no HEAD content to restore to — undo the
-                // filesystem write directly and unstage whatever `git add` staged.
-                // For an edit, HEAD already has the previous content, so restore it
-                // (this also un-stages any partial `git add`, in one step).
-                let rollback = if is_create {
-                    match tokio::fs::remove_file(abs_path).await {
-                        Ok(()) => git::unstage(data_path_str, rel_path).await,
-                        Err(e) => Err(anyhow::Error::new(e)
-                            .context("Failed to remove newly-written file during rollback")),
-                    }
-                } else {
-                    git::restore_from_head(data_path_str, rel_path).await
-                };
-
-                return match rollback {
-                    Ok(()) => Err(McpError::internal_error(
-                        format!(
-                            "'{}' was not {}: git commit failed and the attempted change has \
-                             been rolled back — nothing changed, safe to retry. Cause: {:#}",
-                            rel_path,
-                            if is_create { "created" } else { "edited" },
-                            source
-                        ),
-                        outcome_data(WriteOutcome::FailedNoChange),
-                    )),
-                    // The rollback ITSELF failed — a third, worse state than either of
-                    // the above. The file may now be gone/changed on disk with no
-                    // corresponding commit, or the index may not match HEAD. Report it
-                    // distinctly and loudly rather than letting it masquerade as a
-                    // clean no-op.
-                    Err(rollback_err) => {
-                        error!(
-                            "Rollback FAILED after a pre-commit git failure for '{}': {:#}. \
-                             Original cause: {:#}. Filesystem and git state may now be \
-                             inconsistent.",
-                            rel_path, rollback_err, source
-                        );
-                        Err(McpError::internal_error(
-                            format!(
-                                "'{}' is in an INCONSISTENT state: git commit failed AND the \
-                                 rollback attempt itself failed. The working tree may not \
-                                 match git history for this path — do not assume this \
-                                 operation did or did not take effect. Manual inspection is \
-                                 required. Commit cause: {:#}. Rollback cause: {:#}",
-                                rel_path, source, rollback_err
-                            ),
-                            outcome_data(WriteOutcome::FailedInconsistentState),
-                        ))
-                    }
-                };
-            }
-
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
-                warn!(
-                    "commit_and_sync post-commit (sync) failure for '{}', commit {} stands \
-                     uncorrected: {:#}",
-                    rel_path, sha, source
-                );
-
-                // The local file already reflects the new content regardless of push
-                // status, so the local index should too. `rebased_paths` is empty
-                // here — the rebase never ran (fetch/rebase/push all happen after the
-                // commit, so any of them failing means we never got as far as a
-                // trustworthy rebase diff).
-                crate::reindex::mark_paths(std::iter::once(std::path::PathBuf::from(rel_path)));
-
-                let action = if is_create { "Created" } else { "Edited" };
-                let summary = format!(
-                    "{} '{}' (commit {}) — committed locally, but the push to the remote \
-                     failed: {:#}. It will sync on the next successful write or manual \
-                     intervention. Indexing has been queued from the local copy.",
-                    action, rel_path, sha, source
-                );
-                let diff = render_unified_diff(old_content, new_content, rel_path);
-                let mut result_text = summary;
-                if !diff.is_empty() {
-                    result_text = format!("{}\n\n{}", result_text, diff);
-                }
-                return Ok(with_outcome(
-                    CallToolResult::success(vec![Content::text(result_text)]),
-                    WriteOutcome::CommittedPendingSync,
-                ));
-            }
+        let deps = WriteDeps {
+            retrieval: self.deps(),
+            canonical_data_path: &self.canonical_data_path,
+            schema_cache: &self.schema_cache,
+            validation: &config.validation,
+            prepend_description: config.chunking.prepend_description,
+            dedup_enabled: config.write.dedup_enabled,
+            dedup_threshold: config.write.dedup_threshold,
+            git_url: config.source.git_url.as_deref(),
+            branch: &config.source.branch,
+            token: token.as_deref(),
+            commit_author_name: &config.write.commit_author_name,
+            commit_author_email: &config.write.commit_author_email,
         };
 
-        // 7. Mark this path — and anything the rebase pulled in from other commits —
-        //    dirty and return immediately. The reindex worker (src/reindex.rs) does
-        //    the actual chunk/embed/upsert work out of band; this call never blocks on
-        //    it, which is the whole point — embedding is far slower than an MCP
-        //    client's request timeout on a large document.
-        crate::reindex::mark_paths(
-            std::iter::once(std::path::PathBuf::from(rel_path))
-                .chain(commit_outcome.rebased_paths.iter().cloned()),
-        );
+        let req = WriteRequest {
+            rel_path,
+            old_content,
+            new_content,
+            is_create,
+            message,
+            default_verb,
+            force_new,
+            operation,
+            // `edit_document` already enforces the stale-read guard itself, ahead
+            // of applying a surgical old_string/new_string replacement — so a
+            // stale read surfaces as an explicit "changed since you read it"
+            // error rather than a confusing old_string-not-found one. Passing
+            // `None` here avoids redundantly re-hashing the same in-memory
+            // `old_content` a second time; it can never disagree with the first
+            // check since both compare against the identical string.
+            expected_hash: None,
+        };
 
-        // 8. Build unified diff and return success
-        let action = if is_create { "Created" } else { "Edited" };
-        let summary = format!(
-            "{} '{}' (commit {}). Indexing has been queued and will complete shortly.",
-            action, rel_path, commit_outcome.sha
-        );
-        let diff = render_unified_diff(old_content, new_content, rel_path);
-        let mut result_text = summary;
-        if !diff.is_empty() {
-            result_text = format!("{}\n\n{}", result_text, diff);
+        match crate::write::write_document(&deps, req).await {
+            Ok(success) => Ok(create_edit_success_to_result(success, rel_path, is_create)),
+            Err(err) => Err(create_edit_error_to_mcp_error(
+                err,
+                rel_path,
+                is_create,
+                &self.canonical_data_path,
+            )),
         }
-        Ok(with_outcome(
-            CallToolResult::success(vec![Content::text(result_text)]),
-            WriteOutcome::Synced,
-        ))
     }
 
     #[tool(description = "Create a new document in the knowledge base. \
@@ -2919,20 +2648,28 @@ impl KbSearchServer {
     ) -> Result<CallToolResult, McpError> {
         // Resolve path: must be relative, no traversal, not already existing.
         let data_root = self.canonical_data_path.clone();
-        let abs_path = resolve_safe_write_path(&data_root, &params.path)
+        let abs_path = crate::write::resolve_safe_write_path(&data_root, &params.path)
             .map_err(|e| McpError::invalid_params(e, None))?;
 
-        // Include-pattern guard: reject paths the indexer would not pick up.
-        if !self.include_patterns.is_match(&params.path) {
-            return Err(McpError::invalid_params(
-                format!(
-                    "path '{}' does not match any indexable include pattern \
-                     (e.g. must be a markdown file under an included path)",
-                    params.path
-                ),
-                None,
-            ));
-        }
+        // The include-pattern eligibility guard is enforced inside
+        // `write::write_document` itself too — see that module's
+        // `check_include_pattern` — so every caller of the shared write pipeline
+        // (this tool, `edit_document`/`delete_document` via `resolve_within_data`,
+        // and the HTTP UI in `web.rs`) gets it for free instead of each transport
+        // maintaining its own copy that a future caller could forget. It is ALSO
+        // run here, explicitly, ahead of the `exists()` pre-check just below:
+        // pre-refactor, a path that both exists on disk and fails this check was
+        // reported with the include-pattern message, not "already exists; use
+        // edit_document" — which, for such a path, is misleading circular
+        // guidance, since edit_document would then reject the same path as not
+        // permitted. Running `write::write_document`'s check later is not
+        // sufficient to restore that priority on its own, since the `exists()`
+        // check below returns before ever reaching it. Same message text as
+        // `write::write_document`'s own check (see `create_edit_error_to_mcp_error`'s
+        // `UnsafePath` arm), so existing callers see the exact same wording.
+        crate::write::check_include_pattern_against(&self.include_patterns, &params.path).map_err(
+            |e| create_edit_error_to_mcp_error(e, &params.path, true, &self.canonical_data_path),
+        )?;
 
         // File must not already exist for create.
         if abs_path.exists() {
@@ -3116,7 +2853,12 @@ impl KbSearchServer {
             ));
         }
 
-        // 1. Resolve the path (must already exist on disk).
+        // Resolve the path (must already exist on disk). This is the same fuzzy
+        // resolver `get_document`/`edit_document` use — relative to the KB root, a
+        // unique basename, or absolute — and produces this tool's richer NotFound
+        // text. It stays here rather than in `write::delete_document`, which does
+        // its own plain existence check as a defense-in-depth fallback for callers
+        // (like the HTTP UI) that address a document by exact path instead.
         let canonical = match retrieval::resolve_within_data(
             raw,
             &self.canonical_data_path,
@@ -3153,161 +2895,29 @@ impl KbSearchServer {
             .to_string_lossy()
             .into_owned();
 
-        // Validate the commit message BEFORE deleting anything. Rejecting it after the
-        // removal would leave the file gone from disk but never committed, with the
-        // Qdrant and state-DB purge — which only runs after a successful commit —
-        // skipped too, so search would keep returning a document that no longer exists.
-        validate_commit_message(params.message.as_deref())?;
-
-        // 2. Read file content before removal (used for diff output).
-        let old_content = tokio::fs::read_to_string(&canonical).await.map_err(|e| {
-            error!("Failed to read '{}': {}", canonical.display(), e);
-            McpError::internal_error(format!("Failed to read file before deletion: {}", e), None)
-        })?;
-
-        // 3. Remove the file from disk.
-        tokio::fs::remove_file(&canonical).await.map_err(|e| {
-            error!("Failed to remove '{}': {}", canonical.display(), e);
-            McpError::internal_error(format!("Failed to remove file: {}", e), None)
-        })?;
-
-        // 4. Commit + push the deletion.
-        let commit_message = build_commit_message(
-            params.message.as_deref(),
-            &format!("docs: delete {}", rel_path),
-            "delete_document",
-        );
-
         let token = std::env::var(&config.source.git_token_env)
             .ok()
             .filter(|s| !s.is_empty());
 
-        // `commit_and_sync` distinguishes WHERE it failed — see `git::CommitSyncError`
-        // — which matters a great deal here, since the file is already gone from disk
-        // by this point:
-        //
-        // - `PreCommit` (add/commit failed): HEAD never recorded the deletion, so the
-        //   file's absence from disk is the ONLY trace of this call. Restore it from
-        //   HEAD so the caller sees "nothing changed" and can safely retry.
-        // - `PostCommit` (fetch/rebase/push failed): the deletion IS a real local
-        //   commit — HEAD already reflects the file being gone. Restoring it here
-        //   would resurrect a document that, as far as local git history is
-        //   concerned, was legitimately deleted. Leave it deleted and report the
-        //   push as pending instead.
-        let data_path_str = self.canonical_data_path.to_str().unwrap_or_default();
-        let commit_outcome = match git::commit_and_sync(
-            config.source.git_url.as_deref(),
-            &config.source.branch,
-            data_path_str,
-            token.as_deref(),
-            &rel_path,
-            &commit_message,
-            &config.write.commit_author_name,
-            &config.write.commit_author_email,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-
-            Err(git::CommitSyncError::PreCommit(source)) => {
-                error!(
-                    "commit_and_sync pre-commit failure deleting '{}', restoring from HEAD: {:#}",
-                    rel_path, source
-                );
-
-                match git::restore_from_head(data_path_str, &rel_path).await {
-                    Ok(()) => {
-                        return Err(McpError::internal_error(
-                            format!(
-                                "'{}' was NOT deleted: git commit failed and the file has been \
-                                 restored from HEAD — nothing changed, safe to retry. \
-                                 Cause: {:#}",
-                                rel_path, source
-                            ),
-                            outcome_data(WriteOutcome::FailedNoChange),
-                        ));
-                    }
-                    // The restore ITSELF failed — a third, worse state than either a
-                    // clean delete or a clean no-op: the file is gone from disk with
-                    // no corresponding commit. Report it distinctly and loudly rather
-                    // than letting it masquerade as either of the other two.
-                    Err(restore_err) => {
-                        error!(
-                            "Restore FAILED after a pre-commit git failure deleting '{}': {:#}. \
-                             Original cause: {:#}. The file is gone from disk and NOT \
-                             committed — filesystem and git are now inconsistent.",
-                            rel_path, restore_err, source
-                        );
-                        return Err(McpError::internal_error(
-                            format!(
-                                "'{}' is in an INCONSISTENT state: git commit failed AND the \
-                                 attempt to restore the file from HEAD also failed. The file is \
-                                 gone from disk but was never committed as deleted — do not \
-                                 assume it exists or that the deletion is durable. Manual \
-                                 inspection is required. Commit cause: {:#}. \
-                                 Restore cause: {:#}",
-                                rel_path, source, restore_err
-                            ),
-                            outcome_data(WriteOutcome::FailedInconsistentState),
-                        ));
-                    }
-                }
-            }
-
-            Err(git::CommitSyncError::PostCommit { sha, source }) => {
-                warn!(
-                    "commit_and_sync post-commit (sync) failure deleting '{}', deletion commit \
-                     {} stands uncorrected: {:#}",
-                    rel_path, sha, source
-                );
-
-                // The file is already gone from local disk regardless of push status,
-                // so the local index should reflect that regardless too.
-                crate::reindex::mark_paths(std::iter::once(std::path::PathBuf::from(&rel_path)));
-
-                let summary = format!(
-                    "Deleted '{}' (commit {}) — committed locally, but the push to the remote \
-                     failed: {:#}. It will sync on the next successful write or manual \
-                     intervention. Index cleanup has been queued from the local copy.",
-                    rel_path, sha, source
-                );
-                let diff = render_unified_diff(&old_content, "", &rel_path);
-                let mut result_text = summary;
-                if !diff.is_empty() {
-                    result_text = format!("{}\n\n{}", result_text, diff);
-                }
-                return Ok(with_outcome(
-                    CallToolResult::success(vec![Content::text(result_text)]),
-                    WriteOutcome::CommittedPendingSync,
-                ));
-            }
+        let deps = WriteDeps {
+            retrieval: self.deps(),
+            canonical_data_path: &self.canonical_data_path,
+            schema_cache: &self.schema_cache,
+            validation: &config.validation,
+            prepend_description: config.chunking.prepend_description,
+            dedup_enabled: config.write.dedup_enabled,
+            dedup_threshold: config.write.dedup_threshold,
+            git_url: config.source.git_url.as_deref(),
+            branch: &config.source.branch,
+            token: token.as_deref(),
+            commit_author_name: &config.write.commit_author_name,
+            commit_author_email: &config.write.commit_author_email,
         };
 
-        // 5. Mark this path — and anything the rebase pulled in — dirty and return
-        //    immediately. The worker's scoped indexer purges a path's Qdrant points
-        //    and state rows itself once it re-checks and finds the file gone (the
-        //    missing-file branch of `ingest::index_paths`), so there is no separate
-        //    purge to do here anymore — this is "one reindex path" applied to deletes
-        //    too, not a special case.
-        crate::reindex::mark_paths(
-            std::iter::once(std::path::PathBuf::from(&rel_path))
-                .chain(commit_outcome.rebased_paths.iter().cloned()),
-        );
-
-        // 6. Return success with summary + diff of removed content.
-        let summary = format!(
-            "Deleted '{}' (commit {}). Index cleanup has been queued and will complete shortly.",
-            rel_path, commit_outcome.sha
-        );
-        let diff = render_unified_diff(&old_content, "", &rel_path);
-        let mut result_text = summary;
-        if !diff.is_empty() {
-            result_text = format!("{}\n\n{}", result_text, diff);
+        match crate::write::delete_document(&deps, &rel_path, params.message.as_deref()).await {
+            Ok(success) => Ok(delete_success_to_result(success, &rel_path)),
+            Err(err) => Err(delete_error_to_mcp_error(err, &rel_path)),
         }
-        Ok(with_outcome(
-            CallToolResult::success(vec![Content::text(result_text)]),
-            WriteOutcome::Synced,
-        ))
     }
 }
 
@@ -3371,6 +2981,7 @@ pub(crate) fn make_test_resolved_config(data_path: &std::path::Path) -> Arc<Reso
         write: crate::config::WriteConfig::default(),
         search: crate::config::SearchConfig::default(),
         reranking: None,
+        ui: crate::config::UiConfig::default(),
         provenance: Default::default(),
     })
 }
@@ -3387,6 +2998,17 @@ pub(crate) fn empty_test_schema_cache() -> crate::schema::SharedSchemaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These now live in `write.rs` (the dedup gate and commit-message/diff
+    // helpers moved there with the rest of the write pipeline); imported here
+    // so the tests below — ported verbatim — keep compiling unchanged.
+    use crate::write::{
+        build_commit_message, build_dedup_query, dedup_search_opts, dedup_verdict,
+        render_unified_diff,
+    };
+
+    /// Mirrors `write::DEDUP_QUERY_CHAR_LIMIT` (private there), so the ported
+    /// `build_dedup_query_*` tests below keep compiling unchanged.
+    const DEDUP_QUERY_CHAR_LIMIT: usize = 2000;
 
     // --- list_documents filter parsing ---
 
@@ -5102,6 +4724,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_document_on_existing_but_not_permitted_file_returns_include_pattern_error() {
+        // G3 regression: pre-refactor, a path that BOTH exists on disk AND fails
+        // the include-pattern check was reported with the include-pattern
+        // message, not "already exists" — reporting "already exists; use
+        // edit_document" here would be misleading circular guidance, since
+        // edit_document rejects the same path as not permitted right back.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Exists on disk as a `.md` file, but the server below only permits
+        // `.txt` files — so it both exists AND fails the include-pattern check.
+        std::fs::write(sub.join("existing.md"), "# Already here").unwrap();
+
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.txt".to_string()], config);
+
+        let params = CreateDocumentParams {
+            path: "docs/existing.md".to_string(),
+            content: "---\ntitle: Test\n---\n# New content".to_string(),
+            message: None,
+            force_new: None,
+        };
+        let result = server.create_document(Parameters(params)).await;
+
+        assert!(result.is_err(), "create should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("indexable include pattern"),
+            "error should report the include-pattern rejection, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("already exists"),
+            "error should not fall back to the misleading 'already exists' message, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn already_exists_race_error_reports_the_absolute_path() {
+        // `create_document`'s own pre-check (`abs_path.exists()`) catches the
+        // ordinary "already exists" case before ever reaching `write.rs` — see
+        // `create_document_on_existing_file_returns_use_edit_error` above. The
+        // `WriteError::AlreadyExists` arm this test drives is only reachable via
+        // a genuine TOCTOU race (the file appears between that pre-check and
+        // `write::write_document`'s `create_new` open), which pre-`write.rs`-
+        // extraction code reported with the absolute filesystem path rather than
+        // the repo-relative one — restore that wording (N2).
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_data_path = tmp.path().canonicalize().unwrap();
+        let rel_path = "docs/existing.md";
+
+        let err = create_edit_error_to_mcp_error(
+            WriteError::AlreadyExists,
+            rel_path,
+            true,
+            &canonical_data_path,
+        );
+
+        let expected_abs = canonical_data_path.join(rel_path);
+        assert!(
+            err.message.contains(&expected_abs.display().to_string()),
+            "expected the absolute path '{}' in the message, got: {}",
+            expected_abs.display(),
+            err.message
+        );
+        assert!(
+            err.message.contains("edit_document"),
+            "error should still mention edit_document, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn internal_write_error_reaches_mcp_callers_with_the_same_text_as_before() {
+        // G2: `WriteError::Internal` exists so `web.rs` can hide a canonicalize
+        // failure's embedded absolute path from an untrusted caller. MCP is a
+        // trusted surface that was already relaying this exact text via
+        // `WriteError::UnsafePath` before that split — both adapters must keep
+        // doing so, verbatim, for `Internal` too.
+        let msg = "Invalid path: cannot canonicalize data root '/data/kb': \
+                    No such file or directory (os error 2)"
+            .to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_data_path = tmp.path().canonicalize().unwrap();
+
+        let create_err = create_edit_error_to_mcp_error(
+            WriteError::Internal { msg: msg.clone() },
+            "docs/x.md",
+            true,
+            &canonical_data_path,
+        );
+        assert_eq!(create_err.message, msg);
+
+        let delete_err =
+            delete_error_to_mcp_error(WriteError::Internal { msg: msg.clone() }, "docs/x.md");
+        assert_eq!(delete_err.message, msg);
+    }
+
+    #[tokio::test]
     async fn include_pattern_guard_rejects_non_matching_path() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_test_resolved_config(tmp.path());
@@ -5201,6 +4923,7 @@ mod tests {
             write: crate::config::WriteConfig::default(),
             search: crate::config::SearchConfig::default(),
             reranking: None,
+            ui: crate::config::UiConfig::default(),
             provenance: Default::default(),
         });
 
@@ -5450,6 +5173,7 @@ mod tests {
             },
             search: crate::config::SearchConfig::default(),
             reranking: None,
+            ui: crate::config::UiConfig::default(),
             provenance: Default::default(),
         });
 
@@ -5668,79 +5392,8 @@ mod tests {
     // behavior — the FailedInconsistentState outcome and message — so it replaces
     // this test rather than sitting alongside a strictly weaker duplicate.
 
-    // -----------------------------------------------------------------------
-    // resolve_safe_write_path unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn safe_write_path_treats_a_leading_slash_as_the_kb_root() {
-        // Callers cannot know where the KB lives inside the container, so `/x.md` and
-        // `x.md` must address the same document. The escape checks still apply — this
-        // resolves under the data root, it does not reach the real /etc.
-        let tmp = tempfile::tempdir().unwrap();
-
-        let rooted = resolve_safe_write_path(tmp.path(), "/notes/a.md").unwrap();
-        let relative = resolve_safe_write_path(tmp.path(), "notes/a.md").unwrap();
-        assert_eq!(rooted, relative);
-        assert!(rooted.starts_with(tmp.path()));
-
-        // And traversal is still rejected however it is spelled.
-        assert!(resolve_safe_write_path(tmp.path(), "/../escape.md").is_err());
-        assert!(resolve_safe_write_path(tmp.path(), "../escape.md").is_err());
-    }
-
-    #[test]
-    fn safe_write_path_rejects_parent_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = resolve_safe_write_path(tmp.path(), "../../etc/shadow");
-        assert!(result.is_err(), "parent-dir component must be rejected");
-        let msg = result.unwrap_err();
-        assert!(msg.contains(".."), "error should mention '..', got: {msg}");
-    }
-
-    #[test]
-    fn safe_write_path_accepts_normal_nested_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        // The file doesn't need to exist; the ancestor (tmp itself) does.
-        let result = resolve_safe_write_path(tmp.path(), "subdir/docs/guide.md");
-        assert!(
-            result.is_ok(),
-            "normal nested path should be accepted, got: {:?}",
-            result
-        );
-        let abs = result.unwrap();
-        assert!(
-            abs.starts_with(tmp.path()),
-            "returned path should be under data_root"
-        );
-    }
-
-    #[test]
-    fn safe_write_path_rejects_symlinked_ancestor_outside_root() {
-        // Create two separate temp directories.
-        let inside_tmp = tempfile::tempdir().unwrap();
-        let outside_tmp = tempfile::tempdir().unwrap();
-
-        // Create a subdirectory inside inside_tmp that is actually a symlink
-        // pointing to outside_tmp.
-        let escaped_dir = inside_tmp.path().join("escaped");
-        std::os::unix::fs::symlink(outside_tmp.path(), &escaped_dir)
-            .expect("failed to create symlink");
-
-        // A path through the symlink: "escaped/secret.md"
-        // Lexically this is under inside_tmp, but canonically it resolves outside.
-        let result = resolve_safe_write_path(inside_tmp.path(), "escaped/secret.md");
-
-        assert!(
-            result.is_err(),
-            "path through symlinked ancestor pointing outside root must be rejected"
-        );
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("symlink") || msg.contains("escapes"),
-            "error should mention symlink or escape, got: {msg}"
-        );
-    }
+    // `resolve_safe_write_path` unit tests moved to `write.rs` alongside the
+    // function itself — see that module's test suite.
 
     // -----------------------------------------------------------------------
     // parse_edit_mode unit tests
