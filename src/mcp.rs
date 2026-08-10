@@ -1560,7 +1560,13 @@ impl KbSearchServer {
         // genuinely happened, so it is left alone and reported as "committed, sync
         // pending" instead.
         let data_path_str = self.canonical_data_path.to_str().unwrap_or_default();
+
+        // Held across the commit AND any rollback below — see `write::write_document`.
+        // A schema write races document writes and the webhook for the same index.
+        let git_lock = git::lock_git().await;
+
         let commit_outcome = match git::commit_and_sync(
+            &git_lock,
             config.source.git_url.as_deref(),
             &config.source.branch,
             data_path_str,
@@ -1587,12 +1593,12 @@ impl KbSearchServer {
                 // partial `git add`, in one step).
                 let rollback = if is_new {
                     match tokio::fs::remove_file(&abs_path).await {
-                        Ok(()) => git::unstage(data_path_str, rel_path).await,
+                        Ok(()) => git::unstage(&git_lock, data_path_str, rel_path).await,
                         Err(e) => Err(anyhow::Error::new(e)
                             .context("Failed to remove newly-written schema file during rollback")),
                     }
                 } else {
-                    git::restore_from_head(data_path_str, rel_path).await
+                    git::restore_from_head(&git_lock, data_path_str, rel_path).await
                 };
 
                 return match rollback {
