@@ -27,10 +27,12 @@
  *     (neighborhood) mode is expressed as an `.excluded` display:none
  *     class rather than element removal, so switching between local and
  *     global is cheap and non-destructive.
- *   - Graph labels are level-of-detail: `min-zoomed-font-size` hides
- *     them when zoomed out, and a `.hover-label` class (mouseover)
- *     force-shows the hovered node's label with a themed backing so the
- *     old every-label-overlapping-every-other mess can't come back.
+ *   - Graph labels are level-of-detail: a `.no-label` class is toggled
+ *     by visible node count (LABEL_MAX_NODES — zoom can't help, see the
+ *     comment there), so a doc's neighbourhood is labelled while the
+ *     full KB is dots; a `.hover-label` class (mouseover) force-shows
+ *     the hovered node's label with a themed backing, so the old
+ *     every-label-overlapping-every-other mess can't come back.
  *   - fcose (vendored, with its layout-base/cose-base dependencies —
  *     see index.html's script order) is the default layout because it
  *     packs the KB's many disconnected components far better than the
@@ -62,6 +64,22 @@
   const SEARCH_DEBOUNCE_MS = 300;
   const RECENT_DOCS_COUNT = 10;
 
+  /** Graph labels are drawn only when at most this many nodes are
+   * visible (see updateLabelVisibility). Zoom is deliberately NOT the
+   * trigger: `text-max-width` is in model units, so labels and the gaps
+   * between nodes scale together — a label ~3x wider than its node's
+   * share of space overlaps its neighbours identically at every zoom
+   * level. Only node count changes that ratio. Chosen so a doc's
+   * neighbourhood view is labelled while the full KB stays dots. */
+  const LABEL_MAX_NODES = 60;
+
+  /** Minimum model-unit gap between nodes when labels are drawn, in the
+   * same units as the node style's `text-max-width` (120) plus margin.
+   * fcose packs edge-less nodes about 40 units apart — fine for dots,
+   * but every label would then overlap its neighbours. See
+   * spreadForLabels. */
+  const LABEL_MIN_SPACING = 150;
+
   const darkMq = window.matchMedia("(prefers-color-scheme: dark)");
 
   // -------------------------------------------------------------------
@@ -76,6 +94,7 @@
   let cy = null; // lazily-created Cytoscape instance
   let cyNeedsLayout = false; // graph structure changed while view inactive
   let lastGraphKey = null; // mode/root/depth/semantic of the last layout
+  let labelsVisible = null; // last applied label state (see updateLabelVisibility)
 
   let activeRoute = { view: "home" };
   let currentDetailId = null; // doc shown in the doc view
@@ -107,14 +126,6 @@
           "label": "data(label)",
           "color": t.nodeLabel,
           "font-size": 11,
-          // Level-of-detail: when the rendered label would be smaller
-          // than this, it isn't drawn at all. Must sit with headroom
-          // ABOVE fitGraph's 1.5x zoom cap (11px font x 1.5 = 16.5):
-          // a densely-packed full-KB layout can fit right at the cap,
-          // and a threshold at-or-below 16.5 re-renders every label
-          // there — the unreadable label soup this exists to prevent.
-          // At 20, labels appear from ~1.8x zoom in.
-          "min-zoomed-font-size": 20,
           "text-valign": "bottom",
           "text-margin-y": 4,
           "text-wrap": "wrap",
@@ -131,12 +142,25 @@
           "opacity": 0.55,
         },
       },
+      // Level-of-detail, toggled by updateLabelVisibility. Cytoscape's
+      // own `min-zoomed-font-size` can't express this: it compares
+      // against `font-size * 2^ceil(log2(zoom * devicePixelRatio))`, so
+      // the effective size jumps in power-of-two steps AND depends on
+      // the viewer's display (11px at zoom 0.77 computes as 22px on a
+      // retina screen, 11px elsewhere) — and zoom is the wrong trigger
+      // anyway (see LABEL_MAX_NODES). The three rules after this one
+      // re-show individual labels and must stay later in the array —
+      // equal specificity, last wins.
+      {
+        selector: "node.no-label",
+        style: { "text-opacity": 0 },
+      },
       {
         // Force-show the hovered node's label regardless of zoom, with a
         // themed backing plate so it reads over neighboring elements.
         selector: "node.hover-label",
         style: {
-          "min-zoomed-font-size": 0,
+          "text-opacity": 1,
           "font-size": 12,
           "text-background-color": t.labelBg,
           "text-background-opacity": 0.9,
@@ -150,7 +174,7 @@
         style: {
           "border-width": 3,
           "border-color": "#f59e0b",
-          "min-zoomed-font-size": 0,
+          "text-opacity": 1,
         },
       },
       {
@@ -159,7 +183,7 @@
         style: {
           "border-width": 4,
           "border-color": "#f59e0b",
-          "min-zoomed-font-size": 0,
+          "text-opacity": 1,
           "z-index": 997,
         },
       },
@@ -297,7 +321,10 @@
         if (existing && existing.length) {
           existing.data(nodeIndex[id]);
         } else {
-          cy.add({ group: "nodes", data: nodeIndex[id] });
+          // Match the current label state, or a node added into a
+          // dots-only graph would draw its label alone.
+          const added = cy.add({ group: "nodes", data: nodeIndex[id] });
+          if (labelsVisible === false) added.addClass("no-label");
           changed = true;
         }
       }
@@ -886,6 +913,7 @@
         }
       }
     });
+    updateLabelVisibility();
     if (runLayout) runGraphLayout();
   }
 
@@ -902,6 +930,59 @@
       cy.zoom(1.5);
       cy.center(eles);
     }
+  }
+
+  /** Scale a laid-out node set apart until neighbours are at least
+   * LABEL_MIN_SPACING apart, so the labels drawn over them don't
+   * collide. Uniform scaling about the centroid, so it preserves the
+   * layout's structure exactly — it only changes the scale, and the
+   * subsequent fit absorbs that. Only runs when labels are actually
+   * drawn, which bounds the O(n^2) distance scan to LABEL_MAX_NODES
+   * (and is why the full-KB view — where spreading would shrink the fit
+   * to unreadable dust — never reaches it). */
+  function spreadForLabels(eles) {
+    if (!labelsVisible) return;
+    const nodes = eles.nodes();
+    if (nodes.length < 2) return;
+
+    const pos = nodes.map((n) => n.position());
+    let minD = Infinity;
+    for (let i = 0; i < pos.length; i++) {
+      for (let j = i + 1; j < pos.length; j++) {
+        const d = Math.hypot(pos[i].x - pos[j].x, pos[i].y - pos[j].y);
+        if (d < minD) minD = d;
+      }
+    }
+    if (!(minD > 0) || minD >= LABEL_MIN_SPACING) return;
+
+    const factor = LABEL_MIN_SPACING / minD;
+    const bb = nodes.boundingBox();
+    const originX = (bb.x1 + bb.x2) / 2;
+    const originY = (bb.y1 + bb.y2) / 2;
+    cy.batch(() => {
+      nodes.forEach((n) => {
+        const p = n.position();
+        n.position({
+          x: originX + (p.x - originX) * factor,
+          y: originY + (p.y - originY) * factor,
+        });
+      });
+    });
+  }
+
+  /** Draw node labels only while the visible set is small enough to read
+   * (see LABEL_MAX_NODES) — in practice, a doc's neighbourhood but not
+   * the full KB. Hovered, selected, and neighbourhood-root nodes keep
+   * their labels either way via later style rules, so a dots-only graph
+   * is still fully identifiable by pointing at it. Called whenever the
+   * visible set changes, not on zoom. */
+  function updateLabelVisibility() {
+    const show = cy.nodes().not(".excluded").length <= LABEL_MAX_NODES;
+    if (show === labelsVisible) return;
+    labelsVisible = show;
+    cy.batch(() => {
+      cy.nodes().toggleClass("no-label", !show);
+    });
   }
 
   function runGraphLayout() {
@@ -929,7 +1010,10 @@
       // fcose plugin missing/failed — built-in force layout still works.
       layout = eles.layout({ name: "cose", animate: false, padding: 30, fit: false });
     }
-    layout.one("layoutstop", () => fitGraph(eles));
+    layout.one("layoutstop", () => {
+      spreadForLabels(eles);
+      fitGraph(eles);
+    });
     layout.run();
   }
 
