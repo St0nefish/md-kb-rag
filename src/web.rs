@@ -263,6 +263,36 @@ async fn dompurify_handler() -> impl IntoResponse {
     )
 }
 
+async fn layout_base_handler() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../assets/ui/vendor/layout-base.js"),
+    )
+}
+
+async fn cose_base_handler() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../assets/ui/vendor/cose-base.js"),
+    )
+}
+
+async fn fcose_handler() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../assets/ui/vendor/cytoscape-fcose.js"),
+    )
+}
+
 async fn edit_js_handler() -> impl IntoResponse {
     (
         [(
@@ -1241,6 +1271,9 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/assets/viz.css", get(viz_css_handler))
         .route("/assets/viz.js", get(viz_js_handler))
         .route("/assets/cytoscape.min.js", get(cytoscape_handler))
+        .route("/assets/layout-base.js", get(layout_base_handler))
+        .route("/assets/cose-base.js", get(cose_base_handler))
+        .route("/assets/cytoscape-fcose.js", get(fcose_handler))
         .route("/assets/marked.min.js", get(marked_handler))
         .route("/assets/dompurify.min.js", get(dompurify_handler))
         .route("/assets/edit.js", get(edit_js_handler))
@@ -1709,6 +1742,9 @@ mod tests {
             ("/assets/viz.css", "text/css"),
             ("/assets/viz.js", "application/javascript"),
             ("/assets/cytoscape.min.js", "application/javascript"),
+            ("/assets/layout-base.js", "application/javascript"),
+            ("/assets/cose-base.js", "application/javascript"),
+            ("/assets/cytoscape-fcose.js", "application/javascript"),
             ("/assets/marked.min.js", "application/javascript"),
             ("/assets/dompurify.min.js", "application/javascript"),
             ("/assets/edit.js", "application/javascript"),

@@ -224,3 +224,16 @@ under the Apache License, Version 2.0 (reproduced above) and the Mozilla
 Public License 2.0 (<https://www.mozilla.org/MPL/2.0/>). It is used to
 sanitize marked.js's HTML output before it is assigned to `innerHTML`
 anywhere in this UI (see `viz.js`'s `window.KBViz.renderMarkdown` helper).
+
+## Third-party notice: cytoscape-fcose (and dependencies)
+
+`vendor/cytoscape-fcose.js` (v2.2.0), `vendor/cose-base.js` (v2.2.0), and
+`vendor/layout-base.js` (v2.0.1) are not part of the OKF-derived code
+above. They are the fCoSE force-directed layout plugin for Cytoscape.js
+(<https://github.com/iVis-at-Bilkent/cytoscape.js-fcose>) and its two
+supporting libraries (<https://github.com/iVis-at-Bilkent/cose-base>,
+<https://github.com/iVis-at-Bilkent/layout-base>), vendored unmodified
+(unpkg UMD builds), copyright i-Vis Research Lab at Bilkent University,
+all MIT-licensed. fCoSE is the default graph layout because it packs the
+knowledge base's many disconnected components far better than
+Cytoscape's built-in cose layout.
