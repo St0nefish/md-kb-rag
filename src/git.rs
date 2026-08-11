@@ -1,13 +1,61 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 /// Maximum time to wait for a git subprocess (clone) before treating it as
 /// hung and returning an error.
 pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Serializes every git invocation against the knowledge-base clone.
+///
+/// A git working copy is not safe for concurrent mutation: `add`, `commit`,
+/// `merge` and `rebase` all take `.git/index.lock`, and whichever process loses
+/// the race fails outright with `Unable to create '.git/index.lock': File
+/// exists`. Worse than the failure is what it leaves behind — a half-staged
+/// index whose own rollback can lose the same race, wedging the clone so that
+/// every later write commits locally but can never rebase (`cannot rebase: You
+/// have unstaged changes`) and so never syncs again.
+///
+/// Two independent producers reach this clone while the server is running: the
+/// write tools (`write.rs` → [`commit_and_sync`]) and the webhook handler
+/// (`webhook.rs`, fetch + ff-only merge). They overlap routinely rather than
+/// exceptionally, because every write pushes to the KB's git host, which fires
+/// a webhook straight back at us seconds later.
+///
+/// Until #92 this was covered incidentally by `webhook::REINDEX_LOCK`; that lock
+/// is gone, and `reindex::REINDEX_QUEUE` which replaced it serializes *indexing*,
+/// not *git*. Hence an explicit lock whose only job is git.
+static GIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Proof that the holder has exclusive access to the knowledge-base clone.
+///
+/// Every function in this module that shells out to git in `data_path` demands
+/// one by reference, so "did I take the lock?" is answered by the type checker
+/// rather than by review. Because the guard is passed as a `&` argument and
+/// never re-acquired internally, a call chain cannot deadlock itself on this
+/// non-reentrant mutex: there is exactly one acquisition per sequence, at the
+/// top.
+///
+/// Hold it across a whole logical operation, not per command. In particular a
+/// failed write and its rollback must run under a *single* acquisition —
+/// releasing in between is what lets another writer observe, and then commit,
+/// a half-staged index.
+#[must_use = "the git lock is released as soon as this guard is dropped"]
+pub struct GitLock(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+/// Acquire exclusive access to the knowledge-base clone.
+///
+/// Deliberately unbounded: the operations it guards are individually capped at
+/// [`GIT_TIMEOUT`], so the wait is bounded in practice by the holder's own
+/// timeouts, and a caller that gave up early would just resume racing.
+pub async fn lock_git() -> GitLock {
+    GitLock(GIT_LOCK.lock().await)
+}
 
 /// Inject a token into an HTTPS URL for authenticated git operations.
 /// SSH URLs are returned unchanged.
@@ -58,6 +106,7 @@ pub fn redact_url(s: &str) -> String {
 /// Returns `Ok(true)` if a fresh clone was performed, `Ok(false)` if the repo
 /// already existed.
 pub async fn ensure_repo(
+    _lock: &GitLock,
     git_url: &str,
     branch: &str,
     data_path: &str,
@@ -135,7 +184,7 @@ pub struct CommitOutcome {
 /// `pub(crate)` so `webhook.rs` can compute its own before/after range around the
 /// fetch + ff-only merge it performs, the same way `commit_and_sync` does around its
 /// own fetch + rebase.
-pub(crate) async fn rev_parse_head(data_path: &str) -> anyhow::Result<String> {
+pub(crate) async fn rev_parse_head(_lock: &GitLock, data_path: &str) -> anyhow::Result<String> {
     let out = timeout(
         GIT_TIMEOUT,
         Command::new("git")
@@ -206,6 +255,7 @@ fn parse_diff_name_status(output: &str) -> Vec<std::path::PathBuf> {
 /// cannot, since content hashing does not know about the old path. Either way both
 /// paths are enqueued; `-M` is for a cleaner log line, not correctness here).
 pub(crate) async fn git_diff_name_status(
+    _lock: &GitLock,
     data_path: &str,
     old: &str,
     new: &str,
@@ -290,6 +340,7 @@ pub enum CommitSyncError {
 /// rather than treat every failure the same way.
 #[allow(clippy::too_many_arguments)]
 pub async fn commit_and_sync(
+    lock: &GitLock,
     git_url: Option<&str>,
     branch: &str,
     data_path: &str,
@@ -348,13 +399,20 @@ pub async fn commit_and_sync(
         )));
     }
 
-    // --- git commit -m <message> ---
+    // --- git commit -m <message> -- <rel_path> ---
     // Set the author identity inline so the command is self-contained even in
     // environments without a global git user configured. Both author and committer
     // derive from user.* when not otherwise specified.
+    //
+    // The trailing pathspec is what keeps this commit to the caller's own file.
+    // Without it `git commit` commits the ENTIRE index, so any unrelated staged
+    // entry — left by a failed write whose rollback did not complete, by the
+    // separate `index --full` CLI process, or by anything else touching the clone —
+    // silently rides along in this document's commit. The `add` above was already
+    // path-scoped; the commit has to be too, or the scoping accomplishes nothing.
     let commit_out = timeout(
         GIT_TIMEOUT,
-        git_cmd_authored(&["commit", "-m", message]).output(),
+        git_cmd_authored(&["commit", "-m", message, "--", rel_path]).output(),
     )
     .await
     .map_err(|_| {
@@ -377,7 +435,7 @@ pub async fn commit_and_sync(
     // The commit has landed. Every failure from here on is PostCommit — HEAD already
     // includes it, so `local_sha` (captured now, before anything else can touch HEAD)
     // is a real, durable local commit no matter what the rest of this call does.
-    let local_sha = rev_parse_head(data_path).await.map_err(|e| {
+    let local_sha = rev_parse_head(lock, data_path).await.map_err(|e| {
         // rev-parse HEAD failing immediately after a successful `git commit` would
         // mean something is badly wrong with the repo itself, not with sync — but the
         // commit above DID succeed, so this is still unambiguously post-commit. There
@@ -500,13 +558,13 @@ pub async fn commit_and_sync(
         // learning what changed locally, though in practice a push failure aborts the
         // whole call anyway.
         let new_head =
-            rev_parse_head(data_path)
+            rev_parse_head(lock, data_path)
                 .await
                 .map_err(|e| CommitSyncError::PostCommit {
                     sha: local_sha.clone(),
                     source: e,
                 })?;
-        rebased_paths = git_diff_name_status(data_path, &old_head, &new_head)
+        rebased_paths = git_diff_name_status(lock, data_path, &old_head, &new_head)
             .await
             .map_err(|e| CommitSyncError::PostCommit {
                 sha: local_sha.clone(),
@@ -539,12 +597,13 @@ pub async fn commit_and_sync(
 
         // The rebase may have replayed our commit onto a new sha — read HEAD fresh
         // for the success return rather than reusing `local_sha`.
-        let sha = rev_parse_head(data_path)
-            .await
-            .map_err(|e| CommitSyncError::PostCommit {
-                sha: local_sha.clone(),
-                source: e,
-            })?;
+        let sha =
+            rev_parse_head(lock, data_path)
+                .await
+                .map_err(|e| CommitSyncError::PostCommit {
+                    sha: local_sha.clone(),
+                    source: e,
+                })?;
         return Ok(CommitOutcome { sha, rebased_paths });
     }
 
@@ -570,7 +629,11 @@ pub async fn commit_and_sync(
 /// already tracked, or it would not have been deletable/editable). It does NOT hold
 /// for a brand-new path whose first-ever commit failed before landing (`create_document`);
 /// use [`unstage`] for that case instead.
-pub async fn restore_from_head(data_path: &str, rel_path: &str) -> anyhow::Result<()> {
+pub async fn restore_from_head(
+    _lock: &GitLock,
+    data_path: &str,
+    rel_path: &str,
+) -> anyhow::Result<()> {
     let out = timeout(
         GIT_TIMEOUT,
         Command::new("git")
@@ -611,7 +674,7 @@ pub async fn restore_from_head(data_path: &str, rel_path: &str) -> anyhow::Resul
 /// HEAD content to fall back to (`restore_from_head` would fail on it — see its
 /// doc), so the caller removes the file itself and calls this to make sure `git add`
 /// staging it doesn't silently ride along on some later, unrelated commit.
-pub async fn unstage(data_path: &str, rel_path: &str) -> anyhow::Result<()> {
+pub async fn unstage(_lock: &GitLock, data_path: &str, rel_path: &str) -> anyhow::Result<()> {
     let out = timeout(
         GIT_TIMEOUT,
         Command::new("git")
@@ -703,7 +766,9 @@ pub(crate) mod tests {
         // Create a fake .git directory
         std::fs::create_dir(dir.path().join(".git")).unwrap();
 
+        let lock = lock_git().await;
         let result = ensure_repo(
+            &lock,
             "https://example.com/repo.git",
             "main",
             dir.path().to_str().unwrap(),
@@ -774,7 +839,9 @@ pub(crate) mod tests {
         let target = tempfile::TempDir::new().unwrap();
         let clone_path = target.path().join("repo");
 
+        let lock = lock_git().await;
         let result = ensure_repo(
+            &lock,
             bare.path().to_str().unwrap(),
             "main",
             clone_path.to_str().unwrap(),
@@ -801,7 +868,9 @@ pub(crate) mod tests {
         // Nested path that doesn't exist yet
         let clone_path = target.path().join("deeply/nested/repo");
 
+        let lock = lock_git().await;
         let result = ensure_repo(
+            &lock,
             bare.path().to_str().unwrap(),
             "main",
             clone_path.to_str().unwrap(),
@@ -820,8 +889,11 @@ pub(crate) mod tests {
         let target = tempfile::TempDir::new().unwrap();
         let clone_path = target.path().join("repo");
 
+        let lock = lock_git().await;
+
         // First call — should clone
         let first = ensure_repo(
+            &lock,
             bare.path().to_str().unwrap(),
             "main",
             clone_path.to_str().unwrap(),
@@ -833,6 +905,7 @@ pub(crate) mod tests {
 
         // Second call — should short-circuit
         let second = ensure_repo(
+            &lock,
             bare.path().to_str().unwrap(),
             "main",
             clone_path.to_str().unwrap(),
@@ -850,7 +923,9 @@ pub(crate) mod tests {
         // Pre-populate directory with a file (but no .git)
         std::fs::write(target.path().join("stale-file.txt"), "leftover data").unwrap();
 
+        let lock = lock_git().await;
         let result = ensure_repo(
+            &lock,
             bare.path().to_str().unwrap(),
             "main",
             target.path().to_str().unwrap(),
@@ -876,7 +951,9 @@ pub(crate) mod tests {
         let target = tempfile::TempDir::new().unwrap();
         let clone_path = target.path().join("repo");
 
+        let lock = lock_git().await;
         let result = ensure_repo(
+            &lock,
             bare.path().to_str().unwrap(),
             "nonexistent-branch",
             clone_path.to_str().unwrap(),
@@ -892,7 +969,9 @@ pub(crate) mod tests {
         let target = tempfile::TempDir::new().unwrap();
         let clone_path = target.path().join("repo");
 
+        let lock = lock_git().await;
         let result = ensure_repo(
+            &lock,
             "/nonexistent/path/to/repo.git",
             "main",
             clone_path.to_str().unwrap(),
@@ -908,7 +987,9 @@ pub(crate) mod tests {
         let target = tempfile::TempDir::new().unwrap();
         let clone_path = target.path().join("repo");
 
+        let lock = lock_git().await;
         let result = ensure_repo(
+            &lock,
             "https://example.com/nonexistent/repo.git",
             "main",
             clone_path.to_str().unwrap(),
@@ -980,7 +1061,9 @@ pub(crate) mod tests {
         // Write a new file into the working repo
         std::fs::write(work.path().join("notes.md"), "# Notes\nHello world").unwrap();
 
+        let lock = lock_git().await;
         let outcome = commit_and_sync(
+            &lock,
             None,
             "main",
             work_path,
@@ -1040,7 +1123,9 @@ pub(crate) mod tests {
         // Write a new file into the working repo
         std::fs::write(work.path().join("article.md"), "# Article\nContent here").unwrap();
 
+        let lock = lock_git().await;
         let outcome = commit_and_sync(
+            &lock,
             Some(&bare_url),
             "main",
             work_path,
@@ -1083,10 +1168,13 @@ pub(crate) mod tests {
         let bare = create_bare_repo("main");
         let bare_url = format!("file://{}", bare.path().to_str().unwrap());
 
+        let lock = lock_git().await;
+
         // Clone A: will push first
         let work_a = clone_bare_repo(bare.path(), "main");
         std::fs::write(work_a.path().join("conflict.md"), "version A").unwrap();
         commit_and_sync(
+            &lock,
             Some(&bare_url),
             "main",
             work_a.path().to_str().unwrap(),
@@ -1137,6 +1225,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let result = commit_and_sync(
+            &lock,
             Some(&bare_url),
             "main",
             work_b.path().to_str().unwrap(),
@@ -1171,10 +1260,13 @@ pub(crate) mod tests {
         let bare = create_bare_repo("main");
         let bare_url = format!("file://{}", bare.path().to_str().unwrap());
 
+        let lock = lock_git().await;
+
         // Clone A pushes first, adding other.md.
         let work_a = clone_bare_repo(bare.path(), "main");
         std::fs::write(work_a.path().join("other.md"), "from A").unwrap();
         commit_and_sync(
+            &lock,
             Some(&bare_url),
             "main",
             work_a.path().to_str().unwrap(),
@@ -1208,6 +1300,7 @@ pub(crate) mod tests {
 
         std::fs::write(work_b.path().join("mine.md"), "from B").unwrap();
         let outcome = commit_and_sync(
+            &lock,
             Some(&bare_url),
             "main",
             work_b.path().to_str().unwrap(),
@@ -1263,11 +1356,13 @@ pub(crate) mod tests {
         let work = clone_bare_repo(bare.path(), "main");
         let work_path = work.path().to_str().unwrap();
 
-        let head_before = rev_parse_head(work_path).await.unwrap();
+        let lock = lock_git().await;
+        let head_before = rev_parse_head(&lock, work_path).await.unwrap();
 
         // "missing.md" was never written into the working tree, so `git add` has
         // nothing to stage and fails before any commit is attempted.
         let result = commit_and_sync(
+            &lock,
             None,
             "main",
             work_path,
@@ -1284,7 +1379,7 @@ pub(crate) mod tests {
             other => panic!("expected CommitSyncError::PreCommit, got: {:?}", other),
         }
 
-        let head_after = rev_parse_head(work_path).await.unwrap();
+        let head_after = rev_parse_head(&lock, work_path).await.unwrap();
         assert_eq!(
             head_before, head_after,
             "a PreCommit failure must not move HEAD"
@@ -1303,7 +1398,9 @@ pub(crate) mod tests {
 
         std::fs::write(work.path().join("article.md"), "content").unwrap();
 
+        let lock = lock_git().await;
         let result = commit_and_sync(
+            &lock,
             // No such path — fetch fails immediately, no network required.
             Some("/nonexistent/path/to/repo.git"),
             "main",
@@ -1335,7 +1432,7 @@ pub(crate) mod tests {
             "the local commit must still exist after a post-commit sync failure, got: {}",
             show_str
         );
-        let head = rev_parse_head(work_path).await.unwrap();
+        let head = rev_parse_head(&lock, work_path).await.unwrap();
         assert_eq!(
             head, sha,
             "the sha attached to the error must match the real local HEAD"
@@ -1352,7 +1449,9 @@ pub(crate) mod tests {
 
         std::fs::write(work.path().join("secret.md"), "content").unwrap();
 
+        let lock = lock_git().await;
         let result = commit_and_sync(
+            &lock,
             Some("https://example.com/nonexistent/repo.git"),
             "main",
             work_path,
@@ -1408,7 +1507,10 @@ pub(crate) mod tests {
             .unwrap();
         assert!(!work.path().join("README.md").exists());
 
-        restore_from_head(work_path, "README.md").await.unwrap();
+        let lock = lock_git().await;
+        restore_from_head(&lock, work_path, "README.md")
+            .await
+            .unwrap();
 
         assert!(
             work.path().join("README.md").exists(),
@@ -1440,7 +1542,10 @@ pub(crate) mod tests {
 
         std::fs::write(work.path().join("README.md"), "clobbered content").unwrap();
 
-        restore_from_head(work_path, "README.md").await.unwrap();
+        let lock = lock_git().await;
+        restore_from_head(&lock, work_path, "README.md")
+            .await
+            .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(work.path().join("README.md")).unwrap(),
@@ -1461,7 +1566,8 @@ pub(crate) mod tests {
 
         std::fs::write(work.path().join("brand-new.md"), "new content").unwrap();
 
-        let result = restore_from_head(work_path, "brand-new.md").await;
+        let lock = lock_git().await;
+        let result = restore_from_head(&lock, work_path, "brand-new.md").await;
         assert!(
             result.is_err(),
             "restoring a path HEAD never had must fail, not silently no-op"
@@ -1494,7 +1600,8 @@ pub(crate) mod tests {
             "A  newfile.md"
         );
 
-        unstage(work_path, "newfile.md").await.unwrap();
+        let lock = lock_git().await;
+        unstage(&lock, work_path, "newfile.md").await.unwrap();
 
         let status_after = std::process::Command::new("git")
             .args(["status", "--porcelain"])
@@ -1523,7 +1630,8 @@ pub(crate) mod tests {
 
         // "never-staged.md" does not exist anywhere — not on disk, not in the index,
         // not at HEAD.
-        let result = unstage(work_path, "never-staged.md").await;
+        let lock = lock_git().await;
+        let result = unstage(&lock, work_path, "never-staged.md").await;
         assert!(
             result.is_ok(),
             "unstage must be a safe no-op for a path that was never staged, got: {:?}",
@@ -1566,6 +1674,139 @@ pub(crate) mod tests {
         assert_eq!(
             parse_diff_name_status(out),
             vec![std::path::PathBuf::from("new.md")]
+        );
+    }
+
+    // --- #104: concurrent git access to the knowledge-base clone ---
+
+    /// Helper: `git` in `work_path` with `safe.directory` set, returning stdout.
+    fn git_out(work_path: &str, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", &format!("safe.directory={}", work_path)])
+            .args(args)
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// Regression for #104. Writes arriving together used to race on
+    /// `.git/index.lock`: the loser failed outright with "Unable to create
+    /// '.git/index.lock': File exists", and could leave a half-staged index whose
+    /// own rollback lost the same race — wedging the clone so every later write
+    /// committed locally but could never rebase or push again.
+    ///
+    /// Each task acquires `GIT_LOCK` independently, which is the contention this
+    /// exercises. Multi-threaded so the tasks genuinely overlap rather than merely
+    /// interleaving at await points.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_commits_serialize_instead_of_racing_the_index_lock() {
+        const N: usize = 8;
+
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap().to_string();
+
+        for i in 0..N {
+            std::fs::write(work.path().join(format!("doc{i}.md")), format!("# Doc {i}")).unwrap();
+        }
+
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let work_path = work_path.clone();
+            handles.push(tokio::spawn(async move {
+                let lock = lock_git().await;
+                commit_and_sync(
+                    &lock,
+                    None,
+                    "main",
+                    &work_path,
+                    None,
+                    &format!("doc{i}.md"),
+                    &format!("add doc{i}.md"),
+                    "test-bot",
+                    "test-bot@localhost",
+                )
+                .await
+            }));
+        }
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.unwrap();
+            assert!(
+                result.is_ok(),
+                "write {i} failed under concurrency: {:?}",
+                result.err()
+            );
+        }
+
+        // Every document landed in history...
+        let log = git_out(&work_path, &["log", "--name-only", "--format="]);
+        for i in 0..N {
+            assert!(
+                log.contains(&format!("doc{i}.md")),
+                "doc{i}.md missing from history:\n{log}"
+            );
+        }
+
+        // ...and nothing was left half-staged behind them. A non-empty index here
+        // is precisely the state that used to block every subsequent rebase.
+        let staged = git_out(&work_path, &["diff", "--cached", "--name-only"]);
+        assert!(
+            staged.trim().is_empty(),
+            "index should be clean after concurrent writes, still staged: {staged}"
+        );
+    }
+
+    /// Regression for #104. `git commit -m MSG` commits the ENTIRE index, so a
+    /// stray staged entry — left by a failed write whose rollback did not
+    /// complete, or by the separate `index --full` CLI process — silently rode
+    /// along inside an unrelated document's commit. The `add` was already
+    /// path-scoped; the commit has to be too.
+    #[tokio::test]
+    async fn commit_is_scoped_to_its_path_and_ignores_unrelated_staged_entries() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("mine.md"), "# Mine").unwrap();
+        std::fs::write(work.path().join("stray.md"), "# Stray").unwrap();
+
+        // Residue from something other than this write.
+        git_out(work_path, &["add", "--", "stray.md"]);
+
+        let lock = lock_git().await;
+        commit_and_sync(
+            &lock,
+            None,
+            "main",
+            work_path,
+            None,
+            "mine.md",
+            "add mine.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+        drop(lock);
+
+        let head = git_out(work_path, &["show", "--name-only", "--format=", "HEAD"]);
+        assert!(
+            head.contains("mine.md"),
+            "own path should be committed: {head}"
+        );
+        assert!(
+            !head.contains("stray.md"),
+            "an unrelated staged entry must NOT ride along in this commit: {head}"
+        );
+
+        // The stray is left exactly as it was — scoping the commit neither commits
+        // nor discards someone else's staged work.
+        let staged = git_out(work_path, &["diff", "--cached", "--name-only"]);
+        assert!(
+            staged.contains("stray.md"),
+            "unrelated staged entry should be untouched, staged: {staged}"
         );
     }
 }

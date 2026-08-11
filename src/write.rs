@@ -779,7 +779,13 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     // failure means the commit is a real, durable part of local history — rolling
     // it back here would silently undo work that genuinely happened, so it is
     // left alone and reported as "committed, sync pending" instead.
+    // Held across the commit AND any rollback below. Releasing between the two
+    // would let another writer see — and, since it stages its own path into the
+    // same index, commit — the half-staged entry this call is about to undo.
+    let git_lock = git::lock_git().await;
+
     let commit_outcome = match git::commit_and_sync(
+        &git_lock,
         deps.git_url,
         deps.branch,
         data_path_str,
@@ -805,12 +811,12 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             // (this also un-stages any partial `git add`, in one step).
             let rollback = if is_create {
                 match tokio::fs::remove_file(&abs_path).await {
-                    Ok(()) => git::unstage(data_path_str, rel_path).await,
+                    Ok(()) => git::unstage(&git_lock, data_path_str, rel_path).await,
                     Err(e) => Err(anyhow::Error::new(e)
                         .context("Failed to remove newly-written file during rollback")),
                 }
             } else {
-                git::restore_from_head(data_path_str, rel_path).await
+                git::restore_from_head(&git_lock, data_path_str, rel_path).await
             };
 
             return match rollback {
@@ -961,7 +967,13 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     //   would resurrect a document that, as far as local git history is
     //   concerned, was legitimately deleted. Leave it deleted and report the sync
     //   as pending instead.
+    // Held across the commit AND the restore below, for the same reason as on the
+    // write path: a rollback that runs outside the acquisition that produced the
+    // failure is racing every other writer.
+    let git_lock = git::lock_git().await;
+
     let commit_outcome = match git::commit_and_sync(
+        &git_lock,
         deps.git_url,
         deps.branch,
         data_path_str,
@@ -981,7 +993,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                 rel_path, source
             );
 
-            match git::restore_from_head(data_path_str, rel_path).await {
+            match git::restore_from_head(&git_lock, data_path_str, rel_path).await {
                 Ok(()) => {
                     return Err(WriteError::PreCommitFailed {
                         rolled_back: true,

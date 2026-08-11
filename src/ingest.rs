@@ -1405,6 +1405,7 @@ async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bo
             .ok()
             .filter(|s| !s.is_empty());
         crate::git::ensure_repo(
+            &crate::git::lock_git().await,
             git_url,
             &config.source.branch,
             config.data_path(),

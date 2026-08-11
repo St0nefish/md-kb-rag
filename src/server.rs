@@ -1237,7 +1237,12 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
 
     // Auto-clone if git_url is set and data_path isn't a repo yet
     if let Some(ref git_url) = config.source.git_url {
+        // Nothing else is running yet — the server has not bound a listener, so
+        // this acquisition is uncontended. Taken anyway so that every git
+        // invocation in the process goes through the same gate, with no "except
+        // at startup" carve-out for a later reader to have to remember.
         let fresh = git::ensure_repo(
+            &git::lock_git().await,
             git_url,
             &config.source.branch,
             config.data_path(),
