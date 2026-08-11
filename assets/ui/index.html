@@ -46,7 +46,10 @@
     <span class="muted">graph viewer</span>
   </div>
   <div class="controls">
-    <input id="search" type="search" placeholder="Search title / id / tag">
+    <div class="search-wrap">
+      <input id="search" type="search" placeholder="Search the knowledge base" autocomplete="off">
+      <div id="search-results" hidden></div>
+    </div>
     <select id="filter-type">
       <option value="">All types</option>
     </select>

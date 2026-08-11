@@ -240,16 +240,33 @@
         });
       }
 
-      // Debounced semantic search — highlights hits distinctly from dim.
+      // Debounced semantic search — populates the results panel and
+      // highlights hits distinctly from dim.
       clearTimeout(searchDebounceTimer);
       if (!q) {
         cy.elements().removeClass("search-hit");
         searchToken++; // invalidate any in-flight request
+        hideSearchResults();
         return;
       }
       searchDebounceTimer = setTimeout(() => {
         runSemanticSearch(raw.trim());
       }, SEARCH_DEBOUNCE_MS);
+    });
+
+    document.getElementById("search").addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        hideSearchResults();
+      } else if (e.key === "Enter") {
+        // Open the top hit, if the results panel is showing any.
+        const first = document.querySelector("#search-results .search-result");
+        if (first) first.click();
+      }
+    });
+
+    // Click anywhere outside the search box/panel dismisses the results.
+    document.addEventListener("pointerdown", (e) => {
+      if (!e.target.closest(".search-wrap")) hideSearchResults();
     });
 
     document.getElementById("filter-type").addEventListener("change", (e) => {
@@ -276,9 +293,13 @@
     let data;
     try {
       const res = await fetch(`api/search?q=${encodeURIComponent(q)}`);
-      if (!res.ok) return;
+      if (!res.ok) {
+        if (token === searchToken) renderSearchResults(null);
+        return;
+      }
       data = await res.json();
     } catch (err) {
+      if (token === searchToken) renderSearchResults(null);
       return;
     }
     if (token !== searchToken) return; // a newer query has since been issued
@@ -290,6 +311,89 @@
     if (hits.length) {
       cy.animate({ fit: { eles: hits, padding: 40 } }, { duration: 200 });
     }
+
+    renderSearchResults(data.results || []);
+  }
+
+  /** Render semantic search hits as a clickable results list under the
+   * search box. `api/search` returns chunk-level hits ordered by score, so
+   * a document can appear more than once — keep only its best (first)
+   * chunk. `results` semantics: null = the search request itself failed,
+   * [] = it succeeded with no hits. */
+  function renderSearchResults(results) {
+    const panel = document.getElementById("search-results");
+    panel.innerHTML = "";
+    panel.hidden = false;
+
+    if (results === null) {
+      const p = document.createElement("div");
+      p.className = "search-results-empty";
+      p.textContent = "Search unavailable.";
+      panel.appendChild(p);
+      return;
+    }
+
+    const seen = new Set();
+    const docs = results.filter((r) => {
+      if (seen.has(r.file_path)) return false;
+      seen.add(r.file_path);
+      return true;
+    });
+
+    if (!docs.length) {
+      const p = document.createElement("div");
+      p.className = "search-results-empty";
+      p.textContent = "No results.";
+      panel.appendChild(p);
+      return;
+    }
+
+    for (const r of docs) {
+      const item = document.createElement("div");
+      item.className = "search-result";
+      item.tabIndex = 0;
+
+      const head = document.createElement("div");
+      head.className = "search-result-head";
+      const title = document.createElement("span");
+      title.className = "search-result-title";
+      title.textContent = r.title || r.file_path;
+      const score = document.createElement("span");
+      score.className = "search-result-score";
+      score.textContent = r.score.toFixed(2);
+      head.appendChild(title);
+      head.appendChild(score);
+      item.appendChild(head);
+
+      const path = document.createElement("div");
+      path.className = "search-result-path";
+      path.textContent = r.file_path;
+      item.appendChild(path);
+
+      const snippet = (r.text || "").replace(/\s+/g, " ").trim();
+      if (snippet) {
+        const snip = document.createElement("div");
+        snip.className = "search-result-snippet";
+        snip.textContent = snippet.length > 160 ? snippet.slice(0, 160) + "…" : snippet;
+        item.appendChild(snip);
+      }
+
+      const open = () => {
+        hideSearchResults();
+        showDetail(r.file_path);
+      };
+      item.addEventListener("click", open);
+      item.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") open();
+      });
+      panel.appendChild(item);
+    }
+  }
+
+  function hideSearchResults() {
+    const panel = document.getElementById("search-results");
+    panel.hidden = true;
+    panel.innerHTML = "";
   }
 
   function clearSelection() {
