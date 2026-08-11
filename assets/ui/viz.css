@@ -107,7 +107,12 @@ body {
   flex-direction: column;
   height: 100vh;
 }
-header {
+/* Scoped to the page chrome only — a bare `header` selector (as the
+ * OKF original had) also matches the doc view's <header
+ * class="detail-header"> and the editor's <header id="editor-toolbar">,
+ * flattening the doc title/path onto one flex row under the action
+ * buttons. */
+body > header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -527,7 +532,10 @@ hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 .btn-danger { background: var(--bg-panel); border-color: var(--danger-border); color: var(--danger); }
 .btn-danger:hover { background: var(--danger-bg); }
 
-.detail-header { position: relative; }
+/* padding-right keeps the title/path clear of the absolutely-positioned
+ * action buttons. */
+.detail-header { position: relative; padding-right: 190px; }
+#detail-id { overflow-wrap: anywhere; }
 .detail-actions {
   position: absolute;
   top: 0;
