@@ -1,34 +1,37 @@
 <!--
-  Adapted from Google's Open Knowledge Format (OKF) reference viewer
-  (reference_agent/bundle/templates/viz.html), licensed under the
-  Apache License, Version 2.0. See LICENSE-okf.md in this directory
-  for the full license text and a summary of what changed.
+  Docs-first shell for the knowledge-base web UI.
 
-  Changes from the original: cytoscape/marked are loaded from local
-  vendored copies instead of a CDN (DOMPurify is a further addition not
-  present in the OKF original — see below); the viz.css/js "__PLACEHOLDER__"
-  templating (this file was originally filled in by a Python
-  generator, one static HTML file per bundle) is gone in favor of
-  plain external <link>/<script> tags, since this page is served
-  as-is by the app and fetches its data live; the window.BUNDLE_NAME/
-  window.BUNDLE inline-data injection block is removed for the same
-  reason — see viz.js's api/graph fetch; detail panel fields (Resource,
-  Sources, Generated, Verified) that don't exist in this project's
-  frontmatter schema were replaced with ones that do (Domain, Modified).
+  Historically this page was a single-view graph browser adapted from
+  Google's Open Knowledge Format (OKF) reference viewer
+  (reference_agent/bundle/templates/viz.html), Apache License 2.0 — see
+  LICENSE-okf.md in this directory. The Cytoscape graph canvas, its
+  style handling, and the detail-panel markup (now the doc view inside
+  #view-doc) descend from that code. The rest of the shell — the
+  sidebar document tree, home/browse views, hash routing, and the
+  graph toolbar — is md-kb-rag's own.
 
-  In-browser editing (not part of the original OKF viewer) was added on
-  top: Edit/Delete buttons on the detail panel, a "New document" button
-  in the header, and an editor overlay (textarea + live marked.js
-  preview + a schema-hints panel) driven by assets/edit.js against
-  api/doc and api/schema. See edit.js's header comment for the save/
-  create/delete flow.
+  Layout: a persistent header (brand, semantic search with a results
+  panel, graph link, New document) and sidebar (document tree built
+  from api/graph) around a main area that swaps between four
+  hash-routed views:
 
-  DOMPurify is vendored (assets/dompurify.min.js) and loaded before
-  viz.js so that every marked.parse() output — the detail panel body
-  and the editor's preview pane — is sanitized before it is assigned to
-  innerHTML. See viz.js's window.KBViz.renderMarkdown helper. See
-  LICENSE-okf.md for DOMPurify's license note (it is not part of the
-  OKF-derived code and is dual Apache-2.0/MPL-2.0 licensed).
+    #/               -> #view-home   (recent docs + browse-by-domain)
+    #/browse/<dir>   -> #view-browse (doc listing under a prefix)
+    #/doc/<path>     -> #view-doc    (the primary surface: doc reading)
+    #/graph[/<path>] -> #view-graph  (full-KB graph, or the <path>
+                                      doc's neighborhood)
+
+  Vendored scripts are loaded from local copies, never a CDN. Load
+  order matters: cytoscape first, then layout-base -> cose-base ->
+  cytoscape-fcose (each UMD build reads the previous one's global, and
+  fcose self-registers against the global cytoscape); marked +
+  DOMPurify before viz.js (every marked.parse() output is sanitized —
+  see viz.js's renderMarkdown); edit.js last, on top of viz.js's
+  window.KBViz surface.
+
+  In-browser editing (assets/edit.js) is unchanged from the graph-era
+  UI: it keys off the editor-*/confirm-* overlay ids and the
+  new-doc-btn/edit-btn/delete-btn buttons, all preserved here.
 -->
 <!doctype html>
 <html lang="en">
@@ -36,68 +39,115 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Knowledge Base Viewer</title>
+<title>Knowledge Base</title>
 <link rel="stylesheet" href="assets/viz.css">
 </head>
 <body>
 <header>
   <div class="title">
-    <strong>Knowledge Base</strong>
-    <span class="muted">graph viewer</span>
+    <a id="brand" href="#/"><strong>Knowledge Base</strong></a>
   </div>
   <div class="controls">
     <div class="search-wrap">
       <input id="search" type="search" placeholder="Search the knowledge base" autocomplete="off">
       <div id="search-results" hidden></div>
     </div>
-    <select id="filter-type">
-      <option value="">All types</option>
-    </select>
-    <select id="layout">
-      <option value="cose">cose (force)</option>
-      <option value="concentric">concentric</option>
-      <option value="breadthfirst">breadth-first</option>
-      <option value="circle">circle</option>
-      <option value="grid">grid</option>
-    </select>
-    <button id="reset">Reset view</button>
+    <a id="nav-graph" class="btn" href="#/graph">Graph</a>
     <button id="new-doc-btn" class="btn btn-primary">New document</button>
   </div>
 </header>
 
-<main>
-  <section id="graph">
-    <div id="graph-loading">Loading graph…</div>
-    <div id="graph-error" hidden></div>
-  </section>
-  <section id="detail">
-    <div id="detail-empty" class="muted">Click a node to see its details.</div>
-    <article id="detail-content" hidden>
-      <header class="detail-header">
-        <div class="detail-actions">
-          <button id="edit-btn" class="btn">Edit</button>
-          <button id="delete-btn" class="btn btn-danger">Delete</button>
-        </div>
-        <span class="type-chip" id="detail-type"></span>
-        <h1 id="detail-title"></h1>
-        <div class="muted" id="detail-id"></div>
-      </header>
-      <div class="badges" id="detail-badges"></div>
-      <dl class="frontmatter">
-        <dt>Description</dt><dd id="detail-description"></dd>
-        <dt>Domain</dt><dd id="detail-domain"></dd>
-        <dt>Tags</dt><dd id="detail-tags"></dd>
-        <dt>Modified</dt><dd id="detail-mtime"></dd>
-      </dl>
-      <hr>
-      <div id="detail-body"></div>
-      <section id="detail-backlinks" hidden>
-        <h2>Cited by</h2>
-        <ul id="backlinks-list"></ul>
-      </section>
-    </article>
-  </section>
-</main>
+<div id="app">
+  <aside id="sidebar">
+    <nav id="doc-tree"></nav>
+  </aside>
+
+  <main id="content">
+    <div id="app-loading">Loading knowledge base…</div>
+    <div id="app-error" hidden></div>
+
+    <section id="view-home" class="view" hidden>
+      <h1>Knowledge Base</h1>
+      <div id="home-stats" class="muted"></div>
+      <div class="home-section">
+        <h2>Recently modified</h2>
+        <div id="home-recent"></div>
+      </div>
+      <div class="home-section">
+        <h2>Browse</h2>
+        <div id="home-domains" class="domain-grid"></div>
+      </div>
+    </section>
+
+    <section id="view-browse" class="view" hidden>
+      <h1 id="browse-title"></h1>
+      <div id="browse-count" class="muted"></div>
+      <div id="browse-list"></div>
+    </section>
+
+    <section id="view-doc" class="view" hidden>
+      <article id="detail-content">
+        <header class="detail-header">
+          <div class="detail-actions">
+            <button id="local-graph-btn" class="btn">Graph</button>
+            <button id="edit-btn" class="btn">Edit</button>
+            <button id="delete-btn" class="btn btn-danger">Delete</button>
+          </div>
+          <span class="type-chip" id="detail-type"></span>
+          <h1 id="detail-title"></h1>
+          <div class="muted" id="detail-id"></div>
+        </header>
+        <div class="badges" id="detail-badges"></div>
+        <dl class="frontmatter">
+          <dt>Description</dt><dd id="detail-description"></dd>
+          <dt>Domain</dt><dd id="detail-domain"></dd>
+          <dt>Tags</dt><dd id="detail-tags"></dd>
+          <dt>Modified</dt><dd id="detail-mtime"></dd>
+        </dl>
+        <hr>
+        <div id="detail-body"></div>
+        <section id="detail-backlinks" hidden>
+          <h2>Cited by</h2>
+          <ul id="backlinks-list"></ul>
+        </section>
+      </article>
+    </section>
+
+    <section id="view-graph" class="view" hidden>
+      <div id="graph-toolbar">
+        <span id="graph-mode-label" class="muted"></span>
+        <span id="graph-local-controls" hidden>
+          <label class="toolbar-label" for="graph-depth">hops
+            <select id="graph-depth">
+              <option value="1" selected>1</option>
+              <option value="2">2</option>
+            </select>
+          </label>
+          <a id="graph-full-btn" class="btn" href="#/graph">Full graph</a>
+        </span>
+        <span class="toolbar-spacer"></span>
+        <select id="filter-type">
+          <option value="">All types</option>
+        </select>
+        <select id="layout">
+          <option value="fcose" selected>fcose (force)</option>
+          <option value="cose">cose (force)</option>
+          <option value="concentric">concentric</option>
+          <option value="breadthfirst">breadth-first</option>
+          <option value="circle">circle</option>
+          <option value="grid">grid</option>
+        </select>
+        <label class="toolbar-label" for="toggle-semantic">
+          <input id="toggle-semantic" type="checkbox" checked> semantic edges
+        </label>
+        <button id="reset" class="btn">Reset view</button>
+      </div>
+      <div id="graph">
+        <div id="graph-error" hidden></div>
+      </div>
+    </section>
+  </main>
+</div>
 
 <div id="editor-overlay" hidden>
   <div id="editor-modal">
@@ -140,6 +190,9 @@
 </div>
 
 <script src="assets/cytoscape.min.js"></script>
+<script src="assets/layout-base.js"></script>
+<script src="assets/cose-base.js"></script>
+<script src="assets/cytoscape-fcose.js"></script>
 <script src="assets/marked.min.js"></script>
 <script src="assets/dompurify.min.js"></script>
 <script src="assets/viz.js"></script>
