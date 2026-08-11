@@ -17,6 +17,7 @@
 //! counts (documents, points) live in SQLite and Qdrant where they belong.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{LazyLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -644,6 +645,49 @@ pub fn uptime_secs() -> f64 {
     PROCESS_START.elapsed().as_secs_f64()
 }
 
+/// Unix-seconds timestamp of the most recent MCP request this process has served, or
+/// `0` if it has served none since boot. Process-global for the same reason
+/// [`INDEX_STATUS`] is: there is exactly one MCP listener per process, and it is
+/// simpler for a deploy pipeline to poll one `/status` field than to thread a session
+/// registry through to it. See `server.rs`'s `/mcp`-only middleware, the sole writer,
+/// and `.github/workflows/release.yml`'s "Wait for KB quiet" step, the sole external
+/// reader — it polls this to avoid severing a live Claude Desktop session mid-deploy.
+static LAST_MCP_REQUEST_UNIX: AtomicI64 = AtomicI64::new(0);
+
+/// Record that an MCP request just arrived. Called once per request by the `/mcp`-only
+/// middleware in `server.rs` — never by `/status`, `/metrics`, `/health`, the webhook
+/// handler, or the web UI, so a Prometheus scraper hitting `/status` on a timer cannot
+/// itself keep the quiet gate from ever reporting quiet.
+pub fn note_mcp_request() {
+    LAST_MCP_REQUEST_UNIX.store(unix_now(), Ordering::Relaxed);
+}
+
+/// Seconds since the last MCP request, or `None` if this process has served none yet.
+///
+/// `Relaxed` ordering is enough: this is a single independent counter with no other
+/// memory access that needs to stay ordered relative to it.
+pub fn mcp_last_request_age_secs() -> Option<u64> {
+    let ts = LAST_MCP_REQUEST_UNIX.load(Ordering::Relaxed);
+    if ts == 0 {
+        return None;
+    }
+    // `.max(0)`: a backward clock step between the store and this read would otherwise
+    // underflow the `as u64` cast into a huge age instead of a small (or zero) one.
+    Some((unix_now() - ts).max(0) as u64)
+}
+
+/// Test-only serialization for `LAST_MCP_REQUEST_UNIX`.
+///
+/// The static is process-global, and both this module's tests and `server.rs`'s
+/// exercise it — `cargo test` runs those concurrently in the same binary, so one
+/// test's `note_mcp_request()` landing mid-timing-assertion in another would make it
+/// flaky. `pub(crate)` (not private to `tests` below) so `server.rs`'s tests can hold
+/// the same lock, mirroring `config::test_support::ENV_MUTEX`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static MCP_CLOCK_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1059,19 @@ mod tests {
         let out = redact_error("token=café&x=1 — naïve");
         assert!(!out.contains("café"), "{out}");
         assert!(out.contains("naïve"), "{out}");
+    }
+
+    #[test]
+    fn mcp_last_request_age_is_some_and_small_right_after_noting_a_request() {
+        // `LAST_MCP_REQUEST_UNIX` is process-global (like `INDEX_STATUS`'s statics)
+        // and `server.rs` has tests that touch it too — see `test_support`.
+        let _lock = test_support::MCP_CLOCK_MUTEX.lock().unwrap();
+        note_mcp_request();
+        let age = mcp_last_request_age_secs().expect("a request was just noted");
+        assert!(
+            age < 5,
+            "age should be ~0s right after note_mcp_request: {age}"
+        );
     }
 
     #[test]

@@ -67,6 +67,71 @@ jobs:
             "$IMAGE"
           echo "skipped=false" >> "$GITHUB_OUTPUT"
 
+      - name: Wait for KB quiet
+        if: steps.retag.outputs.skipped != 'true'
+        run: |
+          URL="${{ vars.KB_STATUS_URL }}"
+          TOKEN="${{ secrets.KB_STATUS_TOKEN }}"
+
+          # Both must be configured for the gate to arm. Unset is how you opt out
+          # (e.g. a deploy target with no `mcp_last_request_age_secs` support yet, or
+          # one nobody has wired the org vars/secrets up for) — a redeploy must never
+          # hang because of a gate nobody asked for.
+          if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
+            echo "::notice::KB_STATUS_URL and/or KB_STATUS_TOKEN is not set — quiet-gate skipped, deploying immediately."
+            exit 0
+          fi
+
+          # Tunable: how long /mcp must have been idle before it's safe to sever
+          # whatever session is (or isn't) live. Claude Desktop's own traffic is far
+          # more frequent than this during an active session, so a lull this long is
+          # a reasonable proxy for "nobody is mid-conversation".
+          QUIET_SECS=600
+          # Hard cap: a deploy must never stall forever waiting for a lull that never
+          # comes — a session that's simply long-running would otherwise block every
+          # future release indefinitely.
+          MAX_WAIT_SECS=1800
+          POLL_INTERVAL_SECS=30
+          MAX_CONSECUTIVE_FAILURES=3
+
+          waited=0
+          consecutive_failures=0
+          while true; do
+            if response=$(curl -fsS -H "Authorization: Bearer ${TOKEN}" "$URL" 2>&1); then
+              consecutive_failures=0
+              age=$(printf '%s' "$response" | jq -r '.mcp_last_request_age_secs // "null"')
+
+              if [ "$age" = "null" ]; then
+                echo "mcp_last_request_age_secs is null or absent (no MCP traffic yet, or a server predating this field) — proceeding."
+                exit 0
+              fi
+
+              if [ "$age" -ge "$QUIET_SECS" ] 2>/dev/null; then
+                echo "MCP has been quiet for ${age}s (>= ${QUIET_SECS}s) — proceeding with deploy."
+                exit 0
+              fi
+
+              echo "MCP last request ${age}s ago (< ${QUIET_SECS}s quiet window) — waiting ${POLL_INTERVAL_SECS}s..."
+            else
+              consecutive_failures=$((consecutive_failures + 1))
+              echo "::warning::Quiet-gate poll of ${URL} failed (${consecutive_failures}/${MAX_CONSECUTIVE_FAILURES}): ${response}"
+              # Best-effort: the gate must never be the reason a deploy fails, so a
+              # flaky/unreachable /status proceeds rather than blocking forever.
+              if [ "$consecutive_failures" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
+                echo "::warning::${MAX_CONSECUTIVE_FAILURES} consecutive quiet-gate poll failures — proceeding with deploy anyway."
+                exit 0
+              fi
+            fi
+
+            if [ "$waited" -ge "$MAX_WAIT_SECS" ]; then
+              echo "::warning::Waited ${waited}s for a quiet window that never came (cap ${MAX_WAIT_SECS}s) — deploying anyway."
+              exit 0
+            fi
+
+            sleep "$POLL_INTERVAL_SECS"
+            waited=$((waited + POLL_INTERVAL_SECS))
+          done
+
       - name: Trigger Watchtower
         if: steps.retag.outputs.skipped != 'true'
         run: |

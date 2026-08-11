@@ -273,6 +273,19 @@ pub struct StatusResponse {
     pub uptime_secs: f64,
     pub collection: String,
     pub data_path: String,
+    /// Seconds since this process last served an MCP request, or `null` if it never
+    /// has (fresh boot, or `md-kb-rag status`, which runs in its own process with no
+    /// MCP traffic of its own — see `StatusState::for_cli`). Deliberately not
+    /// `skip_serializing_if`: the deploy quiet-gate in
+    /// `.github/workflows/release.yml` distinguishes "no MCP traffic yet" (`null`,
+    /// proceed) from an old server that predates this field (also absent, also
+    /// proceed) only by not needing to — both read the same way through `jq`.
+    ///
+    /// Computed fresh on every `/status`/`/metrics` response, even when the rest of
+    /// the snapshot is served from `STATUS_CACHE_TTL`'s cache — see `status_handler`
+    /// and `metrics_handler`. A quiet-gate poll that got a stale cached age could let
+    /// a redeploy through mid-session or stall a deploy needlessly.
+    pub mcp_last_request_age_secs: Option<u64>,
     pub indexing: crate::status::StatusSnapshot,
     /// Pending work on the reindex worker's dirty-path queue — always idle (0 paths,
     /// no full reconcile pending) for `md-kb-rag status`, which runs in its own
@@ -421,6 +434,10 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
         uptime_secs: crate::status::uptime_secs(),
         collection: config.qdrant.collection.clone(),
         data_path: config.data_path().to_string(),
+        // Present for completeness — `status_handler`/`metrics_handler` overwrite this
+        // again after the cache read, since a collection here can be served stale for
+        // up to `STATUS_CACHE_TTL` by `cached_status`.
+        mcp_last_request_age_secs: crate::status::mcp_last_request_age_secs(),
         indexing: crate::status::INDEX_STATUS.snapshot(),
         queue: crate::reindex::REINDEX_QUEUE.snapshot(),
         store,
@@ -464,11 +481,19 @@ async fn cached_status(state: &StatusState) -> StatusResponse {
 }
 
 async fn status_handler(State(state): State<StatusState>) -> Json<StatusResponse> {
-    Json(cached_status(&state).await)
+    let mut status = cached_status(&state).await;
+    // The rest of the snapshot may be up to `STATUS_CACHE_TTL` stale, which is fine —
+    // but the deploy quiet-gate in `.github/workflows/release.yml` polls this one
+    // field on a tight loop, and a cached age would either let a redeploy through
+    // mid-session or make the gate wait out a session that already ended.
+    status.mcp_last_request_age_secs = crate::status::mcp_last_request_age_secs();
+    Json(status)
 }
 
 async fn metrics_handler(State(state): State<StatusState>) -> Response {
-    let status = cached_status(&state).await;
+    let mut status = cached_status(&state).await;
+    // See `status_handler`: this field must never be served stale from the cache.
+    status.mcp_last_request_age_secs = crate::status::mcp_last_request_age_secs();
     let body = render_prometheus(&status);
 
     axum::response::IntoResponse::into_response((
@@ -539,6 +564,17 @@ pub fn render_prometheus(status: &StatusResponse) -> String {
         "gauge",
         &plain(status.uptime_secs),
     );
+
+    if let Some(age) = status.mcp_last_request_age_secs {
+        metric(
+            "kb_mcp_last_request_age_seconds",
+            "Seconds since this process last served an MCP request. Absent if it has \
+             served none yet. Polled by the deploy quiet-gate before recycling the \
+             container.",
+            "gauge",
+            &plain(age as f64),
+        );
+    }
 
     metric(
         "kb_reindex_queue_pending_paths",
@@ -821,6 +857,17 @@ async fn bearer_auth(
         warn!(path = %path, "Bearer auth rejected");
         Err(StatusCode::UNAUTHORIZED)
     }
+}
+
+/// Marks that an MCP request just arrived, for the deploy quiet-gate (see
+/// `status::note_mcp_request`). Applied only to `mcp_router`, below `bearer_auth`
+/// so it never runs for `/status`, `/metrics`, `/health`, the webhook handler, or the
+/// web UI — and so a request that fails auth does not count either. Without that
+/// ordering, an unauthenticated caller looping on `/mcp` could keep the quiet gate
+/// from ever reporting quiet.
+async fn note_mcp_request_mw(request: axum::extract::Request, next: Next) -> Response {
+    crate::status::note_mcp_request();
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,6 +1590,11 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     let mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        // Added before `bearer_auth` below, which makes `bearer_auth` the outer layer
+        // — it runs first and short-circuits unauthenticated requests before this one
+        // ever sees them. See `note_mcp_request_mw`'s doc comment for why that order
+        // matters.
+        .route_layer(middleware::from_fn(note_mcp_request_mw))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             bearer_auth,
@@ -1716,6 +1768,7 @@ mod tests {
             uptime_secs: 42.0,
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
+            mcp_last_request_age_secs: Some(17),
             indexing: s.snapshot(),
             queue: crate::reindex::QueueSnapshot {
                 pending_paths: 3,
@@ -1750,6 +1803,9 @@ mod tests {
     #[test]
     fn prometheus_output_covers_indexing_store_and_breakdown() {
         let out = render_prometheus(&sample_status());
+
+        // Deploy quiet-gate input.
+        assert!(out.contains("kb_mcp_last_request_age_seconds 17"));
 
         // Pending reindex-queue work.
         assert!(out.contains("kb_reindex_queue_pending_paths 3"));
@@ -2140,6 +2196,88 @@ mod tests {
         *state.cache.lock().await = None;
         let third = cached_status(&state).await;
         assert_eq!(third.store.indexed_files, Some(2));
+    }
+
+    // `LAST_MCP_REQUEST_UNIX` is process-global; the lock below is held across the
+    // `status_handler(...).await` calls on purpose, mirroring `ENV_MUTEX`'s use
+    // above — `#[tokio::test]`'s single-threaded runtime means nothing else on this
+    // OS thread can contend for it while this task is suspended, and a concurrent
+    // test on another thread just blocks on `.lock()` until this one finishes.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn status_handler_never_serves_a_cached_mcp_request_age() {
+        let _clock_lock = crate::status::test_support::MCP_CLOCK_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config: config::shared_config(config),
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        // Note a request, let it age a couple of seconds, then prime the cache: the
+        // cached response has that larger age baked into it.
+        crate::status::note_mcp_request();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let primed = status_handler(State(state.clone())).await.0;
+        let baked_in_age = primed.mcp_last_request_age_secs.expect("noted just above");
+        assert!(
+            baked_in_age >= 2,
+            "sanity check on the priming call: {baked_in_age}"
+        );
+
+        // A fresh MCP request lands. The rest of the snapshot is still well within
+        // `STATUS_CACHE_TTL` and will be served from cache, but the age must not be
+        // frozen at the value baked into that cached response.
+        crate::status::note_mcp_request();
+        let second = status_handler(State(state.clone())).await.0;
+        let age = second.mcp_last_request_age_secs.expect("noted just above");
+        assert!(
+            age < baked_in_age,
+            "age must be recomputed fresh on every request, not served from the \
+             STATUS_CACHE_TTL cache: baked_in={baked_in_age}, got={age}"
+        );
+    }
+
+    // See the comment above `status_handler_never_serves_a_cached_mcp_request_age`
+    // for why holding `MCP_CLOCK_MUTEX` across `.await` here is intentional and safe.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn mcp_route_middleware_notes_the_request_only_when_authenticated() {
+        let _clock_lock = crate::status::test_support::MCP_CLOCK_MUTEX.lock().unwrap();
+
+        // Mirrors production's `mcp_router` layer order: `bearer_auth` is added
+        // after `note_mcp_request_mw`, which makes `bearer_auth` the outer layer —
+        // it runs first, so an unauthenticated request never reaches the note
+        // middleware at all.
+        let auth_state = AuthState {
+            bearer_token: Some("secret".into()),
+        };
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn(note_mcp_request_mw))
+            .route_layer(middleware::from_fn_with_state(auth_state, bearer_auth));
+
+        let req = Request::builder()
+            .uri("/probe")
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let req = Request::builder()
+            .uri("/probe")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let age = crate::status::mcp_last_request_age_secs().expect("noted by the middleware");
+        assert!(age < 5, "age should be ~0s right after the request: {age}");
     }
 
     #[tokio::test]

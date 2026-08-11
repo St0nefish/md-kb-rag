@@ -612,6 +612,9 @@ mod tests {
             uptime_secs: 1.0,
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
+            // A fresh CLI-mode process has never served an MCP request — see
+            // `StatusState::for_cli`.
+            mcp_last_request_age_secs: None,
             indexing: status::IndexStatus::new().snapshot(),
             queue: crate::reindex::QueueSnapshot {
                 pending_paths: 0,
