@@ -137,10 +137,21 @@ pub async fn handle_webhook(
             None => git_url.clone(),
         };
 
+        // One acquisition for the whole rev-parse → fetch → merge → rev-parse →
+        // diff sequence. Per-command locking would be worse than useless here: a
+        // write landing between our fetch and our merge changes what the merge
+        // does, and one landing between the merge and the diff makes the computed
+        // range attribute that write's files to this webhook's pull.
+        //
+        // The inline `git fetch`/`git merge` below are covered by this guard being
+        // alive for the rest of the block, not by a signature — they are the only
+        // git invocations outside `git.rs`. Keep it that way.
+        let git_lock = crate::git::lock_git().await;
+
         // Captured before the fetch so the range diffed below covers exactly what
         // this webhook's pull brought in — the same before/after pattern
         // `commit_and_sync` uses around its own fetch + rebase.
-        let old_head = match crate::git::rev_parse_head(data_path).await {
+        let old_head = match crate::git::rev_parse_head(&git_lock, data_path).await {
             Ok(sha) => sha,
             Err(e) => {
                 error!("Failed to read HEAD before fetch: {:#}", e);
@@ -250,7 +261,7 @@ pub async fn handle_webhook(
         // (src/reindex.rs) picks this up and does the actual indexing out of band, so
         // this handler can return as soon as the local clone is up to date — it no
         // longer waits for (or even starts) a reindex itself.
-        let new_head = match crate::git::rev_parse_head(data_path).await {
+        let new_head = match crate::git::rev_parse_head(&git_lock, data_path).await {
             Ok(sha) => sha,
             Err(e) => {
                 error!("Failed to read HEAD after merge: {:#}", e);
@@ -261,7 +272,10 @@ pub async fn handle_webhook(
             }
         };
 
-        let changed = match crate::git::git_diff_name_status(data_path, &old_head, &new_head).await
+        let changed = match crate::git::git_diff_name_status(
+            &git_lock, data_path, &old_head, &new_head,
+        )
+        .await
         {
             Ok(paths) => paths,
             Err(e) => {
