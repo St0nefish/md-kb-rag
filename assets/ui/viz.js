@@ -108,9 +108,11 @@
           "color": t.nodeLabel,
           "font-size": 11,
           // Level-of-detail: when the rendered label would be smaller
-          // than this, it isn't drawn at all. Zoomed out, the graph is
-          // dots-only instead of an unreadable label soup.
-          "min-zoomed-font-size": 10,
+          // than this, it isn't drawn at all. Deliberately above the
+          // 11px base font size: at fit zoom (~1.0 for a dense KB) the
+          // graph is dots-only, and labels appear once zoomed to ~1.5x
+          // — otherwise the full-KB view is an unreadable label soup.
+          "min-zoomed-font-size": 16,
           "text-valign": "bottom",
           "text-margin-y": 4,
           "text-wrap": "wrap",
@@ -889,6 +891,17 @@
     return cy.elements().not(".excluded").not(".sem-hidden");
   }
 
+  /** Fit the viewport to `eles`, but never closer than 1.5x — fitting a
+   * one-node neighborhood would otherwise fill the screen with a single
+   * giant dot. */
+  function fitGraph(eles) {
+    cy.fit(eles, 30);
+    if (cy.zoom() > 1.5) {
+      cy.zoom(1.5);
+      cy.center(eles);
+    }
+  }
+
   function runGraphLayout() {
     const eles = visibleGraphEles();
     if (!eles.nodes().length) return;
@@ -906,7 +919,7 @@
       // fcose plugin missing/failed — built-in force layout still works.
       eles.layout({ name: "cose", animate: false, padding: 30 }).run();
     }
-    cy.fit(eles, 30);
+    fitGraph(eles);
   }
 
   function renderGraphView(root) {
@@ -1146,7 +1159,7 @@
     });
     document.getElementById("reset").addEventListener("click", () => {
       if (!cy) return;
-      cy.fit(visibleGraphEles(), 30);
+      fitGraph(visibleGraphEles());
       cy.elements().unselect();
     });
     document.getElementById("filter-type").addEventListener("change", (e) => {
