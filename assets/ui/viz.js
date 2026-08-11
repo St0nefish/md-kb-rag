@@ -908,20 +908,29 @@
     const eles = visibleGraphEles();
     if (!eles.nodes().length) return;
     const name = document.getElementById("layout").value;
-    const opts = { name, animate: false, padding: 30 };
+    // fit: false is load-bearing: every cytoscape layout fits the
+    // viewport itself by default when it finishes, and fcose finishes
+    // asynchronously — its built-in fit would land AFTER (and silently
+    // overwrite) fitGraph's capped fit, zooming a densely-packed
+    // full-KB layout past the label threshold. Instead, fit exactly
+    // once per layout, capped, on layoutstop (which fires within
+    // run() for synchronous layouts and at completion for async ones).
+    const opts = { name, animate: false, padding: 30, fit: false };
     if (name === "fcose") {
       opts.quality = "default";
       // Pack the KB's many disconnected components instead of scattering
       // them — the main reason fcose is the default over built-in cose.
       opts.packComponents = true;
     }
+    let layout;
     try {
-      eles.layout(opts).run();
+      layout = eles.layout(opts);
     } catch (err) {
       // fcose plugin missing/failed — built-in force layout still works.
-      eles.layout({ name: "cose", animate: false, padding: 30 }).run();
+      layout = eles.layout({ name: "cose", animate: false, padding: 30, fit: false });
     }
-    fitGraph(eles);
+    layout.one("layoutstop", () => fitGraph(eles));
+    layout.run();
   }
 
   function renderGraphView(root) {
