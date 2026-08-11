@@ -737,6 +737,14 @@ pub struct UpdateSchemaParams {
     /// Apply even when existing documents would fail the new rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
+
+    /// Required to let `add_values`, `set_field`, or `remove_field` apply against the
+    /// knowledge-base root scope (path omitted/empty). Root-scope mutations are guarded
+    /// per the KB's `meta/schema-tag-policy.md` — pass `true` only when the change is a
+    /// deliberate design decision consistent with that policy, not as a routine default.
+    /// Not needed for `remove_values`, for `dry_run` calls, or for any non-root path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledge_root_change: Option<bool>,
 }
 
 /// Parameters for the `search` tool.
@@ -2186,6 +2194,27 @@ impl KbSearchServer {
             }
         };
 
+        // Root-scope mutations need an explicit opt-in (see `acknowledge_root_change`'s
+        // doc comment). `remove_values` is exempt — shrinking the root vocabulary is the
+        // policy-aligned direction, and the casualty check below already guards it — and
+        // `dry_run` is exempt everywhere, since it writes nothing. This must run before
+        // `file.apply()` below: the point is to refuse before any edit is computed or
+        // written, not merely before the commit.
+        let is_root = rel_dir.as_os_str().is_empty();
+        let is_gated_op = !matches!(edit, crate::schema::SchemaEdit::RemoveValues { .. });
+        let dry_run_requested = params.dry_run.unwrap_or(false);
+        let acknowledged = params.acknowledge_root_change.unwrap_or(false);
+        if is_root && is_gated_op && !dry_run_requested && !acknowledged {
+            return Err(McpError::invalid_params(
+                "root schema changes are guarded: the root tag vocabulary is \
+                 identity-only by policy (see meta/schema-tag-policy.md in this \
+                 knowledge base). Pass acknowledge_root_change=true only if this change \
+                 is a deliberate design decision consistent with that policy."
+                    .to_string(),
+                None,
+            ));
+        }
+
         let mut file = schemas
             .raw_file_at(&rel_dir)
             .map_err(|e| invalid(format!("Existing schema at '{}' is unreadable: {e}. Fix it by hand before editing through this tool.", rel_dir.display())))?;
@@ -3259,6 +3288,7 @@ mod tests {
             definition: None,
             dry_run: None,
             force: None,
+            acknowledge_root_change: None,
         }
     }
 
@@ -3727,6 +3757,7 @@ mod tests {
                 definition: None,
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await
             .expect("update_schema must succeed against this git-backed harness");
@@ -3803,6 +3834,7 @@ mod tests {
                 definition: Some(definition(serde_json::json!({ "required": true }))),
                 dry_run: Some(true),
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await
             .unwrap();
@@ -3838,6 +3870,7 @@ mod tests {
                 definition: Some(definition(serde_json::json!({ "required": true }))),
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await
             .expect_err("must refuse rather than silently invalidate documents");
@@ -3879,6 +3912,7 @@ mod tests {
                 definition: None,
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await
             .expect("a non-breaking change must succeed against this git-backed harness");
@@ -3928,6 +3962,7 @@ mod tests {
                 )),
                 dry_run: Some(true),
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await
             .unwrap();
@@ -3963,6 +3998,7 @@ mod tests {
                 definition: Some(definition(serde_json::json!({ "required": true }))),
                 dry_run: None,
                 force: Some(true),
+                acknowledge_root_change: None,
             }))
             .await
             .expect("force must succeed against this git-backed harness");
@@ -3996,6 +4032,7 @@ mod tests {
                 }))),
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await
             .expect_err("a field cannot be both a value and a container");
@@ -4023,11 +4060,207 @@ mod tests {
                 definition: None,
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await
             .expect_err("traversal must be rejected");
 
         assert!(format!("{:?}", err).contains(".."));
+    }
+
+    #[tokio::test]
+    async fn update_schema_root_add_values_refused_without_acknowledgment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: None,
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["x".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .expect_err("root add_values must be refused without acknowledge_root_change");
+
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("root schema changes are guarded"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("meta/schema-tag-policy.md"), "got: {msg}");
+        assert!(msg.contains("acknowledge_root_change"), "got: {msg}");
+        assert!(
+            !tmp.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+            "a refused change must leave the filesystem untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_root_set_field_and_remove_field_are_refused_without_acknowledgment() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_schema_file(
+            &tmp,
+            "",
+            "fields:\n  tags:\n    type: enum\n    values: [x]\n",
+        );
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: None,
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: None,
+                definition: Some(definition(serde_json::json!({ "type": "text" }))),
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .expect_err("root set_field must be refused without acknowledge_root_change");
+        assert!(format!("{:?}", err).contains("root schema changes are guarded"));
+
+        let err = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: None,
+                operation: "remove_field".into(),
+                field: "tags".into(),
+                values: None,
+                definition: None,
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .expect_err("root remove_field must be refused without acknowledge_root_change");
+        assert!(format!("{:?}", err).contains("root schema changes are guarded"));
+    }
+
+    #[tokio::test]
+    async fn update_schema_root_add_values_allowed_with_acknowledgment() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: None,
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["identity".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: Some(true),
+            }))
+            .await
+            .expect("root add_values must succeed once acknowledged");
+
+        assert!(
+            work.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+            "the acknowledged change must actually be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_root_add_values_allowed_with_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: None,
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["identity".into()]),
+                definition: None,
+                dry_run: Some(true),
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .expect("a root dry run must not be gated");
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["dry_run"], serde_json::json!(true));
+        assert_eq!(
+            structured["summary"],
+            serde_json::json!("added to 'tags': identity"),
+            "the dry-run result must be exactly what the same edit against a non-root \
+             scope would report — the root guard must not alter dry-run behavior"
+        );
+        assert!(
+            !tmp.path().join(crate::schema::SCHEMA_FILE_NAME).exists(),
+            "a dry run must not touch the filesystem"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_root_remove_values_allowed_without_acknowledgment() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        write_schema_file(
+            &work,
+            "",
+            "fields:\n  tags:\n    type: enum\n    values: [x, y]\n",
+        );
+        git_commit_all(&work, crate::schema::SCHEMA_FILE_NAME, "add root schema");
+        let (server, _config) = make_git_backed_server(&work);
+
+        server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: None,
+                operation: "remove_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["y".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .expect("root remove_values must not require acknowledge_root_change");
+
+        let written = work.path().join(crate::schema::SCHEMA_FILE_NAME);
+        let yaml = std::fs::read_to_string(&written).unwrap();
+        let reparsed: crate::schema::SchemaFile = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(reparsed.fields["tags"].values, Some(vec!["x".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn update_schema_non_root_add_values_allowed_without_acknowledgment() {
+        // Already exercised incidentally by other update_schema tests (e.g.
+        // `update_schema_accepts_a_change_that_breaks_nothing`), but this test names
+        // the property the root guard must not regress: the gate is root-only.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "add_values".into(),
+                field: "tags".into(),
+                values: Some(vec!["x".into()]),
+                definition: None,
+                dry_run: None,
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .expect("non-root scopes must not require acknowledge_root_change");
+
+        assert!(
+            work.path()
+                .join("notes")
+                .join(crate::schema::SCHEMA_FILE_NAME)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -5840,6 +6073,7 @@ mod tests {
                 definition: None,
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await
             .expect("update_schema must succeed against this git-backed harness");
@@ -6478,6 +6712,7 @@ mod tests {
                 definition: None,
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await;
 
@@ -6542,6 +6777,7 @@ mod tests {
                 definition: None,
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await;
 
@@ -6600,6 +6836,7 @@ mod tests {
                 definition: None,
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await;
 
@@ -6683,6 +6920,7 @@ mod tests {
                 definition: None,
                 dry_run: None,
                 force: None,
+                acknowledge_root_change: None,
             }))
             .await;
 
