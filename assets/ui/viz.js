@@ -108,11 +108,13 @@
           "color": t.nodeLabel,
           "font-size": 11,
           // Level-of-detail: when the rendered label would be smaller
-          // than this, it isn't drawn at all. Deliberately above the
-          // 11px base font size: at fit zoom (~1.0 for a dense KB) the
-          // graph is dots-only, and labels appear once zoomed to ~1.5x
-          // — otherwise the full-KB view is an unreadable label soup.
-          "min-zoomed-font-size": 16,
+          // than this, it isn't drawn at all. Must sit with headroom
+          // ABOVE fitGraph's 1.5x zoom cap (11px font x 1.5 = 16.5):
+          // a densely-packed full-KB layout can fit right at the cap,
+          // and a threshold at-or-below 16.5 re-renders every label
+          // there — the unreadable label soup this exists to prevent.
+          // At 20, labels appear from ~1.8x zoom in.
+          "min-zoomed-font-size": 20,
           "text-valign": "bottom",
           "text-margin-y": 4,
           "text-wrap": "wrap",
