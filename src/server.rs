@@ -185,7 +185,26 @@ const STATUS_QDRANT_TIMEOUT: Duration = Duration::from_secs(5);
 /// giving up and letting the process exit anyway. A run this long is already an
 /// anomaly the reconcile sweep will retry after restart; shutdown should not hang
 /// indefinitely behind it.
-const SHUTDOWN_INDEX_WAIT: Duration = Duration::from_secs(30);
+///
+/// Must stay comfortably below the deployment's watchtower stop grace
+/// (`WATCHTOWER_TIMEOUT=90s` in the watchtower compose) so graceful shutdown finishes
+/// before watchtower escalates to SIGKILL. The old 30s bound was never actually
+/// enough for real runs — a 15-file run observed in production took 47s — so it was
+/// giving up on indexing long before indexing actually settled, defeating the point
+/// of waiting at all. 75s leaves headroom under the 90s grace for the git-quiesce
+/// wait that runs immediately after this one (bounded separately, see its own
+/// timeout) and for process teardown; both bounds maxing out simultaneously is the
+/// pathological case this can't fully protect against, but that already means
+/// something is stuck well past its own anomaly threshold.
+const SHUTDOWN_INDEX_WAIT: Duration = Duration::from_secs(75);
+/// Bound on how long graceful shutdown waits to acquire [`git::GIT_LOCK`] after the
+/// indexing wait above has settled, so an in-flight `commit_and_sync`
+/// (add→commit→fetch→rebase→push) finishes before the process exits rather than
+/// being SIGKILLed mid-rebase and leaving the clone in an interrupted state. Every
+/// git subprocess it could be waiting behind is itself capped at `git::GIT_TIMEOUT`,
+/// so this bound exists only to keep the shutdown path itself from hanging forever —
+/// it does not hand git any headroom it didn't already have.
+const SHUTDOWN_GIT_QUIESCE_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct StatusState {
@@ -1241,8 +1260,13 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         // this acquisition is uncontended. Taken anyway so that every git
         // invocation in the process goes through the same gate, with no "except
         // at startup" carve-out for a later reader to have to remember.
+        //
+        // Held across both `ensure_repo` and `recover_interrupted_state` below —
+        // "prepare the clone for first use" is one logical sequence, and the repo
+        // rule is to acquire once per sequence, not once per call.
+        let git_lock = git::lock_git().await;
         let fresh = git::ensure_repo(
-            &git::lock_git().await,
+            &git_lock,
             git_url,
             &config.source.branch,
             config.data_path(),
@@ -1250,6 +1274,16 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         )
         .await
         .context("Failed to ensure git repository")?;
+
+        // Clean up whatever a killed predecessor process left behind — an
+        // interrupted rebase/merge, or a stale `.git/index.lock` — before the
+        // bootstrap scan below (or anything else) reads from the clone. Must run
+        // before the reconcile scan needs the repo, which is exactly the point in
+        // startup this is: right after the clone is confirmed to exist, before
+        // any read of it.
+        git::recover_interrupted_state(&git_lock, Path::new(config.data_path())).await;
+        drop(git_lock);
+
         if fresh {
             info!("Fresh clone — running initial full index");
             ingest::scan_and_index(&config, true, crate::status::Trigger::Startup)
@@ -1670,6 +1704,28 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         // `INDEX_STATUS` the worker already keeps current, bounded so a genuinely
         // stuck run cannot hang shutdown forever.
         wait_for_indexing_to_settle(|| crate::status::INDEX_STATUS.snapshot().indexing).await;
+
+        // By the time this future resolves, axum has already stopped accepting new
+        // connections and drained/cancelled in-flight requests — that is what
+        // `.with_graceful_shutdown` gates on. So no NEW git work can start past this
+        // point; the only git activity that can still be running is whatever was
+        // already mid-flight (typically a write tool's `commit_and_sync`) when the
+        // signal arrived. Acquiring `git::GIT_LOCK` here — once, per the module's
+        // "acquire once per logical sequence" rule, since this is its own complete
+        // sequence rather than a link in some longer call chain — therefore proves
+        // that last git operation has actually finished, rather than being SIGKILLed
+        // mid-rebase and leaving `.git/index.lock` or an interrupted rebase behind
+        // for `git::recover_interrupted_state` to clean up on the next boot. There is
+        // nothing to do with the guard beyond that proof, so it is dropped
+        // immediately.
+        match tokio::time::timeout(SHUTDOWN_GIT_QUIESCE_WAIT, git::lock_git()).await {
+            Ok(_guard) => debug!("Git clone quiesced for shutdown"),
+            Err(_) => warn!(
+                "Timed out after {:?} waiting for the git clone to quiesce before shutdown — \
+                 an in-flight git operation may still be running when the process exits",
+                SHUTDOWN_GIT_QUIESCE_WAIT
+            ),
+        }
     })
     .await
     .context("Server error")?;

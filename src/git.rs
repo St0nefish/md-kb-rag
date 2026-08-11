@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -695,6 +696,108 @@ pub async fn unstage(_lock: &GitLock, data_path: &str, rel_path: &str) -> anyhow
     if !out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
         anyhow::bail!("git reset -- {} failed: {}", rel_path, stderr);
+    }
+    Ok(())
+}
+
+/// Clean up git state left behind by a process that was killed mid-operation —
+/// an interrupted rebase/merge, or a stale `.git/index.lock` — before anything else
+/// in this process touches the clone.
+///
+/// Call once, at startup, right after the clone is confirmed to exist (i.e. right
+/// after [`ensure_repo`]) and before the bootstrap scan or anything else reads from
+/// it. It exists because a SIGKILL (watchtower's stop-grace timeout, or anything
+/// else that doesn't give the process a chance to finish) can land mid `git rebase`
+/// or mid `git commit`. Unlike the index — survivable via idempotent UUID5 upserts
+/// plus the startup reconcile — the clone has no self-healing path of its own: an
+/// interrupted rebase or a stale `index.lock` makes every subsequent
+/// [`commit_and_sync`] fail, forever, with no recovery short of this.
+///
+/// ## Why removing `index.lock` unconditionally is safe here
+///
+/// Elsewhere, "is this lockfile stale" requires checking whether its owning process
+/// is still alive, because another live process could legitimately hold it right
+/// now. That check does not apply here. This process is the clone's *sole* owner
+/// inside the container — no sibling process ever touches this working copy — and
+/// this function runs exactly once, at the very start of this process's life,
+/// before it has issued a single git command of its own. Any lockfile found at this
+/// point cannot belong to "us" (we haven't done anything yet) and cannot belong to
+/// a concurrent process (there isn't one); by construction it is leftover from a
+/// killed predecessor.
+///
+/// ## Ordering
+///
+/// `index.lock` is removed FIRST. `git rebase --abort` / `git merge --abort` both
+/// need to write to the index themselves, and would fail with "Unable to create
+/// '.git/index.lock': File exists" if the stale lock were still in place — exactly
+/// the failure this function exists to clear.
+///
+/// ## Failure handling
+///
+/// Never fails boot: every abort command's own failure is logged and swallowed
+/// rather than propagated. A repo broken in some way this can't fix keeps failing
+/// loudly on the reconcile sweep and on every write after this — a much better
+/// place to surface it than blocking startup.
+pub async fn recover_interrupted_state(lock: &GitLock, repo: &Path) {
+    let git_dir = repo.join(".git");
+
+    // First: the index lock, so the aborts below can actually touch the index.
+    let index_lock = git_dir.join("index.lock");
+    if index_lock.exists() {
+        warn!(
+            "Found stale .git/index.lock at startup (left behind by a killed \
+             predecessor process — this process is the clone's sole owner and has \
+             only just started, so no live process can hold it) — removing it"
+        );
+        if let Err(e) = tokio::fs::remove_file(&index_lock).await {
+            error!("Failed to remove stale .git/index.lock: {e:#}");
+        }
+    }
+
+    let rebase_merge = git_dir.join("rebase-merge");
+    let rebase_apply = git_dir.join("rebase-apply");
+    if rebase_merge.exists() || rebase_apply.exists() {
+        let marker = if rebase_merge.exists() {
+            "rebase-merge"
+        } else {
+            "rebase-apply"
+        };
+        warn!("Found an interrupted rebase at startup (.git/{marker} present) — aborting it");
+        if let Err(e) = run_abort(lock, repo, &["rebase", "--abort"]).await {
+            error!("git rebase --abort failed during startup recovery: {e:#}");
+        }
+    }
+
+    let merge_head = git_dir.join("MERGE_HEAD");
+    if merge_head.exists() {
+        warn!("Found an interrupted merge at startup (.git/MERGE_HEAD present) — aborting it");
+        if let Err(e) = run_abort(lock, repo, &["merge", "--abort"]).await {
+            error!("git merge --abort failed during startup recovery: {e:#}");
+        }
+    }
+}
+
+/// Run a git abort subcommand (`rebase --abort` / `merge --abort`) in `repo`,
+/// returning an error with redacted stderr on non-zero exit or timeout. Shared by
+/// [`recover_interrupted_state`]'s two abort paths.
+async fn run_abort(_lock: &GitLock, repo: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let data_path = repo.to_string_lossy();
+    let joined = args.join(" ");
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args(["-c", &format!("safe.directory={}", data_path)])
+            .args(args)
+            .current_dir(repo)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git {} timed out after {:?}", joined, GIT_TIMEOUT))?
+    .with_context(|| format!("Failed to spawn git {}", joined))?;
+
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git {} failed: {}", joined, stderr);
     }
     Ok(())
 }
@@ -1808,5 +1911,196 @@ pub(crate) mod tests {
             staged.contains("stray.md"),
             "unrelated staged entry should be untouched, staged: {staged}"
         );
+    }
+
+    // --- recover_interrupted_state ---
+
+    #[tokio::test]
+    async fn recover_interrupted_state_removes_stale_index_lock() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let index_lock = work.path().join(".git").join("index.lock");
+        std::fs::write(&index_lock, b"").unwrap();
+        assert!(index_lock.exists(), "test setup: index.lock must exist");
+
+        let lock = lock_git().await;
+        recover_interrupted_state(&lock, work.path()).await;
+
+        assert!(
+            !index_lock.exists(),
+            "stale index.lock must be removed at startup"
+        );
+    }
+
+    /// A real conflicted rebase, left mid-flight (not auto-aborted, unlike what
+    /// `commit_and_sync` does on a conflict) — the shape a SIGKILL landing mid
+    /// `git rebase` would leave behind.
+    #[tokio::test]
+    async fn recover_interrupted_state_aborts_a_stuck_rebase() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+        let lock = lock_git().await;
+
+        // Clone A pushes conflict.md first.
+        let work_a = clone_bare_repo(bare.path(), "main");
+        std::fs::write(work_a.path().join("conflict.md"), "version A").unwrap();
+        commit_and_sync(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_a.path().to_str().unwrap(),
+            None,
+            "conflict.md",
+            "add conflict.md from A",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        // Clone B, rewound to before A's commit, commits a conflicting version of
+        // the same file locally (no push).
+        let work_b = clone_bare_repo(bare.path(), "main");
+        let work_b_path = work_b.path().to_str().unwrap();
+        let commits = git_out(work_b_path, &["log", "--format=%H", "-2"]);
+        let parent_sha = commits.lines().nth(1).unwrap().trim().to_string();
+        git_out(work_b_path, &["reset", "--hard", &parent_sha]);
+        std::fs::write(work_b.path().join("conflict.md"), "version B").unwrap();
+        git_out(work_b_path, &["add", "conflict.md"]);
+        git_out(
+            work_b_path,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add conflict.md from B",
+            ],
+        );
+
+        // Fetch and rebase manually, WITHOUT aborting on failure — this is what
+        // leaves `.git/rebase-merge` behind for recovery to find.
+        git_out(work_b_path, &["fetch", &bare_url, "main"]);
+        let rebase_out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "rebase",
+                "FETCH_HEAD",
+            ])
+            .current_dir(work_b_path)
+            .output()
+            .unwrap();
+        assert!(
+            !rebase_out.status.success(),
+            "expected a genuine rebase conflict"
+        );
+        assert!(
+            work_b.path().join(".git/rebase-merge").exists()
+                || work_b.path().join(".git/rebase-apply").exists(),
+            "conflicted rebase should leave a rebase-merge/rebase-apply marker"
+        );
+
+        recover_interrupted_state(&lock, work_b.path()).await;
+
+        assert!(
+            !work_b.path().join(".git/rebase-merge").exists(),
+            "rebase-merge marker must be cleared"
+        );
+        assert!(
+            !work_b.path().join(".git/rebase-apply").exists(),
+            "rebase-apply marker must be cleared"
+        );
+        let status = git_out(work_b_path, &["status", "--porcelain"]);
+        assert!(
+            status.trim().is_empty(),
+            "working tree must be clean after the rebase is aborted, got: {status}"
+        );
+    }
+
+    /// A real conflicted merge, left mid-flight — the shape a SIGKILL landing mid
+    /// `git merge` (e.g. the webhook handler's ff-only merge, if it ever fell back
+    /// to a real merge) would leave behind.
+    #[tokio::test]
+    async fn recover_interrupted_state_aborts_a_stuck_merge() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        git_out(work_path, &["checkout", "-b", "other"]);
+        std::fs::write(work.path().join("README.md"), "# other branch content").unwrap();
+        git_out(
+            work_path,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-am",
+                "other branch edit",
+            ],
+        );
+
+        git_out(work_path, &["checkout", "main"]);
+        std::fs::write(work.path().join("README.md"), "# main branch content").unwrap();
+        git_out(
+            work_path,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-am",
+                "main branch edit",
+            ],
+        );
+
+        let merge_out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "merge",
+                "other",
+            ])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        assert!(!merge_out.status.success(), "expected a genuine conflict");
+        assert!(work.path().join(".git/MERGE_HEAD").exists());
+
+        let lock = lock_git().await;
+        recover_interrupted_state(&lock, work.path()).await;
+
+        assert!(
+            !work.path().join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD must be cleared after the merge is aborted"
+        );
+        let status = git_out(work_path, &["status", "--porcelain"]);
+        assert!(
+            status.trim().is_empty(),
+            "working tree must be clean after the merge is aborted, got: {status}"
+        );
+    }
+
+    /// A clean repo — nothing to recover — must be a silent no-op.
+    #[tokio::test]
+    async fn recover_interrupted_state_is_a_no_op_on_a_clean_repo() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+
+        let lock = lock_git().await;
+        recover_interrupted_state(&lock, work.path()).await;
+
+        // Still a normal, healthy repo — recovery didn't damage anything.
+        let status = git_out(work.path().to_str().unwrap(), &["status", "--porcelain"]);
+        assert!(status.trim().is_empty());
     }
 }
