@@ -74,27 +74,64 @@ pub fn discover_files(data_path: &Path, indexing: &IndexingConfig) -> Result<Vec
     let exclude_filenames: HashSet<&str> =
         indexing.exclude_files.iter().map(|s| s.as_str()).collect();
 
+    let filter = WalkFilter {
+        include_set: &include_set,
+        exclude_set: &exclude_set,
+        exclude_filenames: &exclude_filenames,
+    };
+
     let mut matched: Vec<PathBuf> = Vec::new();
 
-    walk_dir(
-        data_path,
-        data_path,
-        &include_set,
-        &exclude_set,
-        &exclude_filenames,
-        &mut matched,
-    )?;
+    walk_dir(data_path, data_path, Some(&filter), &mut matched)?;
 
     matched.sort();
     Ok(matched)
 }
 
+/// Recursively collect the absolute path of every regular file under `dir`
+/// (which may be nested below `root`), at any depth, symlinks skipped — the
+/// write path's unfiltered counterpart to [`discover_files`], sharing the same
+/// recursive walk (symlink-skip, per-entry error handling, dir recursion) via
+/// `walk_dir`'s `filter: None` mode rather than re-implementing it.
+/// `write::move_directory` needs to see EVERY file under a prefix, indexable
+/// or not, both to detect a non-empty destination and to enumerate exactly
+/// what a source subtree contains — unlike `discover_files`, which exists to
+/// answer "what should the indexer index" and must stay filtered.
+///
+/// `root` only affects how paths get stripped for `include_set`/`exclude_set`
+/// matching, which does not apply in unfiltered mode — passing `dir` itself as
+/// `root` is fine here.
+pub(crate) fn walk_dir_unfiltered(root: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut matched: Vec<PathBuf> = Vec::new();
+    walk_dir(root, dir, None, &mut matched)?;
+    Ok(matched)
+}
+
+/// The include/exclude filter `walk_dir` applies to each regular file it visits.
+/// Grouped into one struct so `walk_dir` takes a single `Option<&WalkFilter>`
+/// rather than three separate optional parameters that would all need to be
+/// `Some`/`None` in lockstep.
+struct WalkFilter<'a> {
+    include_set: &'a GlobSet,
+    exclude_set: &'a Option<GlobSet>,
+    exclude_filenames: &'a HashSet<&'a str>,
+}
+
+/// Recursively walk `dir`, collecting every regular file's absolute path into
+/// `matched`. Symlinks are always skipped (this walker underlies both the
+/// indexer's file discovery and `write::move_directory`'s subtree scan, and a
+/// symlink loop or a hostile symlink target is unwelcome in either).
+///
+/// `filter` is `None` for an unfiltered walk (every regular file matches — see
+/// [`walk_dir_unfiltered`]) or `Some` to additionally require the entry match
+/// `include_set` and not match `exclude_set`/`exclude_filenames`, relative to
+/// `root` (see [`discover_files`]). A single implementation for both modes
+/// means a future fix to symlink-loop or entry-error handling here reaches
+/// both callers instead of only whichever one it was made in.
 fn walk_dir(
     root: &Path,
     dir: &Path,
-    include_set: &GlobSet,
-    exclude_set: &Option<GlobSet>,
-    exclude_filenames: &HashSet<&str>,
+    filter: Option<&WalkFilter>,
     matched: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let entries = std::fs::read_dir(dir)
@@ -113,14 +150,7 @@ fn walk_dir(
         }
 
         if file_type.is_dir() {
-            walk_dir(
-                root,
-                &path,
-                include_set,
-                exclude_set,
-                exclude_filenames,
-                matched,
-            )?;
+            walk_dir(root, &path, filter, matched)?;
             continue;
         }
 
@@ -128,9 +158,14 @@ fn walk_dir(
             continue;
         }
 
+        let Some(filter) = filter else {
+            matched.push(path);
+            continue;
+        };
+
         // Check exclude_files by filename
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-            && exclude_filenames.contains(file_name)
+            && filter.exclude_filenames.contains(file_name)
         {
             debug!("Skipping excluded filename: {}", path.display());
             continue;
@@ -142,12 +177,12 @@ fn walk_dir(
         let rel_str = rel.to_string_lossy();
 
         // Must match at least one include pattern
-        if !include_set.is_match(rel_str.as_ref()) {
+        if !filter.include_set.is_match(rel_str.as_ref()) {
             continue;
         }
 
         // Must not match any exclude pattern
-        if let Some(excl) = exclude_set
+        if let Some(excl) = filter.exclude_set
             && excl.is_match(rel_str.as_ref())
         {
             debug!("Excluding file: {}", path.display());

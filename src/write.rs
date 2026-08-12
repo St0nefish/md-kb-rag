@@ -23,6 +23,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use futures::stream::{self, StreamExt};
 use tracing::{error, warn};
 
 use crate::config::ValidationConfig;
@@ -1123,6 +1124,40 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //    leave that mutation uncommitted.
     validate_commit_message(message)?;
 
+    // 9.5. Acquire GIT_LOCK now and hold ONE guard across every remaining
+    //    mutation of the clone below — the destination write, the source
+    //    removal, the referencing-document read-modify-write (step 10.5), the
+    //    commit, and any rollback — rather than acquiring it only just before
+    //    the commit as this used to. Two reasons, both load-bearing:
+    //
+    //    - Step 10.5 reads another document's CURRENT body, computes a
+    //      rewrite, and writes it back with no hash/staleness check of its
+    //      own (unlike a caller-driven edit, which can supply
+    //      `expected_hash`). Left unlocked, a concurrent writer to that same
+    //      referencing document can land its own write in the gap between
+    //      this read and this write and be silently clobbered with no
+    //      conflict reported to either side. Holding GIT_LOCK across the
+    //      whole read-modify-write serializes it against every other
+    //      operation that also mutates the clone through this lock,
+    //      including another concurrent move.
+    //    - The destination write and source removal immediately below are
+    //      themselves mutations of the clone, and the SAME reasoning that
+    //      motivates locking step 10.5 applies to them: leaving them outside
+    //      the acquisition would still let a concurrent webhook merge or
+    //      another write's commit interleave with an in-progress, not-yet-
+    //      committed move, and would reintroduce exactly the kind of
+    //      "acquire, release, re-acquire" gap CLAUDE.md's git-serialization
+    //      section warns against. Pulling them in also matches this
+    //      codebase's existing convention of one acquisition per logical
+    //      mutating sequence (see `write_document`'s and `delete_document`'s
+    //      identical single acquisition spanning their own commit+rollback).
+    //      Nothing between here and the commit below performs a SECOND
+    //      `lock_git()` call — every helper that used to acquire its own
+    //      (the `cleanup_lock` below, formerly a fresh acquisition) now takes
+    //      this same guard by reference instead, which is what keeps this
+    //      non-reentrant mutex from deadlocking against itself.
+    let git_lock = git::lock_git().await;
+
     // 10. Filesystem: write the DESTINATION first (`create_new`, so this can never
     //    silently clobber a file that appeared between the check above and now),
     //    THEN remove the source. This order is load-bearing, not arbitrary:
@@ -1294,11 +1329,14 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                         // HEAD (the source, and every referencing document already
                         // rewritten this loop) or brand new and untracked (the
                         // destination), so unwinding by hand is safe: restore the
-                        // tracked ones from HEAD, delete the untracked one.
-                        let cleanup_lock = git::lock_git().await;
+                        // tracked ones from HEAD, delete the untracked one. Reuses the
+                        // `git_lock` acquired in step 9.5 above rather than acquiring a
+                        // second guard — this non-reentrant mutex is already held for
+                        // this entire sequence, and a fresh `lock_git()` call here would
+                        // deadlock against it.
                         for done in &rewritten_paths {
                             if let Err(e) =
-                                git::restore_from_head(&cleanup_lock, data_path_str, done).await
+                                git::restore_from_head(&git_lock, data_path_str, done).await
                             {
                                 error!(
                                     "Rollback: failed to restore rewritten referencing \
@@ -1308,7 +1346,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                             }
                         }
                         if let Err(e) =
-                            git::restore_from_head(&cleanup_lock, data_path_str, source_rel).await
+                            git::restore_from_head(&git_lock, data_path_str, source_rel).await
                         {
                             error!(
                                 "Rollback: failed to restore source '{}': {:#}. This needs \
@@ -1347,11 +1385,13 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     );
 
     // 11. Commit the move AND every rewritten referencing document as ONE
-    //     atomic commit, under one lock acquisition held across the commit AND
-    //     any rollback below — releasing it in between would let another
-    //     writer stage into (and, since it commits its own path, commit) the
-    //     very half-staged state this call is about to undo. See
-    //     write_document's identical comment for the full reasoning.
+    //     atomic commit, under the SAME lock acquisition (step 9.5, above)
+    //     already held across the destination write, source removal, and
+    //     referencing-document rewrite — releasing it in between any of those
+    //     and the commit would let another writer stage into (and, since it
+    //     commits its own path, commit) the very half-staged state this call
+    //     is about to undo. See write_document's identical comment for the
+    //     full reasoning.
     //     Deduplicated defensively even though `links_targeting` already
     //     returns DISTINCT source paths and cannot return `source_rel`/
     //     `dest_rel` themselves (dest_rel is guaranteed not to have existed as
@@ -1362,8 +1402,6 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             commit_paths.push(p.as_str());
         }
     }
-
-    let git_lock = git::lock_git().await;
 
     let commit_outcome = match git::commit_and_sync(
         &git_lock,
@@ -1726,9 +1764,10 @@ impl From<WriteError> for DirectoryMoveError {
 
 /// Recursively collect the KB-root-relative path of every regular file under
 /// `abs_dir` (which must itself already exist as a directory), at any depth.
-/// Symlinks are skipped, mirroring `ingest::discover_files`'s own caution around
-/// them — this is a write-path helper, not the indexer, but a hostile symlink is
-/// just as unwelcome here.
+/// Symlinks are skipped — delegates the actual recursive walk to
+/// `ingest::walk_dir_unfiltered`, the same walker `discover_files` runs (just in
+/// its unfiltered mode), so a future fix to symlink-loop or entry-error
+/// handling in one reaches both instead of only whichever one it landed in.
 ///
 /// Unfiltered: returns every file, not just indexable documents. `move_directory`
 /// uses this both for the source-subtree scan (filtered to indexable documents,
@@ -1736,36 +1775,51 @@ impl From<WriteError> for DirectoryMoveError {
 /// destination-prefix collision check (deliberately left UNFILTERED there, since
 /// ANY file under the destination — indexable or not — means the prefix is not
 /// free).
+///
+/// Synchronous (a plain recursive `std::fs` walk) — callers on the async path
+/// must run this via [`walk_subtree_files_async`] instead of calling it
+/// directly, so a large subtree scan runs off the tokio worker thread rather
+/// than blocking every other task scheduled on it.
 fn walk_subtree_files(canonical_data_path: &Path, abs_dir: &Path) -> std::io::Result<Vec<String>> {
-    fn walk(canonical_data_path: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                walk(canonical_data_path, &path, out)?;
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            let rel = path
-                .strip_prefix(canonical_data_path)
+    let files = crate::ingest::walk_dir_unfiltered(canonical_data_path, abs_dir)
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    let mut out: Vec<String> = files
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(canonical_data_path)
                 .unwrap_or(&path)
                 .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            out.push(rel);
-        }
-        Ok(())
-    }
-
-    let mut out = Vec::new();
-    walk(canonical_data_path, abs_dir, &mut out)?;
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        })
+        .collect();
     out.sort();
     Ok(out)
+}
+
+/// Off-thread wrapper around [`walk_subtree_files`] for callers inside async
+/// `move_directory`: a large recursive subtree scan is exactly the kind of
+/// blocking filesystem work `ingest.rs`'s own `discover_relative` already runs
+/// via `spawn_blocking` (see its doc comment) rather than directly on a tokio
+/// worker thread — done inline here it would stall every unrelated MCP/webhook
+/// task scheduled on that same worker for the whole walk. Takes owned buffers
+/// so the spawned closure needs nothing borrowed from the caller's stack
+/// (`Path` args are cloned into `PathBuf`s before crossing into the blocking
+/// closure) — in particular, this never captures the caller's held `GitLock`
+/// guard, which must stay on the calling task.
+async fn walk_subtree_files_async(
+    canonical_data_path: &Path,
+    abs_dir: &Path,
+) -> std::io::Result<Vec<String>> {
+    let canonical_data_path = canonical_data_path.to_path_buf();
+    let abs_dir = abs_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || walk_subtree_files(&canonical_data_path, &abs_dir))
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(std::io::Error::other(format!(
+            "walk_subtree_files task panicked: {e}"
+        ))),
+    }
 }
 
 /// Best-effort, recursive, deepest-first removal of every now-empty directory
@@ -1781,6 +1835,9 @@ fn walk_subtree_files(canonical_data_path: &Path, abs_dir: &Path) -> std::io::Re
 /// `source_dir` has been moved out, `source_dir` itself does not linger as an
 /// empty husk on disk (and, symmetrically, so a rolled-back move's
 /// now-empty destination directory does not linger either).
+///
+/// Synchronous, same reason as [`walk_subtree_files`] — async callers must go
+/// through [`remove_empty_dirs_best_effort_async`].
 fn remove_empty_dirs_best_effort(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1791,6 +1848,22 @@ fn remove_empty_dirs_best_effort(dir: &Path) {
         }
     }
     let _ = std::fs::remove_dir(dir);
+}
+
+/// Off-thread wrapper around [`remove_empty_dirs_best_effort`], same rationale
+/// as [`walk_subtree_files_async`]: a deep, mostly-empty directory tree left
+/// behind by a large move is still a synchronous recursive `std::fs` walk, and
+/// every call site here runs while `move_directory` holds `GitLock` — this
+/// takes an owned `PathBuf` rather than borrowing the caller's `&Path`, so
+/// nothing from the caller's stack (least of all the lock guard, which callers
+/// never pass in) crosses into the blocking closure. Best-effort by
+/// construction already (the sync version swallows every error), so a panicked
+/// blocking task is just logged, not propagated.
+async fn remove_empty_dirs_best_effort_async(dir: &Path) {
+    let dir = dir.to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || remove_empty_dirs_best_effort(&dir)).await {
+        error!("remove_empty_dirs_best_effort task panicked: {e}");
+    }
 }
 
 /// Undo every filesystem change [`move_directory`] has made SO FAR — before it
@@ -1808,23 +1881,34 @@ fn remove_empty_dirs_best_effort(dir: &Path) {
 /// — there is no such no-op equivalent for creating/removing a file that may or
 /// may not exist, so those two stay precise per call site.
 ///
-/// Acquires its own [`git::GitLock`] (mirrors `write_document_move`'s identical
-/// `cleanup_lock` for its own pre-commit filesystem-rollback branch): nothing has
-/// been staged or committed yet at any call site, so this is a self-contained
-/// "mutate, then roll back" sequence with no other acquisition to race against.
+/// Takes the caller's already-held [`git::GitLock`] rather than acquiring its
+/// own: `move_directory` now holds ONE guard across its entire mutating
+/// sequence — every destination write, every source removal, every outside
+/// referencing-document rewrite, the commit, and any rollback — for the same
+/// data-loss reason `write_document_move` holds one across its equivalent
+/// sequence (an unlocked read-modify-write of another document can be raced
+/// and silently clobbered by a concurrent writer). This function runs from
+/// failure paths INSIDE that sequence, so it must reuse the same guard rather
+/// than call `git::lock_git()` itself — `GIT_LOCK` is a non-reentrant mutex,
+/// and a second acquisition here while the first is still held by the caller
+/// would deadlock the whole call chain against itself. (Previously this
+/// acquired its own lock, on the reasoning that nothing had been staged or
+/// committed yet at any call site; that remains true of the git plumbing, but
+/// not of the filesystem mutations this function itself performs, which is
+/// exactly the gap the data-loss finding this change fixes was about.)
 /// Every individual restore/removal failure is logged, not propagated — the
 /// caller has already committed to failing the whole move and just needs
 /// everything recoverable put back, best effort.
 async fn rollback_directory_move_filesystem(
+    lock: &git::GitLock,
     data_path_str: &str,
     moves: &[(String, String)],
     abs_dest_dir: &Path,
     written_dest: &[PathBuf],
     rewritten_refs: &[String],
 ) {
-    let lock = git::lock_git().await;
     for (old_rel, _new_rel) in moves {
-        if let Err(e) = git::restore_from_head(&lock, data_path_str, old_rel).await {
+        if let Err(e) = git::restore_from_head(lock, data_path_str, old_rel).await {
             error!(
                 "move_directory rollback: failed to restore source '{}': {:#}. This needs \
                  operator attention.",
@@ -1845,9 +1929,9 @@ async fn rollback_directory_move_filesystem(
     // Best-effort: tidy up any destination directory left empty by the removals
     // above, so a rolled-back move does not leave an empty destination prefix
     // behind — see `remove_empty_dirs_best_effort`'s doc comment.
-    remove_empty_dirs_best_effort(abs_dest_dir);
+    remove_empty_dirs_best_effort_async(abs_dest_dir).await;
     for ref_path in rewritten_refs {
-        if let Err(e) = git::restore_from_head(&lock, data_path_str, ref_path).await {
+        if let Err(e) = git::restore_from_head(lock, data_path_str, ref_path).await {
             error!(
                 "move_directory rollback: failed to restore referencing document '{}': {:#}. \
                  This needs operator attention.",
@@ -1895,9 +1979,10 @@ async fn rollback_directory_move_filesystem(
 ///   self-reference case, same as `write_document_move`).
 ///
 /// Separately, every document OUTSIDE the moved subtree that links INTO it
-/// (`StateDb::links_targeting`, filtered to sources outside `source_dir` —
-/// sources INSIDE it are the outbound pass above, and are never processed
-/// twice) has its link text rewritten to the moved document's new location,
+/// (`StateDb::links_targeting_many`, one batched query over every moved path,
+/// filtered to sources outside `source_dir` — sources INSIDE it are the
+/// outbound pass above, and are never processed twice) has its link text
+/// rewritten to the moved document's new location,
 /// riding along in the same commit. Same best-effort semantics as
 /// `write_document_move`: with no `StateDb` (`WriteDeps::state == None`), this
 /// step is skipped entirely and the move still proceeds.
@@ -1911,6 +1996,17 @@ async fn rollback_directory_move_filesystem(
 /// steps run unconditionally, and `rolled_back` is `true` only if every single
 /// one of them succeeded. On success, every path is marked dirty in one
 /// `reindex::mark_paths` call.
+///
+/// How many documents' `validate::validate_content` calls run at once (see the
+/// body below): each may exec an external `lint_command` subprocess, so this
+/// is a *process* concurrency bound, not just an async-task one. 8 is
+/// deliberately conservative — in the same range as a typical machine's core
+/// count — chosen to get most of the win over a fully serial loop (N times
+/// fewer round trips through subprocess spawn/exit latency) without letting a
+/// large subtree move fork hundreds of lint processes at once and risk
+/// exhausting file descriptors or thrashing the host.
+const DIRECTORY_MOVE_VALIDATION_CONCURRENCY: usize = 8;
+
 pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     source_dir: &str,
@@ -1934,11 +2030,10 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // Guard 1 + guard 3: walk the whole source subtree once, collecting both the
     // indexable documents (guard 1) and whether any `.kb-schema.yaml` lives
     // anywhere underneath (guard 3) — one filesystem walk answers both.
-    let source_files =
-        walk_subtree_files(deps.canonical_data_path, &abs_source_dir).map_err(|e| {
-            DirectoryMoveError::Io {
-                msg: format!("Failed to scan source directory '{}': {}", source_dir, e),
-            }
+    let source_files = walk_subtree_files_async(deps.canonical_data_path, &abs_source_dir)
+        .await
+        .map_err(|e| DirectoryMoveError::Io {
+            msg: format!("Failed to scan source directory '{}': {}", source_dir, e),
         })?;
 
     if let Some(schema_path) = source_files.iter().find(|p| {
@@ -1970,11 +2065,10 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         return Err(DirectoryMoveError::AlreadyExists);
     }
     if abs_dest_dir.is_dir() {
-        let dest_files =
-            walk_subtree_files(deps.canonical_data_path, &abs_dest_dir).map_err(|e| {
-                DirectoryMoveError::Io {
-                    msg: format!("Failed to scan destination directory '{}': {}", dest_dir, e),
-                }
+        let dest_files = walk_subtree_files_async(deps.canonical_data_path, &abs_dest_dir)
+            .await
+            .map_err(|e| DirectoryMoveError::Io {
+                msg: format!("Failed to scan destination directory '{}': {}", dest_dir, e),
             })?;
         if !dest_files.is_empty() {
             return Err(DirectoryMoveError::AlreadyExists);
@@ -2000,13 +2094,17 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         .collect();
 
     // Guard 4 (frozen, per document) + guard 5 (eligibility/safety, per
-    // document) + the outbound link rewrite + destination-schema validation.
-    // ALL before any mutation: every document is only ever READ here, and every
-    // failure path below returns before touching the filesystem.
+    // document) + the outbound link rewrite. ALL before any mutation: every
+    // document is only ever READ here, and every failure path below returns
+    // before touching the filesystem. These checks are all cheap, in-memory or
+    // single-file-read work, so they stay a plain serial loop — same
+    // first-failure-wins behavior as before, e.g. `AlreadyExists`/`Frozen` on
+    // whichever document trips it first. Only `validate::validate_content`
+    // below (which may exec a `lint_command` subprocess) is expensive enough,
+    // and independent enough per document, to run concurrently.
     let schemas = crate::schema::load_shared(deps.schema_cache);
     // (old_rel, new_rel, content_to_write)
     let mut contents: Vec<(String, String, String)> = Vec::new();
-    let mut validation_failures: Vec<(String, ValidationResult)> = Vec::new();
 
     for (old_rel, new_rel) in &moves {
         check_include_pattern(deps, old_rel)?;
@@ -2041,31 +2139,84 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             moving.get(resolved).map(|new| new.to_string())
         });
 
-        let schema = schemas.resolve_for(Path::new(new_rel.as_str()));
-        let (validation_result, _validated) = validate::validate_content(
-            Path::new(new_rel.as_str()),
-            &content_to_write,
-            schema,
-            deps.validation,
-        )
-        .await
-        .map_err(|e| {
-            error!(
-                "Validation error moving '{}' -> '{}': {:#}",
-                old_rel, new_rel, e
-            );
-            DirectoryMoveError::Io {
-                msg: format!("Failed to validate content: {}", e),
-            }
-        })?;
-        if !validation_result.valid {
-            validation_failures.push((new_rel.clone(), validation_result));
-        }
-
         contents.push((old_rel.clone(), new_rel.clone(), content_to_write));
     }
 
+    // Destination-schema validation, run concurrently across every document
+    // rather than one `validate::validate_content` await at a time — each call
+    // may exec an external `lint_command` subprocess, so a 200-document
+    // subtree previously paid 200x that subprocess's spawn/exit latency
+    // serially. Bounded via `buffer_unordered`, not spawned one task per
+    // document unbounded: an unbounded fan-out on a large subtree would fork
+    // hundreds of lint subprocesses at once and risks exhausting file
+    // descriptors or thrashing the machine. `DIRECTORY_MOVE_VALIDATION_CONCURRENCY`
+    // documents `N`'s reasoning.
+    //
+    // Semantics are preserved exactly: this collects EVERY document's outcome
+    // before deciding anything (`.collect::<Vec<_>>().await` drains the whole
+    // bounded stream), so a document that fails validation can never be
+    // reported as "the only failure" just because it finished first under
+    // concurrency — same as the old serial loop reporting every failure
+    // encountered before returning `Validation`. A genuine `validate_content`
+    // error (as opposed to an ordinary "invalid" result) still aborts the move
+    // exactly like the old loop's `?` did — the first one found after the
+    // whole bounded batch settles, rather than mid-loop, since concurrent
+    // tasks already in flight cannot be un-started once launched.
+    // Built via a plain loop (not `Iterator::map`) so each future's captures are
+    // inferred independently rather than through one `FnMut` closure signature
+    // that has to hold for every item uniformly — the latter runs into a known
+    // rustc limitation ("implementation of `FnOnce` is not general enough")
+    // once the closure's return type borrows from both the loop item and an
+    // outer variable (`schemas`) at once.
+    let mut validation_futures = Vec::with_capacity(contents.len());
+    for (_old_rel, new_rel, content_to_write) in &contents {
+        let schema = schemas.resolve_for(Path::new(new_rel.as_str()));
+        validation_futures.push(async move {
+            let outcome = validate::validate_content(
+                Path::new(new_rel.as_str()),
+                content_to_write,
+                schema,
+                deps.validation,
+            )
+            .await
+            .map(|(validation_result, _validated)| validation_result);
+            (new_rel.clone(), outcome)
+        });
+    }
+    let validation_outcomes: Vec<(String, anyhow::Result<ValidationResult>)> =
+        stream::iter(validation_futures)
+            .buffer_unordered(DIRECTORY_MOVE_VALIDATION_CONCURRENCY)
+            .collect()
+            .await;
+
+    let mut validation_failures: Vec<(String, ValidationResult)> = Vec::new();
+    for (new_rel, outcome) in validation_outcomes {
+        match outcome {
+            Ok(validation_result) => {
+                if !validation_result.valid {
+                    validation_failures.push((new_rel, validation_result));
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Validation error moving into '{}' (source '{}' -> '{}'): {:#}",
+                    new_rel, source_dir, dest_dir, e
+                );
+                return Err(DirectoryMoveError::Io {
+                    msg: format!("Failed to validate content: {}", e),
+                });
+            }
+        }
+    }
+
     if !validation_failures.is_empty() {
+        // Sort so the reported order is deterministic regardless of which
+        // validation happened to finish first under `buffer_unordered` — the
+        // old serial loop always reported failures in `moves` order (which is
+        // sorted, per `walk_subtree_files`), and callers' error text
+        // (`mcp::move_directory_error_to_mcp_error`) reads more like a stable
+        // report when it stays that way.
+        validation_failures.sort_by(|a, b| a.0.cmp(&b.0));
         return Err(DirectoryMoveError::Validation {
             failures: validation_failures,
         });
@@ -2074,6 +2225,27 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     validate_commit_message(message)?;
 
     let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
+
+    // Acquire GIT_LOCK now and hold ONE guard across every remaining mutation
+    // of the clone below — phase 1 (destination writes), phase 2 (source
+    // removals), phase 3 (outside referencing-document rewrites), the commit,
+    // and any rollback — rather than only around the commit as this used to.
+    // Same reasoning as `write_document_move`'s identical hoist: phase 3 is an
+    // unlocked read-modify-write of documents OUTSIDE this move's own path
+    // set, with no staleness check of its own, so a concurrent writer to one
+    // of those documents can land its write in the gap between this read and
+    // this write and be silently clobbered. Phases 1 and 2 are pulled in too
+    // for the same reason `write_document_move` pulls in its own destination
+    // write/source removal: they are themselves clone mutations, and holding
+    // one guard across the whole sequence (rather than acquire/release/
+    // re-acquire) is both this codebase's existing convention and what keeps
+    // an in-progress, not-yet-committed move from interleaving with another
+    // writer's commit or a concurrent webhook merge. Every helper reachable
+    // from here that used to acquire its own `GitLock` —
+    // `rollback_directory_move_filesystem`, called from every failure branch
+    // in phases 1-3 — now takes this same guard by reference instead, which
+    // is what keeps this non-reentrant mutex from deadlocking against itself.
+    let git_lock = git::lock_git().await;
 
     // Filesystem mutation, phase 1: write every DESTINATION first (`create_new`,
     // same non-clobbering guarantee `write_document_move` relies on), before
@@ -2087,6 +2259,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             Ok(p) => p,
             Err(e) => {
                 rollback_directory_move_filesystem(
+                    &git_lock,
                     data_path_str,
                     &moves,
                     &abs_dest_dir,
@@ -2101,6 +2274,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {
             rollback_directory_move_filesystem(
+                &git_lock,
                 data_path_str,
                 &moves,
                 &abs_dest_dir,
@@ -2129,6 +2303,32 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
 
         match write_outcome {
             Ok(()) => written_dest.push(abs_dest),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // TOCTOU collision: guard 2 above walked the destination prefix
+                // and found it clear, but something has landed at this exact
+                // computed destination since then. This is the same benign,
+                // retryable race `write_document_move`'s equivalent
+                // `create_new` open maps to `WriteError::AlreadyExists` — map
+                // it identically here rather than letting it fall into the
+                // generic `Io` arm below, which `move_directory_error_to_mcp_error`
+                // reports as an opaque internal error instead of a clear
+                // "already exists" the caller can act on.
+                error!(
+                    "Destination '{}' already exists (TOCTOU collision) while moving directory \
+                     '{}' -> '{}'. Undoing every filesystem change made so far.",
+                    new_rel, source_dir, dest_dir
+                );
+                rollback_directory_move_filesystem(
+                    &git_lock,
+                    data_path_str,
+                    &moves,
+                    &abs_dest_dir,
+                    &written_dest,
+                    &[],
+                )
+                .await;
+                return Err(DirectoryMoveError::AlreadyExists);
+            }
             Err(e) => {
                 error!(
                     "Failed to write destination '{}' while moving directory '{}' -> '{}': {}. \
@@ -2136,6 +2336,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                     new_rel, source_dir, dest_dir, e
                 );
                 rollback_directory_move_filesystem(
+                    &git_lock,
                     data_path_str,
                     &moves,
                     &abs_dest_dir,
@@ -2165,6 +2366,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             Ok(p) => p,
             Err(e) => {
                 rollback_directory_move_filesystem(
+                    &git_lock,
                     data_path_str,
                     &moves,
                     &abs_dest_dir,
@@ -2182,6 +2384,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 old_rel, source_dir, dest_dir, e
             );
             rollback_directory_move_filesystem(
+                &git_lock,
                 data_path_str,
                 &moves,
                 &abs_dest_dir,
@@ -2203,17 +2406,28 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // `remove_empty_dirs_best_effort`'s doc comment. Git does not track empty
     // directories, so this has no bearing on the commit below; it just keeps
     // the old prefix from lingering as an empty husk on disk.
-    remove_empty_dirs_best_effort(&abs_source_dir);
+    remove_empty_dirs_best_effort_async(&abs_source_dir).await;
 
     // Phase 3: rewrite documents OUTSIDE the moved subtree that link INTO it, so
     // those links keep resolving after the move — riding along in the SAME
     // commit as the move itself. Sources INSIDE the subtree are handled by the
     // outbound pass above and must never be processed again here.
+    //
+    // One batched `links_targeting_many` call over every moved path rather than
+    // a `links_targeting` call per document: for a large subtree that was
+    // hundreds of independent SQLite round-trips in a plain for-loop. The
+    // per-source aggregation below is unchanged — a referencing document that
+    // links to several moved targets still gets exactly one `outside_refs`
+    // entry, with every target it references collected onto it.
     let mut outside_refs: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     if let Some(state) = deps.state {
-        for (old_rel, new_rel) in &moves {
-            match state.links_targeting(old_rel, "markdown").await {
-                Ok(referencing_paths) => {
+        let target_paths: Vec<String> = moves.iter().map(|(old_rel, _)| old_rel.clone()).collect();
+        match state.links_targeting_many(&target_paths, "markdown").await {
+            Ok(by_target) => {
+                for (old_rel, new_rel) in &moves {
+                    let Some(referencing_paths) = by_target.get(old_rel.as_str()) else {
+                        continue;
+                    };
                     for ref_path in referencing_paths {
                         if moving.contains_key(ref_path.as_str()) {
                             // Inside the subtree — handled by the outbound
@@ -2222,18 +2436,18 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                             continue;
                         }
                         outside_refs
-                            .entry(ref_path)
+                            .entry(ref_path.clone())
                             .or_default()
                             .push((old_rel.clone(), new_rel.clone()));
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        "Skipping incoming-link rewrite for '{}' while moving directory \
-                         '{}' -> '{}': the reverse-link query failed: {:#}",
-                        old_rel, source_dir, dest_dir, e
-                    );
-                }
+            }
+            Err(e) => {
+                warn!(
+                    "Skipping incoming-link rewrite for every moved document while moving \
+                     directory '{}' -> '{}': the batched reverse-link query failed: {:#}",
+                    source_dir, dest_dir, e
+                );
             }
         }
     }
@@ -2287,6 +2501,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 ref_path, source_dir, dest_dir, e
             );
             rollback_directory_move_filesystem(
+                &git_lock,
                 data_path_str,
                 &moves,
                 &abs_dest_dir,
@@ -2302,11 +2517,11 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     }
 
     // Commit the move AND every rewritten referencing document as ONE atomic
-    // commit, under one lock acquisition held across the commit AND any
-    // rollback below — releasing it in between would let another writer stage
-    // into (and, since it commits its own path, commit) the very half-staged
-    // state this call is about to undo. See `write_document_move`'s identical
-    // comment for the full reasoning.
+    // commit, under the SAME lock acquisition (above) already held across
+    // phases 1-3 — releasing it in between any of those and the commit would
+    // let another writer stage into (and, since it commits its own path,
+    // commit) the very half-staged state this call is about to undo. See
+    // `write_document_move`'s identical comment for the full reasoning.
     let commit_message = build_commit_message(
         message,
         &format!("docs: move {} to {}", source_dir, dest_dir),
@@ -2323,8 +2538,6 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             commit_paths.push(ref_path.as_str());
         }
     }
-
-    let git_lock = git::lock_git().await;
 
     let commit_outcome = match git::commit_and_sync(
         &git_lock,
@@ -2393,7 +2606,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             }
             // Best-effort: tidy up any destination directory left empty by the
             // removals above — see `remove_empty_dirs_best_effort`'s doc comment.
-            remove_empty_dirs_best_effort(&abs_dest_dir);
+            remove_empty_dirs_best_effort_async(&abs_dest_dir).await;
             for ref_path in &rewritten_paths {
                 if let Err(e) = git::restore_from_head(&git_lock, data_path_str, ref_path).await {
                     rolled_back = false;
@@ -3835,6 +4048,63 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // GIT_LOCK hoist regression (data-loss finding fix): `write_document_move`
+    // must acquire `GIT_LOCK` before its destination write / source removal /
+    // referencing-document rewrite, not just before the commit, and must hold
+    // that ONE guard across all of it. Proven at runtime rather than merely
+    // structurally: another holder of `GIT_LOCK` must observably block the
+    // call, and releasing that holder must let it proceed to completion
+    // without hanging (a hang would mean something reachable from this call
+    // tried to reacquire the already-held, non-reentrant mutex).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_document_move_blocks_while_git_lock_is_externally_held_then_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = "---\ntitle: A\n---\n# A";
+        std::fs::write(tmp.path().join("source-lockcheck.md"), original).unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        // Hold GIT_LOCK exactly as a concurrent writer, the webhook handler, or
+        // the reindex worker would.
+        let held = git::lock_git().await;
+
+        let req = make_move_req(
+            "source-lockcheck.md",
+            "dest-lockcheck.md",
+            original,
+            original,
+        );
+        let deps = harness.deps();
+        let move_fut = write_document(&deps, req);
+        tokio::pin!(move_fut);
+        let still_blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut move_fut).await;
+        assert!(
+            still_blocked.is_err(),
+            "write_document_move must block on GIT_LOCK (acquired ahead of the destination \
+             write, per the finding's fix) while another holder has it"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), move_fut)
+            .await
+            .expect(
+                "write_document_move must proceed to completion once GIT_LOCK is released, not \
+                 hang against its own held guard -- a hang here would mean this non-reentrant \
+                 mutex is being acquired a second time somewhere in the call chain",
+            );
+        // Not git-backed, so the commit itself fails fast once the lock is free --
+        // the point of this test is that nothing deadlocks, not the outcome.
+        match result.unwrap_err() {
+            WriteError::PreCommitFailed { .. } => {}
+            other => panic!("expected PreCommitFailed, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Move + incoming-link rewrite (WriteDeps::state, `document_links` reverse
     // lookup, `ingest::find_markdown_link_occurrences`/`relativize_md_path`)
     // -----------------------------------------------------------------------
@@ -4743,6 +5013,122 @@ mod tests {
             "# Already here",
             "the pre-existing destination content must be untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn move_directory_toctou_destination_collision_reports_already_exists_not_io() {
+        // A collision that appears AFTER the batch pre-check (guard 2) and the
+        // per-document defensive re-check, but before the per-document
+        // `create_new` write in phase 1, must surface as `AlreadyExists` (a
+        // benign, retryable race), not the generic `Io` arm. `Io` maps to
+        // `McpError::internal_error`, which would misreport a completely
+        // ordinary race as a server fault.
+        //
+        // Reproduced deterministically rather than via a hopeful thread race:
+        // a configured `lint_command` makes `validate::validate_content`
+        // `.await` a real subprocess (`sleep 0.3`) for the one document in
+        // this move, which happens AFTER that document's own per-document
+        // `exists()` check but BEFORE phase 1 ever runs. `tokio::join!` runs
+        // that subprocess wait concurrently (same task, cooperative
+        // scheduling) with a second future that creates the destination file
+        // partway through the sleep -- landing squarely in the TOCTOU window
+        // this fix closes. This also exercises `rollback_directory_move_filesystem`
+        // for real with the lock-hoist fix in place: if that helper still
+        // tried to acquire its own `GitLock` (the pre-fix behavior) instead of
+        // reusing the one `move_directory` already holds by this point, this
+        // test would hang until the outer `timeout` below fails it.
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("old-toctou");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("a.md"), "---\ntitle: A\n---\n# A").unwrap();
+
+        let mut config = crate::mcp::make_test_resolved_config(tmp.path());
+        Arc::get_mut(&mut config).unwrap().validation.lint_command =
+            Some(vec!["sh".into(), "-c".into(), "sleep 0.3".into()]);
+        let harness = Harness::new(&tmp, config);
+
+        let dest_dir = tmp.path().join("new-toctou");
+        let dest_file = dest_dir.join("a.md");
+        let collision_content = "collision, landed after the pre-check";
+
+        let deps = harness.deps();
+        let (move_result, _) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                move_directory(&deps, "old-toctou", "new-toctou", None),
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    std::fs::create_dir_all(&dest_dir).unwrap();
+                    std::fs::write(&dest_file, collision_content).unwrap();
+                },
+            )
+        })
+        .await
+        .expect("move_directory must not hang");
+
+        let err = move_result.unwrap_err();
+        assert!(
+            matches!(err, DirectoryMoveError::AlreadyExists),
+            "a destination collision appearing after the pre-check must map to \
+             AlreadyExists, not a generic Io error; got {err:?}"
+        );
+        assert!(
+            source_dir.join("a.md").exists(),
+            "the source must be untouched -- phase 1 never got far enough to remove it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest_file).unwrap(),
+            collision_content,
+            "move_directory must never have touched the colliding file (create_new can't \
+             overwrite it, and rollback only removes what IT wrote)"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_directory_blocks_while_git_lock_is_externally_held_then_completes() {
+        // GIT_LOCK hoist regression (data-loss finding fix): `move_directory`
+        // must acquire `GIT_LOCK` before phase 1 (destination writes), not
+        // just before the commit, and hold that ONE guard across phases 1-3,
+        // the commit, and any rollback. Proven at runtime: another holder of
+        // `GIT_LOCK` must observably block the call, and releasing that
+        // holder must let it proceed to completion without hanging -- a hang
+        // would mean something reachable from `move_directory` (e.g.
+        // `rollback_directory_move_filesystem`) is trying to reacquire the
+        // already-held, non-reentrant mutex instead of reusing it.
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("old-lockcheck");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("a.md"), "---\ntitle: A\n---\n# A").unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let held = git::lock_git().await;
+
+        let deps = harness.deps();
+        let move_fut = move_directory(&deps, "old-lockcheck", "new-lockcheck", None);
+        tokio::pin!(move_fut);
+        let still_blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut move_fut).await;
+        assert!(
+            still_blocked.is_err(),
+            "move_directory must block on GIT_LOCK (acquired ahead of phase 1, per the \
+             finding's fix) while another holder has it"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), move_fut)
+            .await
+            .expect(
+                "move_directory must proceed to completion once GIT_LOCK is released, not hang \
+                 against its own held guard -- a hang here would mean this non-reentrant mutex \
+                 is being acquired a second time somewhere in the call chain",
+            );
+        // Not git-backed, so the commit itself fails fast once the lock is free --
+        // the point of this test is that nothing deadlocks, not the outcome.
+        match result.unwrap_err() {
+            DirectoryMoveError::PreCommitFailed { .. } => {}
+            other => panic!("expected PreCommitFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

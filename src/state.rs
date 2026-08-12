@@ -773,6 +773,51 @@ impl StateDb {
         Ok(rows.into_iter().map(|(path,)| path).collect())
     }
 
+    /// Batch equivalent of [`Self::links_targeting`], for a caller that already knows
+    /// every target it cares about up front (`write::move_directory`'s reverse-link
+    /// scan, run once for every moved document) and wants one or a few round trips
+    /// instead of one `links_targeting` call per target.
+    ///
+    /// Returns every `(target_path, source_path)` pair among `target_paths`, scoped to
+    /// `kind` exactly like `links_targeting`, grouped by target: a target with no
+    /// referencing sources simply has no key in the returned map (mirroring
+    /// `links_targeting`'s empty-`Vec` result for the same case), and each target's
+    /// sources come back distinct and sorted, matching `links_targeting`'s own
+    /// `SELECT DISTINCT ... ORDER BY source_path`.
+    ///
+    /// Chunks `target_paths` at [`SQLITE_MAX_PARAMS_PER_QUERY`] (500) bound
+    /// parameters per statement, same as [`Self::get_many`] — SQLite's default limit is
+    /// 999 total bound parameters per statement, and each chunk here also binds `kind`,
+    /// so 500 leaves comfortable headroom under that ceiling for a single query.
+    pub async fn links_targeting_many(
+        &self,
+        target_paths: &[String],
+        kind: &str,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for chunk in target_paths.chunks(SQLITE_MAX_PARAMS_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "SELECT DISTINCT target_path, source_path FROM document_links WHERE target_path IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for path in chunk {
+                separated.push_bind(path);
+            }
+            builder.push(") AND kind = ");
+            builder.push_bind(kind);
+            builder.push(" ORDER BY target_path, source_path");
+            let rows: Vec<(String, String)> =
+                builder.build_query_as().fetch_all(&self.pool).await?;
+            for (target_path, source_path) in rows {
+                out.entry(target_path).or_default().push(source_path);
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove every edge originating from `path`, in either direction of kind.
     ///
     /// Called when a document is deleted/purged (from [`Self::delete_document`]) so a
@@ -3156,6 +3201,149 @@ mod tests {
             .await
             .unwrap();
         assert!(sources.is_empty());
+    }
+
+    // -- links_targeting_many ----------------------------------------------------
+
+    /// Insert `(source_path, target_path, kind)` rows into `document_links` via a
+    /// handful of multi-row `INSERT`s, so the chunk-boundary test below (500+ distinct
+    /// targets) stays fast — same rationale as `bulk_insert_indexed_files`/
+    /// `bulk_insert_documents` above. `score` is always bound `NULL`: none of these
+    /// tests care about it.
+    async fn bulk_insert_document_links(db: &StateDb, rows: &[(String, String, String)]) {
+        const ROWS_PER_STATEMENT: usize = 100;
+        for chunk in rows.chunks(ROWS_PER_STATEMENT) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO document_links (source_path, target_path, kind, score) ",
+            );
+            builder.push_values(chunk, |mut b, (source_path, target_path, kind)| {
+                b.push_bind(source_path)
+                    .push_bind(target_path)
+                    .push_bind(kind)
+                    .push_bind(Option::<f64>::None);
+            });
+            builder.build().execute(db.pool_for_test()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn links_targeting_many_returns_matches_grouped_by_target() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("target1.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("c.md", "markdown", &[("target1.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("b.md", "markdown", &[("target1.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("d.md", "markdown", &[("target2.md".to_string(), None)])
+            .await
+            .unwrap();
+        // A source unrelated to either queried target must not show up.
+        db.replace_links("e.md", "markdown", &[("other.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let by_target = db
+            .links_targeting_many(
+                &["target1.md".to_string(), "target2.md".to_string()],
+                "markdown",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            by_target.get("target1.md"),
+            Some(&vec![
+                "a.md".to_string(),
+                "b.md".to_string(),
+                "c.md".to_string()
+            ]),
+            "multiple sources targeting the same path must all come back, sorted, \
+             matching links_targeting's own ordering"
+        );
+        assert_eq!(by_target.get("target2.md"), Some(&vec!["d.md".to_string()]));
+        assert_eq!(
+            by_target.len(),
+            2,
+            "a target with no referencing sources must have no key at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn links_targeting_many_filters_by_kind() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("target.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("b.md", "semantic", &[("target.md".to_string(), Some(0.9))])
+            .await
+            .unwrap();
+
+        let markdown = db
+            .links_targeting_many(&["target.md".to_string()], "markdown")
+            .await
+            .unwrap();
+        assert_eq!(
+            markdown.get("target.md"),
+            Some(&vec!["a.md".to_string()]),
+            "a semantic-kind row must not come back when asking for markdown"
+        );
+
+        let semantic = db
+            .links_targeting_many(&["target.md".to_string()], "semantic")
+            .await
+            .unwrap();
+        assert_eq!(semantic.get("target.md"), Some(&vec!["b.md".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn links_targeting_many_empty_input_returns_empty_map() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("target.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let result = db.links_targeting_many(&[], "markdown").await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn links_targeting_many_spans_a_500_param_chunk_boundary() {
+        // 501 distinct target paths: one full 500-param chunk plus one row spilling
+        // into a second chunk. Each has exactly one source pointing at it, so an
+        // off-by-one at the chunk seam would show up as a missing target rather than
+        // silently merging two targets' sources together.
+        let (db, _dir) = test_db().await;
+        let targets: Vec<String> = (0..501).map(|i| format!("target-{i:05}.md")).collect();
+        let rows: Vec<(String, String, String)> = targets
+            .iter()
+            .map(|target| {
+                (
+                    format!("source-for-{target}"),
+                    target.clone(),
+                    "markdown".to_string(),
+                )
+            })
+            .collect();
+        bulk_insert_document_links(&db, &rows).await;
+
+        let by_target = db.links_targeting_many(&targets, "markdown").await.unwrap();
+
+        assert_eq!(
+            by_target.len(),
+            501,
+            "every target across the chunk boundary must come back"
+        );
+        for target in &targets {
+            assert_eq!(
+                by_target.get(target),
+                Some(&vec![format!("source-for-{target}")]),
+                "wrong (or missing) source attached to '{target}' at the chunk boundary"
+            );
+        }
     }
 
     #[tokio::test]

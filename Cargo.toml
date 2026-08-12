@@ -75,6 +75,11 @@ tokio-util = "0.7"
 # Text diffing (unified diff output for write tool results)
 similar = "2"
 
+# Bounded-concurrency stream combinators (e.g. `buffer_unordered`) for fanning out
+# independent async work — subprocess validation, DB lookups — without spawning
+# unbounded tasks.
+futures = "0.3"
+
 # Date/time parsing for mtime range filters and CLI date flags
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
