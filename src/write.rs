@@ -20,6 +20,7 @@
 //! human-readable summary needs, which the fixed `WriteSuccess{outcome, sha,
 //! rebased_paths, diff}` shape had no room for otherwise.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use tracing::{error, warn};
@@ -30,6 +31,7 @@ use crate::git;
 use crate::qdrant::RetrievalStore;
 use crate::retrieval::{RetrievalDeps, SearchFilters};
 use crate::schema::SharedSchemaCache;
+use crate::state::StateDb;
 use crate::validate::{self, ValidationResult};
 
 // ---------------------------------------------------------------------------
@@ -200,6 +202,22 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub token: Option<&'a str>,
     pub commit_author_name: &'a str,
     pub commit_author_email: &'a str,
+    /// The document metadata index, used ONLY by `write_document_move` to find
+    /// documents whose body links to the move's SOURCE path
+    /// (`StateDb::links_targeting`) so their link text can be rewritten in the
+    /// same commit as the move.
+    ///
+    /// `None` disables link rewriting entirely — `write_document_move` still
+    /// performs the move itself, it just skips the reverse-link query and
+    /// leaves every other document's links exactly as they were (they still
+    /// self-heal on that document's own next reindex, since `document_links`
+    /// is rebuilt from each document's current on-disk body, not trusted as an
+    /// authoritative index). This exists for callers/tests that have no
+    /// `StateDb` handle at all — it is NOT a normal operating mode. Both real
+    /// callers (`mcp.rs`'s `KbSearchServer`, `web.rs`'s `UiState`) have a
+    /// `StateDb` available via their own `Arc<OnceCell<StateDb>>` and MUST
+    /// pass `Some` here so production writes always rewrite incoming links.
+    pub state: Option<&'a StateDb>,
 }
 
 /// A create or edit request against the write pipeline.
@@ -226,6 +244,34 @@ pub struct WriteRequest<'a> {
     /// may safely pass `None` here — re-checking the same in-memory content a
     /// second time can never disagree with the first check.
     pub expected_hash: Option<&'a str>,
+    /// When `Some`, turns this call into a document MOVE instead of a create/edit:
+    /// `rel_path` is the move's SOURCE and this is its DESTINATION. The caller is
+    /// still responsible for computing `new_content` (this function never reads
+    /// `rel_path`'s content itself, move or not) — typically the source's current
+    /// content, possibly transformed.
+    ///
+    /// Both paths are subject to the same eligibility (include-pattern) and
+    /// path-safety checks the non-move path applies to `rel_path`, and either
+    /// directory being schema-frozen blocks the whole move. Frontmatter
+    /// validation, however, runs against the DESTINATION's resolved schema, not
+    /// the source's — that is the whole point of a move: the destination
+    /// directory may enforce different frontmatter than the source did. The
+    /// create-only dedup gate never runs for a move (it is not a create, and the
+    /// document's own pre-move content would trivially self-match).
+    ///
+    /// `is_create` must be `false` whenever this is `Some` — a create has no
+    /// source to move from, so combining the two is a caller bug, reported as
+    /// `WriteError::Internal` rather than any user-facing variant. `expected_hash`
+    /// IS applied to the move path: it guards against a stale read of the
+    /// SOURCE, checked against `old_content` before anything touches the
+    /// filesystem, with the same `WriteError::StaleHash` contract as the
+    /// non-move path. `force_new` remains meaningless for a move and is simply
+    /// ignored when `dest_path` is `Some` — there is no dedup gate to bypass.
+    ///
+    /// `None` (the default) is the existing create/edit behavior, byte-for-byte
+    /// unchanged — this field did not exist before, so every existing caller gets
+    /// `None` for free.
+    pub dest_path: Option<&'a str>,
 }
 
 /// The two outcomes a write can land on. Both are the tool's happy path from a
@@ -256,6 +302,14 @@ pub struct WriteSuccess {
     /// for a human-readable summary. `None` on a fully synced write.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_failure_cause: Option<String>,
+    /// Repo-relative paths of OTHER documents whose link text to the move's
+    /// SOURCE was rewritten to point at its new location, and which rode along
+    /// in the same commit. Always empty for a create/edit/delete, and for a
+    /// move with `WriteDeps::state == None` or with no incoming links to
+    /// rewrite. A move silently editing other documents without surfacing
+    /// which ones is not acceptable — callers must report this list, not just
+    /// the move's own source/destination.
+    pub rewritten_paths: Vec<String>,
 }
 
 /// Every structured failure mode of the write pipeline. Callers map these onto
@@ -535,6 +589,15 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &WriteDeps<'_, E, Q>,
     req: WriteRequest<'_>,
 ) -> Result<WriteSuccess, WriteError> {
+    // A move is a different enough shape at nearly every step (two paths through
+    // eligibility/safety/frozen checks, validation against the DESTINATION's
+    // schema rather than `rel_path`'s, a write-then-remove filesystem sequence, a
+    // two-path rollback) that folding it into the branches below would make both
+    // harder to follow — see `write_document_move`'s doc comment.
+    if req.dest_path.is_some() {
+        return write_document_move(deps, req).await;
+    }
+
     let WriteRequest {
         rel_path,
         old_content,
@@ -545,6 +608,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         force_new,
         operation,
         expected_hash,
+        dest_path: _,
     } = req;
 
     // 0. Include-pattern eligibility guard: reject paths the indexer would not
@@ -790,7 +854,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         deps.branch,
         data_path_str,
         deps.token,
-        rel_path,
+        &[rel_path],
         &commit_message,
         deps.commit_author_name,
         deps.commit_author_email,
@@ -865,6 +929,8 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                 rebased_paths: Vec::new(),
                 diff: render_unified_diff(old_content, new_content, rel_path),
                 sync_failure_cause: Some(format!("{:#}", source)),
+                // Not a move — nothing else was rewritten.
+                rewritten_paths: Vec::new(),
             });
         }
     };
@@ -884,6 +950,1522 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         sha: commit_outcome.sha,
         diff: render_unified_diff(old_content, new_content, rel_path),
         rebased_paths: commit_outcome.rebased_paths,
+        sync_failure_cause: None,
+        // Not a move — nothing else was rewritten.
+        rewritten_paths: Vec::new(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// write_document_move: the MOVE branch of write_document (WriteRequest::dest_path)
+// ---------------------------------------------------------------------------
+
+/// The MOVE branch of `write_document`, split out because a move touches TWO
+/// paths at every stage that the create/edit path only ever touches one:
+/// eligibility, path-safety, schema-frozen, the filesystem mutation itself, the
+/// commit, and — the part most worth keeping legible on its own — the rollback.
+/// Interleaving that with the single-path create/edit logic above would have
+/// made both harder to reason about; keeping it here means the non-move path
+/// reads exactly as it did before this existed, and this function's rollback is
+/// the only thing you need to hold in your head to convince yourself it is
+/// correct.
+///
+/// Called only from `write_document` when `req.dest_path.is_some()`; implements
+/// that field's contract in the order documented there.
+async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    req: WriteRequest<'_>,
+) -> Result<WriteSuccess, WriteError> {
+    let WriteRequest {
+        rel_path: source_rel,
+        old_content,
+        new_content,
+        is_create,
+        message,
+        default_verb: _,
+        force_new: _,
+        operation,
+        expected_hash,
+        dest_path,
+    } = req;
+    let dest_rel = dest_path.expect("write_document_move called with req.dest_path == None");
+
+    // 1. A create with a dest_path is a caller bug, not a runtime condition: a
+    //    create has no prior file to move FROM. Reported as `Internal` — the same
+    //    variant this pipeline uses for other "this should never happen from a
+    //    well-behaved caller" states — rather than a user-facing variant.
+    if is_create {
+        return Err(WriteError::Internal {
+            msg: "write_document called with is_create=true and dest_path set; a create \
+                  cannot also be a move"
+                .to_string(),
+        });
+    }
+
+    // 2. Eligibility + path-safety for BOTH paths, before anything else — mirrors
+    //    write_document's own "0" / "0.5" ordering (see its comments for why this
+    //    must run before validation, and in particular before a configured
+    //    validation.lint_command exec). A move that is safe to write TO but not
+    //    safe to remove FROM (or vice versa) must be rejected before either side
+    //    is touched. The resolved paths are discarded here, same as
+    //    write_document's early check — each is re-resolved immediately before
+    //    the filesystem action that uses it, below.
+    check_include_pattern(deps, source_rel)?;
+    check_include_pattern(deps, dest_rel)?;
+    safe_write_path(deps, source_rel)?;
+    safe_write_path(deps, dest_rel)?;
+
+    // 3. Optional stale-read guard against the SOURCE, before anything touches
+    //    the filesystem — same contract as write_document's step 1 (see that
+    //    comment for the reasoning), just relocated ahead of the existence/
+    //    collision checks below so a stale read never even gets to observe
+    //    whether the destination is free. `old_content` is hashed exactly as
+    //    the non-move path hashes it: callers supply the freshly-read on-disk
+    //    SOURCE content, which is what makes the comparison meaningful.
+    if let Some(expected) = expected_hash {
+        let actual = crate::ingest::compute_hash_from_bytes(old_content.as_bytes());
+        if !expected.trim().eq_ignore_ascii_case(&actual) {
+            return Err(WriteError::StaleHash {
+                expected: expected.trim().to_string(),
+                actual,
+            });
+        }
+    }
+
+    // 4. Source must exist.
+    let abs_source = safe_write_path(deps, source_rel)?;
+    if !abs_source.exists() {
+        return Err(WriteError::NotFound);
+    }
+
+    // 5. Destination must NOT already exist — a move never overwrites.
+    let abs_dest = safe_write_path(deps, dest_rel)?;
+    if abs_dest.exists() {
+        return Err(WriteError::AlreadyExists);
+    }
+
+    // 6. Schema-frozen guard against BOTH paths: removing a file from a frozen
+    //    directory mutates that directory's contents exactly as adding one does,
+    //    so either side being frozen blocks the whole move.
+    let schemas = crate::schema::load_shared(deps.schema_cache);
+    if let Some(reason) = schemas.is_frozen(Path::new(source_rel)) {
+        return Err(WriteError::Frozen {
+            reason: reason.to_string(),
+        });
+    }
+    if let Some(reason) = schemas.is_frozen(Path::new(dest_rel)) {
+        return Err(WriteError::Frozen {
+            reason: reason.to_string(),
+        });
+    }
+
+    // 6.5. Outbound-link re-relativization: EVERY relative link inside the
+    //    document being moved was authored against wherever it used to live
+    //    (`source_rel`'s directory) — not just a link back to itself. Moving
+    //    the document changes that base directory, so any such link whose
+    //    text doesn't change would silently repoint at a different file once
+    //    resolved from the new location (e.g. `../shared/doc.md` from
+    //    `old/a.md` means `shared/doc.md`; the same text from `new/deep/a.md`
+    //    means something else entirely). This is distinct from step 10.5
+    //    below, which rewrites OTHER documents that link INTO this one — this
+    //    step fixes the links this document itself contains, which point OUT.
+    //
+    //    `find_markdown_link_occurrences(new_content, source_rel)` resolves
+    //    every occurrence against `source_rel` — the document's OLD
+    //    location — which is the correct context regardless of what the link
+    //    points at, because that's the directory the link text was actually
+    //    written against. Each occurrence's true KB-root-relative target is
+    //    therefore `o.resolved`, with one exception: a link whose target IS
+    //    `source_rel` is a self-reference, and the document's true target is
+    //    no longer `source_rel` — it's `dest_rel`, since that's where the
+    //    document now lives. Every occurrence then gets re-relativized from
+    //    `dest_rel` (the document's NEW location) to its own target, which is
+    //    what keeps it resolving to the same file post-move.
+    let content_to_write = rewrite_outbound_links(new_content, source_rel, dest_rel, |resolved| {
+        (resolved == source_rel).then(|| dest_rel.to_string())
+    });
+
+    // 7. Frontmatter validation against the DESTINATION's resolved schema, NOT
+    //    the source's. This is the whole point of a move: the destination
+    //    directory may require different frontmatter than the source did.
+    //    Validated against `content_to_write` (the self-link rewrite above, if
+    //    any) since that is what actually lands at the destination — not the
+    //    caller's original `new_content`.
+    let schema = schemas.resolve_for(Path::new(dest_rel));
+    let (validation_result, _validated) = validate::validate_content(
+        Path::new(dest_rel),
+        &content_to_write,
+        schema,
+        deps.validation,
+    )
+    .await
+    .map_err(|e| {
+        error!(
+            "Validation error moving '{}' -> '{}': {:#}",
+            source_rel, dest_rel, e
+        );
+        WriteError::Io {
+            msg: format!("Failed to validate content: {}", e),
+        }
+    })?;
+
+    if !validation_result.valid {
+        return Err(WriteError::Validation {
+            result: validation_result,
+        });
+    }
+
+    // 8. No dedup gate: a move is not a create, and the document's own content
+    //    would trivially self-match its pre-move copy anyway.
+
+    // 9. Validate the commit message BEFORE touching the filesystem — same reason
+    //    as write_document/delete_document: rejecting it after a mutation would
+    //    leave that mutation uncommitted.
+    validate_commit_message(message)?;
+
+    // 10. Filesystem: write the DESTINATION first (`create_new`, so this can never
+    //    silently clobber a file that appeared between the check above and now),
+    //    THEN remove the source. This order is load-bearing, not arbitrary:
+    //    - If the destination write fails, nothing has happened yet — the source
+    //      is exactly as it was.
+    //    - If the SOURCE removal fails afterward, the content still exists (at
+    //      the destination) — recoverable by deleting that destination copy and
+    //      reporting failure, which is exactly what happens below.
+    //    The reverse order (remove source, then write destination) has no such
+    //    recovery: a crash or failure between the two would delete the document
+    //    from disk with no copy anywhere, for real user content. Write-then-remove
+    //    is the only ordering where every failure point still has a path back to
+    //    "nothing lost".
+    let abs_dest = safe_write_path(deps, dest_rel)?;
+    if let Some(parent) = abs_dest.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            error!(
+                "Failed to create parent directories for '{}': {}",
+                abs_dest.display(),
+                e
+            );
+            WriteError::Io {
+                msg: format!("Failed to create parent directories: {}", e),
+            }
+        })?;
+    }
+
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&abs_dest)
+            .await
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    WriteError::AlreadyExists
+                } else {
+                    error!("Failed to create file '{}': {}", abs_dest.display(), e);
+                    WriteError::Io {
+                        msg: format!("Failed to create file: {}", e),
+                    }
+                }
+            })?;
+        file.write_all(content_to_write.as_bytes())
+            .await
+            .map_err(|e| {
+                error!("Failed to write file '{}': {}", abs_dest.display(), e);
+                WriteError::Io {
+                    msg: format!("Failed to write file: {}", e),
+                }
+            })?;
+    }
+
+    // Re-verify the source immediately before removing it — same TOCTOU
+    // reasoning as write_document's own re-resolve-before-mutation pattern.
+    let abs_source = safe_write_path(deps, source_rel)?;
+    if let Err(e) = tokio::fs::remove_file(&abs_source).await {
+        error!(
+            "Failed to remove source '{}' while moving it to '{}'; deleting the destination \
+             copy so the move leaves nothing behind: {}",
+            source_rel, dest_rel, e
+        );
+        // The destination write above already landed on disk with no git change
+        // yet to make it durable — undo it fully rather than leave the document
+        // sitting at two paths at once.
+        if let Err(cleanup_err) = tokio::fs::remove_file(&abs_dest).await {
+            error!(
+                "Failed to clean up destination '{}' after a failed source removal during a \
+                 move: {}. The document now exists at BOTH '{}' and '{}' — this needs operator \
+                 attention.",
+                dest_rel, cleanup_err, source_rel, dest_rel
+            );
+        }
+        return Err(WriteError::Io {
+            msg: format!("Failed to remove source file during move: {}", e),
+        });
+    }
+
+    let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
+
+    // 10.5. Rewrite OTHER documents whose body links to the SOURCE path, so
+    //    those links keep resolving after the move — riding along in the SAME
+    //    commit as the move itself (the path slice below includes every path
+    //    rewritten here). Runs after the destination/source filesystem work
+    //    above (the move is definitely proceeding by this point — every
+    //    validation gate has already passed) and before anything touches git,
+    //    so a failure partway through can still be undone by hand (see the
+    //    write failure branch below) rather than racing a rollback against a
+    //    half-committed state.
+    //
+    //    Frozen directories: deliberately NOT checked here. `schemas.is_frozen`
+    //    guards frontmatter/content changes to a directory's document set — a
+    //    link-text rewrite touches neither; it edits prose inside the Markdown
+    //    body of a document that already exists and was already valid. Treating
+    //    "the referencing document happens to live under a frozen directory" as
+    //    a reason to fail the WHOLE MOVE would be surprising (the caller asked
+    //    to move one document, not to write into the frozen one) and gains
+    //    nothing safety-wise, so frozen referencing documents are rewritten
+    //    exactly like any other.
+    //
+    //    Best-effort against the reverse-link index itself: if there is no
+    //    `StateDb` (`deps.state == None` — see that field's doc comment) or the
+    //    query fails outright, link rewriting is simply skipped; the move still
+    //    proceeds. Every referencing document's `document_links` rows also
+    //    self-heal on that document's own next reindex regardless of what
+    //    happens here.
+    let mut rewritten_paths: Vec<String> = Vec::new();
+    if let Some(state) = deps.state {
+        match state.links_targeting(source_rel, "markdown").await {
+            Ok(referencing_paths) => {
+                for ref_path in referencing_paths {
+                    // The source linking to itself is the self-reference case
+                    // handled above as part of `content_to_write` — it is not a
+                    // separate file to rewrite, and must not be processed twice.
+                    if ref_path == source_rel {
+                        continue;
+                    }
+
+                    let abs_ref = match safe_write_path(deps, &ref_path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            warn!(
+                                "Skipping link rewrite in '{}' while moving '{}' -> '{}': the \
+                                 path no longer resolves safely (stale document_links row?)",
+                                ref_path, source_rel, dest_rel
+                            );
+                            continue;
+                        }
+                    };
+                    let body = match tokio::fs::read_to_string(&abs_ref).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            // Stale `document_links` row: the referencing document no
+                            // longer exists on disk (or isn't readable). Not this
+                            // move's problem to fix — skip it rather than fail the
+                            // move over another document's already-broken state.
+                            warn!(
+                                "Skipping link rewrite in '{}' while moving '{}' -> '{}': \
+                                 failed to read it, likely a stale document_links row: {}",
+                                ref_path, source_rel, dest_rel, e
+                            );
+                            continue;
+                        }
+                    };
+                    let occurrences: Vec<_> =
+                        crate::ingest::find_markdown_link_occurrences(&body, &ref_path)
+                            .into_iter()
+                            .filter(|o| o.resolved.as_str() == source_rel)
+                            .collect();
+                    if occurrences.is_empty() {
+                        // Stale row again: `document_links` says this document links
+                        // to the source, but nothing in its CURRENT body actually
+                        // resolves there anymore. Skip — writing it back unchanged
+                        // would put a no-op entry in the move's commit.
+                        continue;
+                    }
+
+                    let replacement = crate::ingest::relativize_md_path(&ref_path, dest_rel);
+                    let new_body = apply_link_replacements(&body, &occurrences, &replacement);
+                    if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
+                        error!(
+                            "Failed to rewrite links into '{}' while moving '{}' -> '{}': {}. \
+                             Undoing every filesystem change made for this move so far.",
+                            ref_path, source_rel, dest_rel, e
+                        );
+                        // Nothing has touched git yet at this point (no `git add`, no
+                        // commit) — every path involved is either still tracked at
+                        // HEAD (the source, and every referencing document already
+                        // rewritten this loop) or brand new and untracked (the
+                        // destination), so unwinding by hand is safe: restore the
+                        // tracked ones from HEAD, delete the untracked one.
+                        let cleanup_lock = git::lock_git().await;
+                        for done in &rewritten_paths {
+                            if let Err(e) =
+                                git::restore_from_head(&cleanup_lock, data_path_str, done).await
+                            {
+                                error!(
+                                    "Rollback: failed to restore rewritten referencing \
+                                     document '{}': {:#}. This needs operator attention.",
+                                    done, e
+                                );
+                            }
+                        }
+                        if let Err(e) =
+                            git::restore_from_head(&cleanup_lock, data_path_str, source_rel).await
+                        {
+                            error!(
+                                "Rollback: failed to restore source '{}': {:#}. This needs \
+                                 operator attention.",
+                                source_rel, e
+                            );
+                        }
+                        if let Err(e) = tokio::fs::remove_file(&abs_dest).await {
+                            error!(
+                                "Rollback: failed to remove destination '{}': {}. This needs \
+                                 operator attention.",
+                                dest_rel, e
+                            );
+                        }
+                        return Err(WriteError::Io {
+                            msg: format!("Failed to rewrite links in '{}': {}", ref_path, e),
+                        });
+                    }
+                    rewritten_paths.push(ref_path);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Skipping incoming-link rewrite while moving '{}' -> '{}': the \
+                     reverse-link query failed: {:#}",
+                    source_rel, dest_rel, e
+                );
+            }
+        }
+    }
+
+    let commit_message = build_commit_message(
+        message,
+        &format!("docs: move {} to {}", source_rel, dest_rel),
+        operation,
+    );
+
+    // 11. Commit the move AND every rewritten referencing document as ONE
+    //     atomic commit, under one lock acquisition held across the commit AND
+    //     any rollback below — releasing it in between would let another
+    //     writer stage into (and, since it commits its own path, commit) the
+    //     very half-staged state this call is about to undo. See
+    //     write_document's identical comment for the full reasoning.
+    //     Deduplicated defensively even though `links_targeting` already
+    //     returns DISTINCT source paths and cannot return `source_rel`/
+    //     `dest_rel` themselves (dest_rel is guaranteed not to have existed as
+    //     a prior document, and source_rel is filtered out above).
+    let mut commit_paths: Vec<&str> = vec![source_rel, dest_rel];
+    for p in &rewritten_paths {
+        if !commit_paths.contains(&p.as_str()) {
+            commit_paths.push(p.as_str());
+        }
+    }
+
+    let git_lock = git::lock_git().await;
+
+    let commit_outcome = match git::commit_and_sync(
+        &git_lock,
+        deps.git_url,
+        deps.branch,
+        data_path_str,
+        deps.token,
+        &commit_paths,
+        &commit_message,
+        deps.commit_author_name,
+        deps.commit_author_email,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+
+        Err(git::CommitSyncError::PreCommit(source_err)) => {
+            error!(
+                "commit_and_sync pre-commit failure moving '{}' -> '{}', rolling back both \
+                 halves and {} rewritten referencing document(s): {:#}",
+                source_rel,
+                dest_rel,
+                rewritten_paths.len(),
+                source_err
+            );
+
+            // 12. Roll back EVERY part of this move — both halves of the move
+            //     itself, plus every referencing document rewritten above.
+            //     Each is independent of the others and ALL of them always run
+            //     unconditionally, so a failure in one never leaves a
+            //     recoverable part undone:
+            //     - the source was already tracked at HEAD before this call
+            //       (this is a move, not a create), so `restore_from_head` puts
+            //       its content — and un-stages whatever `git add`/removal
+            //       staged for it — back in one step, exactly like
+            //       write_document's edit rollback.
+            //     - the destination has no HEAD content (it is new), so it is
+            //       rolled back exactly like write_document's create rollback:
+            //       remove the file, then unstage whatever `git add` staged
+            //       for it.
+            //     - every rewritten referencing document is, like the source,
+            //       pre-existing and tracked at HEAD, so `restore_from_head`
+            //       reverts its link-text edit the same way it reverts the
+            //       source's content. Getting this third group right is the
+            //       whole point of this rollback being careful: a bug here
+            //       corrupts a user's OTHER, unrelated documents — not just
+            //       the one being moved — so `rolled_back` is true only if
+            //       ALL THREE groups succeed, not just the two the move
+            //       itself touches.
+            let source_restore = git::restore_from_head(&git_lock, data_path_str, source_rel).await;
+            let dest_rollback = match tokio::fs::remove_file(&abs_dest).await {
+                Ok(()) => git::unstage(&git_lock, data_path_str, dest_rel).await,
+                Err(e) => Err(anyhow::Error::new(e)
+                    .context("Failed to remove the new destination file during rollback")),
+            };
+            let mut rewrite_restore_failures: Vec<(String, anyhow::Error)> = Vec::new();
+            for path in &rewritten_paths {
+                if let Err(e) = git::restore_from_head(&git_lock, data_path_str, path).await {
+                    rewrite_restore_failures.push((path.clone(), e));
+                }
+            }
+
+            // All three groups must succeed for the rollback to be considered
+            // clean — if any failed, filesystem and git state are inconsistent
+            // with each other and with HEAD, which needs operator attention
+            // rather than a blind retry (mirrors `PreCommitFailed::rolled_back`'s
+            // contract on the non-move path).
+            let rolled_back = source_restore.is_ok()
+                && dest_rollback.is_ok()
+                && rewrite_restore_failures.is_empty();
+            if !rolled_back {
+                error!(
+                    "Rollback FAILED after a pre-commit git failure moving '{}' -> '{}'. Source \
+                     restore: {:?}. Destination rollback: {:?}. Rewritten-document restore \
+                     failures: {:?}. Original cause: {:#}. Filesystem and git state may now be \
+                     inconsistent.",
+                    source_rel,
+                    dest_rel,
+                    source_restore,
+                    dest_rollback,
+                    rewrite_restore_failures,
+                    source_err
+                );
+            }
+
+            let mut msg = format!("{:#}", source_err);
+            if let Err(e) = &source_restore {
+                msg.push_str(&format!(". Source restore cause: {:#}", e));
+            }
+            if let Err(e) = &dest_rollback {
+                msg.push_str(&format!(". Destination rollback cause: {:#}", e));
+            }
+            for (path, e) in &rewrite_restore_failures {
+                msg.push_str(&format!(". Restore of '{}' cause: {:#}", path, e));
+            }
+
+            return Err(WriteError::PreCommitFailed { rolled_back, msg });
+        }
+
+        Err(git::CommitSyncError::PostCommit {
+            sha,
+            source: source_err,
+        }) => {
+            warn!(
+                "commit_and_sync post-commit (sync) failure moving '{}' -> '{}', commit {} \
+                 stands uncorrected: {:#}",
+                source_rel, dest_rel, sha, source_err
+            );
+
+            // 13. The commit is real and durable — both halves of the move, and
+            //     every rewritten referencing document, already happened as far
+            //     as local git history is concerned, so this is left alone (not
+            //     rolled back) and reported as sync-pending, same as every other
+            //     post-commit failure in this pipeline. `rebased_paths` is empty
+            //     for the same reason as elsewhere: the rebase never ran.
+            crate::reindex::mark_paths(
+                [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
+                    .into_iter()
+                    .chain(rewritten_paths.iter().map(PathBuf::from)),
+            );
+
+            return Ok(WriteSuccess {
+                outcome: WriteOutcome::CommittedPendingSync,
+                sha,
+                rebased_paths: Vec::new(),
+                diff: render_unified_diff(old_content, &content_to_write, dest_rel),
+                sync_failure_cause: Some(format!("{:#}", source_err)),
+                rewritten_paths,
+            });
+        }
+    };
+
+    // 14. Mark the source, the destination, and every rewritten referencing
+    //     document dirty — plus anything the rebase pulled in — in the SAME
+    //     marking call. `ingest::index_paths` purges the now-missing source,
+    //     indexes the new destination, and re-chunks/re-embeds each rewritten
+    //     document (whose `document_links` rows self-heal from its new body in
+    //     the same pass); all of them need to be in the same worklist for the
+    //     worker to do that in one sweep.
+    crate::reindex::mark_paths(
+        [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
+            .into_iter()
+            .chain(rewritten_paths.iter().map(PathBuf::from))
+            .chain(commit_outcome.rebased_paths.iter().cloned()),
+    );
+
+    Ok(WriteSuccess {
+        outcome: WriteOutcome::Synced,
+        sha: commit_outcome.sha,
+        diff: render_unified_diff(old_content, &content_to_write, dest_rel),
+        rebased_paths: commit_outcome.rebased_paths,
+        sync_failure_cause: None,
+        rewritten_paths,
+    })
+}
+
+/// Rewrite every outbound Markdown link occurrence in `content` — a document being
+/// relocated from `old_rel` to `new_rel` — so each one keeps resolving to its
+/// intended target once the document lives at its new location.
+///
+/// `find_markdown_link_occurrences(content, old_rel)` resolves every occurrence
+/// against `old_rel` — the document's OLD location, which is the directory the link
+/// text was actually authored against, regardless of what a given link points at.
+/// For each occurrence, `translate(resolved)` decides that occurrence's TRUE target
+/// after the move: `Some(new_target)` when the linked document is ITSELF moving in
+/// lockstep with this one (its own new path), `None` when it is staying exactly
+/// where it is (the target is unchanged; only the relative spelling needs to
+/// change because the mover's own directory changed). Either way, the final
+/// replacement text is `relativize_md_path(new_rel, true_target)`.
+///
+/// Shared by two callers with different `translate` closures:
+/// - `write_document_move`, whose closure maps only a self-reference
+///   (`resolved == old_rel`) to `new_rel` and nothing else — a single document has
+///   no OTHER document moving alongside it.
+/// - `move_directory`, whose closure is backed by the whole batch's old→new map, so
+///   a link between two documents that are BOTH moving in the same directory move
+///   keeps pointing at each other post-move (see that function's doc comment).
+fn rewrite_outbound_links(
+    content: &str,
+    old_rel: &str,
+    new_rel: &str,
+    translate: impl Fn(&str) -> Option<String>,
+) -> String {
+    let occurrences = crate::ingest::find_markdown_link_occurrences(content, old_rel);
+    if occurrences.is_empty() {
+        return content.to_string();
+    }
+    let replacements: Vec<(crate::ingest::LinkOccurrence, String)> = occurrences
+        .into_iter()
+        .map(|o| {
+            let true_target = translate(&o.resolved).unwrap_or_else(|| o.resolved.clone());
+            let replacement = crate::ingest::relativize_md_path(new_rel, &true_target);
+            (o, replacement)
+        })
+        .collect();
+    apply_link_replacements_each(content, &replacements)
+}
+
+/// Apply a PER-OCCURRENCE text replacement at each occurrence's own span,
+/// back-to-front by span start so an earlier edit's byte-length change can
+/// never invalidate a later span still waiting to be applied. Every
+/// occurrence must have come from scanning `body` itself (e.g.
+/// `ingest::find_markdown_link_occurrences`) — a span from a different string
+/// is undefined behavior for `String::replace_range` (it may panic on a
+/// non-char-boundary, or silently replace the wrong bytes).
+///
+/// This is the ONE place that owns the back-to-front span-ordering rule —
+/// [`apply_link_replacements`] is a thin single-replacement wrapper over this
+/// function rather than a second copy of the sort, so the two rewrite sites
+/// below can never drift apart on ordering.
+///
+/// Used by [`rewrite_outbound_links`] (each link in a moved document's content
+/// can resolve to a DIFFERENT target, so each occurrence needs its own
+/// re-relativized replacement text) and directly by `move_directory`'s
+/// outside-referencing-document rewrite, where one document can reference
+/// SEVERAL different moved documents, each needing its own replacement text —
+/// unlike `apply_link_replacements` below, where every occurrence shares one.
+fn apply_link_replacements_each(
+    body: &str,
+    replacements: &[(crate::ingest::LinkOccurrence, String)],
+) -> String {
+    let mut spans: Vec<(std::ops::Range<usize>, &str)> = replacements
+        .iter()
+        .map(|(o, r)| (o.span.clone(), r.as_str()))
+        .collect();
+    // Sort back-to-front (descending by start) so replacing an earlier-in-text
+    // span never shifts the byte offsets a later-in-iteration-but-earlier-in-text
+    // span still needs.
+    spans.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+
+    let mut out = body.to_string();
+    for (span, replacement) in spans {
+        out.replace_range(span, replacement);
+    }
+    out
+}
+
+/// Single-replacement convenience wrapper over
+/// [`apply_link_replacements_each`], for the common case where every
+/// occurrence gets the SAME replacement text.
+///
+/// Used by `write_document_move`'s referencing-document rewrite (step
+/// 10.5): every occurrence found there resolves to the same moved source
+/// path, so they all become the same relativized destination text.
+fn apply_link_replacements(
+    body: &str,
+    occurrences: &[crate::ingest::LinkOccurrence],
+    replacement: &str,
+) -> String {
+    let paired: Vec<(crate::ingest::LinkOccurrence, String)> = occurrences
+        .iter()
+        .cloned()
+        .map(|o| (o, replacement.to_string()))
+        .collect();
+    apply_link_replacements_each(body, &paired)
+}
+
+// ---------------------------------------------------------------------------
+// move_directory: atomic relocation of every document under a source prefix
+// ---------------------------------------------------------------------------
+
+/// A successful [`move_directory`] call.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DirectoryMoveSuccess {
+    pub outcome: WriteOutcome,
+    pub sha: String,
+    pub rebased_paths: Vec<PathBuf>,
+    /// `(old_rel, new_rel)` for every document moved, sorted by `old_rel`.
+    pub moved: Vec<(String, String)>,
+    /// Documents OUTSIDE the moved subtree whose inline links were rewritten to
+    /// point at a moved document's new location, and which rode along in the same
+    /// commit. Never includes a document that was itself moved — those are
+    /// reported in `moved` instead. Empty when `WriteDeps::state` is `None` or
+    /// nothing outside the subtree referenced it.
+    pub rewritten_paths: Vec<String>,
+    /// Present only when `outcome == CommittedPendingSync`: see
+    /// `WriteSuccess::sync_failure_cause`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_failure_cause: Option<String>,
+}
+
+/// Every structured failure mode of [`move_directory`]. Mirrors
+/// [`WriteError`]'s split of caller-facing vs. operator-facing variants — see
+/// that enum's doc comments for the reasoning behind each shape reused here.
+#[derive(Debug)]
+pub enum DirectoryMoveError {
+    /// `source_dir` does not exist, is not a directory, or contains no document
+    /// matching the configured include patterns — there is nothing to move.
+    SourceEmpty {
+        msg: String,
+    },
+    /// At least one file already lives under `dest_dir` — a directory move never
+    /// merges into, or overwrites, an existing prefix.
+    AlreadyExists,
+    /// A `.kb-schema.yaml` exists somewhere under the source subtree, at `path`.
+    /// A schema file moving together with the documents it governs would change
+    /// the very cascade those documents must validate against — validating them
+    /// against the destination's CURRENT cascade would then be wrong. This is a
+    /// deliberate v1 limitation: move the schema file separately (before or
+    /// after this call), then retry.
+    SchemaInSource {
+        path: String,
+    },
+    /// The schema governing a source or destination document's directory failed
+    /// to parse (`SchemaCache::is_frozen`).
+    Frozen {
+        reason: String,
+    },
+    /// Frontmatter validation against the DESTINATION schema failed for one or
+    /// more documents. Carries every failure, not just the first — the whole
+    /// move is all-or-nothing, so a caller needs to know everything that would
+    /// need fixing, not just whichever document happened to be checked first.
+    Validation {
+        failures: Vec<(String, ValidationResult)>,
+    },
+    UnsafePath {
+        msg: String,
+    },
+    Internal {
+        msg: String,
+    },
+    InvalidCommitMessage {
+        reason: String,
+    },
+    /// `git add`/`git commit` failed. See `WriteError::PreCommitFailed`'s doc
+    /// comment for the `rolled_back` contract — identical here, just scaled to
+    /// every path this move touched: `true` only if every document's source
+    /// restore, every document's destination removal, and every rewritten
+    /// referencing document's restore all succeeded.
+    PreCommitFailed {
+        rolled_back: bool,
+        msg: String,
+    },
+    Io {
+        msg: String,
+    },
+}
+
+/// Maps [`safe_write_path`]/[`check_include_pattern`]/[`validate_commit_message`]
+/// failures onto [`DirectoryMoveError`], so [`move_directory`] can reuse those
+/// helpers with `?` instead of duplicating their logic. In practice only the
+/// first four arms are ever produced by those three call sites — the fallback
+/// exists purely to keep this conversion exhaustive against `WriteError`'s full
+/// variant set, which those helpers' return types do not restrict.
+impl From<WriteError> for DirectoryMoveError {
+    fn from(err: WriteError) -> Self {
+        match err {
+            WriteError::UnsafePath { msg } => DirectoryMoveError::UnsafePath { msg },
+            WriteError::Internal { msg } => DirectoryMoveError::Internal { msg },
+            WriteError::InvalidCommitMessage { reason } => {
+                DirectoryMoveError::InvalidCommitMessage { reason }
+            }
+            WriteError::Io { msg } => DirectoryMoveError::Io { msg },
+            other => DirectoryMoveError::Internal {
+                msg: format!("unexpected error surfaced in move_directory: {:?}", other),
+            },
+        }
+    }
+}
+
+/// Recursively collect the KB-root-relative path of every regular file under
+/// `abs_dir` (which must itself already exist as a directory), at any depth.
+/// Symlinks are skipped, mirroring `ingest::discover_files`'s own caution around
+/// them — this is a write-path helper, not the indexer, but a hostile symlink is
+/// just as unwelcome here.
+///
+/// Unfiltered: returns every file, not just indexable documents. `move_directory`
+/// uses this both for the source-subtree scan (filtered to indexable documents,
+/// and checked for a stray `.kb-schema.yaml`, by the caller) and the
+/// destination-prefix collision check (deliberately left UNFILTERED there, since
+/// ANY file under the destination — indexable or not — means the prefix is not
+/// free).
+fn walk_subtree_files(canonical_data_path: &Path, abs_dir: &Path) -> std::io::Result<Vec<String>> {
+    fn walk(canonical_data_path: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                walk(canonical_data_path, &path, out)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(canonical_data_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            out.push(rel);
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    walk(canonical_data_path, abs_dir, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// Best-effort, recursive, deepest-first removal of every now-empty directory
+/// under (and including) `dir`. `std::fs::remove_dir` only ever succeeds on an
+/// actually-empty directory, so this silently leaves anything non-empty (a
+/// stray non-indexable file the include patterns never touched, e.g.) exactly
+/// where it is — this is tidying up after a move, not a second guarantee
+/// layered on top of `move_directory`'s own guards. A missing `dir` (already
+/// gone, or never existed) is likewise a silent no-op.
+///
+/// Git does not track empty directories at all, so this has no bearing on
+/// what gets committed — it exists purely so that after every document under
+/// `source_dir` has been moved out, `source_dir` itself does not linger as an
+/// empty husk on disk (and, symmetrically, so a rolled-back move's
+/// now-empty destination directory does not linger either).
+fn remove_empty_dirs_best_effort(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_empty_dirs_best_effort(&entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Undo every filesystem change [`move_directory`] has made SO FAR — before it
+/// has touched git at all (no `commit_and_sync` call has run yet) — on a failure
+/// partway through writing destinations, removing sources, or rewriting outside
+/// referencing documents.
+///
+/// Safe to call unconditionally over the FULL `moves` list regardless of how far
+/// phase 1/2 actually got: `git::restore_from_head` on a source whose worktree
+/// content already matches HEAD (i.e. not yet removed) is a harmless no-op, so
+/// passing every source rather than tracking exactly which ones were already
+/// removed keeps this one function correct for every call site instead of
+/// several slightly-different partial-rollback paths. `written_dest` and
+/// `rewritten_refs`, by contrast, are exactly the paths actually mutated so far
+/// — there is no such no-op equivalent for creating/removing a file that may or
+/// may not exist, so those two stay precise per call site.
+///
+/// Acquires its own [`git::GitLock`] (mirrors `write_document_move`'s identical
+/// `cleanup_lock` for its own pre-commit filesystem-rollback branch): nothing has
+/// been staged or committed yet at any call site, so this is a self-contained
+/// "mutate, then roll back" sequence with no other acquisition to race against.
+/// Every individual restore/removal failure is logged, not propagated — the
+/// caller has already committed to failing the whole move and just needs
+/// everything recoverable put back, best effort.
+async fn rollback_directory_move_filesystem(
+    data_path_str: &str,
+    moves: &[(String, String)],
+    abs_dest_dir: &Path,
+    written_dest: &[PathBuf],
+    rewritten_refs: &[String],
+) {
+    let lock = git::lock_git().await;
+    for (old_rel, _new_rel) in moves {
+        if let Err(e) = git::restore_from_head(&lock, data_path_str, old_rel).await {
+            error!(
+                "move_directory rollback: failed to restore source '{}': {:#}. This needs \
+                 operator attention.",
+                old_rel, e
+            );
+        }
+    }
+    for dest in written_dest {
+        if let Err(e) = tokio::fs::remove_file(dest).await {
+            error!(
+                "move_directory rollback: failed to remove destination '{}': {}. This needs \
+                 operator attention.",
+                dest.display(),
+                e
+            );
+        }
+    }
+    // Best-effort: tidy up any destination directory left empty by the removals
+    // above, so a rolled-back move does not leave an empty destination prefix
+    // behind — see `remove_empty_dirs_best_effort`'s doc comment.
+    remove_empty_dirs_best_effort(abs_dest_dir);
+    for ref_path in rewritten_refs {
+        if let Err(e) = git::restore_from_head(&lock, data_path_str, ref_path).await {
+            error!(
+                "move_directory rollback: failed to restore referencing document '{}': {:#}. \
+                 This needs operator attention.",
+                ref_path, e
+            );
+        }
+    }
+}
+
+/// Relocate every document under `source_dir` to the same relative path under
+/// `dest_dir`, as ONE atomic commit — the directory-move counterpart to
+/// [`write_document_move`]'s single-document move, sharing its path-safety,
+/// eligibility, schema-resolution, link-rewriting, and commit/rollback helpers
+/// rather than duplicating them.
+///
+/// # Guards (all before any mutation)
+/// 1. `source_dir` must exist and contain at least one document matching the
+///    configured include patterns, or this is refused as
+///    [`DirectoryMoveError::SourceEmpty`].
+/// 2. No file may already live anywhere under `dest_dir`
+///    ([`DirectoryMoveError::AlreadyExists`]) — a directory move never merges.
+/// 3. No `.kb-schema.yaml` may exist anywhere under the source subtree
+///    ([`DirectoryMoveError::SchemaInSource`]) — see that variant's doc comment.
+/// 4. Neither the source nor destination subtree may be schema-frozen (checked
+///    per document, via `SchemaCache::is_frozen`).
+/// 5. Every source and destination document path passes the same path-safety
+///    ([`safe_write_path`]) and include-pattern eligibility
+///    ([`check_include_pattern`]) checks a single-document write applies.
+///
+/// # Link rewriting
+/// Every relative link inside a moved document was authored against wherever it
+/// used to live. For each moved document, every link occurrence is resolved
+/// against its OLD path ([`rewrite_outbound_links`]), then re-targeted:
+/// - A link whose resolved target is ALSO moving (i.e. is another document under
+///   `source_dir`) is translated to that target's own post-move path, then
+///   re-relativized from the mover's NEW path — preserving the link's original
+///   target now that both ends moved in lockstep. For a target moving in
+///   lockstep with the source this usually reproduces identical text; no rewrite
+///   is emitted when it does (`rewrite_outbound_links` returns the original
+///   content unchanged whenever there are no occurrences, and otherwise only
+///   ever replaces the exact occurrence spans it found).
+/// - A link whose resolved target is NOT moving keeps that exact target; only
+///   its relative spelling is recomputed from the mover's new path.
+/// - A link targeting the document itself maps to its own new path (the
+///   self-reference case, same as `write_document_move`).
+///
+/// Separately, every document OUTSIDE the moved subtree that links INTO it
+/// (`StateDb::links_targeting`, filtered to sources outside `source_dir` —
+/// sources INSIDE it are the outbound pass above, and are never processed
+/// twice) has its link text rewritten to the moved document's new location,
+/// riding along in the same commit. Same best-effort semantics as
+/// `write_document_move`: with no `StateDb` (`WriteDeps::state == None`), this
+/// step is skipped entirely and the move still proceeds.
+///
+/// # Commit / rollback / reindex
+/// One `git::commit_and_sync` call over every old path, every new path, and
+/// every rewritten outside-referencing document (deduped). On a pre-commit
+/// failure, EVERY part of the move is rolled back under the SAME held
+/// `GitLock`: every source restored from HEAD, every destination removed and
+/// unstaged, every rewritten referencing document restored from HEAD — all
+/// steps run unconditionally, and `rolled_back` is `true` only if every single
+/// one of them succeeded. On success, every path is marked dirty in one
+/// `reindex::mark_paths` call.
+pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    source_dir: &str,
+    dest_dir: &str,
+    message: Option<&str>,
+) -> Result<DirectoryMoveSuccess, DirectoryMoveError> {
+    let source_dir = crate::retrieval::kb_root_relative(source_dir).trim_end_matches('/');
+    let dest_dir = crate::retrieval::kb_root_relative(dest_dir).trim_end_matches('/');
+
+    // Guard 5 (path safety) against the two prefixes themselves, ahead of
+    // walking either one.
+    let abs_source_dir = safe_write_path(deps, source_dir)?;
+    let abs_dest_dir = safe_write_path(deps, dest_dir)?;
+
+    if !abs_source_dir.is_dir() {
+        return Err(DirectoryMoveError::SourceEmpty {
+            msg: format!("source directory '{}' does not exist", source_dir),
+        });
+    }
+
+    // Guard 1 + guard 3: walk the whole source subtree once, collecting both the
+    // indexable documents (guard 1) and whether any `.kb-schema.yaml` lives
+    // anywhere underneath (guard 3) — one filesystem walk answers both.
+    let source_files =
+        walk_subtree_files(deps.canonical_data_path, &abs_source_dir).map_err(|e| {
+            DirectoryMoveError::Io {
+                msg: format!("Failed to scan source directory '{}': {}", source_dir, e),
+            }
+        })?;
+
+    if let Some(schema_path) = source_files.iter().find(|p| {
+        Path::new(p)
+            .file_name()
+            .is_some_and(|n| n == crate::schema::SCHEMA_FILE_NAME)
+    }) {
+        return Err(DirectoryMoveError::SchemaInSource {
+            path: schema_path.clone(),
+        });
+    }
+
+    let documents: Vec<String> = source_files
+        .into_iter()
+        .filter(|p| deps.retrieval.include_patterns.is_match(p.as_str()))
+        .collect();
+    if documents.is_empty() {
+        return Err(DirectoryMoveError::SourceEmpty {
+            msg: format!(
+                "source directory '{}' contains no indexable document",
+                source_dir
+            ),
+        });
+    }
+
+    // Guard 2: the destination prefix must be completely free — ANY file
+    // underneath it, indexable or not, is a collision.
+    if abs_dest_dir.is_file() {
+        return Err(DirectoryMoveError::AlreadyExists);
+    }
+    if abs_dest_dir.is_dir() {
+        let dest_files =
+            walk_subtree_files(deps.canonical_data_path, &abs_dest_dir).map_err(|e| {
+                DirectoryMoveError::Io {
+                    msg: format!("Failed to scan destination directory '{}': {}", dest_dir, e),
+                }
+            })?;
+        if !dest_files.is_empty() {
+            return Err(DirectoryMoveError::AlreadyExists);
+        }
+    }
+
+    // Every document's new path, preserving its position under the source
+    // subtree. `documents` is already sorted (`walk_subtree_files` sorts), so
+    // `moves` is too.
+    let source_prefix = format!("{}/", source_dir);
+    let moves: Vec<(String, String)> = documents
+        .iter()
+        .map(|old_rel| {
+            let suffix = old_rel
+                .strip_prefix(&source_prefix)
+                .expect("every scanned document falls under its own source prefix");
+            (old_rel.clone(), format!("{}/{}", dest_dir, suffix))
+        })
+        .collect();
+    let moving: HashMap<&str, &str> = moves
+        .iter()
+        .map(|(old, new)| (old.as_str(), new.as_str()))
+        .collect();
+
+    // Guard 4 (frozen, per document) + guard 5 (eligibility/safety, per
+    // document) + the outbound link rewrite + destination-schema validation.
+    // ALL before any mutation: every document is only ever READ here, and every
+    // failure path below returns before touching the filesystem.
+    let schemas = crate::schema::load_shared(deps.schema_cache);
+    // (old_rel, new_rel, content_to_write)
+    let mut contents: Vec<(String, String, String)> = Vec::new();
+    let mut validation_failures: Vec<(String, ValidationResult)> = Vec::new();
+
+    for (old_rel, new_rel) in &moves {
+        check_include_pattern(deps, old_rel)?;
+        check_include_pattern(deps, new_rel)?;
+        let abs_source_doc = safe_write_path(deps, old_rel)?;
+        let abs_dest_doc = safe_write_path(deps, new_rel)?;
+
+        if let Some(reason) = schemas.is_frozen(Path::new(old_rel.as_str())) {
+            return Err(DirectoryMoveError::Frozen {
+                reason: reason.to_string(),
+            });
+        }
+        if let Some(reason) = schemas.is_frozen(Path::new(new_rel.as_str())) {
+            return Err(DirectoryMoveError::Frozen {
+                reason: reason.to_string(),
+            });
+        }
+
+        if abs_dest_doc.exists() {
+            // Guard 2 already checked the whole prefix; this is a defensive
+            // re-check against a TOCTOU race between that walk and here.
+            return Err(DirectoryMoveError::AlreadyExists);
+        }
+
+        let old_content = tokio::fs::read_to_string(&abs_source_doc)
+            .await
+            .map_err(|e| DirectoryMoveError::Io {
+                msg: format!("Failed to read '{}': {}", old_rel, e),
+            })?;
+
+        let content_to_write = rewrite_outbound_links(&old_content, old_rel, new_rel, |resolved| {
+            moving.get(resolved).map(|new| new.to_string())
+        });
+
+        let schema = schemas.resolve_for(Path::new(new_rel.as_str()));
+        let (validation_result, _validated) = validate::validate_content(
+            Path::new(new_rel.as_str()),
+            &content_to_write,
+            schema,
+            deps.validation,
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                "Validation error moving '{}' -> '{}': {:#}",
+                old_rel, new_rel, e
+            );
+            DirectoryMoveError::Io {
+                msg: format!("Failed to validate content: {}", e),
+            }
+        })?;
+        if !validation_result.valid {
+            validation_failures.push((new_rel.clone(), validation_result));
+        }
+
+        contents.push((old_rel.clone(), new_rel.clone(), content_to_write));
+    }
+
+    if !validation_failures.is_empty() {
+        return Err(DirectoryMoveError::Validation {
+            failures: validation_failures,
+        });
+    }
+
+    validate_commit_message(message)?;
+
+    let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
+
+    // Filesystem mutation, phase 1: write every DESTINATION first (`create_new`,
+    // same non-clobbering guarantee `write_document_move` relies on), before
+    // touching a single source — the same write-then-remove ordering that
+    // function uses, batched: if any destination write fails partway through,
+    // no source has been touched at all, so recovery is just deleting whatever
+    // destinations already landed.
+    let mut written_dest: Vec<PathBuf> = Vec::new();
+    for (_old_rel, new_rel, content_to_write) in &contents {
+        let abs_dest = match safe_write_path(deps, new_rel) {
+            Ok(p) => p,
+            Err(e) => {
+                rollback_directory_move_filesystem(
+                    data_path_str,
+                    &moves,
+                    &abs_dest_dir,
+                    &written_dest,
+                    &[],
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
+        if let Some(parent) = abs_dest.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            rollback_directory_move_filesystem(
+                data_path_str,
+                &moves,
+                &abs_dest_dir,
+                &written_dest,
+                &[],
+            )
+            .await;
+            return Err(DirectoryMoveError::Io {
+                msg: format!(
+                    "Failed to create parent directories for '{}': {}",
+                    new_rel, e
+                ),
+            });
+        }
+
+        let write_outcome: std::io::Result<()> = async {
+            use tokio::io::AsyncWriteExt as _;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&abs_dest)
+                .await?;
+            file.write_all(content_to_write.as_bytes()).await
+        }
+        .await;
+
+        match write_outcome {
+            Ok(()) => written_dest.push(abs_dest),
+            Err(e) => {
+                error!(
+                    "Failed to write destination '{}' while moving directory '{}' -> '{}': {}. \
+                     Undoing every filesystem change made so far.",
+                    new_rel, source_dir, dest_dir, e
+                );
+                rollback_directory_move_filesystem(
+                    data_path_str,
+                    &moves,
+                    &abs_dest_dir,
+                    &written_dest,
+                    &[],
+                )
+                .await;
+                return Err(DirectoryMoveError::Io {
+                    msg: format!(
+                        "Failed to write destination '{}' during directory move: {}",
+                        new_rel, e
+                    ),
+                });
+            }
+        }
+    }
+
+    // Filesystem mutation, phase 2: remove every SOURCE, now that every
+    // destination is confirmed written. A failure partway through is recovered
+    // by restoring every source from HEAD and deleting every destination
+    // written in phase 1 — nothing has touched git yet, so this is a pure
+    // filesystem undo (see `rollback_directory_move_filesystem`'s doc comment
+    // for why restoring the FULL source list, not just the ones already
+    // removed, is safe).
+    for (old_rel, _new_rel, _content_to_write) in &contents {
+        let abs_source = match safe_write_path(deps, old_rel) {
+            Ok(p) => p,
+            Err(e) => {
+                rollback_directory_move_filesystem(
+                    data_path_str,
+                    &moves,
+                    &abs_dest_dir,
+                    &written_dest,
+                    &[],
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = tokio::fs::remove_file(&abs_source).await {
+            error!(
+                "Failed to remove source '{}' while moving directory '{}' -> '{}': {}. \
+                 Restoring every source and deleting every written destination.",
+                old_rel, source_dir, dest_dir, e
+            );
+            rollback_directory_move_filesystem(
+                data_path_str,
+                &moves,
+                &abs_dest_dir,
+                &written_dest,
+                &[],
+            )
+            .await;
+            return Err(DirectoryMoveError::Io {
+                msg: format!(
+                    "Failed to remove source '{}' during directory move: {}",
+                    old_rel, e
+                ),
+            });
+        }
+    }
+
+    // Every document under `source_dir` is gone; tidy up any subdirectory (and
+    // `source_dir` itself) that removing them left empty, best-effort — see
+    // `remove_empty_dirs_best_effort`'s doc comment. Git does not track empty
+    // directories, so this has no bearing on the commit below; it just keeps
+    // the old prefix from lingering as an empty husk on disk.
+    remove_empty_dirs_best_effort(&abs_source_dir);
+
+    // Phase 3: rewrite documents OUTSIDE the moved subtree that link INTO it, so
+    // those links keep resolving after the move — riding along in the SAME
+    // commit as the move itself. Sources INSIDE the subtree are handled by the
+    // outbound pass above and must never be processed again here.
+    let mut outside_refs: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    if let Some(state) = deps.state {
+        for (old_rel, new_rel) in &moves {
+            match state.links_targeting(old_rel, "markdown").await {
+                Ok(referencing_paths) => {
+                    for ref_path in referencing_paths {
+                        if moving.contains_key(ref_path.as_str()) {
+                            // Inside the subtree — handled by the outbound
+                            // rewrite above; processing it again here would
+                            // double-edit it.
+                            continue;
+                        }
+                        outside_refs
+                            .entry(ref_path)
+                            .or_default()
+                            .push((old_rel.clone(), new_rel.clone()));
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Skipping incoming-link rewrite for '{}' while moving directory \
+                         '{}' -> '{}': the reverse-link query failed: {:#}",
+                        old_rel, source_dir, dest_dir, e
+                    );
+                }
+            }
+        }
+    }
+
+    let mut rewritten_paths: Vec<String> = Vec::new();
+    for (ref_path, targets) in &outside_refs {
+        let abs_ref = match safe_write_path(deps, ref_path) {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(
+                    "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': the \
+                     path no longer resolves safely (stale document_links row?)",
+                    ref_path, source_dir, dest_dir
+                );
+                continue;
+            }
+        };
+        let body = match tokio::fs::read_to_string(&abs_ref).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "Skipping link rewrite in '{}' while moving directory '{}' -> '{}': failed \
+                     to read it, likely a stale document_links row: {}",
+                    ref_path, source_dir, dest_dir, e
+                );
+                continue;
+            }
+        };
+
+        let mut replacements: Vec<(crate::ingest::LinkOccurrence, String)> = Vec::new();
+        for (old_rel, new_rel) in targets {
+            let replacement = crate::ingest::relativize_md_path(ref_path, new_rel);
+            for occurrence in crate::ingest::find_markdown_link_occurrences(&body, ref_path)
+                .into_iter()
+                .filter(|o| &o.resolved == old_rel)
+            {
+                replacements.push((occurrence, replacement.clone()));
+            }
+        }
+        if replacements.is_empty() {
+            // Stale document_links row(s): nothing in the CURRENT body actually
+            // resolves to any moved target anymore.
+            continue;
+        }
+
+        let new_body = apply_link_replacements_each(&body, &replacements);
+        if let Err(e) = tokio::fs::write(&abs_ref, new_body.as_bytes()).await {
+            error!(
+                "Failed to rewrite links into '{}' while moving directory '{}' -> '{}': {}. \
+                 Undoing every filesystem change made for this move so far.",
+                ref_path, source_dir, dest_dir, e
+            );
+            rollback_directory_move_filesystem(
+                data_path_str,
+                &moves,
+                &abs_dest_dir,
+                &written_dest,
+                &rewritten_paths,
+            )
+            .await;
+            return Err(DirectoryMoveError::Io {
+                msg: format!("Failed to rewrite links in '{}': {}", ref_path, e),
+            });
+        }
+        rewritten_paths.push(ref_path.clone());
+    }
+
+    // Commit the move AND every rewritten referencing document as ONE atomic
+    // commit, under one lock acquisition held across the commit AND any
+    // rollback below — releasing it in between would let another writer stage
+    // into (and, since it commits its own path, commit) the very half-staged
+    // state this call is about to undo. See `write_document_move`'s identical
+    // comment for the full reasoning.
+    let commit_message = build_commit_message(
+        message,
+        &format!("docs: move {} to {}", source_dir, dest_dir),
+        "move_directory",
+    );
+
+    let mut commit_paths: Vec<&str> = Vec::new();
+    for (old_rel, new_rel) in &moves {
+        commit_paths.push(old_rel.as_str());
+        commit_paths.push(new_rel.as_str());
+    }
+    for ref_path in &rewritten_paths {
+        if !commit_paths.contains(&ref_path.as_str()) {
+            commit_paths.push(ref_path.as_str());
+        }
+    }
+
+    let git_lock = git::lock_git().await;
+
+    let commit_outcome = match git::commit_and_sync(
+        &git_lock,
+        deps.git_url,
+        deps.branch,
+        data_path_str,
+        deps.token,
+        &commit_paths,
+        &commit_message,
+        deps.commit_author_name,
+        deps.commit_author_email,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+
+        Err(git::CommitSyncError::PreCommit(source_err)) => {
+            error!(
+                "commit_and_sync pre-commit failure moving directory '{}' -> '{}', rolling \
+                 back {} document(s) and {} rewritten referencing document(s): {:#}",
+                source_dir,
+                dest_dir,
+                moves.len(),
+                rewritten_paths.len(),
+                source_err
+            );
+
+            // Roll back EVERY part of this move — every source, every
+            // destination, plus every referencing document rewritten above.
+            // Each group is independent of the others and ALL of them always
+            // run unconditionally, so a failure in one never leaves a
+            // recoverable part undone. `rolled_back` is true only if every
+            // single one of these succeeds.
+            let mut rolled_back = true;
+            for (old_rel, _new_rel) in &moves {
+                if let Err(e) = git::restore_from_head(&git_lock, data_path_str, old_rel).await {
+                    rolled_back = false;
+                    error!(
+                        "move_directory rollback: failed to restore source '{}': {:#}. This \
+                         needs operator attention.",
+                        old_rel, e
+                    );
+                }
+            }
+            for (_old_rel, new_rel) in &moves {
+                let result = match safe_write_path(deps, new_rel) {
+                    Ok(abs) => match tokio::fs::remove_file(&abs).await {
+                        Ok(()) => git::unstage(&git_lock, data_path_str, new_rel).await,
+                        Err(e) => Err(anyhow::Error::new(e)
+                            .context("Failed to remove the new destination file during rollback")),
+                    },
+                    Err(e) => Err(anyhow::anyhow!(
+                        "destination '{}' no longer resolves safely during rollback: {:?}",
+                        new_rel,
+                        e
+                    )),
+                };
+                if let Err(e) = result {
+                    rolled_back = false;
+                    error!(
+                        "move_directory rollback: failed to remove destination '{}': {:#}. \
+                         This needs operator attention.",
+                        new_rel, e
+                    );
+                }
+            }
+            // Best-effort: tidy up any destination directory left empty by the
+            // removals above — see `remove_empty_dirs_best_effort`'s doc comment.
+            remove_empty_dirs_best_effort(&abs_dest_dir);
+            for ref_path in &rewritten_paths {
+                if let Err(e) = git::restore_from_head(&git_lock, data_path_str, ref_path).await {
+                    rolled_back = false;
+                    error!(
+                        "move_directory rollback: failed to restore referencing document \
+                         '{}': {:#}. This needs operator attention.",
+                        ref_path, e
+                    );
+                }
+            }
+
+            if !rolled_back {
+                error!(
+                    "Rollback FAILED after a pre-commit git failure moving directory '{}' -> \
+                     '{}'. Filesystem and git state may now be inconsistent. Original cause: \
+                     {:#}",
+                    source_dir, dest_dir, source_err
+                );
+            }
+
+            return Err(DirectoryMoveError::PreCommitFailed {
+                rolled_back,
+                msg: format!("{:#}", source_err),
+            });
+        }
+
+        Err(git::CommitSyncError::PostCommit {
+            sha,
+            source: source_err,
+        }) => {
+            warn!(
+                "commit_and_sync post-commit (sync) failure moving directory '{}' -> '{}', \
+                 commit {} stands uncorrected: {:#}",
+                source_dir, dest_dir, sha, source_err
+            );
+
+            crate::reindex::mark_paths(
+                moves
+                    .iter()
+                    .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
+                    .chain(rewritten_paths.iter().map(PathBuf::from)),
+            );
+
+            return Ok(DirectoryMoveSuccess {
+                outcome: WriteOutcome::CommittedPendingSync,
+                sha,
+                rebased_paths: Vec::new(),
+                moved: moves,
+                rewritten_paths,
+                sync_failure_cause: Some(format!("{:#}", source_err)),
+            });
+        }
+    };
+
+    // Mark the source, the destination, and every rewritten referencing
+    // document dirty — plus anything the rebase pulled in — in the SAME
+    // marking call, same reasoning as `write_document_move`'s identical final
+    // step.
+    crate::reindex::mark_paths(
+        moves
+            .iter()
+            .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
+            .chain(rewritten_paths.iter().map(PathBuf::from))
+            .chain(commit_outcome.rebased_paths.iter().cloned()),
+    );
+
+    Ok(DirectoryMoveSuccess {
+        outcome: WriteOutcome::Synced,
+        sha: commit_outcome.sha,
+        rebased_paths: commit_outcome.rebased_paths,
+        moved: moves,
+        rewritten_paths,
         sync_failure_cause: None,
     })
 }
@@ -978,7 +2560,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
         deps.branch,
         data_path_str,
         deps.token,
-        rel_path,
+        &[rel_path],
         &commit_message,
         deps.commit_author_name,
         deps.commit_author_email,
@@ -1038,6 +2620,11 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                 rebased_paths: Vec::new(),
                 diff: render_unified_diff(&old_content, "", rel_path),
                 sync_failure_cause: Some(format!("{:#}", source)),
+                // Deletes never rewrite other documents' links — a dangling
+                // link to a deleted document self-heals to a dropped edge on
+                // the referencing document's own next reindex, same as any
+                // other stale `document_links` row.
+                rewritten_paths: Vec::new(),
             });
         }
     };
@@ -1059,6 +2646,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
         diff: render_unified_diff(&old_content, "", rel_path),
         rebased_paths: commit_outcome.rebased_paths,
         sync_failure_cause: None,
+        rewritten_paths: Vec::new(),
     })
 }
 
@@ -1246,6 +2834,12 @@ mod tests {
 
     /// Bundle owning everything `WriteDeps<'_, EmbedClient, QdrantStore>` borrows,
     /// so a test can build the deps and hold this alive for the call.
+    ///
+    /// `state_db` is `None` by default — matching `WriteDeps::state`'s own
+    /// "disabled unless explicitly wired up" semantics — so every existing test
+    /// that never calls `with_state_db` keeps exercising the no-rewrite path.
+    /// Tests that exercise link rewriting call `with_state_db` to open a real
+    /// (temp-file-backed) `StateDb` and seed it via `StateDb::replace_links`.
     struct Harness {
         embed: Arc<EmbedClient>,
         qdrant: Arc<QdrantStore>,
@@ -1254,6 +2848,13 @@ mod tests {
         schema_cache: SharedSchemaCache,
         config: Arc<ResolvedConfig>,
         token: Option<String>,
+        state_db: Option<StateDb>,
+        /// Keeps the state DB's backing temp directory alive for as long as the
+        /// harness lives. Deliberately a SEPARATE temp dir from the KB root
+        /// (`canonical_data_path`) — the state DB file must never sit inside the
+        /// git working copy, or every git-backed test's `git status --porcelain
+        /// == ""` assertion would start seeing it as an untracked file.
+        _state_db_dir: Option<tempfile::TempDir>,
     }
 
     impl Harness {
@@ -1273,7 +2874,22 @@ mod tests {
                 schema_cache,
                 config,
                 token: None,
+                state_db: None,
+                _state_db_dir: None,
             }
+        }
+
+        /// Open a real, temp-file-backed `StateDb` (in its own directory, NOT
+        /// the KB root — see `_state_db_dir`'s doc comment) and attach it, so
+        /// `deps()` passes `Some` for `WriteDeps::state` and
+        /// `write_document_move` performs link rewriting. Returns `self` so
+        /// callers can chain it onto `Harness::new(..)`.
+        async fn with_state_db(mut self) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("state.db");
+            self.state_db = Some(StateDb::new(&db_path).await.unwrap());
+            self._state_db_dir = Some(dir);
+            self
         }
 
         fn deps(&self) -> WriteDeps<'_, EmbedClient, QdrantStore> {
@@ -1297,6 +2913,7 @@ mod tests {
                 token: self.token.as_deref(),
                 commit_author_name: &self.config.write.commit_author_name,
                 commit_author_email: &self.config.write.commit_author_email,
+                state: self.state_db.as_ref(),
             }
         }
     }
@@ -1312,6 +2929,27 @@ mod tests {
             force_new: Some(true),
             operation: "test",
             expected_hash: None,
+            dest_path: None,
+        }
+    }
+
+    fn make_move_req<'a>(
+        source_rel: &'a str,
+        dest_rel: &'a str,
+        old_content: &'a str,
+        new_content: &'a str,
+    ) -> WriteRequest<'a> {
+        WriteRequest {
+            rel_path: source_rel,
+            old_content,
+            new_content,
+            is_create: false,
+            message: None,
+            default_verb: "update",
+            force_new: Some(true),
+            operation: "test",
+            expected_hash: None,
+            dest_path: Some(dest_rel),
         }
     }
 
@@ -1557,6 +3195,32 @@ mod tests {
             .current_dir(work.path())
             .output()
             .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                message,
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+    }
+
+    /// Like [`git_commit_all`], but stages and commits several paths in one
+    /// commit — used by the `move_directory` tests below to seed a source
+    /// subtree with more than one document without a separate commit per file.
+    fn git_commit_paths(work: &tempfile::TempDir, rel_paths: &[&str], message: &str) {
+        for rel_path in rel_paths {
+            std::process::Command::new("git")
+                .args(["add", "--", rel_path])
+                .current_dir(work.path())
+                .output()
+                .unwrap();
+        }
         std::process::Command::new("git")
             .args([
                 "-c",
@@ -1845,5 +3509,1301 @@ mod tests {
             }
             other => panic!("expected Internal, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // WriteRequest::dest_path (document MOVE) — write_document_move
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn successful_move_relocates_the_file_in_one_commit_and_marks_both_paths_dirty() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+        let head_before = head_sha(&work);
+
+        let harness = git_backed_harness(&work);
+        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
+
+        // A destination path unique to this test — see
+        // `create_synced_write_marks_the_path_dirty_and_returns_a_diff`'s comment:
+        // REINDEX_QUEUE is a process-wide set shared with every other test in this
+        // binary.
+        let req = make_move_req(
+            "old/loc.md",
+            "new/loc-moved-write-core-test.md",
+            original,
+            original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(!success.sha.is_empty());
+        assert_ne!(
+            success.sha, head_before,
+            "the move must produce a new commit"
+        );
+        assert!(
+            !work.path().join("old/loc.md").exists(),
+            "source must be gone after a successful move"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("new/loc-moved-write-core-test.md")).unwrap(),
+            original
+        );
+        // The removal and the addition both landed in the single commit — nothing
+        // left staged or dangling in the working tree afterward.
+        assert_eq!(git_status(&work), "");
+
+        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        assert!(
+            pending_after >= pending_before + 2,
+            "both the source and destination paths should be marked dirty"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_with_a_stale_expected_hash_is_rejected_and_mutates_nothing() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+        let head_before = head_sha(&work);
+
+        let harness = git_backed_harness(&work);
+
+        let stale_hash = crate::ingest::compute_hash_from_bytes(b"not the current content");
+        let mut req = make_move_req("old/loc.md", "new/loc.md", original, original);
+        req.expected_hash = Some(&stale_hash);
+
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::StaleHash { expected, actual } => {
+                assert_eq!(expected, stale_hash);
+                assert_ne!(actual, stale_hash);
+            }
+            other => panic!("expected StaleHash, got {other:?}"),
+        }
+        assert!(
+            work.path().join("old/loc.md").exists(),
+            "source must be untouched when the expected_hash is stale"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("old/loc.md")).unwrap(),
+            original
+        );
+        assert!(
+            !work.path().join("new/loc.md").exists(),
+            "destination must never be created when the expected_hash is stale"
+        );
+        assert_eq!(head_before, head_sha(&work), "no commit must be made");
+        assert_eq!(git_status(&work), "");
+    }
+
+    #[tokio::test]
+    async fn move_with_a_matching_expected_hash_proceeds_normally() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let harness = git_backed_harness(&work);
+
+        // A destination path unique to this test — REINDEX_QUEUE is process-wide,
+        // shared with every other test in this binary.
+        let correct_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
+        let mut req = make_move_req(
+            "old/loc.md",
+            "new/loc-matching-hash-test.md",
+            original,
+            original,
+        );
+        req.expected_hash = Some(&correct_hash);
+
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(!work.path().join("old/loc.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("new/loc-matching-hash-test.md")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn move_to_an_existing_destination_reports_already_exists_and_mutates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("docs");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let original = "---\ntitle: T\n---\n# Body";
+        std::fs::write(source_dir.join("source.md"), original).unwrap();
+        let dest_dir = tmp.path().join("other");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("dest.md"), "# Already here").unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_move_req("docs/source.md", "other/dest.md", original, original);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(matches!(err, WriteError::AlreadyExists), "got {err:?}");
+        assert_eq!(
+            std::fs::read_to_string(source_dir.join("source.md")).unwrap(),
+            original,
+            "source must be untouched when the destination already exists"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("dest.md")).unwrap(),
+            "# Already here",
+            "the pre-existing destination file must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_validates_against_the_destination_schema_not_the_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("loose");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        // Valid under the (schema-less) source directory, but missing a field the
+        // destination directory's schema requires.
+        let content = "---\ntitle: T\n---\n# Body";
+        std::fs::write(source_dir.join("source.md"), content).unwrap();
+
+        let dest_dir = tmp.path().join("strict");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            dest_dir.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  strict_field:\n    required: true\n",
+        )
+        .unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_move_req("loose/source.md", "strict/dest.md", content, content);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::Validation { result } => {
+                assert!(!result.valid);
+                assert!(
+                    result
+                        .field_errors
+                        .iter()
+                        .any(|e| e.field == "strict_field"),
+                    "expected a strict_field error, got {:?}",
+                    result.field_errors
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(
+            source_dir.join("source.md").exists(),
+            "source must be untouched when destination validation fails"
+        );
+        assert!(
+            !dest_dir.join("dest.md").exists(),
+            "nothing should be written to the destination when validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_with_a_frozen_source_directory_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("frozen-src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(crate::schema::SCHEMA_FILE_NAME),
+            "not: [valid: yaml",
+        )
+        .unwrap();
+        let content = "---\ntitle: T\n---\n# Body";
+        std::fs::write(source_dir.join("source.md"), content).unwrap();
+        let dest_dir = tmp.path().join("dest-ok");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_move_req("frozen-src/source.md", "dest-ok/dest.md", content, content);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(matches!(err, WriteError::Frozen { .. }), "got {err:?}");
+        assert!(source_dir.join("source.md").exists());
+        assert!(!dest_dir.join("dest.md").exists());
+    }
+
+    #[tokio::test]
+    async fn move_with_a_frozen_destination_directory_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source-ok");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let content = "---\ntitle: T\n---\n# Body";
+        std::fs::write(source_dir.join("source.md"), content).unwrap();
+        let dest_dir = tmp.path().join("frozen-dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            dest_dir.join(crate::schema::SCHEMA_FILE_NAME),
+            "not: [valid: yaml",
+        )
+        .unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_move_req(
+            "source-ok/source.md",
+            "frozen-dest/dest.md",
+            content,
+            content,
+        );
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(matches!(err, WriteError::Frozen { .. }), "got {err:?}");
+        assert!(source_dir.join("source.md").exists());
+        assert!(!dest_dir.join("dest.md").exists());
+    }
+
+    #[tokio::test]
+    async fn move_precommit_failure_rolls_back_both_halves() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req("old/loc.md", "new/loc.md", original, original);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
+            other => panic!("expected PreCommitFailed, got {other:?}"),
+        }
+        assert!(
+            work.path().join("old/loc.md").exists(),
+            "source must be restored after a rolled-back move"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("old/loc.md")).unwrap(),
+            original
+        );
+        assert!(
+            !work.path().join("new/loc.md").exists(),
+            "destination must be gone after a rolled-back move"
+        );
+        assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status(&work), "");
+    }
+
+    #[tokio::test]
+    async fn move_with_a_content_change_writes_the_new_content_to_the_destination() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let original =
+            "---\ntitle: Old Title\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("old/loc.md"), original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let harness = git_backed_harness(&work);
+
+        let new_content =
+            "---\ntitle: New Title\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
+        let req = make_move_req("old/loc.md", "new/loc.md", original, new_content);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(!work.path().join("old/loc.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("new/loc.md")).unwrap(),
+            new_content,
+            "the destination must hold the NEW content, not a copy of the source's old content"
+        );
+        assert!(success.diff.contains("+title: New Title"));
+        assert!(success.diff.contains("-title: Old Title"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Move + incoming-link rewrite (WriteDeps::state, `document_links` reverse
+    // lookup, `ingest::find_markdown_link_occurrences`/`relativize_md_path`)
+    // -----------------------------------------------------------------------
+
+    /// A git-backed harness whose `WriteDeps::state` is wired up to a real,
+    /// temp-file-backed `StateDb` (see `Harness::with_state_db`'s doc comment
+    /// for why it lives outside the git working copy), so `write_document_move`
+    /// actually performs link rewriting.
+    async fn git_backed_harness_with_state_db(work: &tempfile::TempDir) -> Harness {
+        git_backed_harness(work).with_state_db().await
+    }
+
+    #[tokio::test]
+    async fn move_rewrites_a_referencing_documents_link_in_the_same_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let referencing_original = "---\ntitle: Referencer\ndescription: d\ntype: guide\n\
+             tags: [t]\n---\n\nSee [the moved doc](old/loc.md) for more.\n";
+        std::fs::write(work.path().join("referencing.md"), referencing_original).unwrap();
+        git_commit_all(&work, "referencing.md", "add referencing.md");
+        let head_before = head_sha(&work);
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let req = make_move_req(
+            "old/loc.md",
+            "new/loc-rewrite-test1.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+
+        let referencing_after =
+            std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing_after.contains("[the moved doc](new/loc-rewrite-test1.md)"),
+            "referencing document's link must point at the new location, got: {referencing_after}"
+        );
+        assert!(!referencing_after.contains("old/loc.md"));
+
+        // Both halves of the move AND the referencing-document rewrite landed in
+        // exactly ONE commit: the working tree is clean and HEAD moved exactly
+        // once (`success.sha` is the only new commit, matching this test's own
+        // assertions on the file contents above having already landed).
+        assert_eq!(git_status(&work), "");
+        assert_ne!(head_before, head_sha(&work));
+        assert_eq!(success.sha, head_sha(&work));
+    }
+
+    #[tokio::test]
+    async fn move_rewrite_relativizes_correctly_for_a_referencing_document_elsewhere() {
+        // The case a naive string substitution gets wrong: the referencing
+        // document lives in a THIRD directory, unrelated to both the source's
+        // and the destination's, so the correct replacement text is neither the
+        // raw destination path nor a copy of the old relative text — it must be
+        // freshly computed from the referencing document's own location,
+        // climbing up ("../../") before descending back down.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs/sub")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("docs/sub/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "docs/sub/loc.md", "add docs/sub/loc.md");
+
+        std::fs::create_dir_all(work.path().join("other/deep")).unwrap();
+        let referencing_original = "---\ntitle: Referencer\ndescription: d\ntype: guide\n\
+             tags: [t]\n---\n\nSee [it](../../docs/sub/loc.md) for more.\n";
+        std::fs::write(work.path().join("other/deep/ref.md"), referencing_original).unwrap();
+        git_commit_all(&work, "other/deep/ref.md", "add other/deep/ref.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "other/deep/ref.md",
+                "markdown",
+                &[("docs/sub/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let req = make_move_req(
+            "docs/sub/loc.md",
+            "archive/2024/loc.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert_eq!(
+            success.rewritten_paths,
+            vec!["other/deep/ref.md".to_string()]
+        );
+
+        let referencing_after =
+            std::fs::read_to_string(work.path().join("other/deep/ref.md")).unwrap();
+        assert!(
+            referencing_after.contains("[it](../../archive/2024/loc.md)"),
+            "expected a correctly relativized (climbing) link, got: {referencing_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_rewrite_skips_links_inside_fences_and_code_spans() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let referencing_original = "---\ntitle: Referencer\ndescription: d\ntype: guide\n\
+             tags: [t]\n---\n\nSee [Real Link](old/loc.md) for docs.\n\n\
+             ```md\n[Fenced](old/loc.md)\n```\n\n\
+             Use `[Code](old/loc.md)` literally.\n";
+        std::fs::write(work.path().join("referencing.md"), referencing_original).unwrap();
+        git_commit_all(&work, "referencing.md", "add referencing.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let req = make_move_req(
+            "old/loc.md",
+            "new/loc-rewrite-test3.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.rewritten_paths, vec!["referencing.md".to_string()]);
+        let referencing_after =
+            std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing_after.contains("[Real Link](new/loc-rewrite-test3.md)"),
+            "the real inline link must be rewritten, got: {referencing_after}"
+        );
+        assert!(
+            referencing_after.contains("[Fenced](old/loc.md)"),
+            "a link inside a fenced code block must NOT be rewritten, got: {referencing_after}"
+        );
+        assert!(
+            referencing_after.contains("`[Code](old/loc.md)`"),
+            "a link inside an inline code span must NOT be rewritten, got: {referencing_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_rewrites_a_self_reference_relative_to_the_destination() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [self](loc.md) too.\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        // No `with_state_db` — the self-reference rewrite is computed purely from
+        // `new_content` and does not depend on the reverse-link index at all, so
+        // this must work identically whether or not `WriteDeps::state` is set.
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req(
+            "old/loc.md",
+            "new/loc-self.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(
+            success.rewritten_paths.is_empty(),
+            "the moved document itself is not a separate 'referencing document'"
+        );
+
+        let dest_content = std::fs::read_to_string(work.path().join("new/loc-self.md")).unwrap();
+        assert!(
+            dest_content.contains("[self](loc-self.md)"),
+            "the self-link must be rewritten relative to the destination's own directory, got: \
+             {dest_content}"
+        );
+        assert!(!dest_content.contains("old/loc.md"));
+    }
+
+    /// Guards the self-reference filter (`o.resolved.as_str() == source_rel`,
+    /// step 6.5 above) against being "fixed" to also match on raw link text
+    /// (`|| o.raw == source_rel`).
+    ///
+    /// Markdown link targets in this codebase are ALWAYS resolved relative to
+    /// the containing document's own directory — there is no root-relative
+    /// form, not even via a leading `/` (`ingest::resolve_relative_md_path`
+    /// treats it as an empty, no-op component). That means a document's raw
+    /// link text can be textually identical to that same document's own
+    /// repo-relative path while resolving somewhere else entirely. Here,
+    /// `old/loc.md` contains a link literally written as `old/loc.md`; from
+    /// inside `old/`, that resolves to `old/old/loc.md` — a different
+    /// document — NOT to `old/loc.md` itself.
+    ///
+    /// The move DOES legitimately rewrite this link's spelling — every
+    /// outbound link in the moved document gets re-relativized, because a
+    /// relative link's meaning depends on the containing document's
+    /// directory, and that directory just changed. "Unchanged text" was
+    /// never the invariant. What must be preserved is the link's *resolved
+    /// target*: comparing the self-reference filter on `o.resolved` (the
+    /// actually-resolved target) correctly re-relativizes this link while
+    /// keeping it pointed at `old/old/loc.md`. Broadening that comparison to
+    /// `o.resolved.as_str() == source_rel || o.raw == source_rel` would
+    /// corrupt it: the raw text matches `source_rel` by coincidence, so the
+    /// rewrite would mistake it for a self-reference and repoint it at the
+    /// moved document — a file it never referenced — while the real target,
+    /// `old/old/loc.md`, is silently dropped. That broadened check only
+    /// "works" by accident for documents living at the KB root, where raw
+    /// text and resolved path happen to coincide; it is wrong everywhere
+    /// else.
+    #[tokio::test]
+    async fn move_preserves_the_target_of_a_link_whose_raw_text_matches_the_source_path() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [not self](old/loc.md) too.\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        // No `with_state_db` — the self-reference rewrite is computed purely from
+        // `new_content` and does not depend on the reverse-link index at all, so
+        // this must work identically whether or not `WriteDeps::state` is set.
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(
+            success.rewritten_paths.is_empty(),
+            "the moved document itself is not a separate 'referencing document'"
+        );
+
+        let dest_content = std::fs::read_to_string(work.path().join("new/loc.md")).unwrap();
+        let occurrences =
+            crate::ingest::find_markdown_link_occurrences(&dest_content, "new/loc.md");
+        let not_self = occurrences
+            .iter()
+            .find(|o| o.raw.contains("loc.md"))
+            .unwrap_or_else(|| panic!("expected a link to loc.md in: {dest_content}"));
+        assert_eq!(
+            not_self.resolved, "old/old/loc.md",
+            "the link's raw text happens to equal the source path but must keep resolving \
+             to old/old/loc.md, a different document, after the move — got raw text {:?} \
+             in: {dest_content}",
+            not_self.raw
+        );
+        assert_ne!(
+            not_self.resolved, "new/loc.md",
+            "the link must not be mistaken for a self-reference (matching on raw text \
+             instead of resolved target) and hijacked onto the moved document — got: \
+             {dest_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_rewrites_a_non_self_link_across_a_depth_change() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        std::fs::write(
+            work.path().join("shared/doc.md"),
+            "---\ntitle: Shared\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Shared\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "shared/doc.md", "add shared/doc.md");
+
+        let source_original = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [shared](../shared/doc.md) too.\n";
+        std::fs::write(work.path().join("old/a.md"), source_original).unwrap();
+        git_commit_all(&work, "old/a.md", "add old/a.md");
+
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req(
+            "old/a.md",
+            "new/deep/a.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        let dest_content = std::fs::read_to_string(work.path().join("new/deep/a.md")).unwrap();
+        // Before the fix, this link's raw text (`../shared/doc.md`) would be left
+        // unchanged by the move and silently resolve to `new/shared/doc.md` — a
+        // different, likely nonexistent, file — once read from the destination's
+        // deeper directory. Assert the actual resolved target, not just a string
+        // match, so this states the real invariant.
+        let occurrences =
+            crate::ingest::find_markdown_link_occurrences(&dest_content, "new/deep/a.md");
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "expected exactly one outbound link, got: {dest_content}"
+        );
+        assert_eq!(
+            occurrences[0].resolved, "shared/doc.md",
+            "the link must still resolve to shared/doc.md after the move, got raw text {:?} \
+             in: {dest_content}",
+            occurrences[0].raw
+        );
+        assert!(
+            dest_content.contains("[shared](../../shared/doc.md)"),
+            "expected a correctly re-relativized (deeper-climbing) link, got: {dest_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_rewrites_a_non_self_link_across_a_sibling_directory_change() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("teams/alpha")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared/inner")).unwrap();
+        std::fs::write(
+            work.path().join("shared/inner/target.md"),
+            "---\ntitle: Target\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Target\n",
+        )
+        .unwrap();
+        git_commit_all(
+            &work,
+            "shared/inner/target.md",
+            "add shared/inner/target.md",
+        );
+
+        let source_original = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [target](../../shared/inner/target.md) too.\n";
+        std::fs::write(work.path().join("teams/alpha/doc.md"), source_original).unwrap();
+        git_commit_all(&work, "teams/alpha/doc.md", "add teams/alpha/doc.md");
+
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req(
+            "teams/alpha/doc.md",
+            "shared/beta/doc.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        let dest_content = std::fs::read_to_string(work.path().join("shared/beta/doc.md")).unwrap();
+        // Same directory DEPTH (2 components) on both sides, so this is testing
+        // something `move_rewrites_a_non_self_link_across_a_depth_change` does not:
+        // the destination now shares a top-level ancestor with the target it never
+        // shared before, so the correct climb SHRINKS from 2 segments to 1, not
+        // grows.
+        let occurrences =
+            crate::ingest::find_markdown_link_occurrences(&dest_content, "shared/beta/doc.md");
+        assert_eq!(occurrences.len(), 1, "got: {dest_content}");
+        assert_eq!(occurrences[0].resolved, "shared/inner/target.md");
+        assert!(
+            dest_content.contains("[target](../inner/target.md)"),
+            "expected the climb to shorten from ../../ to ../, got: {dest_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_pure_rename_in_same_directory_leaves_non_self_links_byte_identical() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::create_dir_all(work.path().join("other")).unwrap();
+        std::fs::write(
+            work.path().join("other/x.md"),
+            "---\ntitle: Other\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Other\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "other/x.md", "add other/x.md");
+
+        let source_original = "---\ntitle: Rename Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [other](../other/x.md) too.\n";
+        std::fs::write(work.path().join("docs/a.md"), source_original).unwrap();
+        git_commit_all(&work, "docs/a.md", "add docs/a.md");
+
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req("docs/a.md", "docs/b.md", source_original, source_original);
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        let dest_content = std::fs::read_to_string(work.path().join("docs/b.md")).unwrap();
+        assert_eq!(
+            dest_content, source_original,
+            "a pure rename within one directory must leave non-self outbound links \
+             byte-identical — no spurious rewrite, no needless diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_outbound_rewrite_skips_links_inside_fences_and_code_spans() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        std::fs::write(
+            work.path().join("shared/doc.md"),
+            "---\ntitle: Shared\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Shared\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "shared/doc.md", "add shared/doc.md");
+
+        let source_original = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [Real Link](../shared/doc.md) for docs.\n\n\
+             ```md\n[Fenced](../shared/doc.md)\n```\n\n\
+             Use `[Code](../shared/doc.md)` literally.\n";
+        std::fs::write(work.path().join("old/a.md"), source_original).unwrap();
+        git_commit_all(&work, "old/a.md", "add old/a.md");
+
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req(
+            "old/a.md",
+            "new/deep/a.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        let dest_content = std::fs::read_to_string(work.path().join("new/deep/a.md")).unwrap();
+        assert!(
+            dest_content.contains("[Real Link](../../shared/doc.md)"),
+            "the real inline link must be re-relativized, got: {dest_content}"
+        );
+        assert!(
+            dest_content.contains("[Fenced](../shared/doc.md)"),
+            "a link inside a fenced code block must NOT be rewritten, got: {dest_content}"
+        );
+        assert!(
+            dest_content.contains("`[Code](../shared/doc.md)`"),
+            "a link inside an inline code span must NOT be rewritten, got: {dest_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_with_a_stale_document_links_row_for_a_deleted_referencing_file_does_not_fail() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        // `ghost.md` was never written to disk — a stale row, as if the
+        // referencing document had since been deleted without the index
+        // catching up yet.
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links("ghost.md", "markdown", &[("old/loc.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let req = make_move_req(
+            "old/loc.md",
+            "new/loc-rewrite-test5.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req)
+            .await
+            .expect("a stale document_links row must not fail the move");
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(
+            success.rewritten_paths.is_empty(),
+            "nothing was actually rewritten — the referencing file doesn't exist"
+        );
+        assert!(!work.path().join("old/loc.md").exists());
+        assert!(work.path().join("new/loc-rewrite-test5.md").exists());
+    }
+
+    #[tokio::test]
+    async fn move_precommit_failure_with_rewrites_restores_the_referencing_document_too() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let referencing_original = "---\ntitle: Referencer\ndescription: d\ntype: guide\n\
+             tags: [t]\n---\n\nSee [the moved doc](old/loc.md) for more.\n";
+        std::fs::write(work.path().join("referencing.md"), referencing_original).unwrap();
+        git_commit_all(&work, "referencing.md", "add referencing.md");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing.md",
+                "markdown",
+                &[("old/loc.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let req = make_move_req(
+            "old/loc.md",
+            "new/loc-rewrite-test6.md",
+            source_original,
+            source_original,
+        );
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
+            other => panic!("expected PreCommitFailed, got {other:?}"),
+        }
+
+        assert!(
+            work.path().join("old/loc.md").exists(),
+            "source must be restored after a rolled-back move"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("old/loc.md")).unwrap(),
+            source_original
+        );
+        assert!(!work.path().join("new/loc-rewrite-test6.md").exists());
+
+        let referencing_after =
+            std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(
+            referencing_after, referencing_original,
+            "the referencing document's link rewrite must be rolled back too, not just the move"
+        );
+
+        assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status(&work), "");
+    }
+
+    #[tokio::test]
+    async fn move_with_no_state_db_does_not_rewrite_a_genuinely_referencing_document() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let referencing_original = "---\ntitle: Referencer\ndescription: d\ntype: guide\n\
+             tags: [t]\n---\n\nSee [the moved doc](old/loc.md) for more.\n";
+        std::fs::write(work.path().join("referencing.md"), referencing_original).unwrap();
+        git_commit_all(&work, "referencing.md", "add referencing.md");
+
+        // Plain `git_backed_harness`, with no `with_state_db` — `WriteDeps::state`
+        // is `None`, so this exercises the "existing non-move / no-DB tests still
+        // pass" contract even though a real referencing document (and, unlike
+        // `move_precommit_failure_with_rewrites_restores_the_referencing_document_too`,
+        // no `document_links` row to find it by) exists on disk.
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req(
+            "old/loc.md",
+            "new/loc-rewrite-test7.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(success.rewritten_paths.is_empty());
+        let referencing_after =
+            std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert_eq!(
+            referencing_after, referencing_original,
+            "with no state DB wired up, the referencing document must be left untouched"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // move_directory: atomic directory move
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn move_directory_relocates_every_document_in_one_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old-dir/sub")).unwrap();
+        let a = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n";
+        let b = "---\ntitle: B\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# B\n";
+        let c = "---\ntitle: C\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# C\n";
+        std::fs::write(work.path().join("old-dir/a.md"), a).unwrap();
+        std::fs::write(work.path().join("old-dir/b.md"), b).unwrap();
+        std::fs::write(work.path().join("old-dir/sub/c.md"), c).unwrap();
+        git_commit_paths(
+            &work,
+            &["old-dir/a.md", "old-dir/b.md", "old-dir/sub/c.md"],
+            "add old-dir",
+        );
+        let head_before = head_sha(&work);
+
+        let harness = git_backed_harness(&work);
+        let success = move_directory(&harness.deps(), "old-dir", "new-dir-test1", None)
+            .await
+            .unwrap();
+
+        assert_eq!(success.moved.len(), 3);
+        assert_ne!(
+            success.sha, head_before,
+            "the move must produce a new commit"
+        );
+        assert!(
+            !work.path().join("old-dir").exists(),
+            "the old prefix must be gone entirely"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("new-dir-test1/a.md")).unwrap(),
+            a
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("new-dir-test1/b.md")).unwrap(),
+            b
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("new-dir-test1/sub/c.md")).unwrap(),
+            c
+        );
+        // Every document plus both prefixes' worth of filesystem changes landed
+        // in the single commit — nothing left staged or dangling.
+        assert_eq!(git_status(&work), "");
+    }
+
+    #[tokio::test]
+    async fn move_directory_preserves_a_link_between_two_documents_inside_the_moved_subtree() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old2/sub1")).unwrap();
+        std::fs::create_dir_all(work.path().join("old2/sub2")).unwrap();
+        let a = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n\
+                 See [b](../sub2/b.md) for more.\n";
+        let b = "---\ntitle: B\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# B\n";
+        std::fs::write(work.path().join("old2/sub1/a.md"), a).unwrap();
+        std::fs::write(work.path().join("old2/sub2/b.md"), b).unwrap();
+        git_commit_paths(&work, &["old2/sub1/a.md", "old2/sub2/b.md"], "add old2");
+
+        let harness = git_backed_harness(&work);
+        let success = move_directory(&harness.deps(), "old2", "moved2/deep/target", None)
+            .await
+            .unwrap();
+        assert_eq!(success.moved.len(), 2);
+
+        // Assert on the RESOLVED target, not the link text: a correct
+        // lockstep-move rewrite usually reproduces identical text (both
+        // documents moved by the same prefix change), so the meaningful check
+        // is that the link still resolves to the MOVED copy of `b.md`, not a
+        // stale path under the old, now-nonexistent `old2/`.
+        let a_after =
+            std::fs::read_to_string(work.path().join("moved2/deep/target/sub1/a.md")).unwrap();
+        let occurrences =
+            crate::ingest::find_markdown_link_occurrences(&a_after, "moved2/deep/target/sub1/a.md");
+        assert_eq!(occurrences.len(), 1, "expected exactly one link occurrence");
+        assert_eq!(occurrences[0].resolved, "moved2/deep/target/sub2/b.md");
+    }
+
+    #[tokio::test]
+    async fn move_directory_preserves_a_link_from_inside_the_subtree_to_a_document_outside_it() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old3")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        let a = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n\
+                 See [shared](../shared/target.md) for more.\n";
+        let target =
+            "---\ntitle: Target\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Target\n";
+        std::fs::write(work.path().join("old3/a.md"), a).unwrap();
+        std::fs::write(work.path().join("shared/target.md"), target).unwrap();
+        git_commit_paths(
+            &work,
+            &["old3/a.md", "shared/target.md"],
+            "add old3 and shared",
+        );
+
+        let harness = git_backed_harness(&work);
+        // Move to a destination several levels DEEPER than the source — a naive
+        // "leave outbound links untouched" implementation would break this link,
+        // since reaching the untouched `shared/target.md` from the new, deeper
+        // location requires more `../` climbs than the original text has.
+        let success = move_directory(&harness.deps(), "old3", "moved3/deeper/still/here", None)
+            .await
+            .unwrap();
+        assert_eq!(success.moved.len(), 1);
+
+        let a_after =
+            std::fs::read_to_string(work.path().join("moved3/deeper/still/here/a.md")).unwrap();
+        let occurrences = crate::ingest::find_markdown_link_occurrences(
+            &a_after,
+            "moved3/deeper/still/here/a.md",
+        );
+        assert_eq!(occurrences.len(), 1, "expected exactly one link occurrence");
+        assert_eq!(
+            occurrences[0].resolved, "shared/target.md",
+            "the link must still resolve to the same, unmoved outside document"
+        );
+        assert!(
+            work.path().join("shared/target.md").exists(),
+            "the outside document must never have moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_directory_rewrites_an_outside_referencing_documents_link() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old4")).unwrap();
+        let a = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n";
+        std::fs::write(work.path().join("old4/a.md"), a).unwrap();
+        git_commit_paths(&work, &["old4/a.md"], "add old4/a.md");
+
+        let referencing = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n\
+                            See [a](old4/a.md) for more.\n";
+        std::fs::write(work.path().join("referencing4.md"), referencing).unwrap();
+        git_commit_paths(&work, &["referencing4.md"], "add referencing4.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing4.md",
+                "markdown",
+                &[("old4/a.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let success = move_directory(&harness.deps(), "old4", "new4", None)
+            .await
+            .unwrap();
+        assert_eq!(success.moved.len(), 1);
+        assert_eq!(success.rewritten_paths, vec!["referencing4.md".to_string()]);
+
+        let ref_after = std::fs::read_to_string(work.path().join("referencing4.md")).unwrap();
+        let occurrences =
+            crate::ingest::find_markdown_link_occurrences(&ref_after, "referencing4.md");
+        assert_eq!(occurrences.len(), 1, "expected exactly one link occurrence");
+        assert_eq!(
+            occurrences[0].resolved, "new4/a.md",
+            "the outside document's link must resolve to the moved document's new location"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_directory_validation_failure_for_one_document_aborts_the_whole_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("loose5");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        // Valid under the (schema-less) source directory, but missing a field the
+        // destination's schema requires.
+        let a = "---\ntitle: A\n---\n# A";
+        let b = "---\ntitle: B\n---\n# B";
+        std::fs::write(source_dir.join("a.md"), a).unwrap();
+        std::fs::write(source_dir.join("b.md"), b).unwrap();
+
+        // The schema lives on the DESTINATION'S PARENT, not literally inside the
+        // (as-yet-nonexistent, and so guard-2-empty) destination prefix itself —
+        // `strict5/target` inherits it via the normal cascade.
+        let dest_parent = tmp.path().join("strict5");
+        std::fs::create_dir_all(&dest_parent).unwrap();
+        std::fs::write(
+            dest_parent.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  strict_field:\n    required: true\n",
+        )
+        .unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let err = move_directory(&harness.deps(), "loose5", "strict5/target", None)
+            .await
+            .unwrap_err();
+        match err {
+            DirectoryMoveError::Validation { failures } => {
+                assert_eq!(
+                    failures.len(),
+                    2,
+                    "both documents are missing strict_field, expected {:?}",
+                    failures
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(
+            source_dir.join("a.md").exists(),
+            "nothing must be mutated when even one document fails validation"
+        );
+        assert!(source_dir.join("b.md").exists());
+        assert!(!tmp.path().join("strict5/target").exists());
+    }
+
+    #[tokio::test]
+    async fn move_directory_with_a_schema_file_in_the_source_subtree_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("old6/sub");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let content = "---\ntitle: A\n---\n# A";
+        std::fs::write(source_dir.join("a.md"), content).unwrap();
+        std::fs::write(
+            source_dir.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  x:\n    required: true\n",
+        )
+        .unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let err = move_directory(&harness.deps(), "old6", "new6", None)
+            .await
+            .unwrap_err();
+        match err {
+            DirectoryMoveError::SchemaInSource { path } => {
+                assert_eq!(
+                    path,
+                    format!("old6/sub/{}", crate::schema::SCHEMA_FILE_NAME)
+                );
+            }
+            other => panic!("expected SchemaInSource, got {other:?}"),
+        }
+        assert!(source_dir.join("a.md").exists());
+        assert!(!tmp.path().join("new6").exists());
+    }
+
+    #[tokio::test]
+    async fn move_directory_to_an_occupied_destination_prefix_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("old7");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let content = "---\ntitle: A\n---\n# A";
+        std::fs::write(source_dir.join("a.md"), content).unwrap();
+
+        let dest_dir = tmp.path().join("occupied7");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("already-here.md"), "# Already here").unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let err = move_directory(&harness.deps(), "old7", "occupied7", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryMoveError::AlreadyExists),
+            "got {err:?}"
+        );
+        assert!(
+            source_dir.join("a.md").exists(),
+            "source must be untouched when the destination prefix is occupied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("already-here.md")).unwrap(),
+            "# Already here",
+            "the pre-existing destination content must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_directory_precommit_failure_rolls_back_every_document_and_referencing_document() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old8")).unwrap();
+        let a = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n";
+        let b = "---\ntitle: B\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# B\n";
+        std::fs::write(work.path().join("old8/a.md"), a).unwrap();
+        std::fs::write(work.path().join("old8/b.md"), b).unwrap();
+        git_commit_paths(&work, &["old8/a.md", "old8/b.md"], "add old8");
+
+        let referencing = "---\ntitle: Referencer\ndescription: d\ntype: guide\ntags: [t]\n---\n\n\
+                            See [a](old8/a.md) for more.\n";
+        std::fs::write(work.path().join("referencing8.md"), referencing).unwrap();
+        git_commit_paths(&work, &["referencing8.md"], "add referencing8.md");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencing8.md",
+                "markdown",
+                &[("old8/a.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let err = move_directory(&harness.deps(), "old8", "new8", None)
+            .await
+            .unwrap_err();
+        match err {
+            DirectoryMoveError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
+            other => panic!("expected PreCommitFailed, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("old8/a.md")).unwrap(),
+            a,
+            "source a.md must be restored after a rolled-back directory move"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("old8/b.md")).unwrap(),
+            b,
+            "source b.md must be restored after a rolled-back directory move"
+        );
+        assert!(
+            !work.path().join("new8").exists(),
+            "destination prefix must be gone after a rolled-back directory move"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("referencing8.md")).unwrap(),
+            referencing,
+            "the referencing document's link rewrite must be rolled back too, not just the move"
+        );
+        assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status(&work), "");
     }
 }

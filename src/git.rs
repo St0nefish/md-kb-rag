@@ -330,11 +330,17 @@ pub enum CommitSyncError {
 /// remote branch, rebase the local branch onto it, and push. Returns the new commit
 /// SHA plus any paths pulled in by the rebase — see [`CommitOutcome`].
 ///
-/// `rel_path` is relative to `data_path`. `message` already includes any provenance trailer.
-/// If `git_url` is None, commit locally only (no fetch/rebase/push).
+/// `paths` are relative to `data_path` and are committed together as a single, atomic
+/// commit — e.g. a document move can stage the old path's removal and the new path's
+/// addition as one call rather than two. `message` already includes any provenance
+/// trailer. If `git_url` is None, commit locally only (no fetch/rebase/push).
 /// On a rebase conflict, abort the rebase (so the working tree is left clean at the local
 /// commit) and return an Err whose message clearly identifies it as a rebase/merge conflict
 /// on the file, distinct from other git failures.
+///
+/// `paths` must not be empty — see the pathspec-scoping comment below on why an
+/// unscoped commit is dangerous. An empty slice returns `CommitSyncError::PreCommit`
+/// before any git command runs.
 ///
 /// The `Err` side distinguishes exactly where in that sequence things went wrong — see
 /// [`CommitSyncError`]. A caller that needs to roll back a failure must match on it
@@ -346,11 +352,17 @@ pub async fn commit_and_sync(
     branch: &str,
     data_path: &str,
     token: Option<&str>,
-    rel_path: &str,
+    paths: &[&str],
     message: &str,
     author_name: &str,
     author_email: &str,
 ) -> Result<CommitOutcome, CommitSyncError> {
+    if paths.is_empty() {
+        return Err(CommitSyncError::PreCommit(anyhow::anyhow!(
+            "commit_and_sync called with no paths"
+        )));
+    }
+
     // Helper: build a base git command with safe.directory set and cwd pointing at data_path.
     // Returns (Command,) ready to have more args appended.
     let git_cmd = |args: &[&str]| {
@@ -380,11 +392,13 @@ pub async fn commit_and_sync(
         cmd
     };
 
-    // --- git add -- <rel_path> ---
+    // --- git add -- <paths...> ---
     // Every failure from here through the end of `git commit` is PreCommit: HEAD has
     // not moved, so a caller can discard whatever this left behind and be back to
     // exactly where it started.
-    let add_out = timeout(GIT_TIMEOUT, git_cmd(&["add", "--", rel_path]).output())
+    let mut add_args: Vec<&str> = vec!["add", "--"];
+    add_args.extend(paths.iter().copied());
+    let add_out = timeout(GIT_TIMEOUT, git_cmd(&add_args).output())
         .await
         .map_err(|_| {
             CommitSyncError::PreCommit(anyhow::anyhow!("git add timed out after {:?}", GIT_TIMEOUT))
@@ -400,31 +414,33 @@ pub async fn commit_and_sync(
         )));
     }
 
-    // --- git commit -m <message> -- <rel_path> ---
+    // --- git commit -m <message> -- <paths...> ---
     // Set the author identity inline so the command is self-contained even in
     // environments without a global git user configured. Both author and committer
     // derive from user.* when not otherwise specified.
     //
-    // The trailing pathspec is what keeps this commit to the caller's own file.
-    // Without it `git commit` commits the ENTIRE index, so any unrelated staged
-    // entry — left by a failed write whose rollback did not complete, by the
+    // The trailing pathspec is what keeps this commit to the caller's own set of
+    // paths. Without it `git commit` commits the ENTIRE index, so any unrelated
+    // staged entry — left by a failed write whose rollback did not complete, by the
     // separate `index --full` CLI process, or by anything else touching the clone —
-    // silently rides along in this document's commit. The `add` above was already
+    // silently rides along in this call's commit. The `add` above was already
     // path-scoped; the commit has to be too, or the scoping accomplishes nothing.
-    let commit_out = timeout(
-        GIT_TIMEOUT,
-        git_cmd_authored(&["commit", "-m", message, "--", rel_path]).output(),
-    )
-    .await
-    .map_err(|_| {
-        CommitSyncError::PreCommit(anyhow::anyhow!(
-            "git commit timed out after {:?}",
-            GIT_TIMEOUT
-        ))
-    })?
-    .map_err(|e| {
-        CommitSyncError::PreCommit(anyhow::Error::new(e).context("Failed to spawn git commit"))
-    })?;
+    // Passing multiple paths here (rather than issuing one commit per path) is what
+    // lets a caller land a multi-file change — e.g. a document move's delete-old +
+    // add-new — as a single atomic commit instead of two.
+    let mut commit_args: Vec<&str> = vec!["commit", "-m", message, "--"];
+    commit_args.extend(paths.iter().copied());
+    let commit_out = timeout(GIT_TIMEOUT, git_cmd_authored(&commit_args).output())
+        .await
+        .map_err(|_| {
+            CommitSyncError::PreCommit(anyhow::anyhow!(
+                "git commit timed out after {:?}",
+                GIT_TIMEOUT
+            ))
+        })?
+        .map_err(|e| {
+            CommitSyncError::PreCommit(anyhow::Error::new(e).context("Failed to spawn git commit"))
+        })?;
     if !commit_out.status.success() {
         let stderr = redact_url(&String::from_utf8_lossy(&commit_out.stderr));
         return Err(CommitSyncError::PreCommit(anyhow::anyhow!(
@@ -1171,7 +1187,7 @@ pub(crate) mod tests {
             "main",
             work_path,
             None,
-            "notes.md",
+            &["notes.md"],
             "add notes.md\n\nmd-kb-rag bot commit",
             "test-bot",
             "test-bot@localhost",
@@ -1233,7 +1249,7 @@ pub(crate) mod tests {
             "main",
             work_path,
             None,
-            "article.md",
+            &["article.md"],
             "add article.md",
             "test-bot",
             "test-bot@localhost",
@@ -1282,7 +1298,7 @@ pub(crate) mod tests {
             "main",
             work_a.path().to_str().unwrap(),
             None,
-            "conflict.md",
+            &["conflict.md"],
             "add conflict.md from A",
             "test-bot",
             "test-bot@localhost",
@@ -1333,7 +1349,7 @@ pub(crate) mod tests {
             "main",
             work_b.path().to_str().unwrap(),
             None,
-            "conflict.md",
+            &["conflict.md"],
             "add conflict.md from B",
             "test-bot",
             "test-bot@localhost",
@@ -1374,7 +1390,7 @@ pub(crate) mod tests {
             "main",
             work_a.path().to_str().unwrap(),
             None,
-            "other.md",
+            &["other.md"],
             "add other.md from A",
             "test-bot",
             "test-bot@localhost",
@@ -1408,7 +1424,7 @@ pub(crate) mod tests {
             "main",
             work_b.path().to_str().unwrap(),
             None,
-            "mine.md",
+            &["mine.md"],
             "add mine.md from B",
             "test-bot",
             "test-bot@localhost",
@@ -1449,6 +1465,434 @@ pub(crate) mod tests {
         );
     }
 
+    /// Two independent new files, committed together via a two-element `paths`
+    /// slice, must land as a single commit that contains both — not two commits,
+    /// and not one commit missing either file.
+    #[tokio::test]
+    async fn commit_and_sync_commits_multiple_paths_in_one_commit() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("one.md"), "# One").unwrap();
+        std::fs::write(work.path().join("two.md"), "# Two").unwrap();
+
+        let lock = lock_git().await;
+        let head_before = rev_parse_head(&lock, work_path).await.unwrap();
+
+        let outcome = commit_and_sync(
+            &lock,
+            None,
+            "main",
+            work_path,
+            None,
+            &["one.md", "two.md"],
+            "add one.md and two.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        let show_out = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=", "HEAD"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let show_str = String::from_utf8_lossy(&show_out.stdout);
+        assert!(
+            show_str.contains("one.md") && show_str.contains("two.md"),
+            "both paths should appear in the single commit, got: {show_str}"
+        );
+
+        let log = std::process::Command::new("git")
+            .args([
+                "rev-list",
+                "--count",
+                &format!("{head_before}..{}", outcome.sha),
+            ])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let count = String::from_utf8_lossy(&log.stdout).trim().to_string();
+        assert_eq!(
+            count, "1",
+            "HEAD should have advanced by exactly one commit, got {count}"
+        );
+    }
+
+    /// A move-shaped change — delete an existing tracked file, create a new one —
+    /// committed in a single `commit_and_sync` call with both paths must produce
+    /// exactly one commit in which the old path is gone and the new path exists.
+    #[tokio::test]
+    async fn commit_and_sync_commits_a_move_shaped_change_as_one_commit() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        // Seed and commit the file that will be "moved" away from.
+        std::fs::write(work.path().join("old.md"), "# Content").unwrap();
+        let lock = lock_git().await;
+        commit_and_sync(
+            &lock,
+            None,
+            "main",
+            work_path,
+            None,
+            &["old.md"],
+            "seed old.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+        let head_before_move = rev_parse_head(&lock, work_path).await.unwrap();
+
+        // Move-shaped change: remove old.md from disk, add new.md.
+        std::fs::remove_file(work.path().join("old.md")).unwrap();
+        std::fs::write(work.path().join("new.md"), "# Content").unwrap();
+
+        let outcome = commit_and_sync(
+            &lock,
+            None,
+            "main",
+            work_path,
+            None,
+            &["old.md", "new.md"],
+            "move old.md to new.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        let log = std::process::Command::new("git")
+            .args([
+                "rev-list",
+                "--count",
+                &format!("{head_before_move}..{}", outcome.sha),
+            ])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let count = String::from_utf8_lossy(&log.stdout).trim().to_string();
+        assert_eq!(
+            count, "1",
+            "the move should land as exactly one commit, got {count}"
+        );
+
+        let name_status = std::process::Command::new("git")
+            .args(["show", "--name-status", "--format=", "HEAD"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let name_status_str = String::from_utf8_lossy(&name_status.stdout);
+        assert!(
+            name_status_str.contains("old.md"),
+            "old.md should be reflected as removed in the commit, got: {name_status_str}"
+        );
+        assert!(
+            name_status_str.contains("new.md"),
+            "new.md should be reflected as added in the commit, got: {name_status_str}"
+        );
+        assert!(
+            !work.path().join("old.md").exists(),
+            "old.md should be gone from the working tree"
+        );
+        assert!(
+            work.path().join("new.md").exists(),
+            "new.md should exist in the working tree"
+        );
+    }
+
+    /// An empty `paths` slice must be rejected before any git command runs — an
+    /// unscoped `git commit --` with no pathspec would commit the ENTIRE index,
+    /// which is exactly what the pathspec-scoping exists to prevent.
+    #[tokio::test]
+    async fn commit_and_sync_empty_paths_returns_precommit_and_creates_no_commit() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        let head_before = rev_parse_head(&lock, work_path).await.unwrap();
+
+        let result = commit_and_sync(
+            &lock,
+            None,
+            "main",
+            work_path,
+            None,
+            &[],
+            "empty paths",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+
+        match result {
+            Err(CommitSyncError::PreCommit(_)) => {}
+            other => panic!("expected CommitSyncError::PreCommit, got: {:?}", other),
+        }
+
+        let head_after = rev_parse_head(&lock, work_path).await.unwrap();
+        assert_eq!(
+            head_before, head_after,
+            "an empty-paths call must not create a commit or move HEAD"
+        );
+    }
+
+    /// One valid path plus one path that neither exists on disk nor was deleted
+    /// from HEAD (a typo'd destination in a move, say) — `git add` fails on the
+    /// bad pathspec before staging anything, so this must fail cleanly as
+    /// `PreCommit` with HEAD untouched, not half-commit the valid path.
+    #[tokio::test]
+    async fn commit_and_sync_multi_path_with_one_bad_path_returns_precommit_and_creates_no_commit()
+    {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        // real.md genuinely exists and would stage cleanly on its own; typo.md was
+        // never written and isn't tracked at HEAD either.
+        std::fs::write(work.path().join("real.md"), "# Real").unwrap();
+
+        let lock = lock_git().await;
+        let head_before = rev_parse_head(&lock, work_path).await.unwrap();
+
+        let result = commit_and_sync(
+            &lock,
+            None,
+            "main",
+            work_path,
+            None,
+            &["real.md", "typo.md"],
+            "move real.md to typo.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+
+        match result {
+            Err(CommitSyncError::PreCommit(_)) => {}
+            other => panic!("expected CommitSyncError::PreCommit, got: {:?}", other),
+        }
+
+        let head_after = rev_parse_head(&lock, work_path).await.unwrap();
+        assert_eq!(
+            head_before, head_after,
+            "a bad path anywhere in the slice must not move HEAD, even when other \
+             paths in the same slice are individually valid"
+        );
+
+        // `git add` fails on the whole pathspec atomically — nothing from this
+        // call, including the otherwise-valid real.md, ends up staged.
+        let staged = git_out(work_path, &["diff", "--cached", "--name-only"]);
+        assert!(
+            staged.trim().is_empty(),
+            "no path should be left staged after a failed multi-path add, staged: {staged}"
+        );
+    }
+
+    /// The same path appearing twice in the slice (e.g. a caller that doesn't
+    /// dedup before calling) must be harmless: `git add`/`git commit` both accept
+    /// a repeated pathspec, and this must still land as one normal commit.
+    #[tokio::test]
+    async fn commit_and_sync_duplicate_paths_in_slice_produce_one_normal_commit() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("dup.md"), "# Dup").unwrap();
+
+        let lock = lock_git().await;
+        let head_before = rev_parse_head(&lock, work_path).await.unwrap();
+
+        let outcome = commit_and_sync(
+            &lock,
+            None,
+            "main",
+            work_path,
+            None,
+            &["dup.md", "dup.md"],
+            "add dup.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        let log = std::process::Command::new("git")
+            .args([
+                "rev-list",
+                "--count",
+                &format!("{head_before}..{}", outcome.sha),
+            ])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let count = String::from_utf8_lossy(&log.stdout).trim().to_string();
+        assert_eq!(
+            count, "1",
+            "a duplicated path must still land as exactly one commit, got {count}"
+        );
+
+        let show_str = git_out(work_path, &["show", "--name-only", "--format=", "HEAD"]);
+        assert!(
+            show_str.contains("dup.md"),
+            "dup.md should be committed once, got: {show_str}"
+        );
+    }
+
+    /// The pathspec-scoping property in
+    /// `commit_is_scoped_to_its_path_and_ignores_unrelated_staged_entries` is the
+    /// whole reason the commit's pathspec exists, and must still hold once that
+    /// pathspec covers 2+ paths — an unrelated staged entry must not ride along
+    /// just because this call is committing a move instead of a single file.
+    #[tokio::test]
+    async fn commit_and_sync_multi_path_commit_ignores_unrelated_staged_entries() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("one.md"), "# One").unwrap();
+        std::fs::write(work.path().join("two.md"), "# Two").unwrap();
+        std::fs::write(work.path().join("stray.md"), "# Stray").unwrap();
+
+        // Residue from something other than this write.
+        git_out(work_path, &["add", "--", "stray.md"]);
+
+        let lock = lock_git().await;
+        commit_and_sync(
+            &lock,
+            None,
+            "main",
+            work_path,
+            None,
+            &["one.md", "two.md"],
+            "add one.md and two.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+        drop(lock);
+
+        let head = git_out(work_path, &["show", "--name-only", "--format=", "HEAD"]);
+        assert!(
+            head.contains("one.md") && head.contains("two.md"),
+            "own paths should be committed: {head}"
+        );
+        assert!(
+            !head.contains("stray.md"),
+            "an unrelated staged entry must NOT ride along in a multi-path commit: {head}"
+        );
+
+        // The stray is left exactly as it was — scoping the commit neither commits
+        // nor discards someone else's staged work.
+        let staged = git_out(work_path, &["diff", "--cached", "--name-only"]);
+        assert!(
+            staged.contains("stray.md"),
+            "unrelated staged entry should be untouched, staged: {staged}"
+        );
+    }
+
+    /// A multi-path (move-shaped) commit that needs a rebase to push — the rebase
+    /// itself must succeed, and `rebased_paths` must still report exactly the OTHER
+    /// commit's path, not be corrupted by this call's own multi-element pathspec.
+    #[tokio::test]
+    async fn commit_and_sync_rebase_succeeds_around_a_multi_path_commit() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+        let lock = lock_git().await;
+
+        // Clone A pushes first, adding other.md — this is the commit the rebase
+        // below must pull in.
+        let work_a = clone_bare_repo(bare.path(), "main");
+        std::fs::write(work_a.path().join("other.md"), "from A").unwrap();
+        commit_and_sync(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_a.path().to_str().unwrap(),
+            None,
+            &["other.md"],
+            "add other.md from A",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        // Clone B, rewound to before A's commit, seeds old.md directly (not
+        // through commit_and_sync — no push yet) so it's a tracked file at HEAD
+        // that the move below can move away from.
+        let work_b = clone_bare_repo(bare.path(), "main");
+        let work_b_path = work_b.path().to_str().unwrap();
+        let commits = git_out(work_b_path, &["log", "--format=%H", "-2"]);
+        let parent_sha = commits.lines().nth(1).unwrap().trim().to_string();
+        git_out(work_b_path, &["reset", "--hard", &parent_sha]);
+
+        std::fs::write(work_b.path().join("old.md"), "# Content").unwrap();
+        git_out(work_b_path, &["add", "old.md"]);
+        git_out(
+            work_b_path,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "seed old.md",
+            ],
+        );
+
+        // Still unaware of A's push, perform the move-shaped multi-path commit;
+        // commit_and_sync's fetch+rebase must pull A's other.md in around it.
+        std::fs::remove_file(work_b.path().join("old.md")).unwrap();
+        std::fs::write(work_b.path().join("new.md"), "# Content").unwrap();
+
+        let outcome = commit_and_sync(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_b_path,
+            None,
+            &["old.md", "new.md"],
+            "move old.md to new.md",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.rebased_paths,
+            vec![std::path::PathBuf::from("other.md")],
+            "the rebase pulled in A's commit, which touched other.md — a multi-path \
+             move commit must not corrupt rebased_paths accounting"
+        );
+
+        let name_status = git_out(work_b_path, &["show", "--name-status", "--format=", "HEAD"]);
+        assert!(
+            name_status.contains("old.md") && name_status.contains("new.md"),
+            "the replayed move commit should still show both paths, got: {name_status}"
+        );
+        assert!(
+            !work_b.path().join("old.md").exists(),
+            "old.md should be gone from the working tree after the rebase"
+        );
+        assert!(
+            work_b.path().join("new.md").exists(),
+            "new.md should exist in the working tree after the rebase"
+        );
+        assert!(
+            work_b.path().join("other.md").exists(),
+            "A's rebased-in commit should also be present in the working tree"
+        );
+    }
+
     // --- CommitSyncError phase-distinction tests ---
 
     /// `git add` fails (the path was never written to disk) — nothing is committed,
@@ -1470,7 +1914,7 @@ pub(crate) mod tests {
             "main",
             work_path,
             None,
-            "missing.md",
+            &["missing.md"],
             "add missing.md",
             "test-bot",
             "test-bot@localhost",
@@ -1509,7 +1953,7 @@ pub(crate) mod tests {
             "main",
             work_path,
             None,
-            "article.md",
+            &["article.md"],
             "add article.md",
             "test-bot",
             "test-bot@localhost",
@@ -1559,7 +2003,7 @@ pub(crate) mod tests {
             "main",
             work_path,
             Some("super_secret_token"),
-            "secret.md",
+            &["secret.md"],
             "add secret.md",
             "test-bot",
             "test-bot@localhost",
@@ -1819,14 +2263,16 @@ pub(crate) mod tests {
             let work_path = work_path.clone();
             handles.push(tokio::spawn(async move {
                 let lock = lock_git().await;
+                let doc_path = format!("doc{i}.md");
+                let doc_message = format!("add doc{i}.md");
                 commit_and_sync(
                     &lock,
                     None,
                     "main",
                     &work_path,
                     None,
-                    &format!("doc{i}.md"),
-                    &format!("add doc{i}.md"),
+                    &[doc_path.as_str()],
+                    &doc_message,
                     "test-bot",
                     "test-bot@localhost",
                 )
@@ -1885,7 +2331,7 @@ pub(crate) mod tests {
             "main",
             work_path,
             None,
-            "mine.md",
+            &["mine.md"],
             "add mine.md",
             "test-bot",
             "test-bot@localhost",
@@ -1950,7 +2396,7 @@ pub(crate) mod tests {
             "main",
             work_a.path().to_str().unwrap(),
             None,
-            "conflict.md",
+            &["conflict.md"],
             "add conflict.md from A",
             "test-bot",
             "test-bot@localhost",

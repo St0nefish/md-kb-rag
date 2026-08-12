@@ -7,8 +7,12 @@
  * Talks to the write pipeline via the fixed HTTP API contract:
  *   GET    api/schema/<path>  -> schema hints panel + new-document template
  *   GET    api/doc/<path>     -> load content + content_hash for editing
- *   POST   api/doc/<path>     -> create/edit
- *                                {content, commit_message, create, expected_hash?}
+ *   POST   api/doc/<path>     -> create/edit/move
+ *                                {content, commit_message, create, expected_hash?, new_path?}
+ *                                `new_path` turns the same POST into an atomic
+ *                                move/rename (see doMove() below) — the server
+ *                                never reads the source itself, so `content` is
+ *                                always sent, same as a plain edit.
  *   DELETE api/doc/<path>     -> delete {commit_message}
  *
  * Editor engine: a plain <textarea> plus a live marked.js preview pane —
@@ -57,6 +61,7 @@
     els.newDocBtn = $("new-doc-btn");
     els.editBtn = $("edit-btn");
     els.deleteBtn = $("delete-btn");
+    els.moveBtn = $("editor-move");
 
     els.confirmOverlay = $("confirm-overlay");
     els.confirmMessage = $("confirm-message");
@@ -71,6 +76,7 @@
 
     els.cancelBtn.addEventListener("click", closeEditor);
     els.saveBtn.addEventListener("click", save);
+    if (els.moveBtn) els.moveBtn.addEventListener("click", openMovePrompt);
     els.textarea.addEventListener("input", schedulePreview);
     els.pathInput.addEventListener("blur", onPathBlur);
 
@@ -146,6 +152,11 @@
     } else {
       els.pathInput.removeAttribute("readonly");
     }
+    // Move/rename only makes sense against an existing document — a create
+    // has no source to move from (the server rejects that combination too,
+    // see post_doc_handler's `new_path` + `create: true` check, but there is
+    // no reason to offer a control here that can only ever 400).
+    if (els.moveBtn) els.moveBtn.hidden = mode !== "edit";
 
     els.textarea.value = "";
     els.preview.innerHTML = "";
@@ -497,15 +508,34 @@
     }
   }
 
-  async function onSaveSuccess(path, data) {
+  /** Shared success path for save() and doMove(). `movedFrom`, when set,
+   * means `path` is a NEW location a document was just moved to — the stale
+   * node at the old path is dropped client-side immediately (same as
+   * doDelete()'s removeNodeById) rather than left to look like a duplicate
+   * until the async reindex worker catches up and refreshGraph() reflects
+   * the move server-side.
+   *
+   * A move may also have rewritten OTHER documents' links to point at the
+   * new location (`data.rewritten_paths`, from the fixed API contract's
+   * `POST /api/doc/{*path}` response) — silently editing other documents
+   * without saying so is not acceptable, so that's appended to the status
+   * line whenever it's non-empty. */
+  async function onSaveSuccess(path, data, movedFrom) {
     const sha = data && data.sha ? String(data.sha).slice(0, 8) : null;
     const pendingSync = data && data.outcome === "committed_pending_sync";
+    const rewrittenCount =
+      data && Array.isArray(data.rewritten_paths) ? data.rewritten_paths.length : 0;
+    const rewriteNote = rewrittenCount
+      ? ` — updated links in ${rewrittenCount} document${rewrittenCount === 1 ? "" : "s"}`
+      : "";
     setStatus(
-      pendingSync
+      (pendingSync
         ? `Committed locally${sha ? ` (${sha})` : ""} — push pending`
-        : `Saved${sha ? ` (${sha})` : ""}`,
+        : `${movedFrom ? "Moved" : "Saved"}${sha ? ` (${sha})` : ""}`) + rewriteNote,
       "ok"
     );
+
+    if (movedFrom) window.KBViz.removeNodeById(movedFrom);
 
     // Re-fetch to pick up the fresh content_hash for any further save in
     // this session, and to reflect any server-side normalization.
@@ -522,6 +552,12 @@
 
     mode = "edit";
     originalPath = path;
+    // No-op for a plain save (path === els.pathInput.value already), but a
+    // move changes the path out from under the editor, so the toolbar's
+    // path field must follow it — otherwise the next Cmd/Ctrl+S or Move…
+    // would keep acting on the OLD path's display value even though
+    // originalPath (what save()/doMove() actually send) has already moved on.
+    els.pathInput.value = path;
     updateModeBadge();
     els.pathInput.setAttribute("readonly", "readonly");
     renderPreview();
@@ -530,6 +566,150 @@
     window.KBViz.showDetail(path);
 
     setTimeout(closeEditor, 700);
+  }
+
+  // -------------------------------------------------------------------
+  // Move / rename
+  // -------------------------------------------------------------------
+
+  /** Prompt for a destination path (prefilled with the current path, so a
+   * rename is a small edit rather than retyping the whole thing) and, if
+   * confirmed, hand off to doMove(). Only reachable in edit mode — see the
+   * `els.moveBtn.hidden = mode !== "edit"` toggle in openEditor(). */
+  async function openMovePrompt() {
+    if (mode !== "edit" || !originalPath) return;
+    clearErrors();
+    const raw = window.prompt(
+      "Move/rename to (repo-relative path):",
+      originalPath
+    );
+    if (raw === null) return; // user cancelled
+    const newPath = raw.trim().replace(/^\/+/, "");
+    if (!newPath) return;
+    if (!newPath.toLowerCase().endsWith(".md")) {
+      window.alert("Path must end in .md");
+      return;
+    }
+    if (newPath === originalPath) {
+      window.alert("New path is the same as the current path.");
+      return;
+    }
+    await doMove(newPath);
+  }
+
+  /** Send the move as a POST with `new_path` set, carrying whatever content
+   * currently sits in the textarea — including unsaved edits, so a rename
+   * and an in-flight edit land in one commit rather than requiring two
+   * saves. Mirrors save()'s shape (same endpoint, same expected_hash guard)
+   * but is kept as its own function rather than folded into save(): the
+   * two have different confirmation copy, different success framing
+   * ("moved" vs "saved"), and — the part most worth keeping separate —
+   * different 409 handling (see renderMoveConflict). */
+  async function doMove(newPath) {
+    if (!originalHash) {
+      showError(
+        "Cannot move: the document hasn't finished loading (or failed to load). Close and reopen the editor."
+      );
+      return;
+    }
+
+    const path = originalPath;
+    const commitMessage = window.prompt(
+      "Commit message:",
+      `docs: move ${path} to ${newPath}`
+    );
+    if (commitMessage === null) return; // user cancelled
+    if (!commitMessage.trim()) {
+      showError("Commit message is required.");
+      return;
+    }
+
+    const body = {
+      content: els.textarea.value,
+      commit_message: commitMessage,
+      create: false,
+      expected_hash: originalHash,
+      new_path: newPath,
+    };
+
+    setStatus("Moving…", null);
+    els.saveBtn.disabled = true;
+    if (els.moveBtn) els.moveBtn.disabled = true;
+    try {
+      const res = await fetch(`api/doc/${window.KBViz.encodePathForApi(path)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await safeJson(res);
+
+      if (res.ok) {
+        await onSaveSuccess(newPath, data, path);
+      } else if (res.status === 422) {
+        // Validation on a move runs against the DESTINATION directory's
+        // schema, not the source's (see write.rs's write_document_move) —
+        // say so, rather than the plain "Validation failed:" save() uses,
+        // so a required-field error here doesn't read as though the
+        // document that was already valid at its old path had regressed.
+        renderFieldErrors(
+          data,
+          `Validation failed against the schema for "${newPath}":`
+        );
+      } else if (res.status === 409) {
+        // A move can 409 two different ways, and they need OPPOSITE
+        // guidance: a stale expected_hash (someone else changed the SOURCE
+        // since it was loaded — see write.rs's write_document_move) means
+        // reload and retry, while a destination collision means the reload
+        // is useless and the fix is to pick a different destination path.
+        // Discriminate on the response body's actual shape rather than its
+        // prose: `write_error_response`'s StaleHash arm always includes an
+        // `expected_hash` field (web.rs), while `post_doc_handler`'s
+        // destination-collision arm (the `AlreadyExists` special case for a
+        // move) never does.
+        if (data && Object.prototype.hasOwnProperty.call(data, "expected_hash")) {
+          // Stale read of the source: same remedy as a plain save's
+          // stale-hash 409, so reuse renderConflict() (its "Reload latest
+          // version" button reloads `path`, the SOURCE — exactly what's
+          // stale here). Picking a different destination would not help
+          // and would silently branch the document.
+          renderConflict(data, path);
+        } else {
+          renderMoveConflict(data, newPath);
+        }
+      } else {
+        renderGenericError(res.status, data);
+      }
+    } catch (err) {
+      setStatus(`Move failed: ${err.message}`, "err");
+    } finally {
+      els.saveBtn.disabled = false;
+      if (els.moveBtn) els.moveBtn.disabled = false;
+    }
+  }
+
+  /** 409 for a move: the destination path already has a document at it.
+   * Distinct from renderConflict() (stale expected_hash / create-on-existing
+   * / edit-on-missing) — a move can also hit a stale-hash 409 (a concurrent
+   * edit of the SOURCE), but doMove() routes that case to renderConflict()
+   * instead, since "reload and retry" is the right guidance there, not
+   * "pick a different destination path". See doMove()'s 409 branch for the
+   * discriminator. */
+  function renderMoveConflict(data, newPath) {
+    els.errors.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = `Move failed (HTTP 409): ${
+      errorMessageFrom(data) ||
+      `a document already exists at "${newPath}".`
+    }`;
+    els.errors.appendChild(p);
+
+    const hint = document.createElement("p");
+    hint.className = "muted";
+    hint.textContent = "Choose a different destination path and try again.";
+    els.errors.appendChild(hint);
+
+    els.errors.hidden = false;
+    setStatus("Move conflict — destination already exists", "err");
   }
 
   // -------------------------------------------------------------------
@@ -607,11 +787,14 @@
   }
 
   /** 422: render the structured per-field validation errors the write
-   * pipeline returns (see write.rs's `FieldError` / `ValidationResult`). */
-  function renderFieldErrors(data) {
+   * pipeline returns (see write.rs's `FieldError` / `ValidationResult`).
+   * `heading` overrides the default lead-in — doMove() passes one naming the
+   * destination directory's schema, since a move validates against THAT
+   * schema, not the source's (see write.rs's write_document_move). */
+  function renderFieldErrors(data, heading) {
     els.errors.innerHTML = "";
     const p = document.createElement("p");
-    p.textContent = "Validation failed:";
+    p.textContent = heading || "Validation failed:";
     els.errors.appendChild(p);
 
     const list = (data && data.field_errors) || [];
