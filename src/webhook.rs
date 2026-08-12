@@ -834,7 +834,7 @@ mod tests {
         let sig = compute_hmac(secret, body);
         let config = git_backed_config(bare.path(), local.path());
 
-        let pending_before = reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        let pending_before = reindex::REINDEX_QUEUE.snapshot_paths();
 
         let status = deliver_webhook(config, secret, &sig).await;
         assert_eq!(status, StatusCode::OK);
@@ -844,15 +844,16 @@ mod tests {
         assert!(local.path().join("webhook-diff/added-2.md").exists());
 
         // REINDEX_QUEUE is process-global, shared with every other test in this
-        // binary (see the note on `handle_webhook_marks_a_full_reconcile_...` above),
-        // so this can only assert a lower bound under parallel `cargo test`. That is
-        // still a real assertion: if the diff came back empty — the exact regression
-        // this test targets — the delta would be 0, and this would fail.
-        let pending_after = reindex::REINDEX_QUEUE.snapshot().pending_paths;
-        assert!(
-            pending_after >= pending_before + 2,
-            "the two files the pull brought in must reach the reindex queue: \
-             before={pending_before} after={pending_after}"
+        // binary (see the note on `handle_webhook_marks_a_full_reconcile_...`
+        // above) — asserting the specific paths below (rather than a bare count)
+        // is what keeps that sharing from making this assertion meaningless: if
+        // the diff came back empty — the exact regression this test targets —
+        // neither path would show up in `pending_after` and this would fail.
+        let pending_after = reindex::REINDEX_QUEUE.snapshot_paths();
+        reindex::test_support::assert_marked_dirty(
+            &pending_before,
+            &pending_after,
+            &["webhook-diff/added-1.md", "webhook-diff/added-2.md"],
         );
     }
 
@@ -874,16 +875,16 @@ mod tests {
         let sig = compute_hmac(secret, body);
         let config = git_backed_config(bare.path(), local.path());
 
-        let pending_before = reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        let pending_before = reindex::REINDEX_QUEUE.snapshot_paths();
 
         push_file_from_a_fresh_clone(bare.path(), "master", "webhook-drop-check/first.md", "one");
         let first_status = deliver_webhook(Arc::clone(&config), secret, &sig).await;
         assert_eq!(first_status, StatusCode::OK);
-        let pending_after_first = reindex::REINDEX_QUEUE.snapshot().pending_paths;
-        assert!(
-            pending_after_first > pending_before,
-            "first delivery must mark its own path: before={pending_before} \
-             after={pending_after_first}"
+        let pending_after_first = reindex::REINDEX_QUEUE.snapshot_paths();
+        reindex::test_support::assert_marked_dirty(
+            &pending_before,
+            &pending_after_first,
+            &["webhook-drop-check/first.md"],
         );
 
         // Second delivery, with the first delivery's mark still undrained — exactly
@@ -892,12 +893,20 @@ mod tests {
         push_file_from_a_fresh_clone(bare.path(), "master", "webhook-drop-check/second.md", "two");
         let second_status = deliver_webhook(Arc::clone(&config), secret, &sig).await;
         assert_eq!(second_status, StatusCode::OK);
-        let pending_after_second = reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        let pending_after_second = reindex::REINDEX_QUEUE.snapshot_paths();
+        // Base this comparison on `pending_after_first`, not `pending_before`: the
+        // point is that the SECOND delivery's own mark lands on top of the first
+        // delivery's still-undrained work, not merely that `second.md` differs
+        // from whatever was pending before either delivery ran.
+        reindex::test_support::assert_marked_dirty(
+            &pending_after_first,
+            &pending_after_second,
+            &["webhook-drop-check/second.md"],
+        );
         assert!(
-            pending_after_second > pending_after_first,
-            "a second delivery must add its own path on top of the first's still-\
-             undrained work, not be dropped because something is already queued: \
-             after_first={pending_after_first} after_second={pending_after_second}"
+            pending_after_second.contains(&std::path::PathBuf::from("webhook-drop-check/first.md")),
+            "the first delivery's path must still be pending — not dropped because \
+             a second delivery arrived while it was still queued"
         );
     }
 }
