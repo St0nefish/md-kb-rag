@@ -963,14 +963,17 @@ fn forbidden(msg: impl Into<String>) -> Response {
 /// unlike the MCP adapter, this is NOT a message-parity surface.
 fn resolve_write_target_error_response(err: retrieval::ResolveErr) -> Response {
     match err {
-        retrieval::ResolveErr::NotFound => write_error_response(&WriteError::NotFound),
+        retrieval::ResolveErr::NotFound => write_error_response(&WriteError::NotFound, None),
         retrieval::ResolveErr::Outside => forbidden("path is outside the data directory"),
         retrieval::ResolveErr::NotPermitted => forbidden("file type not permitted"),
         retrieval::ResolveErr::Other(msg) => {
             error!("resolve_within_data: {msg}");
-            write_error_response(&WriteError::Io {
-                msg: "internal error resolving path".to_string(),
-            })
+            write_error_response(
+                &WriteError::Io {
+                    msg: "internal error resolving path".to_string(),
+                },
+                None,
+            )
         }
     }
 }
@@ -1016,7 +1019,15 @@ fn write_success_response(success: WriteSuccess) -> Response {
 ///   itself failed; filesystem and git state may disagree.
 /// - 500 `{"outcome": "failed_no_change"}` — any other pre-commit failure
 ///   (a clean rollback, or an I/O error before git was ever touched).
-fn write_error_response(err: &WriteError) -> Response {
+///
+/// `dest_path` disambiguates `WriteError::AlreadyExists`, the same way
+/// `mcp.rs`'s `create_edit_error_to_mcp_error` uses its own `dest_path`
+/// parameter for the identical problem: that variant carries no path of its
+/// own, so a plain create/edit collision (unambiguous — there is only one
+/// path in play) and a move-destination collision (which must name the
+/// DESTINATION, not the source being edited) need different messages from
+/// the same arm. Pass `None` for every call with no destination in play.
+fn write_error_response(err: &WriteError, dest_path: Option<&str>) -> Response {
     match err {
         WriteError::Frozen { reason } => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1076,19 +1087,25 @@ fn write_error_response(err: &WriteError) -> Response {
         }
         // Generic "document already exists" is unambiguous for a create (there
         // is only one path in play). A move also produces this variant when its
-        // DESTINATION collides — `post_doc_handler` intercepts that case ahead
-        // of this function (before it ever reaches this generic arm) and
-        // returns a message naming the destination explicitly, so a caller
-        // moving a document is never told "document already exists" about the
-        // very path they're editing.
-        WriteError::AlreadyExists => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "outcome": "failed_no_change",
-                "error": "document already exists",
-            })),
-        )
-            .into_response(),
+        // DESTINATION collides — `dest_path` names the destination explicitly in
+        // that case, so a caller moving a document is never told "document
+        // already exists" about the very path they're editing.
+        WriteError::AlreadyExists => {
+            let msg = match dest_path {
+                Some(dest) => {
+                    format!("a document already exists at the destination path '{dest}'")
+                }
+                None => "document already exists".to_string(),
+            };
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "outcome": "failed_no_change",
+                    "error": msg,
+                })),
+            )
+                .into_response()
+        }
         WriteError::NotFound => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1224,7 +1241,7 @@ async fn post_doc_handler(
             Ok(s) => (s, rel_path),
             Err(e) => {
                 error!("post_doc: failed to read '{}': {}", canonical.display(), e);
-                return write_error_response(&WriteError::Io { msg: e.to_string() });
+                return write_error_response(&WriteError::Io { msg: e.to_string() }, None);
             }
         }
     };
@@ -1269,23 +1286,11 @@ async fn post_doc_handler(
         // comment in write.rs) — for a plain create that's unambiguous (there
         // is only one path in play), but for a move the collision is always on
         // the DESTINATION (`write_document_move` checks source-exists before
-        // dest-exists, so this variant can only mean the destination). Name it
-        // explicitly here rather than falling through to
-        // `write_error_response`'s generic "document already exists", which
-        // would read as though `rel_path` (the document the caller is editing)
-        // were the problem.
-        Err(WriteError::AlreadyExists) if dest_rel.is_some() => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "outcome": "failed_no_change",
-                "error": format!(
-                    "a document already exists at the destination path '{}'",
-                    dest_rel.as_deref().unwrap_or_default()
-                ),
-            })),
-        )
-            .into_response(),
-        Err(err) => write_error_response(&err),
+        // dest-exists, so this variant can only mean the destination).
+        // `write_error_response`'s `dest_path` parameter names it explicitly in
+        // that case, so the message never reads as though `rel_path` (the
+        // document the caller is editing) were the problem.
+        Err(err) => write_error_response(&err, dest_rel.as_deref()),
     }
 }
 
@@ -1329,7 +1334,7 @@ async fn delete_doc_handler(
 
     match write::delete_document(&deps, &rel_path, body.commit_message.as_deref()).await {
         Ok(success) => write_success_response(success),
-        Err(err) => write_error_response(&err),
+        Err(err) => write_error_response(&err, None),
     }
 }
 
@@ -2116,7 +2121,7 @@ mod tests {
             errors: vec!["title is required".into()],
             field_errors: vec![sample_field_error()],
         };
-        let resp = write_error_response(&WriteError::Validation { result });
+        let resp = write_error_response(&WriteError::Validation { result }, None);
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let json = body_json(resp).await;
         assert_eq!(json["outcome"], "failed_no_change");
@@ -2128,9 +2133,12 @@ mod tests {
 
     #[tokio::test]
     async fn write_error_response_frozen_is_422() {
-        let resp = write_error_response(&WriteError::Frozen {
-            reason: "invalid yaml".into(),
-        });
+        let resp = write_error_response(
+            &WriteError::Frozen {
+                reason: "invalid yaml".into(),
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let json = body_json(resp).await;
         assert_eq!(json["outcome"], "failed_no_change");
@@ -2138,11 +2146,14 @@ mod tests {
 
     #[tokio::test]
     async fn write_error_response_dedup_hit_is_409() {
-        let resp = write_error_response(&WriteError::DedupHit {
-            duplicate_of: "docs/existing.md".into(),
-            similarity: 0.92,
-            threshold: 0.85,
-        });
+        let resp = write_error_response(
+            &WriteError::DedupHit {
+                duplicate_of: "docs/existing.md".into(),
+                similarity: 0.92,
+                threshold: 0.85,
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let json = body_json(resp).await;
         assert_eq!(json["duplicate_of"], "docs/existing.md");
@@ -2150,22 +2161,53 @@ mod tests {
 
     #[tokio::test]
     async fn write_error_response_already_exists_is_409() {
-        let resp = write_error_response(&WriteError::AlreadyExists);
+        let resp = write_error_response(&WriteError::AlreadyExists, None);
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "document already exists");
+        // The frontend (`assets/ui/edit.js`) discriminates a name-collision 409
+        // from a stale-read 409 purely by whether the body carries
+        // `expected_hash` — see `write_error_response_stale_hash_is_409` for the
+        // shape that must, conversely, always carry it. If a collision response
+        // ever grew this field, an edit conflict would silently get "reload the
+        // page" advice instead of "pick a different name/path".
+        assert!(
+            json.get("expected_hash").is_none(),
+            "an AlreadyExists response must never carry expected_hash: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_error_response_already_exists_with_dest_names_destination() {
+        // The move-destination collision case: `dest_path` is `Some`, so the
+        // message must name the destination explicitly rather than use the
+        // generic create/edit-collision wording.
+        let resp = write_error_response(&WriteError::AlreadyExists, Some("moved.md"));
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = body_json(resp).await;
+        let msg = json["error"].as_str().unwrap();
+        assert!(
+            msg.contains("moved.md") && msg.to_lowercase().contains("destination"),
+            "expected the destination path named as the collision, got: {msg}"
+        );
+        assert!(json.get("expected_hash").is_none());
     }
 
     #[tokio::test]
     async fn write_error_response_not_found_is_409() {
-        let resp = write_error_response(&WriteError::NotFound);
+        let resp = write_error_response(&WriteError::NotFound, None);
         assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn write_error_response_stale_hash_is_409() {
-        let resp = write_error_response(&WriteError::StaleHash {
-            expected: "aaa".into(),
-            actual: "bbb".into(),
-        });
+        let resp = write_error_response(
+            &WriteError::StaleHash {
+                expected: "aaa".into(),
+                actual: "bbb".into(),
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let json = body_json(resp).await;
         assert_eq!(json["expected_hash"], "aaa");
@@ -2174,17 +2216,23 @@ mod tests {
 
     #[tokio::test]
     async fn write_error_response_invalid_commit_message_is_400() {
-        let resp = write_error_response(&WriteError::InvalidCommitMessage {
-            reason: "must not contain newlines".into(),
-        });
+        let resp = write_error_response(
+            &WriteError::InvalidCommitMessage {
+                reason: "must not contain newlines".into(),
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn write_error_response_unsafe_path_is_400() {
-        let resp = write_error_response(&WriteError::UnsafePath {
-            msg: "path escapes the knowledge base root".into(),
-        });
+        let resp = write_error_response(
+            &WriteError::UnsafePath {
+                msg: "path escapes the knowledge base root".into(),
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2195,11 +2243,14 @@ mod tests {
         // body must never contain it (mirrors the F4 test for
         // `resolve_within_data`'s analogous failure).
         let abs = "/data/kb/some/container/path";
-        let resp = write_error_response(&WriteError::Internal {
-            msg: format!(
-                "Invalid path: cannot canonicalize data root '{abs}': No such file or directory"
-            ),
-        });
+        let resp = write_error_response(
+            &WriteError::Internal {
+                msg: format!(
+                    "Invalid path: cannot canonicalize data root '{abs}': No such file or directory"
+                ),
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(resp).await;
         let body_str = body.to_string();
@@ -2212,10 +2263,13 @@ mod tests {
 
     #[tokio::test]
     async fn write_error_response_precommit_rolled_back_is_500_failed_no_change() {
-        let resp = write_error_response(&WriteError::PreCommitFailed {
-            rolled_back: true,
-            msg: "commit failed".into(),
-        });
+        let resp = write_error_response(
+            &WriteError::PreCommitFailed {
+                rolled_back: true,
+                msg: "commit failed".into(),
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json = body_json(resp).await;
         assert_eq!(json["outcome"], "failed_no_change");
@@ -2223,10 +2277,13 @@ mod tests {
 
     #[tokio::test]
     async fn write_error_response_precommit_not_rolled_back_is_500_inconsistent_state() {
-        let resp = write_error_response(&WriteError::PreCommitFailed {
-            rolled_back: false,
-            msg: "commit failed AND rollback failed".into(),
-        });
+        let resp = write_error_response(
+            &WriteError::PreCommitFailed {
+                rolled_back: false,
+                msg: "commit failed AND rollback failed".into(),
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json = body_json(resp).await;
         assert_eq!(json["outcome"], "failed_inconsistent_state");
@@ -2234,9 +2291,12 @@ mod tests {
 
     #[tokio::test]
     async fn write_error_response_io_is_500_failed_no_change() {
-        let resp = write_error_response(&WriteError::Io {
-            msg: "disk full".into(),
-        });
+        let resp = write_error_response(
+            &WriteError::Io {
+                msg: "disk full".into(),
+            },
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json = body_json(resp).await;
         assert_eq!(json["outcome"], "failed_no_change");
@@ -2510,7 +2570,7 @@ mod tests {
         assert_eq!(json["outcome"], "failed_no_change");
         // The message must name the DESTINATION as the collision, not read as
         // though `source.md` (the document being edited) were the problem —
-        // see `post_doc_handler`'s `WriteError::AlreadyExists` interception.
+        // see `write_error_response`'s `dest_path` parameter.
         let msg = json["error"].as_str().unwrap();
         assert!(
             msg.contains("taken.md") && msg.to_lowercase().contains("destination"),

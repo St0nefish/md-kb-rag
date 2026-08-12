@@ -1619,6 +1619,7 @@ dependencies = [
  "backoff",
  "chrono",
  "clap",
+ "futures",
  "globset",
  "gray_matter",
  "hex",
