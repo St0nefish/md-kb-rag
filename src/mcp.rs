@@ -1584,15 +1584,15 @@ fn move_directory_error_to_mcp_error(
             ),
             None,
         ),
-        DirectoryMoveError::SchemaInSource { path } => McpError::invalid_params(
+        DirectoryMoveError::BrokenSchemaInSource { path, reason } => McpError::invalid_params(
             format!(
-                "Cannot move '{}': it contains a schema file ('{}'). Moving a directory \
-                 together with its own {} is not supported in this version — the moved \
-                 documents' frontmatter would need to validate against a schema cascade \
-                 that is ALSO moving. Move the schema file separately (e.g. with \
-                 edit_document's MOVE MODE) and retry this move afterward.",
+                "Cannot move '{}': the schema file '{}' under the source subtree is invalid \
+                 ({}). A {} that cannot be read cannot be verified safe to relocate — moving \
+                 documents governed by rules this process cannot parse is exactly the case \
+                 this refuses. Fix it (or remove it) before retrying the move.",
                 source_dir,
                 path,
+                reason,
                 crate::schema::SCHEMA_FILE_NAME
             ),
             None,
@@ -1608,25 +1608,54 @@ fn move_directory_error_to_mcp_error(
             ),
             None,
         ),
-        DirectoryMoveError::Validation { failures } => {
+        DirectoryMoveError::Validation {
+            failures,
+            moved_schema_files,
+        } => {
             let summary = failures
                 .iter()
                 .map(|(path, result)| format!("{}: {}", path, result.errors.join("; ")))
                 .collect::<Vec<_>>()
                 .join(" | ");
+            let schema_note = if moved_schema_files.is_empty() {
+                String::new()
+            } else {
+                let relocated = moved_schema_files
+                    .iter()
+                    .map(|(old, new)| format!("{} -> {}", old, new))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "\n\nThis subtree carries its own {}, which is relocating along with it \
+                     ({}). That means these documents are being checked against a \
+                     GENUINELY DIFFERENT schema cascade than the one that governed them at \
+                     the source — a relocated schema file re-parents onto the destination's \
+                     ancestors, not the source's, so a document that was valid moments ago \
+                     can legitimately stop being valid. Either adjust the destination's \
+                     cascade to still admit these documents, fix the documents themselves, \
+                     or move the schema file separately first.",
+                    crate::schema::SCHEMA_FILE_NAME,
+                    relocated
+                )
+            };
             McpError::invalid_params(
                 format!(
                     "Cannot move '{}' to '{}': frontmatter validation against the \
-                     destination schema failed for {} document(s): {}",
+                     DESTINATION's schema cascade failed for {} document(s): {}{}",
                     source_dir,
                     dest_dir,
                     failures.len(),
-                    summary
+                    summary,
+                    schema_note
                 ),
                 Some(serde_json::json!({
                     "failures": failures.iter().map(|(path, result)| serde_json::json!({
                         "path": path,
                         "field_errors": result.field_errors,
+                    })).collect::<Vec<_>>(),
+                    "moved_schema_files": moved_schema_files.iter().map(|(old, new)| serde_json::json!({
+                        "from": old,
+                        "to": new,
                     })).collect::<Vec<_>>(),
                 })),
             )
@@ -3381,11 +3410,18 @@ impl KbSearchServer {
         dest_path must not already have any file living under it — this tool never merges \
         into or overwrites an existing prefix.\n\
         \n\
-        LIMITATION — schema files: a source subtree containing its own .kb-schema.yaml is \
-        rejected outright. Moving a schema file together with the documents it governs \
-        would change the very cascade those documents must validate against, which this \
-        version of the tool does not support. Move the schema file separately (e.g. with \
-        edit_document's MOVE MODE) and retry this move afterward.\n\
+        SCHEMA FILES: a source subtree containing its own .kb-schema.yaml is supported — the \
+        schema file moves along with the documents it governs. But relocating it re-parents \
+        its cascade: its own declarations are unchanged, but they now merge onto whatever \
+        governs the DESTINATION instead of the source, per field and per attribute. If the \
+        destination's ancestors declare different required fields, values sets, defaults, or \
+        types than the source's did, that difference reaches every document under the moved \
+        subtree — so a document that was valid at the source can legitimately fail validation \
+        at the destination, even though its own content and its own schema file's declarations \
+        never changed. This is checked BEFORE anything is written (see ALL-OR-NOTHING above), \
+        and the error names which schema file relocated and why. An unparseable \
+        .kb-schema.yaml anywhere in the source subtree blocks the move outright — rules that \
+        cannot be read cannot be verified safe to relocate.\n\
         \n\
         LINK REWRITING: a link between two documents that are BOTH moving keeps pointing \
         at each other post-move; a link to a document that stays in place keeps that exact \
@@ -7676,6 +7712,83 @@ mod tests {
                 .join("notes")
                 .join(crate::schema::SCHEMA_FILE_NAME)
                 .exists()
+        );
+    }
+
+    // -- move_directory_error_to_mcp_error: destination-cascade wording -----
+
+    #[test]
+    fn validation_error_names_the_destination_when_a_schema_file_relocated() {
+        // The crux requirement: when the source subtree's own schema file is
+        // moving too, the MCP-facing error must make clear the DESTINATION's
+        // (re-parented) cascade is why documents that were valid at the source
+        // now fail, not leave the caller staring at a bare validation failure.
+        let err = move_directory_error_to_mcp_error(
+            DirectoryMoveError::Validation {
+                failures: vec![(
+                    "dest/target/sub/a.md".to_string(),
+                    crate::validate::ValidationResult {
+                        file_path: "dest/target/sub/a.md".to_string(),
+                        valid: false,
+                        errors: vec!["missing required field 'extra_required'".to_string()],
+                        field_errors: vec![],
+                    },
+                )],
+                moved_schema_files: vec![(
+                    format!("src/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+                    format!("dest/target/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+                )],
+            },
+            "src",
+            "dest/target",
+        );
+
+        assert!(
+            err.message.contains("DESTINATION"),
+            "must name the destination cascade as the reason: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("dest/target"),
+            "must name the destination path: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("re-parent"),
+            "must explain the schema file re-parented onto the destination: {}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains(&format!("src/sub/{}", crate::schema::SCHEMA_FILE_NAME)),
+            "must name which schema file relocated: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn validation_error_without_a_relocated_schema_file_omits_the_reparenting_note() {
+        let err = move_directory_error_to_mcp_error(
+            DirectoryMoveError::Validation {
+                failures: vec![(
+                    "dest/a.md".to_string(),
+                    crate::validate::ValidationResult {
+                        file_path: "dest/a.md".to_string(),
+                        valid: false,
+                        errors: vec!["missing required field 'x'".to_string()],
+                        field_errors: vec![],
+                    },
+                )],
+                moved_schema_files: vec![],
+            },
+            "src",
+            "dest",
+        );
+
+        assert!(
+            !err.message.contains("re-parent"),
+            "no schema file moved, so there is nothing to explain re-parenting for: {}",
+            err.message
         );
     }
 }

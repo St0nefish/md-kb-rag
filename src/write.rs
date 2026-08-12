@@ -1669,7 +1669,10 @@ pub struct DirectoryMoveSuccess {
     pub outcome: WriteOutcome,
     pub sha: String,
     pub rebased_paths: Vec<PathBuf>,
-    /// `(old_rel, new_rel)` for every document moved, sorted by `old_rel`.
+    /// `(old_rel, new_rel)` for every document AND schema file moved (a
+    /// `.kb-schema.yaml` found under the source subtree moves along with the
+    /// documents it governs — see `DirectoryMoveError::BrokenSchemaInSource`'s
+    /// doc comment), sorted by `old_rel`.
     pub moved: Vec<(String, String)>,
     /// Documents OUTSIDE the moved subtree whose inline links were rewritten to
     /// point at a moved document's new location, and which rode along in the same
@@ -1696,26 +1699,42 @@ pub enum DirectoryMoveError {
     /// At least one file already lives under `dest_dir` — a directory move never
     /// merges into, or overwrites, an existing prefix.
     AlreadyExists,
-    /// A `.kb-schema.yaml` exists somewhere under the source subtree, at `path`.
-    /// A schema file moving together with the documents it governs would change
-    /// the very cascade those documents must validate against — validating them
-    /// against the destination's CURRENT cascade would then be wrong. This is a
-    /// deliberate v1 limitation: move the schema file separately (before or
-    /// after this call), then retry.
-    SchemaInSource {
+    /// A `.kb-schema.yaml` somewhere under the source subtree, at `path`, failed
+    /// to parse — `reason` is `SchemaCache::is_frozen`'s message for its
+    /// governing directory.
+    ///
+    /// This mirrors `is_frozen`'s own "rules unreadable ⇒ don't touch" stance:
+    /// moving documents governed by rules this process cannot read is exactly
+    /// the situation where it cannot verify the move is safe, so it refuses
+    /// outright rather than silently carrying the parse failure through into
+    /// the destination. A schema file that DOES parse is not blocked — it moves
+    /// with the documents it governs, and they are validated against the
+    /// cascade that results (see [`SchemaCache::with_remapped_scopes`]).
+    BrokenSchemaInSource {
         path: String,
+        reason: String,
     },
     /// The schema governing a source or destination document's directory failed
     /// to parse (`SchemaCache::is_frozen`).
     Frozen {
         reason: String,
     },
-    /// Frontmatter validation against the DESTINATION schema failed for one or
-    /// more documents. Carries every failure, not just the first — the whole
-    /// move is all-or-nothing, so a caller needs to know everything that would
-    /// need fixing, not just whichever document happened to be checked first.
+    /// Frontmatter validation against the DESTINATION's schema cascade failed
+    /// for one or more documents. Carries every failure, not just the first —
+    /// the whole move is all-or-nothing, so a caller needs to know everything
+    /// that would need fixing, not just whichever document happened to be
+    /// checked first.
     Validation {
         failures: Vec<(String, ValidationResult)>,
+        /// `(old_rel, new_rel)` for every `.kb-schema.yaml` this move is
+        /// relocating — empty when the source subtree carries no schema file
+        /// of its own. Non-empty means the destination cascade these failures
+        /// were checked against is not just "whatever already governed the
+        /// destination" but a genuinely NEW cascade, re-parented by this very
+        /// move — see `SchemaCache::with_remapped_scopes`. Lets the caller-
+        /// facing error name that explicitly instead of leaving a document
+        /// that was valid moments ago looking like an unexplained failure.
+        moved_schema_files: Vec<(String, String)>,
     },
     UnsafePath {
         msg: String,
@@ -1953,10 +1972,22 @@ async fn rollback_directory_move_filesystem(
 ///    [`DirectoryMoveError::SourceEmpty`].
 /// 2. No file may already live anywhere under `dest_dir`
 ///    ([`DirectoryMoveError::AlreadyExists`]) — a directory move never merges.
-/// 3. No `.kb-schema.yaml` may exist anywhere under the source subtree
-///    ([`DirectoryMoveError::SchemaInSource`]) — see that variant's doc comment.
+/// 3. Every `.kb-schema.yaml` under the source subtree must currently parse
+///    ([`DirectoryMoveError::BrokenSchemaInSource`] otherwise — see that
+///    variant's doc comment). One that does is not a blocker: it moves WITH the
+///    documents it governs (as a raw copy — schema files are never frontmatter-
+///    validated or link-rewritten), and every moved document is validated
+///    against a cascade rebuilt with that schema file's governing directory
+///    re-parented onto the destination (`SchemaCache::with_remapped_scopes`),
+///    not against the live cache, which still reflects the OLD parentage until
+///    the post-commit reindex rebuilds it. Relocating a schema file is a
+///    genuine semantic change — a document valid under the source's cascade can
+///    fail under the destination's — and that is exactly what guard 4 below
+///    (`DirectoryMoveError::Validation`) exists to catch before anything moves.
 /// 4. Neither the source nor destination subtree may be schema-frozen (checked
-///    per document, via `SchemaCache::is_frozen`).
+///    per document, via `SchemaCache::is_frozen`), and every moved document's
+///    frontmatter must validate against the (possibly re-parented, per guard 3)
+///    destination cascade.
 /// 5. Every source and destination document path passes the same path-safety
 ///    ([`safe_write_path`]) and include-pattern eligibility
 ///    ([`check_include_pattern`]) checks a single-document write applies.
@@ -2027,24 +2058,26 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         });
     }
 
-    // Guard 1 + guard 3: walk the whole source subtree once, collecting both the
-    // indexable documents (guard 1) and whether any `.kb-schema.yaml` lives
-    // anywhere underneath (guard 3) — one filesystem walk answers both.
+    // Guard 1: walk the whole source subtree once, collecting both the indexable
+    // documents (guard 1) and any `.kb-schema.yaml` living anywhere underneath —
+    // one filesystem walk answers both. A schema file no longer blocks the move
+    // (guard 3, checked further below, once `deps.schema_cache` is loaded) — it
+    // travels WITH the subtree instead, see this function's doc comment.
     let source_files = walk_subtree_files_async(deps.canonical_data_path, &abs_source_dir)
         .await
         .map_err(|e| DirectoryMoveError::Io {
             msg: format!("Failed to scan source directory '{}': {}", source_dir, e),
         })?;
 
-    if let Some(schema_path) = source_files.iter().find(|p| {
-        Path::new(p)
-            .file_name()
-            .is_some_and(|n| n == crate::schema::SCHEMA_FILE_NAME)
-    }) {
-        return Err(DirectoryMoveError::SchemaInSource {
-            path: schema_path.clone(),
-        });
-    }
+    let schema_files_in_source: Vec<String> = source_files
+        .iter()
+        .filter(|p| {
+            Path::new(p)
+                .file_name()
+                .is_some_and(|n| n == crate::schema::SCHEMA_FILE_NAME)
+        })
+        .cloned()
+        .collect();
 
     let documents: Vec<String> = source_files
         .into_iter()
@@ -2093,6 +2126,83 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         .map(|(old, new)| (old.as_str(), new.as_str()))
         .collect();
 
+    // Every schema file's new path, same prefix substitution as `moves` above.
+    // These move as raw copies alongside the documents they govern: never
+    // through frontmatter validation (a `.kb-schema.yaml` has no frontmatter of
+    // its own) and never through link rewriting (nothing in one is a markdown
+    // link). Deliberately excluded from `moving`/`moves` above — those drive the
+    // markdown link-rewrite passes, which a schema file relocation has nothing
+    // to do with.
+    let schema_moves: Vec<(String, String)> = schema_files_in_source
+        .iter()
+        .map(|old_rel| {
+            let suffix = old_rel
+                .strip_prefix(&source_prefix)
+                .expect("every scanned schema file falls under its own source prefix");
+            (old_rel.clone(), format!("{}/{}", dest_dir, suffix))
+        })
+        .collect();
+    // Every path this move touches, documents and schema files alike — used for
+    // commit staging, dirty-marking, rollback, and the success report. `moves`/
+    // `moving` above stay document-only: a schema file is never a markdown link
+    // target and never runs through `validate::validate_content`.
+    let mut all_moves: Vec<(String, String)> = moves
+        .iter()
+        .cloned()
+        .chain(schema_moves.iter().cloned())
+        .collect();
+    // `moves` and `schema_moves` are each individually sorted by `old_rel`
+    // (`walk_subtree_files` sorts), but the chained concatenation is not —
+    // re-sort so `DirectoryMoveSuccess::moved`'s documented ordering holds.
+    all_moves.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let schemas = crate::schema::load_shared(deps.schema_cache);
+
+    // Guard 3: any `.kb-schema.yaml` under the source subtree must currently
+    // parse, or this move is refused outright — see
+    // `DirectoryMoveError::BrokenSchemaInSource`'s doc comment for why (mirrors
+    // `SchemaCache::is_frozen`'s "rules unreadable ⇒ don't touch" stance).
+    // Checked against the `schemas` snapshot just loaded above, the same
+    // staleness tolerance every other check in this function already accepts
+    // (`is_frozen` below, in particular).
+    for schema_path in &schema_files_in_source {
+        let governing_dir = Path::new(schema_path.as_str())
+            .parent()
+            .unwrap_or(Path::new(""));
+        if let Some((_, reason)) = schemas
+            .broken_scopes()
+            .find(|(broken_dir, _)| broken_dir.as_path() == governing_dir)
+        {
+            return Err(DirectoryMoveError::BrokenSchemaInSource {
+                path: schema_path.clone(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+
+    // A NEW, detached cache with every schema file under `source_dir` re-parented
+    // onto `dest_dir` (see `SchemaCache::with_remapped_scopes`). Moved documents
+    // are validated against THIS cache below, not the live one: if the subtree
+    // carries its own schema file(s), the live cache still reflects the OLD
+    // parentage until the post-commit reindex rebuilds it
+    // (`reindex::unit_touches_schema`), so validating against it here would
+    // silently ignore the exact re-parenting this move is about to cause. When
+    // the subtree has no schema file of its own, `remap` never matches anything
+    // actually present in `schemas.raw`... other than possibly one of its own
+    // ancestors, which is intentional: an ancestor's schema is not itself under
+    // `source_dir`, so it is never relocated, and `remapped_schemas` resolves
+    // identically to `schemas` for every moved document in that case.
+    let source_dir_path = Path::new(source_dir);
+    let dest_dir_path = Path::new(dest_dir);
+    let remapped_schemas = schemas.with_remapped_scopes(|dir| {
+        if dir.starts_with(source_dir_path) {
+            let suffix = dir.strip_prefix(source_dir_path).unwrap_or(Path::new(""));
+            Some(dest_dir_path.join(suffix))
+        } else {
+            None
+        }
+    });
+
     // Guard 4 (frozen, per document) + guard 5 (eligibility/safety, per
     // document) + the outbound link rewrite. ALL before any mutation: every
     // document is only ever READ here, and every failure path below returns
@@ -2102,7 +2212,6 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // whichever document trips it first. Only `validate::validate_content`
     // below (which may exec a `lint_command` subprocess) is expensive enough,
     // and independent enough per document, to run concurrently.
-    let schemas = crate::schema::load_shared(deps.schema_cache);
     // (old_rel, new_rel, content_to_write)
     let mut contents: Vec<(String, String, String)> = Vec::new();
 
@@ -2142,6 +2251,25 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         contents.push((old_rel.clone(), new_rel.clone(), content_to_write));
     }
 
+    // Read every schema file's raw content too — same path-safety (guard 5) as
+    // any other moved file, but deliberately NOT `check_include_pattern` (a
+    // `.kb-schema.yaml` never matches the markdown include patterns, so that
+    // check would always reject it) and no `rewrite_outbound_links` (schema
+    // files hold no markdown links). These ride along in the same physical
+    // write/remove phases as `contents` below, chained rather than merged into
+    // it, so they never enter `validate::validate_content`.
+    let mut schema_contents: Vec<(String, String, String)> = Vec::new();
+    for (old_rel, new_rel) in &schema_moves {
+        let abs_source_schema = safe_write_path(deps, old_rel)?;
+        let _abs_dest_schema = safe_write_path(deps, new_rel)?;
+        let raw = tokio::fs::read_to_string(&abs_source_schema)
+            .await
+            .map_err(|e| DirectoryMoveError::Io {
+                msg: format!("Failed to read '{}': {}", old_rel, e),
+            })?;
+        schema_contents.push((old_rel.clone(), new_rel.clone(), raw));
+    }
+
     // Destination-schema validation, run concurrently across every document
     // rather than one `validate::validate_content` await at a time — each call
     // may exec an external `lint_command` subprocess, so a 200-document
@@ -2167,10 +2295,16 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // that has to hold for every item uniformly — the latter runs into a known
     // rustc limitation ("implementation of `FnOnce` is not general enough")
     // once the closure's return type borrows from both the loop item and an
-    // outer variable (`schemas`) at once.
+    // outer variable (`remapped_schemas`) at once.
+    //
+    // Deliberately `remapped_schemas`, not the live `schemas` snapshot: every
+    // moved document's frontmatter is checked against the cascade it will
+    // ACTUALLY resolve to post-move, with any schema file in this subtree
+    // already re-parented onto the destination — see `remapped_schemas`'s doc
+    // comment above and `SchemaCache::with_remapped_scopes`.
     let mut validation_futures = Vec::with_capacity(contents.len());
     for (_old_rel, new_rel, content_to_write) in &contents {
-        let schema = schemas.resolve_for(Path::new(new_rel.as_str()));
+        let schema = remapped_schemas.resolve_for(Path::new(new_rel.as_str()));
         validation_futures.push(async move {
             let outcome = validate::validate_content(
                 Path::new(new_rel.as_str()),
@@ -2219,6 +2353,11 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         validation_failures.sort_by(|a, b| a.0.cmp(&b.0));
         return Err(DirectoryMoveError::Validation {
             failures: validation_failures,
+            // Empty unless this subtree carries its own schema file(s) — lets
+            // the caller-facing error explain WHY a document that was valid at
+            // the source can fail here: the cascade it is being checked against
+            // just re-parented, not merely relocated.
+            moved_schema_files: schema_moves.clone(),
         });
     }
 
@@ -2252,16 +2391,19 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // touching a single source — the same write-then-remove ordering that
     // function uses, batched: if any destination write fails partway through,
     // no source has been touched at all, so recovery is just deleting whatever
-    // destinations already landed.
+    // destinations already landed. Chained with `schema_contents` so every
+    // schema file under the subtree gets the same treatment as any other moved
+    // file — `rollback_directory_move_filesystem` below is always handed
+    // `all_moves` (documents AND schema files), never the document-only `moves`.
     let mut written_dest: Vec<PathBuf> = Vec::new();
-    for (_old_rel, new_rel, content_to_write) in &contents {
+    for (_old_rel, new_rel, content_to_write) in contents.iter().chain(schema_contents.iter()) {
         let abs_dest = match safe_write_path(deps, new_rel) {
             Ok(p) => p,
             Err(e) => {
                 rollback_directory_move_filesystem(
                     &git_lock,
                     data_path_str,
-                    &moves,
+                    &all_moves,
                     &abs_dest_dir,
                     &written_dest,
                     &[],
@@ -2276,7 +2418,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             rollback_directory_move_filesystem(
                 &git_lock,
                 data_path_str,
-                &moves,
+                &all_moves,
                 &abs_dest_dir,
                 &written_dest,
                 &[],
@@ -2321,7 +2463,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 rollback_directory_move_filesystem(
                     &git_lock,
                     data_path_str,
-                    &moves,
+                    &all_moves,
                     &abs_dest_dir,
                     &written_dest,
                     &[],
@@ -2338,7 +2480,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 rollback_directory_move_filesystem(
                     &git_lock,
                     data_path_str,
-                    &moves,
+                    &all_moves,
                     &abs_dest_dir,
                     &written_dest,
                     &[],
@@ -2360,15 +2502,16 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // written in phase 1 — nothing has touched git yet, so this is a pure
     // filesystem undo (see `rollback_directory_move_filesystem`'s doc comment
     // for why restoring the FULL source list, not just the ones already
-    // removed, is safe).
-    for (old_rel, _new_rel, _content_to_write) in &contents {
+    // removed, is safe). Chained with `schema_contents`, same reasoning as
+    // phase 1 above.
+    for (old_rel, _new_rel, _content_to_write) in contents.iter().chain(schema_contents.iter()) {
         let abs_source = match safe_write_path(deps, old_rel) {
             Ok(p) => p,
             Err(e) => {
                 rollback_directory_move_filesystem(
                     &git_lock,
                     data_path_str,
-                    &moves,
+                    &all_moves,
                     &abs_dest_dir,
                     &written_dest,
                     &[],
@@ -2386,7 +2529,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             rollback_directory_move_filesystem(
                 &git_lock,
                 data_path_str,
-                &moves,
+                &all_moves,
                 &abs_dest_dir,
                 &written_dest,
                 &[],
@@ -2503,7 +2646,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             rollback_directory_move_filesystem(
                 &git_lock,
                 data_path_str,
-                &moves,
+                &all_moves,
                 &abs_dest_dir,
                 &written_dest,
                 &rewritten_paths,
@@ -2529,7 +2672,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     );
 
     let mut commit_paths: Vec<&str> = Vec::new();
-    for (old_rel, new_rel) in &moves {
+    for (old_rel, new_rel) in &all_moves {
         commit_paths.push(old_rel.as_str());
         commit_paths.push(new_rel.as_str());
     }
@@ -2560,7 +2703,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                  back {} document(s) and {} rewritten referencing document(s): {:#}",
                 source_dir,
                 dest_dir,
-                moves.len(),
+                all_moves.len(),
                 rewritten_paths.len(),
                 source_err
             );
@@ -2572,7 +2715,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             // recoverable part undone. `rolled_back` is true only if every
             // single one of these succeeds.
             let mut rolled_back = true;
-            for (old_rel, _new_rel) in &moves {
+            for (old_rel, _new_rel) in &all_moves {
                 if let Err(e) = git::restore_from_head(&git_lock, data_path_str, old_rel).await {
                     rolled_back = false;
                     error!(
@@ -2582,7 +2725,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                     );
                 }
             }
-            for (_old_rel, new_rel) in &moves {
+            for (_old_rel, new_rel) in &all_moves {
                 let result = match safe_write_path(deps, new_rel) {
                     Ok(abs) => match tokio::fs::remove_file(&abs).await {
                         Ok(()) => git::unstage(&git_lock, data_path_str, new_rel).await,
@@ -2644,7 +2787,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
             );
 
             crate::reindex::mark_paths(
-                moves
+                all_moves
                     .iter()
                     .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
                     .chain(rewritten_paths.iter().map(PathBuf::from)),
@@ -2654,7 +2797,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 outcome: WriteOutcome::CommittedPendingSync,
                 sha,
                 rebased_paths: Vec::new(),
-                moved: moves,
+                moved: all_moves,
                 rewritten_paths,
                 sync_failure_cause: Some(format!("{:#}", source_err)),
             });
@@ -2664,9 +2807,13 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // Mark the source, the destination, and every rewritten referencing
     // document dirty — plus anything the rebase pulled in — in the SAME
     // marking call, same reasoning as `write_document_move`'s identical final
-    // step.
+    // step. `all_moves` includes any relocated schema file alongside every
+    // document, which is exactly what makes `reindex::unit_touches_schema`
+    // force the shared `SchemaCache` to rebuild before this unit is next
+    // indexed — see that function's doc comment; nothing further is needed
+    // here for the post-commit self-correction this move depends on.
     crate::reindex::mark_paths(
-        moves
+        all_moves
             .iter()
             .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
             .chain(rewritten_paths.iter().map(PathBuf::from))
@@ -2677,7 +2824,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         outcome: WriteOutcome::Synced,
         sha: commit_outcome.sha,
         rebased_paths: commit_outcome.rebased_paths,
-        moved: moves,
+        moved: all_moves,
         rewritten_paths,
         sync_failure_cause: None,
     })
@@ -4951,12 +5098,19 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            DirectoryMoveError::Validation { failures } => {
+            DirectoryMoveError::Validation {
+                failures,
+                moved_schema_files,
+            } => {
                 assert_eq!(
                     failures.len(),
                     2,
                     "both documents are missing strict_field, expected {:?}",
                     failures
+                );
+                assert!(
+                    moved_schema_files.is_empty(),
+                    "no schema file is moving in this scenario"
                 );
             }
             other => panic!("expected Validation, got {other:?}"),
@@ -4969,36 +5123,366 @@ mod tests {
         assert!(!tmp.path().join("strict5/target").exists());
     }
 
+    // -- move_directory: schema files travel with the subtree ---------------
+    //
+    // These replace the old, stricter behavior (a source subtree containing its
+    // own `.kb-schema.yaml` was rejected outright — see git history for
+    // `move_directory_with_a_schema_file_in_the_source_subtree_is_rejected`).
+    // Lifting that restriction is the whole point of this suite: a schema file
+    // now moves along with the documents it governs, re-parenting its cascade
+    // onto the destination — see `SchemaCache::with_remapped_scopes`.
+
     #[tokio::test]
-    async fn move_directory_with_a_schema_file_in_the_source_subtree_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source_dir = tmp.path().join("old6/sub");
+    async fn move_directory_relocates_a_subtree_including_its_own_schema_file() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let source_dir = work.path().join("old6/sub");
         std::fs::create_dir_all(&source_dir).unwrap();
         let content = "---\ntitle: A\n---\n# A";
         std::fs::write(source_dir.join("a.md"), content).unwrap();
         std::fs::write(
             source_dir.join(crate::schema::SCHEMA_FILE_NAME),
-            "fields:\n  x:\n    required: true\n",
+            "fields:\n  title:\n    required: true\n",
+        )
+        .unwrap();
+        git_commit_paths(
+            &work,
+            &[
+                "old6/sub/a.md",
+                &format!("old6/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+            ],
+            "add old6",
+        );
+
+        let harness = git_backed_harness(&work);
+
+        let success = move_directory(&harness.deps(), "old6", "new6", None)
+            .await
+            .unwrap();
+
+        assert!(
+            !work.path().join("old6").exists(),
+            "the whole old prefix, schema file included, must be gone"
+        );
+        assert!(work.path().join("new6/sub/a.md").exists());
+        let moved_schema = work
+            .path()
+            .join("new6/sub")
+            .join(crate::schema::SCHEMA_FILE_NAME);
+        assert!(
+            moved_schema.exists(),
+            "the schema file must have moved along with the document it governs"
+        );
+        assert!(
+            success
+                .moved
+                .contains(&("old6/sub/a.md".to_string(), "new6/sub/a.md".to_string())),
+        );
+        assert!(
+            success.moved.contains(&(
+                format!("old6/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+                format!("new6/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+            )),
+            "the schema file's own relocation must be reported in `moved` too: {:?}",
+            success.moved
+        );
+        assert_eq!(git_status(&work), "");
+
+        // Post-move: rebuilding a real cache off disk must agree with what the
+        // move validated against — proving the prediction was right, not merely
+        // self-consistent.
+        let rebuilt = crate::schema::SchemaCache::build(
+            &work.path().canonicalize().unwrap(),
+            &crate::config::FrontmatterConfig::default(),
+        );
+        assert!(
+            rebuilt
+                .resolve_for(Path::new("new6/sub/a.md"))
+                .fields
+                .get("title")
+                .is_some_and(|f| f.required),
+            "the rebuilt cache must show the relocated schema's rule in effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_directory_schema_file_travels_into_a_stricter_destination_is_rejected() {
+        // The crux case the old guard existed to prevent: the subtree's OWN
+        // schema file travels with it, but the destination's ancestor declares
+        // an ADDITIONAL required field the source's ancestor never did. Nothing
+        // in the moved subtree satisfies it, so the move must fail — and fail
+        // for exactly this reason, not some other validation quirk.
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("src7/sub");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let content = "---\ntitle: A\n---\n# A";
+        std::fs::write(source_dir.join("a.md"), content).unwrap();
+        std::fs::write(
+            source_dir.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  title:\n    required: true\n",
+        )
+        .unwrap();
+
+        // The destination's PARENT declares a field the source's parent never
+        // required.
+        let dest_parent = tmp.path().join("dest7");
+        std::fs::create_dir_all(&dest_parent).unwrap();
+        std::fs::write(
+            dest_parent.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  extra_required:\n    required: true\n",
         )
         .unwrap();
 
         let config = crate::mcp::make_test_resolved_config(tmp.path());
         let harness = Harness::new(&tmp, config);
 
-        let err = move_directory(&harness.deps(), "old6", "new6", None)
+        let err = move_directory(&harness.deps(), "src7", "dest7/target", None)
             .await
             .unwrap_err();
         match err {
-            DirectoryMoveError::SchemaInSource { path } => {
+            DirectoryMoveError::Validation {
+                failures,
+                moved_schema_files,
+            } => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].0, "dest7/target/sub/a.md");
+                assert!(
+                    failures[0]
+                        .1
+                        .errors
+                        .iter()
+                        .any(|e| e.contains("extra_required")),
+                    "must name the field the destination newly requires: {:?}",
+                    failures[0].1.errors
+                );
                 assert_eq!(
-                    path,
-                    format!("old6/sub/{}", crate::schema::SCHEMA_FILE_NAME)
+                    moved_schema_files,
+                    vec![(
+                        format!("src7/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+                        format!("dest7/target/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+                    )],
+                    "the error must name the schema file that is relocating"
                 );
             }
-            other => panic!("expected SchemaInSource, got {other:?}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        assert!(
+            source_dir.join("a.md").exists(),
+            "nothing must be mutated on a rejected move"
+        );
+        assert!(source_dir.join(crate::schema::SCHEMA_FILE_NAME).exists());
+        assert!(!tmp.path().join("dest7/target").exists());
+    }
+
+    #[tokio::test]
+    async fn move_directory_schema_file_travels_into_a_more_permissive_destination_succeeds() {
+        // The mirror of the crux case: the destination's ancestor is more
+        // permissive than the source's was, so documents that were valid stay
+        // valid.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let source_parent = work.path().join("src8");
+        std::fs::create_dir_all(&source_parent).unwrap();
+        std::fs::write(
+            source_parent.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  status:\n    required: true\n",
+        )
+        .unwrap();
+        let source_dir = source_parent.join("sub");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  status:\n    type: enum\n    values: [draft, active]\n",
+        )
+        .unwrap();
+        std::fs::write(source_dir.join("a.md"), "---\nstatus: draft\n---\n# A").unwrap();
+        git_commit_paths(
+            &work,
+            &[
+                &format!("src8/{}", crate::schema::SCHEMA_FILE_NAME),
+                &format!("src8/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+                "src8/sub/a.md",
+            ],
+            "add src8",
+        );
+
+        // Destination has NO ancestor schema at all — strictly more permissive
+        // than the source's parent, which required `status`.
+        let harness = git_backed_harness(&work);
+
+        let success = move_directory(&harness.deps(), "src8/sub", "dest8/sub", None)
+            .await
+            .unwrap();
+        assert_eq!(success.moved.len(), 2, "the document and its schema file");
+        assert!(work.path().join("dest8/sub/a.md").exists());
+        assert_eq!(git_status(&work), "");
+    }
+
+    #[tokio::test]
+    async fn move_directory_relocates_multiple_schema_files_at_different_depths() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let root = work.path().join("src9");
+        std::fs::create_dir_all(root.join("mid/deep")).unwrap();
+        std::fs::write(
+            root.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  top:\n    required: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("mid").join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  mid_field:\n    required: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("mid/deep").join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  deep_field:\n    required: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("mid/deep/doc.md"),
+            "---\ntop: t\nmid_field: m\ndeep_field: d\n---\n# D",
+        )
+        .unwrap();
+        git_commit_paths(
+            &work,
+            &[
+                &format!("src9/{}", crate::schema::SCHEMA_FILE_NAME),
+                &format!("src9/mid/{}", crate::schema::SCHEMA_FILE_NAME),
+                &format!("src9/mid/deep/{}", crate::schema::SCHEMA_FILE_NAME),
+                "src9/mid/deep/doc.md",
+            ],
+            "add src9",
+        );
+
+        let harness = git_backed_harness(&work);
+
+        let success = move_directory(&harness.deps(), "src9", "dest9", None)
+            .await
+            .unwrap();
+        // 1 document + 3 schema files, at 3 different depths.
+        assert_eq!(success.moved.len(), 4, "{:?}", success.moved);
+        for suffix in ["".to_string(), "mid/".to_string(), "mid/deep/".to_string()] {
+            assert!(
+                work.path()
+                    .join(format!(
+                        "dest9/{}{}",
+                        suffix,
+                        crate::schema::SCHEMA_FILE_NAME
+                    ))
+                    .exists(),
+                "schema file at depth '{}' must have relocated",
+                suffix
+            );
+        }
+        assert!(work.path().join("dest9/mid/deep/doc.md").exists());
+        assert_eq!(git_status(&work), "");
+
+        let rebuilt = crate::schema::SchemaCache::build(
+            &work.path().canonicalize().unwrap(),
+            &crate::config::FrontmatterConfig::default(),
+        );
+        let resolved = rebuilt.resolve_for(Path::new("dest9/mid/deep/doc.md"));
+        assert!(resolved.fields["top"].required);
+        assert!(resolved.fields["mid_field"].required);
+        assert!(resolved.fields["deep_field"].required);
+    }
+
+    #[tokio::test]
+    async fn move_directory_values_splicing_field_resolves_differently_under_destination_parent() {
+        // A `$values`-splicing field must resolve against the DESTINATION
+        // parent's set, not the source's — proving the remapped cache re-runs
+        // the splice rather than reusing whatever the live cache had cached.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let source_parent = work.path().join("src10");
+        std::fs::create_dir_all(&source_parent).unwrap();
+        std::fs::write(
+            source_parent.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  tags:\n    values: [source_tag]\n",
+        )
+        .unwrap();
+        let source_dir = source_parent.join("sub");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  tags:\n    values: [$values, own_tag]\n",
+        )
+        .unwrap();
+        std::fs::write(source_dir.join("a.md"), "---\ntags: [own_tag]\n---\n# A").unwrap();
+
+        let dest_parent = work.path().join("dest10");
+        std::fs::create_dir_all(&dest_parent).unwrap();
+        std::fs::write(
+            dest_parent.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  tags:\n    values: [dest_tag]\n",
+        )
+        .unwrap();
+        git_commit_paths(
+            &work,
+            &[
+                &format!("src10/{}", crate::schema::SCHEMA_FILE_NAME),
+                &format!("src10/sub/{}", crate::schema::SCHEMA_FILE_NAME),
+                "src10/sub/a.md",
+                &format!("dest10/{}", crate::schema::SCHEMA_FILE_NAME),
+            ],
+            "add src10 and dest10",
+        );
+
+        let harness = git_backed_harness(&work);
+
+        // `source_tag` is no longer permitted post-move (the source's parent
+        // set is gone), but the document only ever used `own_tag`, which the
+        // moved schema's own splice still contributes — so it stays valid.
+        let success = move_directory(&harness.deps(), "src10/sub", "dest10/sub", None)
+            .await
+            .unwrap();
+        assert_eq!(success.moved.len(), 2);
+        assert_eq!(git_status(&work), "");
+
+        let rebuilt = crate::schema::SchemaCache::build(
+            &work.path().canonicalize().unwrap(),
+            &crate::config::FrontmatterConfig::default(),
+        );
+        let resolved = rebuilt.resolve_for(Path::new("dest10/sub/a.md"));
+        assert_eq!(
+            resolved.fields["tags"].values,
+            Some(vec!["dest_tag".to_string(), "own_tag".to_string()]),
+            "the splice must resolve against the DESTINATION parent's set"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_directory_with_an_unparseable_schema_file_in_source_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("src11/sub");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("a.md"), "---\ntitle: A\n---\n# A").unwrap();
+        std::fs::write(
+            source_dir.join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  tags:\n    values: [$oops]\n",
+        )
+        .unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let err = move_directory(&harness.deps(), "src11", "dest11", None)
+            .await
+            .unwrap_err();
+        match err {
+            DirectoryMoveError::BrokenSchemaInSource { path, reason } => {
+                assert_eq!(
+                    path,
+                    format!("src11/sub/{}", crate::schema::SCHEMA_FILE_NAME)
+                );
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected BrokenSchemaInSource, got {other:?}"),
         }
         assert!(source_dir.join("a.md").exists());
-        assert!(!tmp.path().join("new6").exists());
+        assert!(!tmp.path().join("dest11").exists());
     }
 
     #[tokio::test]
