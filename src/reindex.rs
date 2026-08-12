@@ -122,6 +122,33 @@ impl ReindexQueue {
             full_pending: state.full,
         }
     }
+
+    /// Test-only membership snapshot: the actual set of pending paths, as opposed
+    /// to `snapshot()`'s `pending_paths` count.
+    ///
+    /// A cardinality delta on a `HashSet` cannot distinguish "my path was marked"
+    /// from "some other test's path literal collided with mine and this call was
+    /// a silent no-op" — `REINDEX_QUEUE` is a process-global shared by every test
+    /// in the binary, so tests that need to prove a SPECIFIC path was marked need
+    /// this, not `snapshot()`.
+    ///
+    /// `#[cfg(test)]`-gated so it never ships in the release binary and never
+    /// touches `QueueSnapshot`'s shape — `QueueSnapshot` (the actual `/status` and
+    /// `/metrics` payload, both deliberately unauthenticated routes) stays
+    /// count-only on purpose; putting every pending file's repo-relative path in
+    /// that payload would be an information-disclosure and payload-size change
+    /// made purely for test convenience. Do not promote this method to
+    /// `QueueSnapshot` or drop the `#[cfg(test)]` gate — it exists solely for
+    /// `reindex::test_support::assert_marked_dirty` and the tests that call it
+    /// directly.
+    #[cfg(test)]
+    pub(crate) fn snapshot_paths(&self) -> HashSet<PathBuf> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .paths
+            .clone()
+    }
 }
 
 /// Pending-work summary for `/status` and `/metrics`.
@@ -414,6 +441,52 @@ async fn run_with_retry(
                 );
                 tokio::time::sleep(backoff).await;
             }
+        }
+    }
+}
+
+/// Test-only assertion helper shared across every module whose tests assert that
+/// a specific path was marked dirty on the process-global `REINDEX_QUEUE`
+/// (`mcp.rs`, `write.rs`, `webhook.rs`, `server.rs`). Deliberately `pub(crate)`
+/// rather than private-to-`mod tests`, the same reasoning as
+/// `config::test_support`: those call sites live in other files' `#[cfg(test)]`
+/// modules, not this one.
+///
+/// This exists instead of extending `QueueSnapshot` because `QueueSnapshot` is
+/// the actual `/status`/`/metrics` payload (see `ReindexQueue::snapshot_paths`'s
+/// doc comment) — putting path membership there would be a production shape
+/// change made purely for test convenience. Nothing here compiles into the
+/// release binary.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Assert that every path in `expected` was newly marked dirty between
+    /// `before` and `after`: absent from `before`, present in `after`.
+    ///
+    /// The absence check is the point, not a formality: if a path is already
+    /// pending before the write under test even runs, its literal collides with
+    /// one some other test in the binary uses, and the mark this test means to
+    /// observe is a silent cardinality no-op on the shared `HashSet` — this fails
+    /// loudly instead, naming the path and the fix.
+    pub(crate) fn assert_marked_dirty(
+        before: &HashSet<PathBuf>,
+        after: &HashSet<PathBuf>,
+        expected: &[&str],
+    ) {
+        for &p in expected {
+            let path = PathBuf::from(p);
+            assert!(
+                !before.contains(&path),
+                "REINDEX_QUEUE already contained '{p}' before this test's write \
+                 ran — this path literal collides with one another test in the \
+                 binary uses and never drains; pick a literal unique to this test"
+            );
+            assert!(
+                after.contains(&path),
+                "REINDEX_QUEUE does not contain '{p}' after this test's write \
+                 ran; expected it to have been marked dirty"
+            );
         }
     }
 }

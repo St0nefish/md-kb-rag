@@ -3534,7 +3534,7 @@ mod tests {
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let harness = git_backed_harness(&work);
 
-        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot_paths();
 
         // A path unique to this test: the global `REINDEX_QUEUE` is a process-wide
         // `HashSet<PathBuf>` shared with every other test in this binary (including
@@ -3550,8 +3550,12 @@ mod tests {
         assert!(!success.sha.is_empty());
         assert!(success.diff.contains("+title: Queued"));
 
-        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
-        assert!(pending_after > pending_before);
+        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot_paths();
+        crate::reindex::test_support::assert_marked_dirty(
+            &pending_before,
+            &pending_after,
+            &["docs/queued-write-core-test.md"],
+        );
     }
 
     #[tokio::test]
@@ -3735,19 +3739,30 @@ mod tests {
         std::fs::create_dir_all(work.path().join("old")).unwrap();
         let original =
             "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
-        std::fs::write(work.path().join("old/loc.md"), original).unwrap();
-        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+        // Both the source AND destination literals must be unique across the whole
+        // test binary, not just the destination — see
+        // `create_synced_write_marks_the_path_dirty_and_returns_a_diff`'s comment:
+        // REINDEX_QUEUE is a process-wide HashSet shared with every other test in
+        // this binary, and marking an ALREADY-dirty path is a no-op on its
+        // cardinality. `old/loc.md` is reused as a source path by dozens of other
+        // tests in this file that mark it dirty and never drain it, so under
+        // `--test-threads=1` (deterministic run order) an earlier alphabetically-
+        // sorted test reliably dirties plain `old/loc.md` before this one runs,
+        // silently absorbing this test's own `mark_paths` call for it and turning
+        // the "both paths" delta below into "only one path".
+        std::fs::write(work.path().join("old/loc-move-core-test-src.md"), original).unwrap();
+        git_commit_all(
+            &work,
+            "old/loc-move-core-test-src.md",
+            "add old/loc-move-core-test-src.md",
+        );
         let head_before = head_sha(&work);
 
         let harness = git_backed_harness(&work);
-        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot_paths();
 
-        // A destination path unique to this test — see
-        // `create_synced_write_marks_the_path_dirty_and_returns_a_diff`'s comment:
-        // REINDEX_QUEUE is a process-wide set shared with every other test in this
-        // binary.
         let req = make_move_req(
-            "old/loc.md",
+            "old/loc-move-core-test-src.md",
             "new/loc-moved-write-core-test.md",
             original,
             original,
@@ -3761,7 +3776,7 @@ mod tests {
             "the move must produce a new commit"
         );
         assert!(
-            !work.path().join("old/loc.md").exists(),
+            !work.path().join("old/loc-move-core-test-src.md").exists(),
             "source must be gone after a successful move"
         );
         assert_eq!(
@@ -3772,10 +3787,14 @@ mod tests {
         // left staged or dangling in the working tree afterward.
         assert_eq!(git_status(&work), "");
 
-        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
-        assert!(
-            pending_after >= pending_before + 2,
-            "both the source and destination paths should be marked dirty"
+        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot_paths();
+        crate::reindex::test_support::assert_marked_dirty(
+            &pending_before,
+            &pending_after,
+            &[
+                "old/loc-move-core-test-src.md",
+                "new/loc-moved-write-core-test.md",
+            ],
         );
     }
 

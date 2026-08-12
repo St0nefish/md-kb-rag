@@ -2257,16 +2257,29 @@ mod tests {
 
         // `REINDEX_QUEUE` is a process-global shared with every other test in the
         // suite (mcp.rs's write-tool tests and webhook.rs's tests mark real paths on
-        // it too), and nothing ever drains it back down in this binary — so this can
-        // only assert a lower bound relative to a `before` snapshot, never an exact
-        // count. That is still enough to catch the regression this test exists for:
-        // `collect_status` returning a stale, default, or otherwise disconnected
-        // `QueueSnapshot` instead of `REINDEX_QUEUE.snapshot()`.
+        // it too), and nothing ever drains it back down in this binary — so the
+        // count-based assertion below can only assert a lower bound relative to a
+        // `before` snapshot, never an exact count. That is still enough to catch
+        // the regression this test exists for: `collect_status` returning a stale,
+        // default, or otherwise disconnected `QueueSnapshot` instead of
+        // `REINDEX_QUEUE.snapshot()`.
+        //
+        // The path-level check below is a separate, stronger guard against a
+        // different failure: the marker literal itself colliding with another
+        // test's, which would make the marking below a silent no-op and this test
+        // pass for the wrong reason.
         let before = crate::reindex::REINDEX_QUEUE.snapshot();
+        let before_paths = crate::reindex::REINDEX_QUEUE.snapshot_paths();
         crate::reindex::mark_paths([std::path::PathBuf::from(
             "status-reports-the-actual-pending-reindex-queue-state-marker.md",
         )]);
         crate::reindex::mark_full();
+        let after_paths = crate::reindex::REINDEX_QUEUE.snapshot_paths();
+        crate::reindex::test_support::assert_marked_dirty(
+            &before_paths,
+            &after_paths,
+            &["status-reports-the-actual-pending-reindex-queue-state-marker.md"],
+        );
 
         let status = collect_status(&state).await;
 

@@ -6562,7 +6562,7 @@ mod tests {
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let (server, _config) = make_git_backed_server(&work);
 
-        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot_paths();
 
         let result = server
             .create_document(Parameters(CreateDocumentParams {
@@ -6590,10 +6590,11 @@ mod tests {
             "the old skipped-index warning language must be gone: {text}"
         );
 
-        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
-        assert!(
-            pending_after > pending_before,
-            "create_document must mark its path dirty on the queue"
+        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot_paths();
+        crate::reindex::test_support::assert_marked_dirty(
+            &pending_before,
+            &pending_after,
+            &["docs/queued.md"],
         );
     }
 
@@ -6669,14 +6670,21 @@ mod tests {
     async fn delete_document_reports_queued_cleanup_without_touching_the_indexer() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        // A path unique to this test — see this test's `pending_before`/`pending_after`
+        // comment below: `doomed.md` is reused as the delete target by other tests in
+        // this file (e.g. the precommit/postcommit-failure variants), and one of those
+        // succeeds in marking it dirty on the process-wide REINDEX_QUEUE. Under
+        // `--test-threads=1` that earlier, alphabetically-sorted test reliably runs
+        // first and leaves `doomed.md` already present in the queue's HashSet, so this
+        // test's own `mark_paths` call for the same literal is a silent no-op.
         std::fs::write(
-            work.path().join("doomed.md"),
+            work.path().join("doomed-queued-cleanup-test.md"),
             "---\ntitle: D\n---\n\n# Body\n",
         )
         .unwrap();
         // delete_document git-adds the removed path, so the file must already be tracked.
         std::process::Command::new("git")
-            .args(["add", "doomed.md"])
+            .args(["add", "doomed-queued-cleanup-test.md"])
             .current_dir(work.path())
             .output()
             .unwrap();
@@ -6688,18 +6696,18 @@ mod tests {
                 "user.name=Test",
                 "commit",
                 "-m",
-                "add doomed.md",
+                "add doomed-queued-cleanup-test.md",
             ])
             .current_dir(work.path())
             .output()
             .unwrap();
         let (server, _config) = make_git_backed_server(&work);
 
-        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
+        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot_paths();
 
         let result = server
             .delete_document(Parameters(DeleteDocumentParams {
-                path: "doomed.md".to_string(),
+                path: "doomed-queued-cleanup-test.md".to_string(),
                 message: None,
             }))
             .await;
@@ -6707,7 +6715,7 @@ mod tests {
         let result = result.expect("delete must succeed even though nothing purges it inline");
         let text = format!("{:?}", result.content);
         assert!(
-            text.contains("Deleted 'doomed.md'"),
+            text.contains("Deleted 'doomed-queued-cleanup-test.md'"),
             "must report the successful delete: {text}"
         );
         assert!(
@@ -6719,10 +6727,11 @@ mod tests {
             "the old skipped-purge warning language must be gone: {text}"
         );
 
-        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot().pending_paths;
-        assert!(
-            pending_after > pending_before,
-            "delete_document must mark its path dirty on the queue rather than purging inline"
+        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot_paths();
+        crate::reindex::test_support::assert_marked_dirty(
+            &pending_before,
+            &pending_after,
+            &["doomed-queued-cleanup-test.md"],
         );
     }
 
