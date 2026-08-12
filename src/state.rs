@@ -425,9 +425,12 @@ impl StateDb {
         .execute(&pool)
         .await?;
 
-        // Purging a renamed/deleted file's rows (`delete_links_for`) needs the reverse
-        // lookup — "what points at this target" — which the primary key (source-first)
-        // does not serve.
+        // The reverse lookup — "what points at this target" — which the primary key
+        // (source-first) does not serve. `delete_links_for` does NOT need this: it
+        // purges a renamed/deleted file's OWN outgoing rows, filtered by
+        // `source_path`, which the primary key already serves directly. The live user
+        // of this index is `links_targeting`, which answers "which documents must be
+        // updated when this path moves" for the document-move link rewriter.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_document_links_target
              ON document_links(target_path)",
@@ -745,6 +748,29 @@ impl StateDb {
                 .await?;
 
         Ok(rows)
+    }
+
+    /// Distinct source paths whose `document_links` rows target `target_path`, scoped
+    /// to `kind` (callers pass `"markdown"` to find only real inline-link edges, not
+    /// precomputed `"semantic"` neighbors).
+    ///
+    /// Backs `write::write_document_move`'s "which documents must be updated"
+    /// question: when `target_path` moves, every source this returns has a body that
+    /// needs `find_markdown_link_occurrences` re-run and its link text rewritten. Uses
+    /// `idx_document_links_target`, unlike every other query on this table, which is
+    /// source-first and served by the primary key.
+    pub async fn links_targeting(&self, target_path: &str, kind: &str) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT source_path FROM document_links
+             WHERE target_path = ? AND kind = ?
+             ORDER BY source_path",
+        )
+        .bind(target_path)
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(path,)| path).collect())
     }
 
     /// Remove every edge originating from `path`, in either direction of kind.
@@ -3074,6 +3100,62 @@ mod tests {
         db.replace_links("a.md", "markdown", &[]).await.unwrap();
 
         assert!(db.all_links().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn links_targeting_returns_distinct_sources_ordered() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("target.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("c.md", "markdown", &[("target.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("b.md", "markdown", &[("target.md".to_string(), None)])
+            .await
+            .unwrap();
+        // A source unrelated to `target.md` must not show up.
+        db.replace_links("d.md", "markdown", &[("other.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let sources = db.links_targeting("target.md", "markdown").await.unwrap();
+        assert_eq!(sources, vec!["a.md", "b.md", "c.md"]);
+    }
+
+    #[tokio::test]
+    async fn links_targeting_filters_by_kind() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("target.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("b.md", "semantic", &[("target.md".to_string(), Some(0.9))])
+            .await
+            .unwrap();
+
+        let markdown_sources = db.links_targeting("target.md", "markdown").await.unwrap();
+        assert_eq!(
+            markdown_sources,
+            vec!["a.md"],
+            "a semantic-kind row must not come back when asking for markdown"
+        );
+
+        let semantic_sources = db.links_targeting("target.md", "semantic").await.unwrap();
+        assert_eq!(semantic_sources, vec!["b.md"]);
+    }
+
+    #[tokio::test]
+    async fn links_targeting_no_results_returns_empty() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("other.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let sources = db
+            .links_targeting("nonexistent.md", "markdown")
+            .await
+            .unwrap();
+        assert!(sources.is_empty());
     }
 
     #[tokio::test]

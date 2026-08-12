@@ -834,37 +834,137 @@ pub(crate) fn extract_markdown_links(body: &str, source_rel_path: &str) -> Vec<S
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
 
-    let mut in_fence = false;
-    for line in body.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-
-        for raw_target in raw_link_targets_in_line(line) {
-            if let Some(resolved) = resolve_link_target(&raw_target, source_rel_path)
-                && seen.insert(resolved.clone())
-            {
-                out.push(resolved);
-            }
+    for (_, raw_target) in scan_link_occurrences(body) {
+        if let Some(resolved) = resolve_link_target(&raw_target, source_rel_path)
+            && seen.insert(resolved.clone())
+        {
+            out.push(resolved);
         }
     }
 
     out
 }
 
+/// One inline link found by [`scan_link_occurrences`], carrying enough position
+/// information for a caller to replace exactly its target substring in the original
+/// document.
+///
+/// Produced by [`find_markdown_link_occurrences`] — the span-carrying sibling of
+/// [`extract_markdown_links`] — and consumed by `write::write_document_move`'s
+/// incoming-link rewriter, which needs to find every link pointing at a moved
+/// document's old path and know precisely which bytes to replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkOccurrence {
+    /// Byte range in the original document — valid for direct slicing of the `&str`
+    /// passed to [`find_markdown_link_occurrences`] — covering exactly the raw target
+    /// text (the same substring `raw` holds). Byte offsets, not char offsets: a
+    /// multi-byte UTF-8 character earlier in the document shifts a byte offset without
+    /// shifting a char offset by the same amount.
+    pub span: std::ops::Range<usize>,
+    /// The target exactly as written between `(` and `)` — before the title-suffix and
+    /// `#fragment` stripping [`resolve_link_target`] does.
+    pub raw: String,
+    /// The KB-root-relative path `raw` resolves to.
+    pub resolved: String,
+}
+
+/// Span-carrying sibling of [`extract_markdown_links`]: every inline link in `body`
+/// that resolves to a KB-root-relative markdown path (same judging rules — see that
+/// function's doc comment), paired with the exact byte span of its raw target text.
+///
+/// Shares [`scan_link_occurrences`] — the same fence/code-span/image-skipping walk —
+/// with `extract_markdown_links`, so the two can never disagree about which substrings
+/// in a document are "real" links versus prose/code that merely looks like one: there
+/// is exactly one scanning implementation, and both entry points call it.
+///
+/// Unlike `extract_markdown_links`, this is NOT deduped by resolved target — a document
+/// that links to the same target twice yields two occurrences, one per span, because a
+/// caller rewriting text needs to visit every occurrence, not just learn that an edge
+/// exists.
+///
+/// Used by `write::write_document_move`: both for its own self-reference rewrite
+/// (scanning the moved document's own new content for a link to its old path) and,
+/// per referencing document `StateDb::links_targeting` returns, to find exactly which
+/// spans in that document's body to replace.
+pub(crate) fn find_markdown_link_occurrences(
+    body: &str,
+    source_rel_path: &str,
+) -> Vec<LinkOccurrence> {
+    scan_link_occurrences(body)
+        .into_iter()
+        .filter_map(|(span, raw)| {
+            resolve_link_target(&raw, source_rel_path).map(|resolved| LinkOccurrence {
+                span,
+                raw,
+                resolved,
+            })
+        })
+        .collect()
+}
+
+/// The one scanning implementation behind both [`extract_markdown_links`] and
+/// [`find_markdown_link_occurrences`]. Walks `body` line by line, tracking fenced code
+/// blocks (`` ``` `` /`~~~` toggling, the same line-oriented way `chunk::split_sections`
+/// tracks fences for headings) and delegating each non-fenced line to
+/// [`raw_link_occurrences_in_line`] for inline-code-span and image skipping.
+///
+/// Line-local byte spans from that per-line scan are shifted by each line's own
+/// starting byte offset in `body`, so the spans this returns are valid for slicing
+/// `body` itself, not just the line they came from.
+///
+/// Returns every raw `(target)` payload found, unfiltered and unresolved, alongside its
+/// span — judging a target (title/fragment stripping, external/absolute/non-`.md`
+/// rejection, relative path resolution) is [`resolve_link_target`]'s job, which each
+/// entry point applies itself after this shared walk.
+fn scan_link_occurrences(body: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    let mut offset = 0usize;
+
+    for line in body.split_inclusive('\n') {
+        // `split_inclusive` keeps the line terminator attached, so `line.len()` is
+        // exactly how far `offset` must advance to reach the next line's start — but
+        // the terminator itself (`\n`, or `\r\n`) must be stripped before scanning,
+        // the same way `body.lines()` would strip it.
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+
+        let trimmed = content.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            offset += line.len();
+            continue;
+        }
+        if !in_fence {
+            for (rel_span, raw_target) in raw_link_occurrences_in_line(content) {
+                out.push((offset + rel_span.start..offset + rel_span.end, raw_target));
+            }
+        }
+
+        offset += line.len();
+    }
+
+    out
+}
+
 /// Scan one non-fenced line for inline `[label](target)` links, returning each raw
-/// (unresolved, unfiltered) target string found. Handles the two things that would
-/// otherwise produce false positives on a single line: image syntax (`![...](...)`)
-/// and inline code spans (`` `...` ``) — both are skipped without being scanned for
-/// links.
-fn raw_link_targets_in_line(line: &str) -> Vec<String> {
+/// (unresolved, unfiltered) target's byte span within `line` alongside the target text
+/// itself. Handles the two things that would otherwise produce false positives on a
+/// single line: image syntax (`![...](...)`) and inline code spans (`` `...` ``) —
+/// both are skipped without being scanned for links.
+///
+/// Byte spans, not char spans: [`find_link_parens`] works in `Vec<char>` indices, so
+/// `line.char_indices()` maps each of those char indices to its actual byte offset —
+/// a multi-byte UTF-8 character earlier on the line would otherwise desync a naive
+/// char-count offset from the byte offset a caller needs for slicing.
+fn raw_link_occurrences_in_line(line: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let chars: Vec<char> = line.chars().collect();
-    let mut targets = Vec::new();
+    // One byte offset per char index, plus a trailing entry for `line`'s total byte
+    // length so a target ending at the line's last char can still compute its end.
+    let mut byte_at: Vec<usize> = line.char_indices().map(|(b, _)| b).collect();
+    byte_at.push(line.len());
+
+    let mut occurrences = Vec::new();
     let mut i = 0usize;
     let mut in_code = false;
     let mut code_run_len = 0usize;
@@ -905,7 +1005,8 @@ fn raw_link_targets_in_line(line: &str) -> Vec<String> {
         if chars[i] == '['
             && let Some((target_start, target_end, after)) = find_link_parens(&chars, i)
         {
-            targets.push(chars[target_start..target_end].iter().collect());
+            let raw: String = chars[target_start..target_end].iter().collect();
+            occurrences.push((byte_at[target_start]..byte_at[target_end], raw));
             i = after;
             continue;
         }
@@ -913,7 +1014,7 @@ fn raw_link_targets_in_line(line: &str) -> Vec<String> {
         i += 1;
     }
 
-    targets
+    occurrences
 }
 
 /// Given `chars[bracket] == '['`, look for the `]` closing the bracketed label (no
@@ -1021,6 +1122,50 @@ fn resolve_relative_md_path(target: &str, source_rel_path: &str) -> Option<Strin
     } else {
         Some(stack.join("/"))
     }
+}
+
+/// Inverse of [`resolve_relative_md_path`]: given a referencing document's
+/// KB-root-relative path and a KB-root-relative target path, produce the relative link
+/// text that document should contain to point at that target — e.g. from `dev/a.md` to
+/// `sysadmin/b.md`, `../sysadmin/b.md`; from `dev/a.md` to `dev/b.md`, `b.md`.
+///
+/// Round-trip property: for any `source_rel_path`/`target_rel_path` pair, feeding this
+/// function's output back through `resolve_relative_md_path(_, source_rel_path)` must
+/// return `Some(target_rel_path.to_string())` — see the `relativize_md_path_round_trips`
+/// test.
+///
+/// No filesystem access, same as `resolve_relative_md_path` — pure path algebra over
+/// KB-root-relative strings. Finds the longest shared directory prefix between
+/// `source_rel_path`'s directory and `target_rel_path`'s directory, climbs out of
+/// `source_rel_path`'s directory with `../` past that shared prefix, then descends back
+/// down to `target_rel_path`.
+///
+/// Used by `write::write_document_move` to compute the replacement text for every
+/// link it rewrites — both a referencing document's link to the move's new
+/// destination, and the moved document's own self-reference relative to its new
+/// directory.
+pub(crate) fn relativize_md_path(source_rel_path: &str, target_rel_path: &str) -> String {
+    let source_dir: Vec<&str> = source_rel_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.split('/').filter(|c| !c.is_empty()).collect())
+        .unwrap_or_default();
+    let target_components: Vec<&str> = target_rel_path
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    let target_dir = &target_components[..target_components.len().saturating_sub(1)];
+
+    let common = source_dir
+        .iter()
+        .zip(target_dir.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let climbs = source_dir.len() - common;
+    let mut parts: Vec<&str> = std::iter::repeat_n("..", climbs).collect();
+    parts.extend(target_components[common..].iter().copied());
+
+    parts.join("/")
 }
 
 /// Payload fields to index, unioning the schema tree with the legacy config list.
@@ -2233,6 +2378,119 @@ mod tests {
             let got = extract_markdown_links(body, source);
             let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(got, expected, "case failed: {name}");
+        }
+    }
+
+    // -- find_markdown_link_occurrences ------------------------------------------
+    //
+    // Span-carrying sibling of `extract_markdown_links`. These tests focus on what
+    // `extract_markdown_links_cases` above cannot check: exact byte spans, and that
+    // fenced/code/image skipping (shared via `scan_link_occurrences`) still holds when
+    // spans are in play.
+
+    #[test]
+    fn find_markdown_link_occurrences_spans_match_only_real_links() {
+        let body = "See [Guide](guide.md) for details.\n\n\
+                     ```md\n[Fenced](fenced.md)\n```\n\n\
+                     Use `[Code](code.md)` literally.\n\n\
+                     ![Diagram](diagram.md)\n\n\
+                     Also [Other](other.md).\n";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+
+        let raws: Vec<&str> = occurrences.iter().map(|o| o.raw.as_str()).collect();
+        assert_eq!(
+            raws,
+            vec!["guide.md", "other.md"],
+            "only the two real inline links outside the fence/code-span/image should be reported"
+        );
+
+        let resolved: Vec<&str> = occurrences.iter().map(|o| o.resolved.as_str()).collect();
+        assert_eq!(resolved, vec!["docs/guide.md", "docs/other.md"]);
+
+        for occurrence in &occurrences {
+            assert_eq!(
+                &body[occurrence.span.clone()],
+                occurrence.raw,
+                "span must slice out exactly the raw target text for raw={:?}",
+                occurrence.raw
+            );
+        }
+    }
+
+    #[test]
+    fn find_markdown_link_occurrences_multibyte_utf8_span() {
+        // Multi-byte UTF-8 text (each 'é'/'π'/'—' is more than one byte) sits before the
+        // link on the same line. An implementation that used char offsets as byte
+        // offsets would compute a span that undershoots the real byte position of
+        // "guide.md" — either panicking on a non-UTF8 char-boundary slice or slicing out
+        // the wrong bytes.
+        let body = "Café résumé — π ≈ 3.14: see [Guide](guide.md) for the recipe.";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+        assert_eq!(occurrences.len(), 1);
+
+        let occurrence = &occurrences[0];
+        assert_eq!(occurrence.raw, "guide.md");
+        assert_eq!(occurrence.resolved, "docs/guide.md");
+
+        let expected_start = body
+            .find("guide.md")
+            .expect("target text must appear in body");
+        assert_eq!(occurrence.span.start, expected_start);
+        assert_eq!(occurrence.span.end, expected_start + "guide.md".len());
+        assert_eq!(&body[occurrence.span.clone()], "guide.md");
+    }
+
+    // -- relativize_md_path -------------------------------------------------------
+
+    #[test]
+    fn relativize_md_path_matches_documented_examples() {
+        assert_eq!(
+            relativize_md_path("dev/a.md", "sysadmin/b.md"),
+            "../sysadmin/b.md"
+        );
+        assert_eq!(relativize_md_path("dev/a.md", "dev/b.md"), "b.md");
+    }
+
+    #[test]
+    fn relativize_md_path_round_trips() {
+        // Table-driven, mirroring `extract_markdown_links_cases`'s style: each case is
+        // (name, source_rel_path, target_rel_path). `relativize_md_path`'s output, fed
+        // back through `resolve_relative_md_path` with the same source, must return the
+        // original target — that's the contract, not any particular string shape.
+        let cases: &[(&str, &str, &str)] = &[
+            ("same directory", "dev/a.md", "dev/b.md"),
+            ("deeper subdirectory", "dev/a.md", "dev/sub/b.md"),
+            ("shallower — climbs one level", "dev/sub/a.md", "dev/b.md"),
+            ("sibling subtree", "dev/sub/a.md", "dev/other/b.md"),
+            ("sibling top-level area", "dev/a.md", "sysadmin/b.md"),
+            ("root source, nested target", "a.md", "dev/b.md"),
+            ("nested source, root target", "dev/sub/a.md", "root.md"),
+            ("both at root", "a.md", "b.md"),
+            (
+                "deep climb then deep descent",
+                "dev/a/b/c.md",
+                "sysadmin/x/y/z.md",
+            ),
+            ("target is the source itself", "dev/a.md", "dev/a.md"),
+            (
+                "shared multi-level prefix",
+                "dev/sub/deep/a.md",
+                "dev/sub/other/b.md",
+            ),
+        ];
+
+        for (name, source, target) in cases {
+            let relative = relativize_md_path(source, target);
+            let round_tripped = resolve_relative_md_path(&relative, source);
+            assert_eq!(
+                round_tripped.as_deref(),
+                Some(*target),
+                "case failed: {name} (source={source}, target={target}, relative={relative})"
+            );
         }
     }
 

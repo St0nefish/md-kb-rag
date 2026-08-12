@@ -176,10 +176,17 @@ impl UiState {
     /// build for the MCP tool surface. `token` must outlive the returned value —
     /// callers read it from the environment once per request and hold it in a
     /// local binding (see the handlers below), same convention `mcp.rs` uses.
+    ///
+    /// `state_db`: pass `Some` only for a MOVE (`write::WriteRequest::dest_path`
+    /// set) — `write::write_document_move` is the only reader of
+    /// `WriteDeps::state`, so a plain create/edit or a delete has no use for it,
+    /// and `None` here avoids lazily materializing `state.db` on disk for a
+    /// request that will never touch it (mirrors `mcp.rs`'s identical scoping).
     fn write_deps<'a>(
         &'a self,
         config: &'a ResolvedConfig,
         token: &'a Option<String>,
+        state_db: Option<&'a StateDb>,
     ) -> WriteDeps<'a, EmbedClient, QdrantStore> {
         WriteDeps {
             retrieval: self.deps(),
@@ -194,6 +201,7 @@ impl UiState {
             token: token.as_deref(),
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
+            state: state_db,
         }
     }
 
@@ -902,6 +910,15 @@ struct WriteDocBody {
     create: bool,
     #[serde(default)]
     expected_hash: Option<String>,
+    /// When present, turns this POST into an atomic MOVE: the URL path is the
+    /// move's source, this is its destination — see
+    /// `write::WriteRequest::dest_path`. `content` is still required and is
+    /// always what the client sends (see `post_doc_handler`'s doc comment on
+    /// why this route does not offer a "move unchanged, server re-reads the
+    /// source" shorthand). Combining this with `create: true` is a client
+    /// error: a create has no source to move from.
+    #[serde(default)]
+    new_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -959,7 +976,10 @@ fn resolve_write_target_error_response(err: retrieval::ResolveErr) -> Response {
 }
 
 /// Map a successful `write::write_document`/`write::delete_document` result onto
-/// the fixed HTTP contract's 200 body: `{"outcome", "sha", "rebased_paths"}`.
+/// the fixed HTTP contract's 200 body: `{"outcome", "sha", "rebased_paths",
+/// "rewritten_paths"}`. `rewritten_paths` is always `[]` outside a move — a move
+/// silently editing other documents without surfacing which ones is not
+/// acceptable, so this is always present, not just when non-empty.
 fn write_success_response(success: WriteSuccess) -> Response {
     let outcome = match success.outcome {
         WriteOutcome::Synced => "synced",
@@ -976,6 +996,7 @@ fn write_success_response(success: WriteSuccess) -> Response {
             "outcome": outcome,
             "sha": success.sha,
             "rebased_paths": rebased_paths,
+            "rewritten_paths": success.rewritten_paths,
         })),
     )
         .into_response()
@@ -1053,6 +1074,13 @@ fn write_error_response(err: &WriteError) -> Response {
             )
                 .into_response()
         }
+        // Generic "document already exists" is unambiguous for a create (there
+        // is only one path in play). A move also produces this variant when its
+        // DESTINATION collides — `post_doc_handler` intercepts that case ahead
+        // of this function (before it ever reaches this generic arm) and
+        // returns a message naming the destination explicitly, so a caller
+        // moving a document is never told "document already exists" about the
+        // very path they're editing.
         WriteError::AlreadyExists => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1112,9 +1140,22 @@ fn write_error_response(err: &WriteError) -> Response {
     }
 }
 
-/// `POST /api/doc/{*path}`: create (`create: true`) or full-replace-edit
-/// (`create: false`) a document. Thin adapter over `write::write_document` — see
-/// the API contract in the feature plan for the exact request/response shapes.
+/// `POST /api/doc/{*path}`: create (`create: true`), full-replace-edit
+/// (`create: false`), or — when `new_path` is set — atomically MOVE a document
+/// from the URL path to `new_path`. Thin adapter over `write::write_document`
+/// (`write::write_document_move` when `new_path` is present) — see the API
+/// contract in the feature plan for the exact request/response shapes.
+///
+/// Move contract: the client always sends `content` — there is no "omit
+/// content to move the file unchanged, let the server read the source"
+/// shorthand. This keeps the handler honest about `write::WriteRequest`'s own
+/// contract (`write_document_move` never reads `rel_path`'s content itself,
+/// move or not — see that field's doc comment) and keeps this route's body
+/// shape uniform across create/edit/move: `content` is unconditionally
+/// required by `WriteDocBody`, so a client doing a pure rename just echoes
+/// back the content it already loaded via `GET api/doc/{*path}` (the editor
+/// already holds this in memory for any open document) rather than the server
+/// re-reading a file the caller may not have looked at recently.
 async fn post_doc_handler(
     State(state): State<UiState>,
     AxumPath(raw_path): AxumPath<String>,
@@ -1131,6 +1172,20 @@ async fn post_doc_handler(
             MAX_WRITE_CONTENT_LEN
         ));
     }
+    // A create has no source to move FROM — combining the two is a client
+    // error, not something `write::write_document_move` should ever see (it
+    // reports that combination as `WriteError::Internal`, a caller-bug
+    // variant, precisely because a well-behaved caller filters it out here).
+    if body.new_path.is_some() && body.create {
+        return bad_request(
+            "new_path cannot be combined with create: true — a create has no source to move from",
+        );
+    }
+    let dest_rel: Option<String> = match body.new_path.as_deref().map(str::trim) {
+        Some("") => return bad_request("new_path is empty"),
+        Some(p) => Some(retrieval::kb_root_relative(p).to_string()),
+        None => None,
+    };
 
     // Include-pattern eligibility guard, same rule the MCP write tools enforce
     // (`create_document`'s explicit `include_patterns.is_match` check /
@@ -1176,7 +1231,16 @@ async fn post_doc_handler(
 
     let config = state.config();
     let token = state.git_token(&config);
-    let deps = state.write_deps(&config, &token);
+    // Only opened for a MOVE — see `UiState::write_deps`'s doc comment on
+    // `state_db` for why a plain create/edit skips this entirely. Best-effort:
+    // a state DB that fails to open degrades the move to "without link
+    // rewriting" rather than failing the request.
+    let state_db = if dest_rel.is_some() {
+        state.state_db().await.ok()
+    } else {
+        None
+    };
+    let deps = state.write_deps(&config, &token, state_db);
 
     let req = WriteRequest {
         rel_path: &rel_path,
@@ -1190,14 +1254,37 @@ async fn post_doc_handler(
         force_new: None,
         operation: if body.create {
             "create_document (web ui)"
+        } else if dest_rel.is_some() {
+            "edit_document (web ui, move)"
         } else {
             "edit_document (web ui, full replace)"
         },
         expected_hash: body.expected_hash.as_deref(),
+        dest_path: dest_rel.as_deref(),
     };
 
     match write::write_document(&deps, req).await {
         Ok(success) => write_success_response(success),
+        // `WriteError::AlreadyExists` carries no path of its own (see its doc
+        // comment in write.rs) — for a plain create that's unambiguous (there
+        // is only one path in play), but for a move the collision is always on
+        // the DESTINATION (`write_document_move` checks source-exists before
+        // dest-exists, so this variant can only mean the destination). Name it
+        // explicitly here rather than falling through to
+        // `write_error_response`'s generic "document already exists", which
+        // would read as though `rel_path` (the document the caller is editing)
+        // were the problem.
+        Err(WriteError::AlreadyExists) if dest_rel.is_some() => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "outcome": "failed_no_change",
+                "error": format!(
+                    "a document already exists at the destination path '{}'",
+                    dest_rel.as_deref().unwrap_or_default()
+                ),
+            })),
+        )
+            .into_response(),
         Err(err) => write_error_response(&err),
     }
 }
@@ -1236,7 +1323,9 @@ async fn delete_doc_handler(
 
     let config = state.config();
     let token = state.git_token(&config);
-    let deps = state.write_deps(&config, &token);
+    // `delete_document` never moves a document, so there is nothing here for a
+    // state DB to do — see `UiState::write_deps`'s doc comment on `state_db`.
+    let deps = state.write_deps(&config, &token, None);
 
     match write::delete_document(&deps, &rel_path, body.commit_message.as_deref()).await {
         Ok(success) => write_success_response(success),
@@ -2160,6 +2249,7 @@ mod tests {
             sha: "deadbeef".into(),
             rebased_paths: vec![PathBuf::from("other.md")],
             diff: "+line".into(),
+            rewritten_paths: Vec::new(),
             sync_failure_cause: None,
         };
         let resp = write_success_response(success);
@@ -2312,6 +2402,199 @@ mod tests {
         let json = body_json(resp).await;
         assert_eq!(json["outcome"], "failed_no_change");
         assert!(json["actual_hash"].as_str().is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // Move (`new_path`) — WriteRequest::dest_path wired through post_doc_handler
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_doc_move_relocates_document_and_returns_200() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("orig.md"),
+            "---\ntitle: Orig\n---\n\n# Orig\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "--", "orig.md"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add orig.md",
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+
+        let state = git_backed_ui_state(&work);
+        let app = ui_router(state);
+        let req = post_doc_request(
+            "orig.md",
+            serde_json::json!({
+                "content": "---\ntitle: Orig\n---\n\n# Orig\n",
+                "commit_message": "docs: move orig.md to moved.md",
+                "create": false,
+                "new_path": "moved.md",
+            }),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "move must succeed");
+        let json = body_json(resp).await;
+        assert_eq!(json["outcome"], "synced");
+        assert!(
+            !work.path().join("orig.md").exists(),
+            "source must be gone after a move"
+        );
+        assert!(
+            work.path().join("moved.md").exists(),
+            "destination must exist after a move"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_doc_move_onto_existing_destination_is_409() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("source.md"),
+            "---\ntitle: Source\n---\n\n# Source\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.path().join("taken.md"),
+            "---\ntitle: Taken\n---\n\n# Taken\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "--", "source.md", "taken.md"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add source.md and taken.md",
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+
+        let state = git_backed_ui_state(&work);
+        let app = ui_router(state);
+        let req = post_doc_request(
+            "source.md",
+            serde_json::json!({
+                "content": "---\ntitle: Source\n---\n\n# Source\n",
+                "create": false,
+                "new_path": "taken.md",
+            }),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = body_json(resp).await;
+        assert_eq!(json["outcome"], "failed_no_change");
+        // The message must name the DESTINATION as the collision, not read as
+        // though `source.md` (the document being edited) were the problem —
+        // see `post_doc_handler`'s `WriteError::AlreadyExists` interception.
+        let msg = json["error"].as_str().unwrap();
+        assert!(
+            msg.contains("taken.md") && msg.to_lowercase().contains("destination"),
+            "expected the destination path named as the collision, got: {msg}"
+        );
+        // Nothing moved: the source is untouched.
+        assert!(work.path().join("source.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("taken.md")).unwrap(),
+            "---\ntitle: Taken\n---\n\n# Taken\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_doc_move_with_stale_expected_hash_is_409() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("source.md"),
+            "---\ntitle: Source\n---\n\n# Source\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "--", "source.md"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add source.md",
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+
+        let state = git_backed_ui_state(&work);
+        let app = ui_router(state);
+        let req = post_doc_request(
+            "source.md",
+            serde_json::json!({
+                "content": "---\ntitle: Source\n---\n\n# Source\n",
+                "create": false,
+                "new_path": "moved.md",
+                "expected_hash": "not-the-real-hash",
+            }),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = body_json(resp).await;
+        assert_eq!(json["outcome"], "failed_no_change");
+        // Must carry the stale-hash shape (an `expected_hash`/`actual_hash` pair),
+        // not the destination-collision shape from
+        // `post_doc_move_onto_existing_destination_is_409` — a stale read must
+        // never be reported as though the destination path were taken.
+        assert_eq!(json["expected_hash"], "not-the-real-hash");
+        assert!(json["actual_hash"].as_str().is_some());
+        // Nothing moved: the source is untouched, the destination never created.
+        assert!(work.path().join("source.md").exists());
+        assert!(!work.path().join("moved.md").exists());
+    }
+
+    #[tokio::test]
+    async fn post_doc_new_path_with_create_is_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let app = ui_router(test_state(&canonical));
+        let req = post_doc_request(
+            "new.md",
+            serde_json::json!({
+                "content": "---\ntitle: New\n---\n\n# Body\n",
+                "create": true,
+                "new_path": "elsewhere.md",
+            }),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!canonical.join("new.md").exists());
+        assert!(!canonical.join("elsewhere.md").exists());
     }
 
     #[tokio::test]

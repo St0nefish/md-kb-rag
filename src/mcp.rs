@@ -25,7 +25,10 @@ use crate::{
     schema::SchemaCache,
     state::{DocumentIndex, DocumentQuery, FieldFilter, OrderBy, StateDb},
     validate,
-    write::{WriteDeps, WriteError, WriteOutcome as CoreWriteOutcome, WriteRequest, WriteSuccess},
+    write::{
+        DirectoryMoveError, DirectoryMoveSuccess, WriteDeps, WriteError,
+        WriteOutcome as CoreWriteOutcome, WriteRequest, WriteSuccess,
+    },
 };
 
 const MAX_QUERY_LEN: usize = 4096;
@@ -838,6 +841,15 @@ pub struct EditDocumentParams {
     /// mismatch. Omit to skip this check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hash: Option<String>,
+    /// Relocate the document to this new repo-relative path in the same commit as
+    /// the edit. The destination must not already exist. The server reads the
+    /// document's CURRENT content itself — you never need to re-send the document
+    /// body just to move it. Combines with either edit mode (surgical or
+    /// full-replace) to relocate AND change content in one commit, or may be
+    /// provided with neither old_string/new_string nor content for a pure move
+    /// that leaves the content unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_path: Option<String>,
 }
 
 /// Parameters for the `delete_document` tool.
@@ -847,6 +859,23 @@ pub struct DeleteDocumentParams {
     /// KB root, a unique basename, or absolute).
     pub path: String,
     /// Optional commit message; defaults to "docs: delete {path}".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Parameters for the `move_directory` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MoveDirectoryParams {
+    /// Source directory prefix, relative to the knowledge base root (e.g.
+    /// "sysadmin/old-project"). Every document under this prefix, at any depth,
+    /// is moved. Must exist and contain at least one indexable document.
+    pub source_path: String,
+    /// Destination directory prefix, relative to the knowledge base root. Must
+    /// not already have any file living under it — this tool never merges into
+    /// or overwrites an existing prefix.
+    pub dest_path: String,
+    /// Optional commit message; if omitted, a message is generated from the two
+    /// prefixes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -861,24 +890,34 @@ pub enum EditMode {
 }
 
 /// Parse and validate the mode fields of `EditDocumentParams`, returning a
-/// typed `EditMode` or a human-readable error string.
+/// typed `Option<EditMode>` or a human-readable error string.
 ///
 /// Rules:
 /// - SURGICAL = `old_string` AND `new_string` both `Some`, `content` is `None`.
 /// - FULL = `content` is `Some`, both `old_string` and `new_string` are `None`.
-/// - Any other combination is rejected.
+/// - Neither SURGICAL nor FULL, but `new_path` is `Some`: `Ok(None)` — a pure
+///   move with content left unchanged. The caller (`edit_document`) reads the
+///   document's current content itself and passes it through untouched.
+/// - Neither SURGICAL nor FULL, and `new_path` is also `None`: rejected — at
+///   least one of the three (surgical, full-replace, move) must be requested.
+/// - SURGICAL and FULL together are always rejected, regardless of `new_path` —
+///   the two edit modes remain mutually exclusive WITH EACH OTHER; `new_path` is
+///   an orthogonal, independent axis that may combine with either one (or
+///   neither).
 /// - Surgical with `old_string == new_string` is rejected (no-op).
-pub fn parse_edit_mode(params: &EditDocumentParams) -> Result<EditMode, String> {
+pub fn parse_edit_mode(params: &EditDocumentParams) -> Result<Option<EditMode>, String> {
     let has_content = params.content.is_some();
     let has_old = params.old_string.is_some();
     let has_new = params.new_string.is_some();
+    let has_move = params.new_path.is_some();
 
     match (has_content, has_old, has_new) {
-        // Full mode
-        (true, false, false) => Ok(EditMode::Full {
+        // Full mode (optionally combined with a move — new_path is orthogonal
+        // and applied by the caller, not read here)
+        (true, false, false) => Ok(Some(EditMode::Full {
             content: params.content.clone().unwrap(),
-        }),
-        // Surgical mode
+        })),
+        // Surgical mode (optionally combined with a move, same as above)
         (false, true, true) => {
             let old = params.old_string.clone().unwrap();
             let new = params.new_string.clone().unwrap();
@@ -887,26 +926,43 @@ pub fn parse_edit_mode(params: &EditDocumentParams) -> Result<EditMode, String> 
                     "old_string and new_string are identical — no change would be made".to_string(),
                 );
             }
-            Ok(EditMode::Surgical { old, new })
+            Ok(Some(EditMode::Surgical { old, new }))
         }
-        // Both modes set
+        // Both modes set: still mutually exclusive with each other even when
+        // new_path is also present — a move never resolves which of the two
+        // conflicting edits to apply before relocating.
         (true, _, _) if has_old || has_new => {
             Err("content is mutually exclusive with old_string/new_string; \
-             provide either content (full replace) or old_string+new_string (surgical edit)"
+             provide either content (full replace) or old_string+new_string (surgical edit) \
+             — not both. new_path may be combined with either one (or with neither, for a \
+             pure move), but it does not resolve a conflict between the two edit modes \
+             themselves."
                 .to_string())
         }
-        // Only one of old_string/new_string
-        (false, true, false) => {
-            Err("old_string requires new_string; provide both for a surgical edit".to_string())
-        }
-        (false, false, true) => {
-            Err("new_string requires old_string; provide both for a surgical edit".to_string())
-        }
-        // Neither mode
-        (false, false, false) => Err(
-            "must provide either content (full replace) or old_string+new_string (surgical edit)"
+        // Only one of old_string/new_string. new_path does not change this —
+        // a surgical edit always needs both halves, move or no move.
+        (false, true, false) => Err(
+            "old_string requires new_string; provide both for a surgical edit. (If you only \
+             meant to move the document, omit old_string entirely and pass new_path alone.)"
                 .to_string(),
         ),
+        (false, false, true) => Err(
+            "new_string requires old_string; provide both for a surgical edit. (If you only \
+             meant to move the document, omit new_string entirely and pass new_path alone.)"
+                .to_string(),
+        ),
+        // Neither edit mode: a pure move if new_path was given, otherwise an error.
+        (false, false, false) => {
+            if has_move {
+                Ok(None)
+            } else {
+                Err(
+                    "must provide content (full replace), old_string+new_string (surgical \
+                     edit), or new_path (move) — at least one is required"
+                        .to_string(),
+                )
+            }
+        }
         // Unreachable combinations (content=true, old=true, new=true or content=true, old/new only)
         _ => Err("content is mutually exclusive with old_string/new_string; \
              provide either content (full replace) or old_string+new_string (surgical edit)"
@@ -1092,6 +1148,24 @@ fn with_outcome(mut result: CallToolResult, outcome: WriteOutcome) -> CallToolRe
     result
 }
 
+/// Like [`with_outcome`], but for `create_document`/`edit_document` specifically:
+/// also attaches `rewritten_paths`, the repo-relative paths of OTHER documents a
+/// MOVE rewrote incoming links in (always `[]` for a non-move write, or a move
+/// with nothing to rewrite). A move that silently edits other documents without
+/// surfacing which ones is not acceptable, so this rides in `structured_content`
+/// on every create/edit result, not just moves.
+fn with_outcome_and_rewrites(
+    mut result: CallToolResult,
+    outcome: WriteOutcome,
+    rewritten_paths: &[String],
+) -> CallToolResult {
+    result.structured_content = Some(serde_json::json!({
+        "outcome": outcome.as_str(),
+        "rewritten_paths": rewritten_paths,
+    }));
+    result
+}
+
 /// Build the `data` payload for an `McpError` reporting a failed write-tool outcome,
 /// so the same `{"outcome": ...}` discriminant is available on the error path too
 /// (`ErrorData::data`), not just on success.
@@ -1108,19 +1182,33 @@ fn create_edit_success_to_result(
     is_create: bool,
 ) -> CallToolResult {
     let action = if is_create { "Created" } else { "Edited" };
+    // Shared by both outcomes below: a one-line addendum naming exactly which
+    // OTHER documents a move rewrote incoming links in, so an agent moving a
+    // document is told about the side effect rather than discovering it later.
+    // Empty for every non-move write and for a move with nothing to rewrite.
+    let rewrite_note = if success.rewritten_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nUpdated links in {} document(s): {}.",
+            success.rewritten_paths.len(),
+            success.rewritten_paths.join(", ")
+        )
+    };
     match success.outcome {
         CoreWriteOutcome::Synced => {
             let summary = format!(
-                "{} '{}' (commit {}). Indexing has been queued and will complete shortly.",
-                action, rel_path, success.sha
+                "{} '{}' (commit {}). Indexing has been queued and will complete shortly.{}",
+                action, rel_path, success.sha, rewrite_note
             );
             let mut result_text = summary;
             if !success.diff.is_empty() {
                 result_text = format!("{}\n\n{}", result_text, success.diff);
             }
-            with_outcome(
+            with_outcome_and_rewrites(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::Synced,
+                &success.rewritten_paths,
             )
         }
         CoreWriteOutcome::CommittedPendingSync => {
@@ -1131,16 +1219,17 @@ fn create_edit_success_to_result(
             let summary = format!(
                 "{} '{}' (commit {}) — committed locally, but the push to the remote \
                  failed: {}. It will sync on the next successful write or manual \
-                 intervention. Indexing has been queued from the local copy.",
-                action, rel_path, success.sha, cause
+                 intervention. Indexing has been queued from the local copy.{}",
+                action, rel_path, success.sha, cause, rewrite_note
             );
             let mut result_text = summary;
             if !success.diff.is_empty() {
                 result_text = format!("{}\n\n{}", result_text, success.diff);
             }
-            with_outcome(
+            with_outcome_and_rewrites(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::CommittedPendingSync,
+                &success.rewritten_paths,
             )
         }
     }
@@ -1153,11 +1242,20 @@ fn create_edit_success_to_result(
 /// `canonical_data_path` is used only to reconstruct the absolute path for the
 /// `AlreadyExists` race (see that arm's comment) — every other arm reports
 /// against `rel_path`, matching what the tool surface's other errors already do.
+///
+/// `dest_path` is `Some` only when this call is (or was attempting to be) a
+/// document MOVE — i.e. `edit_document` was called with `new_path` set. It
+/// disambiguates the `AlreadyExists` arm, which for a move reports a collision
+/// at the DESTINATION, not at `rel_path` (the source, which — for a move — is
+/// expected to already exist). `create_document`'s own TOCTOU race, and every
+/// non-move `edit_document` call, pass `None` here, preserving the original
+/// `AlreadyExists` wording keyed on `rel_path`.
 fn create_edit_error_to_mcp_error(
     err: WriteError,
     rel_path: &str,
     is_create: bool,
     canonical_data_path: &Path,
+    dest_path: Option<&str>,
 ) -> McpError {
     match err {
         WriteError::Frozen { reason } => McpError::invalid_params(
@@ -1203,26 +1301,57 @@ fn create_edit_error_to_mcp_error(
         // that variant's doc comment. MCP is a trusted surface, so unlike
         // `web.rs` (which maps this to a generic message) this stays verbatim.
         WriteError::Internal { msg } => McpError::invalid_params(msg, None),
-        // This is the TOCTOU race path: `create_document`'s own pre-check
-        // (`abs_path.exists()`) already passed, so the file was created between
-        // that check and `write::write_document`'s `create_new` open. Restored to
-        // the pre-`write.rs`-extraction wording, which reported the absolute
-        // filesystem path rather than the repo-relative one — reconstructed here
-        // via `resolve_safe_write_path` since `WriteError::AlreadyExists` itself
-        // carries no path (kept a unit variant so `web.rs`'s exhaustive match
-        // needs no change to accommodate this).
+        // Two distinct races share this variant:
+        //
+        // 1. `create_document`'s own pre-check (`abs_path.exists()`) already
+        //    passed, so the file was created between that check and
+        //    `write::write_document`'s `create_new` open. Restored to the
+        //    pre-`write.rs`-extraction wording, which reported the absolute
+        //    filesystem path rather than the repo-relative one — reconstructed
+        //    here via `resolve_safe_write_path` since `WriteError::AlreadyExists`
+        //    itself carries no path (kept a unit variant so `web.rs`'s exhaustive
+        //    match needs no change to accommodate this). `dest_path` is `None`
+        //    here, so this is the arm that runs.
+        //
+        // 2. `edit_document` was called with `new_path` set (a MOVE, possibly
+        //    combined with a content edit) and the DESTINATION already exists —
+        //    previously impossible for `edit_document`, which had no way to
+        //    reach `AlreadyExists` before moves existed. `rel_path` here is the
+        //    move's SOURCE (which legitimately exists — that's what made this an
+        //    edit rather than a create), so reporting the collision against
+        //    `rel_path` would misdirect the caller at the wrong file. `dest_path`
+        //    disambiguates: when it's `Some`, this arm names the DESTINATION as
+        //    what collided, not the source.
         WriteError::AlreadyExists => {
-            let abs_path = crate::write::resolve_safe_write_path(canonical_data_path, rel_path)
-                .unwrap_or_else(|_| {
-                    canonical_data_path.join(crate::retrieval::kb_root_relative(rel_path))
-                });
-            McpError::invalid_params(
-                format!(
-                    "File '{}' already exists; use edit_document to modify it",
-                    abs_path.display()
-                ),
-                None,
-            )
+            if let Some(dest) = dest_path {
+                let abs_dest = crate::write::resolve_safe_write_path(canonical_data_path, dest)
+                    .unwrap_or_else(|_| {
+                        canonical_data_path.join(crate::retrieval::kb_root_relative(dest))
+                    });
+                McpError::invalid_params(
+                    format!(
+                        "Cannot move '{}' to '{}': the destination '{}' already exists. \
+                         A move never overwrites — choose a different new_path, or delete \
+                         or move the document already at the destination first.",
+                        rel_path,
+                        dest,
+                        abs_dest.display()
+                    ),
+                    None,
+                )
+            } else {
+                let abs_path = crate::write::resolve_safe_write_path(canonical_data_path, rel_path)
+                    .unwrap_or_else(|_| {
+                        canonical_data_path.join(crate::retrieval::kb_root_relative(rel_path))
+                    });
+                McpError::invalid_params(
+                    format!(
+                        "File '{}' already exists; use edit_document to modify it",
+                        abs_path.display()
+                    ),
+                    None,
+                )
+            }
         }
         WriteError::NotFound => {
             McpError::invalid_params(format!("File '{}' does not exist", rel_path), None)
@@ -1352,6 +1481,187 @@ fn delete_error_to_mcp_error(err: WriteError, rel_path: &str) -> McpError {
         // failure modes (schema-frozen check, frontmatter validation, the dedup
         // gate, and create-vs-exists) that the delete pipeline doesn't run.
         other => McpError::internal_error(format!("unexpected write error: {:?}", other), None),
+    }
+}
+
+/// Map a successful `write::move_directory` result onto this tool surface's
+/// `CallToolResult`. Mirrors `create_edit_success_to_result`'s two-outcome shape
+/// (`Synced` / `CommittedPendingSync`), scaled to a whole batch of documents: the
+/// summary line names how many documents moved and lists every `old -> new` pair,
+/// plus the same rewrite-note addendum `create_edit_success_to_result` uses for a
+/// single-document move's incoming-link rewrites.
+fn move_directory_success_to_result(
+    success: DirectoryMoveSuccess,
+    source_dir: &str,
+    dest_dir: &str,
+) -> CallToolResult {
+    let rewrite_note = if success.rewritten_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nUpdated links in {} document(s) outside the moved subtree: {}.",
+            success.rewritten_paths.len(),
+            success.rewritten_paths.join(", ")
+        )
+    };
+    let moved_lines = success
+        .moved
+        .iter()
+        .map(|(old, new)| format!("  {} -> {}", old, new))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let moved_json = success
+        .moved
+        .iter()
+        .map(|(old, new)| serde_json::json!({ "from": old, "to": new }))
+        .collect::<Vec<_>>();
+
+    let (outcome, summary) = match success.outcome {
+        CoreWriteOutcome::Synced => (
+            WriteOutcome::Synced,
+            format!(
+                "Moved {} document(s) from '{}' to '{}' (commit {}). Indexing has been \
+                 queued and will complete shortly.\n\n{}{}",
+                success.moved.len(),
+                source_dir,
+                dest_dir,
+                success.sha,
+                moved_lines,
+                rewrite_note
+            ),
+        ),
+        CoreWriteOutcome::CommittedPendingSync => {
+            let cause = success
+                .sync_failure_cause
+                .as_deref()
+                .unwrap_or("unknown error");
+            (
+                WriteOutcome::CommittedPendingSync,
+                format!(
+                    "Moved {} document(s) from '{}' to '{}' (commit {}) — committed \
+                     locally, but the push to the remote failed: {}. It will sync on the \
+                     next successful write or manual intervention. Indexing has been \
+                     queued from the local copy.\n\n{}{}",
+                    success.moved.len(),
+                    source_dir,
+                    dest_dir,
+                    success.sha,
+                    cause,
+                    moved_lines,
+                    rewrite_note
+                ),
+            )
+        }
+    };
+
+    let mut result = CallToolResult::success(vec![Content::text(summary)]);
+    result.structured_content = Some(serde_json::json!({
+        "outcome": outcome.as_str(),
+        "moved": moved_json,
+        "rewritten_paths": success.rewritten_paths,
+    }));
+    result
+}
+
+/// Map a `write::move_directory` failure onto this tool surface's `McpError`.
+/// Mirrors `create_edit_error_to_mcp_error`'s shape, scaled to
+/// `DirectoryMoveError`'s directory-move-specific variants.
+fn move_directory_error_to_mcp_error(
+    err: DirectoryMoveError,
+    source_dir: &str,
+    dest_dir: &str,
+) -> McpError {
+    match err {
+        DirectoryMoveError::SourceEmpty { msg } => {
+            McpError::invalid_params(format!("Cannot move '{}': {}", source_dir, msg), None)
+        }
+        DirectoryMoveError::AlreadyExists => McpError::invalid_params(
+            format!(
+                "Cannot move '{}' to '{}': the destination already has at least one file \
+                 living under it. A directory move never merges into or overwrites an \
+                 existing prefix — choose a different destination, or clear it first.",
+                source_dir, dest_dir
+            ),
+            None,
+        ),
+        DirectoryMoveError::SchemaInSource { path } => McpError::invalid_params(
+            format!(
+                "Cannot move '{}': it contains a schema file ('{}'). Moving a directory \
+                 together with its own {} is not supported in this version — the moved \
+                 documents' frontmatter would need to validate against a schema cascade \
+                 that is ALSO moving. Move the schema file separately (e.g. with \
+                 edit_document's MOVE MODE) and retry this move afterward.",
+                source_dir,
+                path,
+                crate::schema::SCHEMA_FILE_NAME
+            ),
+            None,
+        ),
+        DirectoryMoveError::Frozen { reason } => McpError::invalid_params(
+            format!(
+                "Cannot move '{}' to '{}': the schema governing one of the directories \
+                 involved is invalid ({}). Fix {} before moving.",
+                source_dir,
+                dest_dir,
+                reason,
+                crate::schema::SCHEMA_FILE_NAME
+            ),
+            None,
+        ),
+        DirectoryMoveError::Validation { failures } => {
+            let summary = failures
+                .iter()
+                .map(|(path, result)| format!("{}: {}", path, result.errors.join("; ")))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            McpError::invalid_params(
+                format!(
+                    "Cannot move '{}' to '{}': frontmatter validation against the \
+                     destination schema failed for {} document(s): {}",
+                    source_dir,
+                    dest_dir,
+                    failures.len(),
+                    summary
+                ),
+                Some(serde_json::json!({
+                    "failures": failures.iter().map(|(path, result)| serde_json::json!({
+                        "path": path,
+                        "field_errors": result.field_errors,
+                    })).collect::<Vec<_>>(),
+                })),
+            )
+        }
+        DirectoryMoveError::UnsafePath { msg } => McpError::invalid_params(msg, None),
+        DirectoryMoveError::Internal { msg } => McpError::invalid_params(msg, None),
+        DirectoryMoveError::InvalidCommitMessage { reason } => {
+            McpError::invalid_params(reason, None)
+        }
+        DirectoryMoveError::PreCommitFailed {
+            rolled_back: true,
+            msg,
+        } => McpError::internal_error(
+            format!(
+                "Directory move from '{}' to '{}' was NOT applied: git commit failed and \
+                 every document has been rolled back — nothing changed, safe to retry. \
+                 Cause: {}",
+                source_dir, dest_dir, msg
+            ),
+            outcome_data(WriteOutcome::FailedNoChange),
+        ),
+        DirectoryMoveError::PreCommitFailed {
+            rolled_back: false,
+            msg,
+        } => McpError::internal_error(
+            format!(
+                "Directory move from '{}' to '{}' is in an INCONSISTENT state: git commit \
+                 failed AND the rollback attempt itself failed. Filesystem and git state \
+                 may not match each other — do not assume this move did or did not take \
+                 effect. Manual inspection is required. {}",
+                source_dir, dest_dir, msg
+            ),
+            outcome_data(WriteOutcome::FailedInconsistentState),
+        ),
+        DirectoryMoveError::Io { msg } => McpError::internal_error(msg, None),
     }
 }
 
@@ -1579,7 +1889,7 @@ impl KbSearchServer {
             &config.source.branch,
             data_path_str,
             token.as_deref(),
-            rel_path,
+            &[rel_path],
             commit_message,
             &config.write.commit_author_name,
             &config.write.commit_author_email,
@@ -2598,6 +2908,11 @@ impl KbSearchServer {
     /// * `default_verb`– verb for the default commit message, e.g. `"add"` or `"update"`.
     /// * `force_new`   – when `Some(true)`, bypasses the dedup gate on create paths.
     /// * `operation`   – label for the `Operation:` git trailer, e.g. `"create_document"`.
+    /// * `dest_path`   – when `Some`, turns this into a document MOVE: `rel_path` is
+    ///   the source, this is the destination. `None` (the default for every
+    ///   `create_document` call, and for a plain `edit_document` call with no
+    ///   `new_path`) is the existing create/edit behavior. See
+    ///   `write::WriteRequest::dest_path`.
     #[allow(clippy::too_many_arguments)]
     async fn write_document(
         &self,
@@ -2609,6 +2924,7 @@ impl KbSearchServer {
         default_verb: &str,
         force_new: Option<bool>,
         operation: &str,
+        dest_path: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
         // One snapshot for the whole call, so a concurrent `POST /admin/reload`
         // cannot mix old and new values across this method's several config reads.
@@ -2629,6 +2945,20 @@ impl KbSearchServer {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Only opened for a MOVE (`dest_path.is_some()`) — `write::write_document`
+        // itself never reads `deps.state` outside `write_document_move`, so a
+        // plain create/edit has no use for it, and opening the state DB lazily
+        // here (rather than unconditionally on every write) avoids materializing
+        // `state.db` on disk for calls that will never touch it. Best-effort: a
+        // state DB that fails to open degrades a move to "without link
+        // rewriting" (see `WriteDeps::state`'s doc comment) rather than failing
+        // the write.
+        let state_db = if dest_path.is_some() {
+            self.state_db().await.ok()
+        } else {
+            None
+        };
+
         let deps = WriteDeps {
             retrieval: self.deps(),
             canonical_data_path: &self.canonical_data_path,
@@ -2642,6 +2972,7 @@ impl KbSearchServer {
             token: token.as_deref(),
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
+            state: state_db,
         };
 
         let req = WriteRequest {
@@ -2661,6 +2992,10 @@ impl KbSearchServer {
             // `old_content` a second time; it can never disagree with the first
             // check since both compare against the identical string.
             expected_hash: None,
+            // Threaded straight from this method's own `dest_path` parameter —
+            // `Some` turns this call into a move. See
+            // `write::WriteRequest::dest_path`.
+            dest_path,
         };
 
         match crate::write::write_document(&deps, req).await {
@@ -2670,6 +3005,7 @@ impl KbSearchServer {
                 rel_path,
                 is_create,
                 &self.canonical_data_path,
+                dest_path,
             )),
         }
     }
@@ -2713,7 +3049,15 @@ impl KbSearchServer {
         // `write::write_document`'s own check (see `create_edit_error_to_mcp_error`'s
         // `UnsafePath` arm), so existing callers see the exact same wording.
         crate::write::check_include_pattern_against(&self.include_patterns, &params.path).map_err(
-            |e| create_edit_error_to_mcp_error(e, &params.path, true, &self.canonical_data_path),
+            |e| {
+                create_edit_error_to_mcp_error(
+                    e,
+                    &params.path,
+                    true,
+                    &self.canonical_data_path,
+                    None,
+                )
+            },
         )?;
 
         // File must not already exist for create.
@@ -2736,12 +3080,15 @@ impl KbSearchServer {
             "add",
             params.force_new,
             "create_document",
+            None, // create_document never moves a document
         )
         .await
     }
 
-    #[tool(description = "Edit an existing document in the knowledge base. \
-        Supports two modes:\n\
+    #[tool(
+        description = "Edit an existing document in the knowledge base, optionally also \
+        relocating it. Content changes and relocation are independent axes: pick zero or one \
+        content mode, and independently choose whether to also move the document.\n\
         \n\
         SURGICAL MODE — provide old_string and new_string (mutually exclusive with content):\n\
         Finds old_string in the document (must appear exactly once) and replaces it with \
@@ -2754,25 +3101,53 @@ impl KbSearchServer {
         YAML frontmatter. Required frontmatter fields and any fixed allowed values \
         (e.g. for type/status) are listed in this server's instructions.\n\
         \n\
-        In both modes the result is validated, committed, and queued for indexing in the \
+        MOVE MODE — provide new_path to relocate the document to a different repo-relative \
+        path, in the same commit as any content change:\n\
+        Unlike SURGICAL and FULL-REPLACE, which are mutually exclusive with EACH OTHER, MOVE \
+        may be combined with either one — or with neither, for a pure relocation that leaves \
+        content unchanged. Pass new_path alone to move the document as-is; pass it together \
+        with old_string+new_string or content to fix up the document and relocate it in one \
+        atomic commit. You never need to re-send the document body just to move it — the \
+        server reads its current content itself. The destination (new_path) must not already \
+        exist; this tool never overwrites. Frontmatter is validated against the DESTINATION \
+        directory's schema, which may differ from the source directory's — call get_schema on \
+        the destination path first if you are not sure what it requires. Moving a document \
+        also automatically updates inline Markdown links in OTHER documents that point at it, \
+        committing those documents in the SAME commit as the move; the updated paths are \
+        reported back in rewritten_paths. LIMITATION: only inline links in the form \
+        [text](path.md) are rewritten. Reference-style links ([text][ref]), wiki-style \
+        [[path]] links, and autolinks (<path.md>) are invisible to this system's link index \
+        and are NOT rewritten — if the knowledge base uses those styles, they need manual \
+        follow-up after a move.\n\
+        \n\
+        At least one of {content, old_string+new_string, new_path} must be provided — a call \
+        with none of them changes nothing and is rejected.\n\
+        \n\
+        In every mode the result is validated, committed, and queued for indexing in the \
         background (the change becomes searchable shortly after this call returns, not \
-        necessarily immediately). The path is resolved like get_document: relative to the KB \
-        root, a unique basename, or absolute. The document must already exist — use \
-        create_document for new files.\n\
+        necessarily immediately). The path parameter (the SOURCE) is resolved like \
+        get_document: relative to the KB root, a unique basename, or absolute. The document at \
+        path must already exist — use create_document for new files. new_path, by contrast, is \
+        taken literally as a repo-relative destination and must NOT already exist.\n\
         \n\
         OPTIONAL STALE-READ GUARD — expected_hash:\n\
         Pass the content_hash get_document returned in structured_content when you read this \
         document, and the edit is refused with an explicit error if the file has changed since \
-        then, instead of a confusing old_string/content mismatch. Omit to skip this check.\n\
+        then, instead of a confusing old_string/content mismatch. Applies to moves too, guarding \
+        against a stale read of the source.\n\
         \n\
         SCOPE: this knowledge base holds durable reference knowledge only. NEVER append session \
-        notes, task state, or other transient content to a document.")]
+        notes, task state, or other transient content to a document."
+    )]
     async fn edit_document(
         &self,
         Parameters(params): Parameters<EditDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Parse and validate the edit mode (surgical vs full-replace).
+        // Parse and validate the content-edit mode (surgical vs full-replace vs
+        // neither). `new_path` is an orthogonal axis handled below, independent of
+        // this — see `parse_edit_mode`'s doc comment.
         let mode = parse_edit_mode(&params).map_err(|e| McpError::invalid_params(e, None))?;
+        let dest_path = params.new_path.as_deref();
 
         // Resolve the path using the get_document resolver (forgiving: relative/
         // absolute/basename, canonicalized, include-pattern + containment checked).
@@ -2851,13 +3226,32 @@ impl KbSearchServer {
             }
         }
 
-        // Compute new_content and operation label based on mode.
+        // Compute new_content and operation label based on mode. `None` is a pure
+        // move (guaranteed by `parse_edit_mode` to only occur when `dest_path` is
+        // `Some` — see its doc comment): the destination gets the source's current
+        // content, byte-for-byte, since `write::write_document` never reads
+        // `rel_path`'s content itself, move or not.
         let (new_content, operation) = match mode {
-            EditMode::Full { content } => (content, "edit_document (full replace)"),
-            EditMode::Surgical { old, new } => {
+            None => (old_content.clone(), "edit_document (move)"),
+            Some(EditMode::Full { content }) => (
+                content,
+                if dest_path.is_some() {
+                    "edit_document (full replace + move)"
+                } else {
+                    "edit_document (full replace)"
+                },
+            ),
+            Some(EditMode::Surgical { old, new }) => {
                 let result = apply_surgical(&old_content, &old, &new, &rel_path)
                     .map_err(|e| McpError::invalid_params(e, None))?;
-                (result, "edit_document (surgical replace)")
+                (
+                    result,
+                    if dest_path.is_some() {
+                        "edit_document (surgical replace + move)"
+                    } else {
+                        "edit_document (surgical replace)"
+                    },
+                )
             }
         };
 
@@ -2870,6 +3264,7 @@ impl KbSearchServer {
             "update",
             None, // no dedup gate for edit
             operation,
+            dest_path,
         )
         .await
     }
@@ -2957,11 +3352,111 @@ impl KbSearchServer {
             token: token.as_deref(),
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
+            // `delete_document` never moves a document — `write::write_document_move`
+            // is the only reader of `WriteDeps::state` — so there is nothing here
+            // for a state DB to do. `None` per `WriteDeps::state`'s doc comment.
+            state: None,
         };
 
         match crate::write::delete_document(&deps, &rel_path, params.message.as_deref()).await {
             Ok(success) => Ok(delete_success_to_result(success, &rel_path)),
             Err(err) => Err(delete_error_to_mcp_error(err, &rel_path)),
+        }
+    }
+
+    #[tool(
+        description = "Relocate every document under a source directory prefix to a \
+        destination prefix, as ONE atomic commit. Use this to reorganize a whole subtree \
+        at once — for a single document, use edit_document's MOVE MODE instead; this tool \
+        has no content-editing ability (no body, no expected_hash, no surgical/full-replace \
+        modes).\n\
+        \n\
+        ALL-OR-NOTHING: every moved document's frontmatter is validated against the \
+        DESTINATION path's schema (which may differ per document, since each keeps its \
+        position under the destination prefix) BEFORE anything is written. If even one \
+        document fails that validation, the whole move is refused and nothing is \
+        mutated — the response names every document that failed, not just the first.\n\
+        \n\
+        PRECONDITIONS: source_path must exist and contain at least one indexable document. \
+        dest_path must not already have any file living under it — this tool never merges \
+        into or overwrites an existing prefix.\n\
+        \n\
+        LIMITATION — schema files: a source subtree containing its own .kb-schema.yaml is \
+        rejected outright. Moving a schema file together with the documents it governs \
+        would change the very cascade those documents must validate against, which this \
+        version of the tool does not support. Move the schema file separately (e.g. with \
+        edit_document's MOVE MODE) and retry this move afterward.\n\
+        \n\
+        LINK REWRITING: a link between two documents that are BOTH moving keeps pointing \
+        at each other post-move; a link to a document that stays in place keeps that exact \
+        target, with only its relative spelling updated for the mover's new location. \
+        Documents OUTSIDE the moved subtree that link INTO it also have those links \
+        rewritten to the new location, committed in the SAME commit as the move — the \
+        rewritten paths are reported back in rewritten_paths. LIMITATION: only inline \
+        links in the form [text](path.md) are rewritten. Reference-style links \
+        ([text][ref]), wiki-style [[path]] links, and autolinks (<path.md>) are invisible \
+        to this system's link index and are NOT rewritten — if the knowledge base uses \
+        those styles, they need manual follow-up after a move.\n\
+        \n\
+        Returns the number of documents moved (with their old -> new paths) and every \
+        rewritten path. Indexing of every moved and rewritten document is queued in the \
+        background — the changes become searchable shortly after this call returns, not \
+        necessarily immediately."
+    )]
+    async fn move_directory(
+        &self,
+        Parameters(params): Parameters<MoveDirectoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = self.config();
+
+        let source_dir = params.source_path.trim();
+        let dest_dir = params.dest_path.trim();
+        if source_dir.is_empty() {
+            return Err(McpError::invalid_params(
+                "source_path parameter is empty".to_string(),
+                None,
+            ));
+        }
+        if dest_dir.is_empty() {
+            return Err(McpError::invalid_params(
+                "dest_path parameter is empty".to_string(),
+                None,
+            ));
+        }
+
+        let token = std::env::var(&config.source.git_token_env)
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        // Best-effort, same as `write_document`'s own lazy state-DB open for a
+        // single-document MOVE: a state DB that fails to open degrades the
+        // incoming-link rewrite to "skip it", not a failed move — see
+        // `WriteDeps::state`'s doc comment.
+        let state_db = self.state_db().await.ok();
+
+        let deps = WriteDeps {
+            retrieval: self.deps(),
+            canonical_data_path: &self.canonical_data_path,
+            schema_cache: &self.schema_cache,
+            validation: &config.validation,
+            prepend_description: config.chunking.prepend_description,
+            dedup_enabled: config.write.dedup_enabled,
+            dedup_threshold: config.write.dedup_threshold,
+            git_url: config.source.git_url.as_deref(),
+            branch: &config.source.branch,
+            token: token.as_deref(),
+            commit_author_name: &config.write.commit_author_name,
+            commit_author_email: &config.write.commit_author_email,
+            state: state_db,
+        };
+
+        match crate::write::move_directory(&deps, source_dir, dest_dir, params.message.as_deref())
+            .await
+        {
+            Ok(success) => Ok(move_directory_success_to_result(
+                success, source_dir, dest_dir,
+            )),
+            Err(err) => Err(move_directory_error_to_mcp_error(err, source_dir, dest_dir)),
         }
     }
 }
@@ -4919,6 +5414,7 @@ mod tests {
             content: Some("---\ntitle: Test\n---\n# Body".to_string()),
             message: None,
             expected_hash: None,
+            new_path: None,
         };
         let result = server.edit_document(Parameters(params)).await;
 
@@ -5030,6 +5526,7 @@ mod tests {
             rel_path,
             true,
             &canonical_data_path,
+            None,
         );
 
         let expected_abs = canonical_data_path.join(rel_path);
@@ -5064,6 +5561,7 @@ mod tests {
             "docs/x.md",
             true,
             &canonical_data_path,
+            None,
         );
         assert_eq!(create_err.message, msg);
 
@@ -5504,6 +6002,7 @@ mod tests {
             content: Some("---\ntitle: Edited Doc\n---\n# New content".to_string()),
             message: None,
             expected_hash: None,
+            new_path: None,
         };
         let result = server.edit_document(Parameters(params)).await;
 
@@ -5652,6 +6151,7 @@ mod tests {
         content: Option<&str>,
         old_string: Option<&str>,
         new_string: Option<&str>,
+        new_path: Option<&str>,
     ) -> EditDocumentParams {
         EditDocumentParams {
             path: "docs/test.md".to_string(),
@@ -5660,37 +6160,38 @@ mod tests {
             new_string: new_string.map(|s| s.to_string()),
             message: None,
             expected_hash: None,
+            new_path: new_path.map(|s| s.to_string()),
         }
     }
 
     #[test]
     fn parse_edit_mode_full_replace_is_recognized() {
-        let params = make_edit_params(Some("new content"), None, None);
+        let params = make_edit_params(Some("new content"), None, None, None);
         let mode = parse_edit_mode(&params).unwrap();
         assert_eq!(
             mode,
-            EditMode::Full {
+            Some(EditMode::Full {
                 content: "new content".to_string()
-            }
+            })
         );
     }
 
     #[test]
     fn parse_edit_mode_surgical_is_recognized() {
-        let params = make_edit_params(None, Some("old text"), Some("new text"));
+        let params = make_edit_params(None, Some("old text"), Some("new text"), None);
         let mode = parse_edit_mode(&params).unwrap();
         assert_eq!(
             mode,
-            EditMode::Surgical {
+            Some(EditMode::Surgical {
                 old: "old text".to_string(),
                 new: "new text".to_string()
-            }
+            })
         );
     }
 
     #[test]
     fn parse_edit_mode_both_modes_rejected() {
-        let params = make_edit_params(Some("full content"), Some("old"), Some("new"));
+        let params = make_edit_params(Some("full content"), Some("old"), Some("new"), None);
         let err = parse_edit_mode(&params).unwrap_err();
         assert!(
             err.contains("mutually exclusive"),
@@ -5700,17 +6201,21 @@ mod tests {
 
     #[test]
     fn parse_edit_mode_neither_mode_rejected() {
-        let params = make_edit_params(None, None, None);
+        let params = make_edit_params(None, None, None, None);
         let err = parse_edit_mode(&params).unwrap_err();
         assert!(
             err.contains("must provide"),
             "expected 'must provide' in error, got: {err}"
         );
+        assert!(
+            err.contains("new_path"),
+            "the error must name new_path as a third option now that moves exist, got: {err}"
+        );
     }
 
     #[test]
     fn parse_edit_mode_only_old_string_rejected() {
-        let params = make_edit_params(None, Some("old"), None);
+        let params = make_edit_params(None, Some("old"), None, None);
         let err = parse_edit_mode(&params).unwrap_err();
         assert!(
             err.contains("new_string"),
@@ -5720,7 +6225,7 @@ mod tests {
 
     #[test]
     fn parse_edit_mode_only_new_string_rejected() {
-        let params = make_edit_params(None, None, Some("new"));
+        let params = make_edit_params(None, None, Some("new"), None);
         let err = parse_edit_mode(&params).unwrap_err();
         assert!(
             err.contains("old_string"),
@@ -5730,11 +6235,76 @@ mod tests {
 
     #[test]
     fn parse_edit_mode_identical_old_new_rejected() {
-        let params = make_edit_params(None, Some("same text"), Some("same text"));
+        let params = make_edit_params(None, Some("same text"), Some("same text"), None);
         let err = parse_edit_mode(&params).unwrap_err();
         assert!(
             err.contains("identical"),
             "expected 'identical' in error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_edit_mode: new_path (move) arms
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_edit_mode_move_alone_is_a_pure_move() {
+        // Neither content mode, but new_path set: Ok(None) — a pure move, content
+        // unchanged.
+        let params = make_edit_params(None, None, None, Some("docs/new-home.md"));
+        let mode = parse_edit_mode(&params).unwrap();
+        assert_eq!(
+            mode, None,
+            "move-only should parse to Ok(None), got: {mode:?}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_surgical_combined_with_move_is_recognized() {
+        let params = make_edit_params(
+            None,
+            Some("old text"),
+            Some("new text"),
+            Some("docs/new-home.md"),
+        );
+        let mode = parse_edit_mode(&params).unwrap();
+        assert_eq!(
+            mode,
+            Some(EditMode::Surgical {
+                old: "old text".to_string(),
+                new: "new text".to_string()
+            }),
+            "surgical + new_path must still parse as Ok(Some(Surgical))"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_full_replace_combined_with_move_is_recognized() {
+        let params = make_edit_params(Some("new content"), None, None, Some("docs/new-home.md"));
+        let mode = parse_edit_mode(&params).unwrap();
+        assert_eq!(
+            mode,
+            Some(EditMode::Full {
+                content: "new content".to_string()
+            }),
+            "full-replace + new_path must still parse as Ok(Some(Full))"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_both_modes_still_rejected_even_with_move() {
+        // surgical and full-replace remain mutually exclusive WITH EACH OTHER
+        // regardless of whether new_path is also present.
+        let params = make_edit_params(
+            Some("full content"),
+            Some("old"),
+            Some("new"),
+            Some("docs/new-home.md"),
+        );
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected 'mutually exclusive' in error even with new_path set, got: {err}"
         );
     }
 
@@ -6454,6 +7024,7 @@ mod tests {
                 ),
                 message: None,
                 expected_hash: None,
+                new_path: None,
             }))
             .await;
 
@@ -6509,6 +7080,7 @@ mod tests {
                 content: Some(new_content.to_string()),
                 message: None,
                 expected_hash: None,
+                new_path: None,
             }))
             .await;
 
@@ -6602,6 +7174,7 @@ mod tests {
                 content: Some("---\ntitle: New\ntype: guide\n---\n# New body\n".to_string()),
                 message: None,
                 expected_hash: Some(stale_hash),
+                new_path: None,
             }))
             .await;
 
@@ -6647,6 +7220,7 @@ mod tests {
                 content: Some(new_content.to_string()),
                 message: None,
                 expected_hash: Some(correct_hash),
+                new_path: None,
             }))
             .await;
 
@@ -6660,6 +7234,153 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
             new_content
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // edit_document: new_path (move), end-to-end through the tool
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn edit_document_move_alone_relocates_content_unchanged() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old Home\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(work.path().join("docs/old-home.md"), original).unwrap();
+        git_commit_all(&work, "docs/old-home.md", "add docs/old-home.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .edit_document(Parameters(EditDocumentParams {
+                path: "docs/old-home.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: None,
+                message: None,
+                expected_hash: None,
+                new_path: Some("docs/new-home.md".to_string()),
+            }))
+            .await;
+
+        let result = result.expect("a pure move (new_path alone) must succeed");
+        assert_eq!(
+            outcome_of(&result.structured_content),
+            Some("synced"),
+            "got: {:?}",
+            result
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("docs/new-home.md")).unwrap(),
+            original,
+            "the destination must have the source's exact original content, unchanged"
+        );
+        assert!(
+            !work.path().join("docs/old-home.md").exists(),
+            "the source must be gone after a move"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_document_move_combined_with_edit_relocates_transformed_content() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let new_content =
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
+
+        let result = server
+            .edit_document(Parameters(EditDocumentParams {
+                path: "edit-me.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some(new_content.to_string()),
+                message: None,
+                expected_hash: None,
+                new_path: Some("archive/edit-me.md".to_string()),
+            }))
+            .await;
+
+        let result = result.expect("a combined move+edit must succeed");
+        assert_eq!(
+            outcome_of(&result.structured_content),
+            Some("synced"),
+            "got: {:?}",
+            result
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("archive/edit-me.md")).unwrap(),
+            new_content,
+            "the destination must hold the TRANSFORMED content, not the pre-move original"
+        );
+        assert!(
+            !work.path().join("edit-me.md").exists(),
+            "the source must be gone after a move"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_document_move_onto_existing_destination_reports_the_destination_as_the_collision()
+    {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let source_content =
+            "---\ntitle: Source\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Source body\n";
+        let dest_content =
+            "---\ntitle: Dest\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Dest body\n";
+        std::fs::write(work.path().join("source.md"), source_content).unwrap();
+        std::fs::write(work.path().join("dest.md"), dest_content).unwrap();
+        git_commit_all(&work, "source.md", "add source.md");
+        git_commit_all(&work, "dest.md", "add dest.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .edit_document(Parameters(EditDocumentParams {
+                path: "source.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: None,
+                message: None,
+                expected_hash: None,
+                new_path: Some("dest.md".to_string()),
+            }))
+            .await;
+
+        let err = result.expect_err("moving onto an existing destination must be rejected");
+        assert!(
+            err.message.contains("dest.md"),
+            "error should name the destination path, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("destination"),
+            "error should make clear it is the DESTINATION that collided, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("'source.md' already exists"),
+            "error must not misattribute the collision to the source, got: {}",
+            err.message
+        );
+
+        // Rejected before any filesystem mutation (write_document_move checks the
+        // destination's existence before writing anything) — both files, source and
+        // pre-existing destination, must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("source.md")).unwrap(),
+            source_content
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("dest.md")).unwrap(),
+            dest_content
         );
     }
 
