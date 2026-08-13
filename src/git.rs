@@ -29,7 +29,7 @@ pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// a webhook straight back at us seconds later.
 ///
 /// Until #92 this was covered incidentally by `webhook::REINDEX_LOCK`; that lock
-/// is gone, and `reindex::REINDEX_QUEUE` which replaced it serializes *indexing*,
+/// is gone, and `reindex::ReindexQueue` which replaced it serializes *indexing*,
 /// not *git*. Hence an explicit lock whose only job is git.
 static GIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 

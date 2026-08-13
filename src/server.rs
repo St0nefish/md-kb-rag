@@ -219,6 +219,11 @@ pub struct StatusState {
     state_db: Arc<tokio::sync::OnceCell<crate::state::StateDb>>,
     /// Last collected response and when, for [`STATUS_CACHE_TTL`] reuse.
     cache: Arc<tokio::sync::Mutex<Option<(std::time::Instant, StatusResponse)>>>,
+    /// The process's one `ReindexQueue` in the live server (see `run_server`'s
+    /// `reindex_queue`); a fresh, private, permanently-idle one for `for_cli` —
+    /// see that constructor's doc comment for why idle is correct there, not a
+    /// simplification.
+    reindex_queue: Arc<crate::reindex::ReindexQueue>,
 }
 
 impl StatusState {
@@ -227,6 +232,10 @@ impl StatusState {
     /// Sharing the collector is what keeps `md-kb-rag status --json` and the `/status`
     /// endpoint from drifting apart. The `indexing` half will always report idle here:
     /// run state is per-process, and the CLI is not the process doing the indexing.
+    /// `reindex_queue` is built fresh and never shared with anything — the CLI has
+    /// no worker and nothing else in this process ever marks it, so it stays
+    /// empty/idle for the same reason `indexing` does, not because of any special
+    /// casing here.
     ///
     /// The CLI has no reload endpoint of its own, so this just wraps the one-off
     /// config as a `SharedConfig` that nothing else ever writes to.
@@ -236,6 +245,7 @@ impl StatusState {
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
         })
     }
 
@@ -441,7 +451,7 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
         collection: config.qdrant.collection.clone(),
         data_path: config.data_path().to_string(),
         indexing: crate::status::INDEX_STATUS.snapshot(),
-        queue: crate::reindex::REINDEX_QUEUE.snapshot(),
+        queue: state.reindex_queue.snapshot(),
         store,
         breakdown,
         config: config.provenance.clone(),
@@ -852,6 +862,10 @@ struct AdminState {
     /// Behind an `Arc` purely so `AdminState` stays cheaply `Clone` (axum clones
     /// per-request state) — the path itself never changes after startup.
     config_path: Arc<std::path::PathBuf>,
+    /// The process's one `ReindexQueue` — `reload::reload_config` marks a full
+    /// reconcile on it after a successful swap, and that must be the same
+    /// queue `reindex::run_worker` drains, not a private one.
+    reindex_queue: Arc<crate::reindex::ReindexQueue>,
 }
 
 /// `POST /admin/reload` — re-read and re-validate `config.yaml` from disk and swap
@@ -870,7 +884,11 @@ struct AdminState {
 /// fail, and the running config is left completely untouched — this endpoint just
 /// reports the failure over HTTP (400) instead of exiting the process.
 async fn reload_handler(State(state): State<AdminState>) -> (StatusCode, Json<serde_json::Value>) {
-    match crate::reload::reload_config(&state.config_path, &state.shared_config) {
+    match crate::reload::reload_config(
+        &state.config_path,
+        &state.shared_config,
+        &state.reindex_queue,
+    ) {
         Ok(report) => {
             info!(
                 applied = report.applied.len(),
@@ -1196,11 +1214,11 @@ async fn build_instructions(
 /// sleep this loop schedules — not just sleeps scheduled after a restart), then call
 /// `on_fire`.
 ///
-/// `on_fire` is injected — production passes `reindex::mark_full` — so tests can
-/// observe exactly when and how often a firing happened without depending on
-/// `REINDEX_QUEUE`'s process-global, monotonic `full_pending` flag, which other
-/// tests elsewhere in the suite may already have set for the remaining life of the
-/// test binary.
+/// `on_fire` is injected — production passes a closure that calls
+/// `ReindexQueue::mark_full` on the process's one `reindex_queue` — so tests can
+/// observe exactly when and how often a firing happened against a queue private
+/// to that test, without depending on any process-global state shared with the
+/// rest of the suite.
 async fn reconcile_loop(shared_config: SharedConfig, ct: CancellationToken, on_fire: impl Fn()) {
     loop {
         // Read fresh every iteration (not captured once) so a reload's new
@@ -1315,6 +1333,18 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         Arc::new(RwLock::new(Arc::new(initial_schemas)));
     let schemas = schema::load_shared(&shared_schema_cache);
 
+    // The single dirty-path queue for this process. Every producer — the MCP
+    // write tools (`KbSearchServer`), the web UI's write routes (`UiState`), the
+    // webhook handler (`WebhookState`), `/admin/reload` (`AdminState`), and
+    // `/status`/`/metrics` (`StatusState`, read-only) — gets its own clone of
+    // this SAME `Arc`, and `reindex::run_worker` below is spawned against it
+    // too. There is deliberately no process-wide default any of them could fall
+    // back on instead (see `reindex::ReindexQueue`'s doc comment on
+    // `run_worker`) — the whole point of threading it explicitly is that a
+    // producer built with a different instance would be a compile-time wiring
+    // mistake here, not a silent runtime one.
+    let reindex_queue = Arc::new(crate::reindex::ReindexQueue::new());
+
     // Ensure collection exists
     qdrant
         .ensure_collection(
@@ -1362,7 +1392,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     let ct = CancellationToken::new();
     let refresh_ct = ct.child_token();
 
-    // Spawn the reindex worker — the single task that drains `reindex::REINDEX_QUEUE`
+    // Spawn the reindex worker — the single task that drains `reindex_queue`
     // and is the only thing (besides the CLI, which has no worker) that ever calls
     // `ingest::index_paths`. From here on, the MCP write tools and the webhook handler
     // just mark paths dirty and return; this task does the actual chunk/embed/upsert
@@ -1371,6 +1401,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // `frontmatter.*`, `validation.*`, and `chunking.*` all observe a reload on the
     // worker's next wake rather than needing a restart.
     tokio::spawn(crate::reindex::run_worker(
+        Arc::clone(&reindex_queue),
         Arc::clone(&shared_config),
         Arc::clone(&shared_schema_cache),
     ));
@@ -1379,7 +1410,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // webhook that never arrived because the server was offline). This does not index
     // synchronously — it marks a full reconcile pending and the worker just spawned
     // picks it up on its own schedule, same as any other queued work.
-    crate::reindex::mark_full();
+    reindex_queue.mark_full();
 
     // Periodic safety-net sweep. See `IndexingConfig::reconcile_interval_secs`'s doc
     // comment for why this interval is a backstop for LOST events, not the indexing
@@ -1387,10 +1418,11 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // `Notify`, independent of this timer.
     let reconcile_ct = ct.child_token();
     let reconcile_shared_config = Arc::clone(&shared_config);
+    let reconcile_queue = Arc::clone(&reindex_queue);
     tokio::spawn(reconcile_loop(
         reconcile_shared_config,
         reconcile_ct,
-        crate::reindex::mark_full,
+        move || reconcile_queue.mark_full(),
     ));
 
     tokio::spawn(async move {
@@ -1484,6 +1516,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         rerank_for_mcp.clone(),
         Arc::clone(&shared_schema_cache),
         Arc::clone(&shared_state_db),
+        Arc::clone(&reindex_queue),
     );
 
     // Build the handler once and clone it per request. In stateless mode the factory
@@ -1500,6 +1533,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         config_for_mcp,
         Arc::clone(&shared_schema_cache),
         rerank_for_mcp,
+        Arc::clone(&reindex_queue),
     )?;
 
     if !config.mcp.allowed_hosts.is_empty() {
@@ -1596,6 +1630,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         qdrant: Arc::clone(&qdrant),
         state_db: Arc::clone(&shared_state_db),
         cache: Arc::new(tokio::sync::Mutex::new(None)),
+        reindex_queue: Arc::clone(&reindex_queue),
     };
     let status_router = Router::new()
         .route("/status", axum::routing::get(status_handler))
@@ -1615,6 +1650,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     let admin_state = AdminState {
         shared_config: Arc::clone(&shared_config),
         config_path: Arc::new(config_path),
+        reindex_queue: Arc::clone(&reindex_queue),
     };
     let admin_router = Router::new()
         .route("/admin/reload", axum::routing::post(reload_handler))
@@ -1642,6 +1678,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
             config: Arc::clone(&shared_config),
             secret,
             git_token: git_pull_token.clone(),
+            reindex_queue: Arc::clone(&reindex_queue),
         };
         let webhook_router = Router::new()
             .route(
@@ -1994,6 +2031,7 @@ mod tests {
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
         };
 
         let status = collect_status(&state).await;
@@ -2044,6 +2082,7 @@ mod tests {
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
         };
 
         let status = collect_status(&state).await;
@@ -2066,6 +2105,7 @@ mod tests {
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
         };
 
         // Must degrade, not panic or 500: if this branch regresses into an unwrap,
@@ -2111,6 +2151,7 @@ mod tests {
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
         };
 
         let status = collect_status(&state).await;
@@ -2152,6 +2193,7 @@ mod tests {
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
         };
 
         let status = collect_status(&state).await;
@@ -2181,6 +2223,7 @@ mod tests {
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
         };
 
         let first = cached_status(&state).await;
@@ -2248,45 +2291,35 @@ mod tests {
     async fn status_reports_the_actual_pending_reindex_queue_state() {
         let dir = tempfile::tempdir().unwrap();
         let config = status_config(dir.path());
+        let queue = Arc::new(crate::reindex::ReindexQueue::new());
         let state = StatusState {
             qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
             config: config::shared_config(config),
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::clone(&queue),
         };
 
-        // `REINDEX_QUEUE` is a process-global shared with every other test in the
-        // suite (mcp.rs's write-tool tests and webhook.rs's tests mark real paths on
-        // it too), and nothing ever drains it back down in this binary — so the
-        // count-based assertion below can only assert a lower bound relative to a
-        // `before` snapshot, never an exact count. That is still enough to catch
-        // the regression this test exists for: `collect_status` returning a stale,
-        // default, or otherwise disconnected `QueueSnapshot` instead of
-        // `REINDEX_QUEUE.snapshot()`.
-        //
-        // The path-level check below is a separate, stronger guard against a
-        // different failure: the marker literal itself colliding with another
-        // test's, which would make the marking below a silent no-op and this test
-        // pass for the wrong reason.
-        let before = crate::reindex::REINDEX_QUEUE.snapshot();
-        let before_paths = crate::reindex::REINDEX_QUEUE.snapshot_paths();
-        crate::reindex::mark_paths([std::path::PathBuf::from(
+        // `queue` is private to this test, so the assertions below can be exact
+        // (it started empty) rather than a lower bound relative to a `before`
+        // snapshot — the regression this test exists for is `collect_status`
+        // returning a stale, default, or otherwise disconnected `QueueSnapshot`
+        // instead of `state.reindex_queue.snapshot()`.
+        queue.mark_paths([std::path::PathBuf::from(
             "status-reports-the-actual-pending-reindex-queue-state-marker.md",
         )]);
-        crate::reindex::mark_full();
-        let after_paths = crate::reindex::REINDEX_QUEUE.snapshot_paths();
+        queue.mark_full();
         crate::reindex::test_support::assert_marked_dirty(
-            &before_paths,
-            &after_paths,
+            &queue,
             &["status-reports-the-actual-pending-reindex-queue-state-marker.md"],
         );
 
         let status = collect_status(&state).await;
 
-        assert!(
-            status.queue.pending_paths > before.pending_paths,
+        assert_eq!(
+            status.queue.pending_paths, 1,
             "collect_status's queue field must reflect the path just marked: \
-             before={before:?}, got={:?}",
+             got={:?}",
             status.queue
         );
         assert!(
@@ -2306,6 +2339,7 @@ mod tests {
         let admin_state = AdminState {
             shared_config,
             config_path: Arc::new(config_path),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
         };
         Router::new()
             .route("/admin/reload", axum::routing::post(reload_handler))
@@ -3144,6 +3178,7 @@ mod tests {
             config::shared_config(mcp::make_test_resolved_config(tmp.path())),
             mcp::empty_test_schema_cache(),
             None,
+            Arc::new(crate::reindex::ReindexQueue::new()),
         )
         .unwrap();
 

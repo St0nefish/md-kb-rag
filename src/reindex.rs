@@ -29,10 +29,26 @@
 //! `ingest::index_paths` (directly, or via `ingest::scan_and_index` for a full
 //! reconcile), which is itself the only function that mutates Qdrant or the state DB —
 //! see its doc comment for that invariant.
+//!
+//! [`ReindexQueue`] itself is an injected dependency, not a process-wide global —
+//! `server::run_server` builds exactly one and clones its `Arc` into every producer
+//! (`KbSearchServer`, `UiState`, `WebhookState`, `AdminState`) and into [`run_worker`].
+//! It used to be a `static REINDEX_QUEUE: LazyLock<ReindexQueue>`, reached ambiently by
+//! every producer via free functions (`mark_paths`/`mark_full`) instead of a
+//! constructor argument. That shape caused a real bug: tests that asserted "this write
+//! marked paths dirty" shared the one global `HashSet` with every other test in the
+//! binary, so a path literal reused by two tests made the second assertion a silent
+//! no-op (marking an already-pending path is a no-op on a `HashSet`'s cardinality) —
+//! caught only under `--test-threads=1`, where libtest's alphabetical ordering made the
+//! collision deterministic. Making the queue a constructor argument instead of ambient
+//! state means each test can hold a private `ReindexQueue::new()` (see `write::Harness`,
+//! `mcp.rs`'s `make_write_test_server`, etc.), so that class of collision is now a
+//! compile-time non-issue rather than a convention every future test author has to
+//! remember.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -68,7 +84,7 @@ pub struct ReindexQueue {
 }
 
 impl ReindexQueue {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: Mutex::new(QueueState {
                 paths: HashSet::new(),
@@ -126,11 +142,14 @@ impl ReindexQueue {
     /// Test-only membership snapshot: the actual set of pending paths, as opposed
     /// to `snapshot()`'s `pending_paths` count.
     ///
-    /// A cardinality delta on a `HashSet` cannot distinguish "my path was marked"
-    /// from "some other test's path literal collided with mine and this call was
-    /// a silent no-op" — `REINDEX_QUEUE` is a process-global shared by every test
-    /// in the binary, so tests that need to prove a SPECIFIC path was marked need
-    /// this, not `snapshot()`.
+    /// Each test now builds and owns its own `ReindexQueue` (see `ReindexQueue::new`
+    /// and `write.rs`'s `Harness`, `mcp.rs`'s `make_write_test_server`, etc.), so
+    /// there is no more risk of a path literal colliding with an unrelated test's —
+    /// that used to be this method's whole reason for existing (a bare
+    /// `snapshot().pending_paths` count can't distinguish "my path was marked" from
+    /// "an unrelated test's collided with mine"). It still earns its keep for a
+    /// simpler reason: `assert_marked_dirty` needs to name exactly which path is
+    /// missing when a test fails, not just report a count mismatch.
     ///
     /// `#[cfg(test)]`-gated so it never ships in the release binary and never
     /// touches `QueueSnapshot`'s shape — `QueueSnapshot` (the actual `/status` and
@@ -156,22 +175,6 @@ impl ReindexQueue {
 pub struct QueueSnapshot {
     pub pending_paths: usize,
     pub full_pending: bool,
-}
-
-/// The process-wide queue. Global for the same reason `status::INDEX_STATUS` and the
-/// old `webhook::REINDEX_LOCK` were: there is exactly one worker per process, so
-/// threading a handle through every producer (three MCP tools, the webhook handler,
-/// the startup/timer tasks) would buy nothing over a `LazyLock`.
-pub static REINDEX_QUEUE: LazyLock<ReindexQueue> = LazyLock::new(ReindexQueue::new);
-
-/// Mark `paths` dirty on the process-wide queue. See [`ReindexQueue::mark_paths`].
-pub fn mark_paths(paths: impl IntoIterator<Item = PathBuf>) {
-    REINDEX_QUEUE.mark_paths(paths);
-}
-
-/// Mark a full reconcile pending on the process-wide queue. See [`ReindexQueue::mark_full`].
-pub fn mark_full() {
-    REINDEX_QUEUE.mark_full();
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +352,21 @@ fn schema_rebuild_runner(
 /// `reload::ReloadEffect::Applied` (or `ReindexRequired` for `chunking.*`, since the
 /// effect only reaches documents indexed after the change) rather than
 /// restart-required — see `reload.rs`'s classification table.
-pub async fn run_worker(shared_config: SharedConfig, schema_cache: SharedSchemaCache) {
+///
+/// `queue` is the injected dependency every producer (the MCP write tools,
+/// `webhook::handle_webhook`, `web.rs`'s write routes) must hold the SAME `Arc`
+/// clone of — `server::run_server` constructs exactly one `ReindexQueue` at
+/// startup and threads it into all of them, this worker included. There is
+/// deliberately no process-wide default to fall back on: a producer that ends up
+/// with a queue instance other than the one this worker drains would silently
+/// stop being indexed, so the type signature (this parameter, plus the matching
+/// field on `KbSearchServer`/`UiState`/`WebhookState`/`write::WriteDeps`) is what
+/// makes that mistake a compile error instead of a runtime bug.
+pub async fn run_worker(
+    queue: Arc<ReindexQueue>,
+    shared_config: SharedConfig,
+    schema_cache: SharedSchemaCache,
+) {
     // A closure rather than passing `schema_cache` straight into `drain_and_run_with`
     // so the rebuild step has the same test-injectable shape as `ingest_runner` (see
     // `RebuildFuture`'s doc comment) — production and tests both go through one
@@ -358,10 +375,10 @@ pub async fn run_worker(shared_config: SharedConfig, schema_cache: SharedSchemaC
         schema_rebuild_runner(config, Arc::clone(&schema_cache))
     };
     loop {
-        REINDEX_QUEUE.notify.notified().await;
+        queue.notify.notified().await;
         // Fresh snapshot per wake, not per process — see this function's doc comment.
         let config = crate::config::load_shared_config(&shared_config);
-        drain_and_run_with(&REINDEX_QUEUE, &config, &ingest_runner, &rebuild).await;
+        drain_and_run_with(&queue, &config, &ingest_runner, &rebuild).await;
     }
 }
 
@@ -446,11 +463,20 @@ async fn run_with_retry(
 }
 
 /// Test-only assertion helper shared across every module whose tests assert that
-/// a specific path was marked dirty on the process-global `REINDEX_QUEUE`
-/// (`mcp.rs`, `write.rs`, `webhook.rs`, `server.rs`). Deliberately `pub(crate)`
-/// rather than private-to-`mod tests`, the same reasoning as
-/// `config::test_support`: those call sites live in other files' `#[cfg(test)]`
-/// modules, not this one.
+/// a specific path was marked dirty on a `ReindexQueue` (`mcp.rs`, `write.rs`,
+/// `webhook.rs`, `server.rs`). Deliberately `pub(crate)` rather than
+/// private-to-`mod tests`, the same reasoning as `config::test_support`: those
+/// call sites live in other files' `#[cfg(test)]` modules, not this one.
+///
+/// Before the queue became an injected dependency, `REINDEX_QUEUE` was one
+/// process-global `HashSet` shared by every test in the binary, so this helper
+/// took a `before`/`after` pair and asserted absence-then-presence — a path
+/// already pending before the write under test even ran meant its literal
+/// collided with some other test's, silently turning the mark into a
+/// cardinality no-op. Each test now builds and owns its own `ReindexQueue` (see
+/// `ReindexQueue::new`), so that collision is structurally impossible and the
+/// `before` snapshot is gone — this just names which expected path is missing
+/// from the final queue when a test fails.
 ///
 /// This exists instead of extending `QueueSnapshot` because `QueueSnapshot` is
 /// the actual `/status`/`/metrics` payload (see `ReindexQueue::snapshot_paths`'s
@@ -461,31 +487,16 @@ async fn run_with_retry(
 pub(crate) mod test_support {
     use super::*;
 
-    /// Assert that every path in `expected` was newly marked dirty between
-    /// `before` and `after`: absent from `before`, present in `after`.
-    ///
-    /// The absence check is the point, not a formality: if a path is already
-    /// pending before the write under test even runs, its literal collides with
-    /// one some other test in the binary uses, and the mark this test means to
-    /// observe is a silent cardinality no-op on the shared `HashSet` — this fails
-    /// loudly instead, naming the path and the fix.
-    pub(crate) fn assert_marked_dirty(
-        before: &HashSet<PathBuf>,
-        after: &HashSet<PathBuf>,
-        expected: &[&str],
-    ) {
+    /// Assert that every path in `expected` is present in `queue`'s current
+    /// pending set.
+    pub(crate) fn assert_marked_dirty(queue: &ReindexQueue, expected: &[&str]) {
+        let pending = queue.snapshot_paths();
         for &p in expected {
             let path = PathBuf::from(p);
             assert!(
-                !before.contains(&path),
-                "REINDEX_QUEUE already contained '{p}' before this test's write \
-                 ran — this path literal collides with one another test in the \
-                 binary uses and never drains; pick a literal unique to this test"
-            );
-            assert!(
-                after.contains(&path),
-                "REINDEX_QUEUE does not contain '{p}' after this test's write \
-                 ran; expected it to have been marked dirty"
+                pending.contains(&path),
+                "ReindexQueue does not contain '{p}'; expected it to have been \
+                 marked dirty"
             );
         }
     }

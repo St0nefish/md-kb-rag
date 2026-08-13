@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -15,6 +17,7 @@ use tracing::{error, info, warn};
 use crate::config::{SharedConfig, WebhookProvider};
 use crate::git::GIT_TIMEOUT;
 use crate::git::{inject_token_into_url, redact_url};
+#[cfg(test)]
 use crate::reindex;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -32,6 +35,12 @@ pub struct WebhookState {
     /// secret this compares against. See `reload.rs`'s "webhook.secret_env" entry.
     pub secret: String,
     pub git_token: Option<String>,
+    /// The same `ReindexQueue` `server::run_server` hands to `KbSearchServer`,
+    /// `UiState`, and `reindex::run_worker` — a webhook delivery and an MCP
+    /// write tool must land on the one queue the worker actually drains. See
+    /// `reindex::ReindexQueue`'s doc comment on `run_worker` for why there is
+    /// no ambient default to fall back on.
+    pub reindex_queue: Arc<crate::reindex::ReindexQueue>,
 }
 
 /// Verify HMAC signature from webhook headers.
@@ -293,13 +302,13 @@ pub async fn handle_webhook(
             changed = changed.len(),
             "Webhook pull applied; marking changed paths dirty"
         );
-        reindex::mark_paths(changed);
+        state.reindex_queue.mark_paths(changed);
     } else {
         // No git_url configured, so there was nothing to fetch and therefore no range
         // to diff. Fall back to a full reconcile so the webhook still causes the
         // worker to look for whatever changed on disk out-of-band.
         info!(provider = ?provider, "Webhook accepted with no git_url configured; marking a full reconcile");
-        reindex::mark_full();
+        state.reindex_queue.mark_full();
     }
 
     (StatusCode::OK, "Changes queued for indexing".to_string())
@@ -310,7 +319,6 @@ mod tests {
     use super::*;
     use crate::config::ResolvedConfig;
     use axum::http::HeaderValue;
-    use std::sync::Arc;
 
     fn compute_hmac(secret: &str, body: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
@@ -533,6 +541,7 @@ mod tests {
             config: crate::config::shared_config(config),
             secret: secret.to_string(),
             git_token: None,
+            reindex_queue: Arc::new(reindex::ReindexQueue::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -559,6 +568,7 @@ mod tests {
             config: crate::config::shared_config(config),
             secret: "correct-secret".to_string(),
             git_token: None,
+            reindex_queue: Arc::new(reindex::ReindexQueue::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -588,6 +598,7 @@ mod tests {
             config: crate::config::shared_config(config),
             secret: secret.to_string(),
             git_token: None,
+            reindex_queue: Arc::new(reindex::ReindexQueue::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -607,14 +618,6 @@ mod tests {
     // — that drop-on-collision bug is exactly what the dirty-path queue replaces.
     // `mark_paths`/`mark_full` never block and never fail, so every accepted webhook
     // takes the same success path regardless of what the worker is doing concurrently.
-    //
-    // We also do not assert on `reindex::REINDEX_QUEUE`'s state here: it is a
-    // process-global shared with every other test in this binary (git.rs's
-    // `commit_and_sync` tests, mcp.rs's write-tool tests), so under parallel
-    // `cargo test` execution its exact contents at any instant are not this test's to
-    // own. `handle_webhook_marks_a_full_reconcile_when_no_git_url_is_configured` below
-    // checks the one flag that is safe to assert on (`full_pending`), since it is only
-    // ever set to `true` and never cleared by anything reachable from tests.
 
     #[tokio::test]
     async fn handle_webhook_marks_a_full_reconcile_when_no_git_url_is_configured() {
@@ -627,10 +630,12 @@ mod tests {
         // minimal_config() has git_url: None, so there is nothing to fetch/diff — the
         // handler's only option is to fall back to a full reconcile.
         let config = minimal_config();
+        let queue = Arc::new(reindex::ReindexQueue::new());
         let state = WebhookState {
             config: crate::config::shared_config(config),
             secret: secret.to_string(),
             git_token: None,
+            reindex_queue: Arc::clone(&queue),
         };
 
         let mut headers = HeaderMap::new();
@@ -645,7 +650,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            reindex::REINDEX_QUEUE.snapshot().full_pending,
+            queue.snapshot().full_pending,
             "a webhook with no git_url must fall back to a full reconcile"
         );
     }
@@ -698,6 +703,7 @@ mod tests {
             config: Arc::clone(&shared),
             secret: secret.to_string(),
             git_token: None,
+            reindex_queue: Arc::new(reindex::ReindexQueue::new()),
         };
 
         // Before the swap: provider is gitea, so a Gitea-style signature is accepted.
@@ -737,7 +743,7 @@ mod tests {
     // renames) in isolation, so these do not re-test diff parsing — they exercise the
     // webhook's OWN wiring around it: does the pre-fetch HEAD actually get captured
     // before the fetch (not after, which would diff an empty range), does the merge
-    // really run, and does the result really reach `reindex::mark_paths`. A local
+    // really run, and does the result really reach `ReindexQueue::mark_paths`. A local
     // bare repo stands in for the live remote, following the same pattern already
     // used by `git.rs`'s `commit_and_sync` tests and `mcp.rs`'s write-tool tests
     // (`crate::git::tests::create_bare_repo` / `clone_bare_repo`) — no live network,
@@ -798,11 +804,22 @@ mod tests {
 
     /// Deliver a signed webhook for `refs/heads/master` against `config` and return
     /// just the status code — the shared plumbing for the tests below.
-    async fn deliver_webhook(config: Arc<ResolvedConfig>, secret: &str, sig: &str) -> StatusCode {
+    ///
+    /// Takes `queue` by reference to an `Arc` so a caller that delivers twice
+    /// (`handle_webhook_does_not_drop_a_second_pull_while_the_first_is_still_queued`)
+    /// can pass the SAME queue instance to both calls and observe the second
+    /// delivery landing on top of the first's still-undrained mark.
+    async fn deliver_webhook(
+        config: Arc<ResolvedConfig>,
+        secret: &str,
+        sig: &str,
+        queue: &Arc<reindex::ReindexQueue>,
+    ) -> StatusCode {
         let state = WebhookState {
             config: crate::config::shared_config(config),
             secret: secret.to_string(),
             git_token: None,
+            reindex_queue: Arc::clone(queue),
         };
         let mut headers = HeaderMap::new();
         headers.insert("x-gitea-signature", HeaderValue::from_str(sig).unwrap());
@@ -815,7 +832,7 @@ mod tests {
 
     /// The core regression this gap exists for: the paths `handle_webhook`'s own
     /// fetch + ff-only merge + diff computed for the pulled range must actually reach
-    /// `reindex::mark_paths`. Capturing HEAD after the fetch instead of before (an
+    /// `ReindexQueue::mark_paths`. Capturing HEAD after the fetch instead of before (an
     /// easy mistake given `commit_and_sync` does the same before/after dance around
     /// its own fetch+rebase) would diff an empty range and silently mark nothing,
     /// even though the fetch and merge both succeeded.
@@ -833,26 +850,21 @@ mod tests {
         let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
         let sig = compute_hmac(secret, body);
         let config = git_backed_config(bare.path(), local.path());
+        let queue = Arc::new(reindex::ReindexQueue::new());
 
-        let pending_before = reindex::REINDEX_QUEUE.snapshot_paths();
-
-        let status = deliver_webhook(config, secret, &sig).await;
+        let status = deliver_webhook(config, secret, &sig, &queue).await;
         assert_eq!(status, StatusCode::OK);
 
         // The ff-only merge must actually have pulled the new commits in.
         assert!(local.path().join("webhook-diff/added-1.md").exists());
         assert!(local.path().join("webhook-diff/added-2.md").exists());
 
-        // REINDEX_QUEUE is process-global, shared with every other test in this
-        // binary (see the note on `handle_webhook_marks_a_full_reconcile_...`
-        // above) — asserting the specific paths below (rather than a bare count)
-        // is what keeps that sharing from making this assertion meaningless: if
-        // the diff came back empty — the exact regression this test targets —
-        // neither path would show up in `pending_after` and this would fail.
-        let pending_after = reindex::REINDEX_QUEUE.snapshot_paths();
+        // `queue` is private to this test — asserting the specific paths below
+        // (rather than a bare count) still matters on its own merits: if the
+        // diff came back empty — the exact regression this test targets —
+        // neither path would show up here and this would fail.
         reindex::test_support::assert_marked_dirty(
-            &pending_before,
-            &pending_after,
+            &queue,
             &["webhook-diff/added-1.md", "webhook-diff/added-2.md"],
         );
     }
@@ -874,39 +886,27 @@ mod tests {
         let body: &[u8] = br#"{"ref":"refs/heads/master"}"#;
         let sig = compute_hmac(secret, body);
         let config = git_backed_config(bare.path(), local.path());
-
-        let pending_before = reindex::REINDEX_QUEUE.snapshot_paths();
+        let queue = Arc::new(reindex::ReindexQueue::new());
 
         push_file_from_a_fresh_clone(bare.path(), "master", "webhook-drop-check/first.md", "one");
-        let first_status = deliver_webhook(Arc::clone(&config), secret, &sig).await;
+        let first_status = deliver_webhook(Arc::clone(&config), secret, &sig, &queue).await;
         assert_eq!(first_status, StatusCode::OK);
-        let pending_after_first = reindex::REINDEX_QUEUE.snapshot_paths();
-        reindex::test_support::assert_marked_dirty(
-            &pending_before,
-            &pending_after_first,
-            &["webhook-drop-check/first.md"],
-        );
+        reindex::test_support::assert_marked_dirty(&queue, &["webhook-drop-check/first.md"]);
 
         // Second delivery, with the first delivery's mark still undrained — exactly
         // the "reindex already in progress" scenario the old REINDEX_LOCK used to
-        // drop the loser on.
+        // drop the loser on. Passing the SAME `queue` again (not a fresh one) is
+        // what makes this exercise "still undrained", not just "a second,
+        // unrelated delivery".
         push_file_from_a_fresh_clone(bare.path(), "master", "webhook-drop-check/second.md", "two");
-        let second_status = deliver_webhook(Arc::clone(&config), secret, &sig).await;
+        let second_status = deliver_webhook(Arc::clone(&config), secret, &sig, &queue).await;
         assert_eq!(second_status, StatusCode::OK);
-        let pending_after_second = reindex::REINDEX_QUEUE.snapshot_paths();
-        // Base this comparison on `pending_after_first`, not `pending_before`: the
-        // point is that the SECOND delivery's own mark lands on top of the first
-        // delivery's still-undrained work, not merely that `second.md` differs
-        // from whatever was pending before either delivery ran.
         reindex::test_support::assert_marked_dirty(
-            &pending_after_first,
-            &pending_after_second,
-            &["webhook-drop-check/second.md"],
-        );
-        assert!(
-            pending_after_second.contains(&std::path::PathBuf::from("webhook-drop-check/first.md")),
-            "the first delivery's path must still be pending — not dropped because \
-             a second delivery arrived while it was still queued"
+            &queue,
+            &[
+                "webhook-drop-check/first.md",
+                "webhook-drop-check/second.md",
+            ],
         );
     }
 }

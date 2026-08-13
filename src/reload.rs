@@ -627,12 +627,16 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
 /// it already knows about rather than hashing file content, see its doc comment —
 /// so the cost of one extra sweep is far smaller than the risk of this function's
 /// classification missing a case and silently leaving a change unpicked-up.
-pub fn reload_config(path: &Path, shared: &SharedConfig) -> anyhow::Result<ReloadReport> {
+pub fn reload_config(
+    path: &Path,
+    shared: &SharedConfig,
+    queue: &crate::reindex::ReindexQueue,
+) -> anyhow::Result<ReloadReport> {
     let new = Config::load(path)?;
     let old = crate::config::load_shared_config(shared);
     let report = diff(&old, &new);
     crate::config::store_shared_config(shared, new);
-    crate::reindex::mark_full();
+    queue.mark_full();
     Ok(report)
 }
 
@@ -783,7 +787,8 @@ mod tests {
             tmp.path(),
             "chunking:\n  max_chunk_size: 100\n  target_chunk_size: 500\n",
         );
-        let result = reload_config(&bad_path, &shared);
+        let queue = crate::reindex::ReindexQueue::new();
+        let result = reload_config(&bad_path, &shared, &queue);
         assert!(result.is_err());
 
         let still_running = crate::config::load_shared_config(&shared);
@@ -806,7 +811,8 @@ mod tests {
         let shared = crate::config::shared_config(std::sync::Arc::new(running));
 
         write_config(tmp.path(), "search:\n  hybrid: false\n");
-        let report = reload_config(&path, &shared).unwrap();
+        let queue = crate::reindex::ReindexQueue::new();
+        let report = reload_config(&path, &shared, &queue).unwrap();
 
         assert_eq!(report.applied.len(), 1);
         assert_eq!(report.applied[0].setting, "search.hybrid");

@@ -203,6 +203,16 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub token: Option<&'a str>,
     pub commit_author_name: &'a str,
     pub commit_author_email: &'a str,
+    /// The dirty-path queue every successful write marks paths on before
+    /// returning — see `reindex::ReindexQueue`. Unlike `state` below, this has
+    /// no `None`/optional mode: a write that lands but never marks its path
+    /// dirty is a correctness bug (the document silently never gets indexed),
+    /// not a degraded-but-acceptable path, so every call site must supply a
+    /// real queue. Borrowed the same way `schema_cache`/`retrieval.qdrant`/
+    /// `retrieval.embed_client` are — the owning transport (`KbSearchServer`,
+    /// `UiState`) holds an `Arc<ReindexQueue>` field and lends a plain
+    /// reference in for the duration of one write.
+    pub queue: &'a crate::reindex::ReindexQueue,
     /// The document metadata index, used ONLY by `write_document_move` to find
     /// documents whose body links to the move's SOURCE path
     /// (`StateDb::links_targeting`) so their link text can be rewritten in the
@@ -922,7 +932,8 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
             // here — the rebase never ran (fetch/rebase/push all happen after the
             // commit, so any of them failing means we never got as far as a
             // trustworthy rebase diff).
-            crate::reindex::mark_paths(std::iter::once(PathBuf::from(rel_path)));
+            deps.queue
+                .mark_paths(std::iter::once(PathBuf::from(rel_path)));
 
             return Ok(WriteSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -941,7 +952,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     // actual chunk/embed/upsert work out of band; this call never blocks on it,
     // which is the whole point — embedding is far slower than a caller's request
     // timeout on a large document.
-    crate::reindex::mark_paths(
+    deps.queue.mark_paths(
         std::iter::once(PathBuf::from(rel_path))
             .chain(commit_outcome.rebased_paths.iter().cloned()),
     );
@@ -1517,7 +1528,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
             //     rolled back) and reported as sync-pending, same as every other
             //     post-commit failure in this pipeline. `rebased_paths` is empty
             //     for the same reason as elsewhere: the rebase never ran.
-            crate::reindex::mark_paths(
+            deps.queue.mark_paths(
                 [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
                     .into_iter()
                     .chain(rewritten_paths.iter().map(PathBuf::from)),
@@ -1541,7 +1552,7 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //     document (whose `document_links` rows self-heal from its new body in
     //     the same pass); all of them need to be in the same worklist for the
     //     worker to do that in one sweep.
-    crate::reindex::mark_paths(
+    deps.queue.mark_paths(
         [PathBuf::from(source_rel), PathBuf::from(dest_rel)]
             .into_iter()
             .chain(rewritten_paths.iter().map(PathBuf::from))
@@ -2786,7 +2797,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
                 source_dir, dest_dir, sha, source_err
             );
 
-            crate::reindex::mark_paths(
+            deps.queue.mark_paths(
                 all_moves
                     .iter()
                     .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
@@ -2812,7 +2823,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
     // force the shared `SchemaCache` to rebuild before this unit is next
     // indexed — see that function's doc comment; nothing further is needed
     // here for the post-commit self-correction this move depends on.
-    crate::reindex::mark_paths(
+    deps.queue.mark_paths(
         all_moves
             .iter()
             .flat_map(|(o, n)| [PathBuf::from(o.clone()), PathBuf::from(n.clone())])
@@ -2972,7 +2983,8 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
 
             // The file is already gone from local disk regardless of push status,
             // so the local index should reflect that regardless too.
-            crate::reindex::mark_paths(std::iter::once(PathBuf::from(rel_path)));
+            deps.queue
+                .mark_paths(std::iter::once(PathBuf::from(rel_path)));
 
             return Ok(WriteSuccess {
                 outcome: WriteOutcome::CommittedPendingSync,
@@ -2995,7 +3007,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     // missing-file branch of `ingest::index_paths`), so there is no separate
     // purge to do here — this is "one reindex path" applied to deletes too, not a
     // special case.
-    crate::reindex::mark_paths(
+    deps.queue.mark_paths(
         std::iter::once(PathBuf::from(rel_path))
             .chain(commit_outcome.rebased_paths.iter().cloned()),
     );
@@ -3209,6 +3221,14 @@ mod tests {
         config: Arc<ResolvedConfig>,
         token: Option<String>,
         state_db: Option<StateDb>,
+        /// Fresh, private to this `Harness` instance — this is the whole point
+        /// of `WriteDeps::queue` becoming an injected dependency: every test
+        /// that builds its own `Harness` gets its own `ReindexQueue`, so a path
+        /// literal used by another test's harness cannot collide with this
+        /// one's, structurally rather than by convention. See
+        /// `same_path_literal_in_two_independent_tests_a`/`_b` for the
+        /// regression guard this makes possible.
+        reindex_queue: crate::reindex::ReindexQueue,
         /// Keeps the state DB's backing temp directory alive for as long as the
         /// harness lives. Deliberately a SEPARATE temp dir from the KB root
         /// (`canonical_data_path`) — the state DB file must never sit inside the
@@ -3235,6 +3255,7 @@ mod tests {
                 config,
                 token: None,
                 state_db: None,
+                reindex_queue: crate::reindex::ReindexQueue::new(),
                 _state_db_dir: None,
             }
         }
@@ -3273,6 +3294,7 @@ mod tests {
                 token: self.token.as_deref(),
                 commit_author_name: &self.config.write.commit_author_name,
                 commit_author_email: &self.config.write.commit_author_email,
+                queue: &self.reindex_queue,
                 state: self.state_db.as_ref(),
             }
         }
@@ -3681,12 +3703,11 @@ mod tests {
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let harness = git_backed_harness(&work);
 
-        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot_paths();
-
-        // A path unique to this test: the global `REINDEX_QUEUE` is a process-wide
-        // `HashSet<PathBuf>` shared with every other test in this binary (including
-        // `mcp.rs`'s own `docs/queued.md`-named test), so reusing a path literal
-        // used elsewhere could collide and silently fail to grow the pending count.
+        // `harness.reindex_queue` is private to this `Harness` instance — no
+        // other test's writes can land on it, so the path literal below needs
+        // no cross-test uniqueness of its own (see `Harness::reindex_queue`'s
+        // doc comment and the `same_path_literal_*` regression guard near the
+        // bottom of this module).
         let req = make_req(
             "docs/queued-write-core-test.md",
             "---\ntitle: Queued\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n",
@@ -3697,11 +3718,62 @@ mod tests {
         assert!(!success.sha.is_empty());
         assert!(success.diff.contains("+title: Queued"));
 
-        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot_paths();
         crate::reindex::test_support::assert_marked_dirty(
-            &pending_before,
-            &pending_after,
+            &harness.reindex_queue,
             &["docs/queued-write-core-test.md"],
+        );
+    }
+
+    // Regression guard for the original bug: before the queue became an
+    // injected dependency, both tests below would have collided on
+    // `crate::reindex::REINDEX_QUEUE` — a single process-wide `HashSet<PathBuf>`
+    // shared by the whole test binary. Marking an already-pending path is a
+    // no-op on a `HashSet`'s cardinality, so whichever of these two ran second
+    // would silently fail to observe its own write having marked its path
+    // dirty. That failure showed up only under `cargo test --
+    // --test-threads=1`, where libtest's alphabetical run order made the
+    // collision deterministic (a plain `cargo test` run could get lucky and
+    // interleave them apart). Each test here now builds its own `Harness` —
+    // and therefore its own private `ReindexQueue` (see
+    // `Harness::reindex_queue`'s doc comment) — so using the IDENTICAL path
+    // literal in both is not just safe, it is the point: this is the case that
+    // used to fail and now provably does not.
+
+    #[tokio::test]
+    async fn same_path_literal_in_two_independent_tests_a() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = git_backed_harness(&work);
+
+        let req = make_req(
+            "docs/same-literal-regression-guard.md",
+            "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n",
+            true,
+        );
+        write_document(&harness.deps(), req).await.unwrap();
+
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["docs/same-literal-regression-guard.md"],
+        );
+    }
+
+    #[tokio::test]
+    async fn same_path_literal_in_two_independent_tests_b() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let harness = git_backed_harness(&work);
+
+        let req = make_req(
+            "docs/same-literal-regression-guard.md",
+            "---\ntitle: B\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n",
+            true,
+        );
+        write_document(&harness.deps(), req).await.unwrap();
+
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["docs/same-literal-regression-guard.md"],
         );
     }
 
@@ -3886,17 +3958,6 @@ mod tests {
         std::fs::create_dir_all(work.path().join("old")).unwrap();
         let original =
             "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
-        // Both the source AND destination literals must be unique across the whole
-        // test binary, not just the destination — see
-        // `create_synced_write_marks_the_path_dirty_and_returns_a_diff`'s comment:
-        // REINDEX_QUEUE is a process-wide HashSet shared with every other test in
-        // this binary, and marking an ALREADY-dirty path is a no-op on its
-        // cardinality. `old/loc.md` is reused as a source path by dozens of other
-        // tests in this file that mark it dirty and never drain it, so under
-        // `--test-threads=1` (deterministic run order) an earlier alphabetically-
-        // sorted test reliably dirties plain `old/loc.md` before this one runs,
-        // silently absorbing this test's own `mark_paths` call for it and turning
-        // the "both paths" delta below into "only one path".
         std::fs::write(work.path().join("old/loc-move-core-test-src.md"), original).unwrap();
         git_commit_all(
             &work,
@@ -3906,7 +3967,6 @@ mod tests {
         let head_before = head_sha(&work);
 
         let harness = git_backed_harness(&work);
-        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot_paths();
 
         let req = make_move_req(
             "old/loc-move-core-test-src.md",
@@ -3934,10 +3994,8 @@ mod tests {
         // left staged or dangling in the working tree afterward.
         assert_eq!(git_status(&work), "");
 
-        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot_paths();
         crate::reindex::test_support::assert_marked_dirty(
-            &pending_before,
-            &pending_after,
+            &harness.reindex_queue,
             &[
                 "old/loc-move-core-test-src.md",
                 "new/loc-moved-write-core-test.md",
@@ -3998,8 +4056,6 @@ mod tests {
 
         let harness = git_backed_harness(&work);
 
-        // A destination path unique to this test — REINDEX_QUEUE is process-wide,
-        // shared with every other test in this binary.
         let correct_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
         let mut req = make_move_req(
             "old/loc.md",

@@ -1745,6 +1745,17 @@ pub struct KbSearchServer {
     /// Lazy rather than constructor-injected so building a server stays synchronous
     /// and infallible with respect to SQLite availability.
     state_db: Arc<tokio::sync::OnceCell<StateDb>>,
+    /// The dirty-path queue every write tool marks paths on (see
+    /// `write::WriteDeps::queue`) and `write_raw_file`/`update_schema` call
+    /// `mark_full` on directly. `server::run_server` constructs exactly one
+    /// `ReindexQueue`, clones this `Arc` into `KbSearchServer`, `UiState`,
+    /// `WebhookState`, and `reindex::run_worker` — all four MUST share the same
+    /// instance, since the worker only ever drains the one it was handed. There
+    /// is no ambient/global fallback (see `reindex::ReindexQueue`'s doc
+    /// comment); a server built without one has no way to get indexing to
+    /// happen at all, which is deliberate — it makes "which queue does this
+    /// producer feed" a constructor argument instead of a runtime assumption.
+    reindex_queue: Arc<crate::reindex::ReindexQueue>,
 }
 
 /// Build an include `GlobSet` for MCP path filtering, with a `**/*.md` fallback
@@ -1784,6 +1795,7 @@ impl KbSearchServer {
         config: crate::config::SharedConfig,
         schema_cache: crate::schema::SharedSchemaCache,
         rerank_client: Option<Arc<RerankClient>>,
+        reindex_queue: Arc<crate::reindex::ReindexQueue>,
     ) -> anyhow::Result<Self> {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
             format!("Failed to canonicalize data path: {}", data_path.display())
@@ -1803,6 +1815,7 @@ impl KbSearchServer {
             schema_cache,
             rerank_client,
             state_db: Arc::new(tokio::sync::OnceCell::new()),
+            reindex_queue,
         })
     }
 
@@ -1998,7 +2011,7 @@ impl KbSearchServer {
                 // concerned — queue the same full reconcile a clean success would.
                 // See this method's doc comment for why that reconcile must NOT run
                 // on the rolled-back (PreCommit) branch above but must here.
-                crate::reindex::mark_full();
+                self.reindex_queue.mark_full();
 
                 return Ok(RawFileOutcome::CommittedPendingSync {
                     sha,
@@ -2014,7 +2027,7 @@ impl KbSearchServer {
         // worker will scan, and `index_paths`' existing schema-fingerprint check
         // (unrelated to this reconcile's OWN full-walk vs scoped distinction) is what
         // actually catches the affected documents once it re-reads them.
-        crate::reindex::mark_full();
+        self.reindex_queue.mark_full();
 
         Ok(RawFileOutcome::Synced {
             sha: commit_outcome.sha,
@@ -3001,6 +3014,7 @@ impl KbSearchServer {
             token: token.as_deref(),
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
+            queue: &self.reindex_queue,
             state: state_db,
         };
 
@@ -3381,6 +3395,7 @@ impl KbSearchServer {
             token: token.as_deref(),
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
+            queue: &self.reindex_queue,
             // `delete_document` never moves a document — `write::write_document_move`
             // is the only reader of `WriteDeps::state` — so there is nothing here
             // for a state DB to do. `None` per `WriteDeps::state`'s doc comment.
@@ -3483,6 +3498,7 @@ impl KbSearchServer {
             token: token.as_deref(),
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
+            queue: &self.reindex_queue,
             state: state_db,
         };
 
@@ -5202,6 +5218,7 @@ mod tests {
             crate::config::shared_config(make_test_resolved_config(tmp.path())),
             empty_test_schema_cache(),
             None,
+            Arc::new(crate::reindex::ReindexQueue::new()),
         )
         .unwrap();
 
@@ -5243,6 +5260,7 @@ mod tests {
             crate::config::shared_config(make_test_resolved_config(tmp.path())),
             empty_test_schema_cache(),
             None,
+            Arc::new(crate::reindex::ReindexQueue::new()),
         )
         .unwrap();
 
@@ -5376,6 +5394,7 @@ mod tests {
             crate::config::shared_config(make_test_resolved_config(tmp.path())),
             empty_test_schema_cache(),
             None,
+            Arc::new(crate::reindex::ReindexQueue::new()),
         )
         .unwrap();
 
@@ -5432,6 +5451,7 @@ mod tests {
             crate::config::shared_config(config),
             schema_cache,
             None,
+            Arc::new(crate::reindex::ReindexQueue::new()),
         )
         .unwrap()
     }
@@ -6575,12 +6595,17 @@ mod tests {
     //
     // Before the async reindex worker, these tools awaited `ingest::run_index` inline
     // and used `REINDEX_LOCK` to keep that from racing the webhook. Now they just mark
-    // paths dirty on `reindex::REINDEX_QUEUE` and return — which also means these tests
-    // no longer need a live Qdrant/embeddings service to reach that point, since
+    // paths dirty on their server's `ReindexQueue` and return — which also means these
+    // tests no longer need a live Qdrant/embeddings service to reach that point, since
     // nothing here calls into the indexer at all.
 
     /// Build a `KbSearchServer` backed by a real git working clone, so write tools get
     /// past `commit_and_sync` and reach the point where they mark paths dirty.
+    ///
+    /// `make_write_test_server` gives this server its own private `ReindexQueue`
+    /// (see that function), so the tests below read it back via
+    /// `server.reindex_queue` — no other test in the binary can have marked
+    /// anything on it.
     fn make_git_backed_server(
         work: &tempfile::TempDir,
     ) -> (KbSearchServer, Arc<crate::config::ResolvedConfig>) {
@@ -6597,8 +6622,6 @@ mod tests {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
         let (server, _config) = make_git_backed_server(&work);
-
-        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot_paths();
 
         let result = server
             .create_document(Parameters(CreateDocumentParams {
@@ -6626,10 +6649,8 @@ mod tests {
             "the old skipped-index warning language must be gone: {text}"
         );
 
-        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot_paths();
         crate::reindex::test_support::assert_marked_dirty(
-            &pending_before,
-            &pending_after,
+            &server.reindex_queue,
             &["docs/queued.md"],
         );
     }
@@ -6706,13 +6727,6 @@ mod tests {
     async fn delete_document_reports_queued_cleanup_without_touching_the_indexer() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
-        // A path unique to this test — see this test's `pending_before`/`pending_after`
-        // comment below: `doomed.md` is reused as the delete target by other tests in
-        // this file (e.g. the precommit/postcommit-failure variants), and one of those
-        // succeeds in marking it dirty on the process-wide REINDEX_QUEUE. Under
-        // `--test-threads=1` that earlier, alphabetically-sorted test reliably runs
-        // first and leaves `doomed.md` already present in the queue's HashSet, so this
-        // test's own `mark_paths` call for the same literal is a silent no-op.
         std::fs::write(
             work.path().join("doomed-queued-cleanup-test.md"),
             "---\ntitle: D\n---\n\n# Body\n",
@@ -6739,8 +6753,6 @@ mod tests {
             .unwrap();
         let (server, _config) = make_git_backed_server(&work);
 
-        let pending_before = crate::reindex::REINDEX_QUEUE.snapshot_paths();
-
         let result = server
             .delete_document(Parameters(DeleteDocumentParams {
                 path: "doomed-queued-cleanup-test.md".to_string(),
@@ -6763,10 +6775,8 @@ mod tests {
             "the old skipped-purge warning language must be gone: {text}"
         );
 
-        let pending_after = crate::reindex::REINDEX_QUEUE.snapshot_paths();
         crate::reindex::test_support::assert_marked_dirty(
-            &pending_before,
-            &pending_after,
+            &server.reindex_queue,
             &["doomed-queued-cleanup-test.md"],
         );
     }
