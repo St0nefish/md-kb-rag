@@ -841,36 +841,74 @@ pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
 // Markdown link extraction (feeds the `document_links` graph)
 // ---------------------------------------------------------------------------
 
-/// Extract every local markdown-to-markdown link `[label](target)` from `body`,
-/// resolved to repo-relative paths anchored at `source_rel_path`'s directory.
+/// Extract every local document-to-document link from `body` — inline
+/// `[label](target.md)`, reference-style (`[label][ref]`/shortcut `[ref]` paired
+/// with a `[ref]: target.md` definition), wiki-style `[[target]]`, and autolink
+/// `<target.md>` — resolved to repo-relative paths anchored at `source_rel_path`'s
+/// directory.
 ///
 /// What counts as a link edge, deliberately narrow:
-/// - Only the inline form `[label](target)`. **Reference-style links
-///   (`[label][ref]` plus a separate `[ref]: target` definition) are NOT supported** —
-///   nothing here tracks reference definitions, so they are silently ignored rather
-///   than partially resolved.
-/// - Images (`![alt](target)`) are skipped entirely — an image is not a document
-///   reference.
+/// - Inline `[label](target)` — unchanged from before this function supported the
+///   other three syntaxes below.
+/// - Reference-style: `[label][ref]` (explicit) and the shortcut `[ref]`, resolved
+///   through a `[ref]: target` DEFINITION anywhere in the document (definitions may
+///   appear before OR after their use sites). A definition only counts as a link
+///   when at least one use site in the document actually references it — an
+///   unreferenced `[ref]: target` renders nothing in CommonMark, so it produces no
+///   edge here either, which keeps extraction and rewriting in lockstep with what
+///   the document actually contains. Label matching is case-insensitive and
+///   whitespace-normalized (`[My Ref]` and `[my   ref]` are the same label), per
+///   CommonMark. A label defined more than once resolves to its FIRST definition;
+///   later duplicates are ignored, also per CommonMark.
+/// - Wiki-style `[[target]]`: unlike every other syntax here, a target with no
+///   `.md` extension is treated as `target.md` — deliberately more lenient, because
+///   the double-bracket wiki convention (Obsidian and similar tools) is
+///   conventionally extension-less, and requiring the literal `.md` suffix would
+///   make this syntax useless for the KBs that actually write it that way. The
+///   pipe-alias form `[[target|Display text]]` is NOT specially handled — no
+///   attempt is made to parse the alias apart from the target, and any target
+///   containing a literal `|` is rejected outright rather than fed through the
+///   default-extension step above (which would otherwise turn `guide.md|Alias`
+///   into a bogus resolved path like `guide.md|Alias.md`); write `[[target]]`
+///   without an alias if you want it indexed.
+/// - Autolinks `<target.md>`: the content between `<` and `>` must contain no
+///   whitespace and (after fragment-stripping) end in `.md`, with no scheme
+///   (`http://`, `https://`, `mailto:`, or any other `scheme://`) and no leading
+///   `/`. This is intentionally conservative — `<` is common in HTML, and
+///   CommonMark autolinks are normally absolute URIs — so an HTML tag with
+///   attributes (`<a href="x.md">`, which contains whitespace) or an absolute URI
+///   (`<https://example.com/x.md>`, which has a scheme) is excluded even though
+///   part of its content ends in `.md`. A bare non-path token (`<div>`,
+///   `<not-a-path>`) is excluded simply for not ending in `.md`.
+/// - Images (`![alt](target)`), including the reference forms `![alt][ref]` and
+///   shortcut `![alt]`, are skipped entirely for every syntax above — an image is
+///   not a document reference.
 /// - Anything inside a fenced code block (`` ``` `` or `~~~`, tracked the same
 ///   line-oriented way `chunk::split_sections` tracks fences for headings) or an
-///   inline code span (`` `...` ``) is skipped — link syntax shown as a prose example
-///   is not a real link.
+///   inline code span (`` `...` ``) is skipped for every syntax above, including
+///   reference definitions: a definition line inside a fence is not indexed, and a
+///   definition line wholly wrapped in an inline code span never matches the
+///   definition syntax in the first place (it does not start with `[` at the
+///   line's own indentation once the surrounding backticks are accounted for).
 /// - A trailing `#fragment` is stripped before the target is judged, and an
 ///   anchor-only target (nothing left after stripping) is dropped.
-/// - External targets (`http://`, `https://`, `mailto:`, protocol-relative `//...`),
-///   absolute paths (`/...`), and anything not ending in `.md` are dropped — this
-///   graph only connects markdown documents to each other by relative path.
+/// - External targets (`http://`, `https://`, `mailto:`, any other `scheme://`,
+///   protocol-relative `//...`), absolute paths (`/...`), and anything not ending
+///   in `.md` (after the wiki-style default-extension step above) are dropped —
+///   this graph only connects markdown documents to each other by relative path.
 /// - `./` and `../` are resolved against `source_rel_path`'s directory; a target that
 ///   would climb above the knowledge-base root is rejected outright (dropped) rather
 ///   than clamped, since clamping could silently collide with an unrelated document.
-/// - Results are deduped, preserving first-seen order — linking the same target twice
-///   produces one edge.
+/// - Results are deduped, preserving document order — for a reference-style link
+///   that order is the DEFINITION's position, not any use site's, since the
+///   definition is what this function (and the rewriter sharing its scan) treats as
+///   the link's true location. Linking the same target twice produces one edge.
 pub(crate) fn extract_markdown_links(body: &str, source_rel_path: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
 
-    for (_, raw_target) in scan_link_occurrences(body) {
-        if let Some(resolved) = resolve_link_target(&raw_target, source_rel_path)
+    for (_, raw_target, kind) in scan_link_occurrences(body) {
+        if let Some(resolved) = resolve_link_target(&raw_target, source_rel_path, kind)
             && seen.insert(resolved.clone())
         {
             out.push(resolved);
@@ -880,9 +918,14 @@ pub(crate) fn extract_markdown_links(body: &str, source_rel_path: &str) -> Vec<S
     out
 }
 
-/// One inline link found by [`scan_link_occurrences`], carrying enough position
+/// One link occurrence found by [`scan_link_occurrences`], carrying enough position
 /// information for a caller to replace exactly its target substring in the original
 /// document.
+///
+/// For a reference-style link, this is the DEFINITION's occurrence — never a use
+/// site's. See [`scan_link_occurrences`]'s doc comment for why that is the only
+/// choice that lets a rewrite fix every use at once without also touching (and thus
+/// double-rewriting) the use sites themselves.
 ///
 /// Produced by [`find_markdown_link_occurrences`] — the span-carrying sibling of
 /// [`extract_markdown_links`] — and consumed by `write::write_document_move`'s
@@ -892,30 +935,41 @@ pub(crate) fn extract_markdown_links(body: &str, source_rel_path: &str) -> Vec<S
 pub(crate) struct LinkOccurrence {
     /// Byte range in the original document — valid for direct slicing of the `&str`
     /// passed to [`find_markdown_link_occurrences`] — covering exactly the raw target
-    /// text (the same substring `raw` holds). Byte offsets, not char offsets: a
-    /// multi-byte UTF-8 character earlier in the document shifts a byte offset without
-    /// shifting a char offset by the same amount.
+    /// text (the same substring `raw` holds; for a reference-style link, the
+    /// DEFINITION's target text, not any `[text][ref]`/`[ref]` use site). Byte
+    /// offsets, not char offsets: a multi-byte UTF-8 character earlier in the
+    /// document shifts a byte offset without shifting a char offset by the same
+    /// amount.
     pub span: std::ops::Range<usize>,
-    /// The target exactly as written between `(` and `)` — before the title-suffix and
+    /// The target exactly as written (between `(`/`)` for inline, between the
+    /// double brackets for wiki-style, between `<`/`>` for an autolink, or after
+    /// `[ref]:` for a reference definition) — before the title-suffix and
     /// `#fragment` stripping [`resolve_link_target`] does.
     pub raw: String,
     /// The KB-root-relative path `raw` resolves to.
     pub resolved: String,
 }
 
-/// Span-carrying sibling of [`extract_markdown_links`]: every inline link in `body`
-/// that resolves to a KB-root-relative markdown path (same judging rules — see that
-/// function's doc comment), paired with the exact byte span of its raw target text.
+/// Span-carrying sibling of [`extract_markdown_links`]: every recognized link
+/// occurrence in `body` that resolves to a KB-root-relative markdown path (same
+/// judging rules — see that function's doc comment), paired with the exact byte
+/// span of the text a rewrite should replace.
 ///
-/// Shares [`scan_link_occurrences`] — the same fence/code-span/image-skipping walk —
-/// with `extract_markdown_links`, so the two can never disagree about which substrings
-/// in a document are "real" links versus prose/code that merely looks like one: there
-/// is exactly one scanning implementation, and both entry points call it.
+/// Shares [`scan_link_occurrences`] — the same fence/code-span/image-skipping walk,
+/// for every syntax — with `extract_markdown_links`, so the two can never disagree
+/// about which substrings in a document are "real" links versus prose/code that
+/// merely looks like one: there is exactly one scanning implementation, and both
+/// entry points call it.
 ///
-/// Unlike `extract_markdown_links`, this is NOT deduped by resolved target — a document
-/// that links to the same target twice yields two occurrences, one per span, because a
-/// caller rewriting text needs to visit every occurrence, not just learn that an edge
-/// exists.
+/// Unlike `extract_markdown_links`, this is NOT deduped by resolved target — a
+/// document that links to the same target twice via two DIFFERENT occurrences (e.g.
+/// two inline links, or an inline link and a wiki link) yields two entries, one per
+/// span, because a caller rewriting text needs to visit every occurrence, not just
+/// learn that an edge exists. A reference-style link is the one exception in
+/// practice: however many `[text][ref]`/`[ref]` use sites share one definition, that
+/// definition still produces exactly ONE occurrence here (see
+/// [`scan_link_occurrences`]'s doc comment) — rewriting it once is what fixes every
+/// use at once, and the use sites themselves are never touched.
 ///
 /// Used by `write::write_document_move`: both for its own self-reference rewrite
 /// (scanning the moved document's own new content for a link to its old path) and,
@@ -927,8 +981,8 @@ pub(crate) fn find_markdown_link_occurrences(
 ) -> Vec<LinkOccurrence> {
     scan_link_occurrences(body)
         .into_iter()
-        .filter_map(|(span, raw)| {
-            resolve_link_target(&raw, source_rel_path).map(|resolved| LinkOccurrence {
+        .filter_map(|(span, raw, kind)| {
+            resolve_link_target(&raw, source_rel_path, kind).map(|resolved| LinkOccurrence {
                 span,
                 raw,
                 resolved,
@@ -937,22 +991,58 @@ pub(crate) fn find_markdown_link_occurrences(
         .collect()
 }
 
+/// Whether a raw target may default to a `.md` extension when it lacks one. Only
+/// wiki-style `[[target]]` gets this leniency — see [`extract_markdown_links`]'s doc
+/// comment for why every other syntax requires the literal `.md` suffix as written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RawLinkKind {
+    /// Inline `(target)`, autolink `<target>`, and reference-style definition
+    /// targets — must end in `.md` exactly as written.
+    Explicit,
+    /// Wiki-style `[[target]]` — an extension-less target is assumed to mean
+    /// `target.md`.
+    Wiki,
+}
+
 /// The one scanning implementation behind both [`extract_markdown_links`] and
-/// [`find_markdown_link_occurrences`]. Walks `body` line by line, tracking fenced code
+/// [`find_markdown_link_occurrences`] — see [`extract_markdown_links`]'s doc comment
+/// for exactly what each recognized syntax (inline, reference-style, wiki-style,
+/// autolink) requires to match. Walks `body` line by line, tracking fenced code
 /// blocks (`` ``` `` /`~~~` toggling, the same line-oriented way `chunk::split_sections`
-/// tracks fences for headings) and delegating each non-fenced line to
-/// [`raw_link_occurrences_in_line`] for inline-code-span and image skipping.
+/// tracks fences for headings).
 ///
-/// Line-local byte spans from that per-line scan are shifted by each line's own
-/// starting byte offset in `body`, so the spans this returns are valid for slicing
-/// `body` itself, not just the line they came from.
+/// Reference-style links need the WHOLE document before they can be resolved: a
+/// `[ref]: target` definition may appear after every use site that names it, so a
+/// single top-to-bottom pass cannot both scan and resolve them in the same step.
+/// This function still walks the body's text exactly ONCE — collecting every
+/// inline/wiki/autolink occurrence, every reference DEFINITION (with its target
+/// span), and every reference-style label USED, all in one line-by-line pass via
+/// [`parse_reference_definition`] and [`scan_line_constructs`] — and only resolves
+/// reference-style links (matching used labels against definitions, keeping the
+/// first definition per label per CommonMark) as a second, non-scanning step after
+/// that walk completes.
 ///
-/// Returns every raw `(target)` payload found, unfiltered and unresolved, alongside its
-/// span — judging a target (title/fragment stripping, external/absolute/non-`.md`
-/// rejection, relative path resolution) is [`resolve_link_target`]'s job, which each
-/// entry point applies itself after this shared walk.
-fn scan_link_occurrences(body: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let mut out = Vec::new();
+/// For a resolved reference-style link, the occurrence emitted here spans the
+/// DEFINITION's target text, never a use site's: rewriting the definition is what
+/// fixes every use at once, and rewriting (or even just reporting) the use sites
+/// too would either be redundant or, worse, corrupt text that was never the actual
+/// edit target. A definition with NO use site referencing it is dropped entirely —
+/// CommonMark renders nothing for an unreferenced definition, so treating it as a
+/// link here would extract/rewrite something invisible to a reader.
+///
+/// Returns every raw target payload found, unfiltered and unresolved, alongside its
+/// span and which [`RawLinkKind`] produced it (only wiki-style gets a default `.md`
+/// extension) — judging a target (title/fragment stripping, external/absolute/
+/// non-`.md` rejection, relative path resolution) is [`resolve_link_target`]'s job,
+/// which each entry point applies itself after this shared walk. The result is
+/// sorted by span start, which is what gives a reference-style occurrence its
+/// position in document order (the DEFINITION's position) even though it was
+/// resolved out of band from the inline/wiki/autolink occurrences collected during
+/// the per-line walk.
+fn scan_link_occurrences(body: &str) -> Vec<(std::ops::Range<usize>, String, RawLinkKind)> {
+    let mut out: Vec<(std::ops::Range<usize>, String, RawLinkKind)> = Vec::new();
+    let mut ref_defs: Vec<(String, std::ops::Range<usize>, String)> = Vec::new();
+    let mut used_labels: HashSet<String> = HashSet::new();
     let mut in_fence = false;
     let mut offset = 0usize;
 
@@ -970,29 +1060,142 @@ fn scan_link_occurrences(body: &str) -> Vec<(std::ops::Range<usize>, String)> {
             offset += line.len();
             continue;
         }
+
         if !in_fence {
-            for (rel_span, raw_target) in raw_link_occurrences_in_line(content) {
-                out.push((offset + rel_span.start..offset + rel_span.end, raw_target));
+            if let Some((label, rel_span, raw_target)) = parse_reference_definition(content) {
+                // A reference-definition line is not ALSO scanned for other
+                // constructs — CommonMark treats it as its own line-level
+                // construct, not prose that might additionally contain a link.
+                ref_defs.push((
+                    label,
+                    offset + rel_span.start..offset + rel_span.end,
+                    raw_target,
+                ));
+            } else {
+                let scan = scan_line_constructs(content);
+                for (rel_span, raw_target, kind) in scan.occurrences {
+                    out.push((
+                        offset + rel_span.start..offset + rel_span.end,
+                        raw_target,
+                        kind,
+                    ));
+                }
+                used_labels.extend(scan.ref_uses);
             }
         }
 
         offset += line.len();
     }
 
+    // Resolve reference-style: only a USED label's definition becomes an
+    // occurrence, and only the FIRST definition for a given label counts
+    // (CommonMark: a duplicate definition is shadowed by the first one seen).
+    let mut first_def_by_label: HashMap<&str, &(String, std::ops::Range<usize>, String)> =
+        HashMap::new();
+    for def in &ref_defs {
+        first_def_by_label.entry(def.0.as_str()).or_insert(def);
+    }
+    for label in &used_labels {
+        if let Some(def) = first_def_by_label.get(label.as_str()) {
+            out.push((def.1.clone(), def.2.clone(), RawLinkKind::Explicit));
+        }
+    }
+
+    out.sort_by_key(|(span, _, _)| span.start);
     out
 }
 
-/// Scan one non-fenced line for inline `[label](target)` links, returning each raw
-/// (unresolved, unfiltered) target's byte span within `line` alongside the target text
-/// itself. Handles the two things that would otherwise produce false positives on a
-/// single line: image syntax (`![...](...)`) and inline code spans (`` `...` ``) —
-/// both are skipped without being scanned for links.
+/// If `line` is (the entirety of) a CommonMark-style reference LINK DEFINITION —
+/// `[label]: target` at up to 3 spaces of indentation, optionally followed by a
+/// title on the same line, which is left untouched — return the label (normalized
+/// per [`normalize_ref_label`]) and the byte span/raw text of just the `target`
+/// portion within `line`. Returns `None` for anything else, INCLUDING a line
+/// wrapped in an inline code span (`` `[ref]: target.md` `` does not start with `[`
+/// at the line's own indentation, so it never matches — the surrounding backticks
+/// are the first character) and any line inside a fenced code block (handled by the
+/// caller, [`scan_link_occurrences`], which never calls this for a fenced line).
 ///
-/// Byte spans, not char spans: [`find_link_parens`] works in `Vec<char>` indices, so
+/// Deliberately narrow: the destination must be a bare, whitespace-free token on the
+/// SAME line as the label (no `<angle-bracket>`-wrapped destination, and no
+/// destination/title continued onto a following line) — CommonMark allows both, but
+/// neither is needed for the relative `.md` paths this KB actually links with, and
+/// supporting them would require a real multi-line parser rather than this
+/// single-line one.
+fn parse_reference_definition(line: &str) -> Option<(String, std::ops::Range<usize>, String)> {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    if indent > 3 || !trimmed.starts_with('[') {
+        return None;
+    }
+
+    let rest = &trimmed[1..];
+    let colon_idx = rest.find("]:")?;
+    let label = &rest[..colon_idx];
+    if label.is_empty() {
+        return None;
+    }
+
+    let after_colon = &rest[colon_idx + 2..];
+    let target = after_colon.trim_start();
+    let leading_ws = after_colon.len() - target.len();
+    let target_len = target.find(char::is_whitespace).unwrap_or(target.len());
+    if target_len == 0 {
+        return None;
+    }
+    let raw_target = &target[..target_len];
+
+    // Byte offset of `raw_target` within the original (untrimmed) `line`: indent
+    // (leading whitespace) + `[` (1 byte) + colon_idx (label bytes) + `]:` (2
+    // bytes) + leading_ws (whitespace after the colon).
+    let start = indent + 1 + colon_idx + 2 + leading_ws;
+    let end = start + raw_target.len();
+
+    Some((
+        normalize_ref_label(label),
+        start..end,
+        raw_target.to_string(),
+    ))
+}
+
+/// CommonMark reference-label matching is case-insensitive and normalizes internal
+/// whitespace runs to a single space — `[My Ref]` and `[my   ref]` name the same
+/// definition. Used to normalize both a use site's label and a definition's label
+/// before comparing them.
+fn normalize_ref_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Everything [`scan_line_constructs`] finds on one non-fenced, non-definition
+/// line: real link occurrences (inline/wiki/autolink — reference-style definitions
+/// are handled separately, by [`parse_reference_definition`], since they are a
+/// whole-line construct) and every reference-style LABEL used on the line
+/// (`[text][ref]`'s `ref`, or a bare `[ref]` shortcut candidate), normalized for
+/// later matching against collected definitions in [`scan_link_occurrences`].
+struct LineConstructs {
+    occurrences: Vec<(std::ops::Range<usize>, String, RawLinkKind)>,
+    ref_uses: Vec<String>,
+}
+
+/// Scan one non-fenced, non-definition line for every recognized link construct:
+/// inline `[label](target)`, wiki `[[target]]`, autolink `<target>`, and
+/// reference-style use sites (`[label][ref]` and the shortcut `[ref]`, both
+/// recorded as candidate labels only — resolving them against known definitions is
+/// [`scan_link_occurrences`]'s job, once the whole document has been walked).
+///
+/// Handles the same two things this function's inline-only predecessor handled —
+/// image syntax (`![alt](target)`, including its `![alt][ref]`/`![alt]` reference
+/// forms) and inline code spans (`` `...` ``) — plus the three added syntaxes.
+///
+/// Byte spans, not char spans: [`find_link_parens`]/[`find_double_bracket_close`]/
+/// [`scan_autolink_candidate`] all work in `Vec<char>` indices, so
 /// `line.char_indices()` maps each of those char indices to its actual byte offset —
 /// a multi-byte UTF-8 character earlier on the line would otherwise desync a naive
 /// char-count offset from the byte offset a caller needs for slicing.
-fn raw_link_occurrences_in_line(line: &str) -> Vec<(std::ops::Range<usize>, String)> {
+fn scan_line_constructs(line: &str) -> LineConstructs {
     let chars: Vec<char> = line.chars().collect();
     // One byte offset per char index, plus a trailing entry for `line`'s total byte
     // length so a target ending at the line's last char can still compute its end.
@@ -1000,6 +1203,7 @@ fn raw_link_occurrences_in_line(line: &str) -> Vec<(std::ops::Range<usize>, Stri
     byte_at.push(line.len());
 
     let mut occurrences = Vec::new();
+    let mut ref_uses = Vec::new();
     let mut i = 0usize;
     let mut in_code = false;
     let mut code_run_len = 0usize;
@@ -1028,47 +1232,176 @@ fn raw_link_occurrences_in_line(line: &str) -> Vec<(std::ops::Range<usize>, Stri
             continue;
         }
 
-        // Image: skip the whole `![...](...)` construct, extracting nothing from it.
+        // Image, plain or reference form: skip the whole construct, extracting
+        // nothing — an image is never a document link, for any syntax.
         if chars[i] == '!' && chars.get(i + 1) == Some(&'[') {
-            i = match find_link_parens(&chars, i + 1) {
-                Some((_, _, after)) => after,
-                None => i + 1,
-            };
+            i = skip_image(&chars, i + 1);
             continue;
         }
 
+        // Wiki-style [[target]].
         if chars[i] == '['
-            && let Some((target_start, target_end, after)) = find_link_parens(&chars, i)
+            && chars.get(i + 1) == Some(&'[')
+            && let Some(close) = find_double_bracket_close(&chars, i)
         {
+            let (target_start, target_end) = (i + 2, close);
             let raw: String = chars[target_start..target_end].iter().collect();
-            occurrences.push((byte_at[target_start]..byte_at[target_end], raw));
+            occurrences.push((
+                byte_at[target_start]..byte_at[target_end],
+                raw,
+                RawLinkKind::Wiki,
+            ));
+            i = close + 2;
+            continue;
+        }
+
+        // Autolink <target>.
+        if chars[i] == '<'
+            && let Some((content_start, content_end, after, has_whitespace)) =
+                scan_autolink_candidate(&chars, i)
+        {
+            if !has_whitespace {
+                let raw: String = chars[content_start..content_end].iter().collect();
+                occurrences.push((
+                    byte_at[content_start]..byte_at[content_end],
+                    raw,
+                    RawLinkKind::Explicit,
+                ));
+            }
             i = after;
             continue;
+        }
+
+        if chars[i] == '[' {
+            // Inline [label](target).
+            if let Some((target_start, target_end, after)) = find_link_parens(&chars, i) {
+                let raw: String = chars[target_start..target_end].iter().collect();
+                occurrences.push((
+                    byte_at[target_start]..byte_at[target_end],
+                    raw,
+                    RawLinkKind::Explicit,
+                ));
+                i = after;
+                continue;
+            }
+
+            // Reference-style: [text][ref] (explicit) or [ref] (shortcut
+            // candidate — real only if a matching definition exists, decided
+            // later by the caller once the whole document has been walked).
+            if let Some(label1_close) = find_bracket_close(&chars, i) {
+                let label1: String = chars[i + 1..label1_close].iter().collect();
+                if chars.get(label1_close + 1) == Some(&'[')
+                    && let Some(label2_close) = find_bracket_close(&chars, label1_close + 1)
+                {
+                    let label2: String = chars[label1_close + 2..label2_close].iter().collect();
+                    let effective = if label2.trim().is_empty() {
+                        label1
+                    } else {
+                        label2
+                    };
+                    ref_uses.push(normalize_ref_label(&effective));
+                    i = label2_close + 1;
+                    continue;
+                }
+                ref_uses.push(normalize_ref_label(&label1));
+                i = label1_close + 1;
+                continue;
+            }
         }
 
         i += 1;
     }
 
-    occurrences
+    LineConstructs {
+        occurrences,
+        ref_uses,
+    }
 }
 
-/// Given `chars[bracket] == '['`, look for the `]` closing the bracketed label (no
-/// nested-bracket support — link/image labels are plain text in practice) and, if a
-/// `(` immediately follows it, the parenthesized target after that (parens balanced,
-/// so a target containing a literal `(`/`)` still resolves correctly).
+/// Skip an image construct starting at `chars[bracket] == '['` (the caller has
+/// already matched the preceding `!`), covering all three forms —
+/// `![alt](target)`, `![alt][ref]`, and the bare `![alt]` — returning the char
+/// index just past whichever form matched (or just past the alt label if neither
+/// followed). An image's target/reference is never extracted as a document link,
+/// for any syntax.
+fn skip_image(chars: &[char], bracket: usize) -> usize {
+    let Some(label_close) = find_bracket_close(chars, bracket) else {
+        return bracket + 1;
+    };
+    if chars.get(label_close + 1) == Some(&'(') {
+        match find_link_parens(chars, bracket) {
+            Some((_, _, after)) => after,
+            None => label_close + 1,
+        }
+    } else if chars.get(label_close + 1) == Some(&'[')
+        && let Some(ref_close) = find_bracket_close(chars, label_close + 1)
+    {
+        ref_close + 1
+    } else {
+        label_close + 1
+    }
+}
+
+/// Find the index of the `]` closing a label opened at `chars[open] == '['` (no
+/// nested-bracket support — link/image/reference labels are plain text in
+/// practice). Shared by inline links, images, and reference-style use sites, so all
+/// of them treat "what is a label" the same way.
+fn find_bracket_close(chars: &[char], open: usize) -> Option<usize> {
+    let mut j = open + 1;
+    while j < chars.len() && chars[j] != ']' {
+        j += 1;
+    }
+    (j < chars.len()).then_some(j)
+}
+
+/// Find the index of the first `]` of a closing `]]` for a wiki link opened at
+/// `chars[open] == chars[open + 1] == '['`. No nested `[[`/`]]` support, same
+/// simplification as [`find_bracket_close`].
+fn find_double_bracket_close(chars: &[char], open: usize) -> Option<usize> {
+    let mut j = open + 2;
+    while j + 1 < chars.len() {
+        if chars[j] == ']' && chars[j + 1] == ']' {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// From `chars[open] == '<'`, look for a `>` on the SAME line with nothing that
+/// looks like nested markup (a second `<` before the close), returning
+/// `(content_start, content_end, index_after_closing_gt, contains_whitespace)`.
+/// `contains_whitespace` lets the caller reject the candidate outright: a real
+/// document-link autolink never contains whitespace, while most HTML tags with
+/// attributes do (`<a href="x.md">`) — see [`extract_markdown_links`]'s doc comment
+/// for the full autolink acceptance policy. Returns `None` when nothing on this
+/// line closes the `<` at all (leave it as an ordinary character — most commonly
+/// the start of literal HTML that spans past this line).
+fn scan_autolink_candidate(chars: &[char], open: usize) -> Option<(usize, usize, usize, bool)> {
+    let mut j = open + 1;
+    let mut has_whitespace = false;
+    while j < chars.len() && chars[j] != '>' && chars[j] != '<' {
+        if chars[j].is_whitespace() {
+            has_whitespace = true;
+        }
+        j += 1;
+    }
+    if j >= chars.len() || chars[j] != '>' {
+        return None;
+    }
+    Some((open + 1, j, j + 1, has_whitespace))
+}
+
+/// Given `chars[bracket] == '['`, look for the `]` closing the bracketed label and,
+/// if a `(` immediately follows it, the parenthesized target after that (parens
+/// balanced, so a target containing a literal `(`/`)` still resolves correctly).
 ///
 /// Returns `(target_start, target_end, index_after_closing_paren)` as char indices,
 /// with `target_end` exclusive — or `None` if `bracket` is not actually the start of
 /// an inline link (a bare `[`, or reference-style `[label][ref]`, both of which look
 /// identical to this point).
 fn find_link_parens(chars: &[char], bracket: usize) -> Option<(usize, usize, usize)> {
-    let mut j = bracket + 1;
-    while j < chars.len() && chars[j] != ']' {
-        j += 1;
-    }
-    if j >= chars.len() {
-        return None; // Unterminated label.
-    }
+    let j = find_bracket_close(chars, bracket)?;
     if chars.get(j + 1) != Some(&'(') {
         return None; // Not immediately followed by a target — not this parser's job.
     }
@@ -1093,8 +1426,15 @@ fn find_link_parens(chars: &[char], bracket: usize) -> Option<(usize, usize, usi
 }
 
 /// Judge and resolve one raw link target against `source_rel_path`'s directory.
-/// Returns `None` for anything [`extract_markdown_links`]'s doc comment says to drop.
-fn resolve_link_target(raw_target: &str, source_rel_path: &str) -> Option<String> {
+/// Returns `None` for anything [`extract_markdown_links`]'s doc comment says to
+/// drop. `kind` controls the one syntax-specific rule: whether an extension-less
+/// target defaults to `.md` (wiki-style only — see [`extract_markdown_links`]'s doc
+/// comment for why).
+fn resolve_link_target(
+    raw_target: &str,
+    source_rel_path: &str,
+    kind: RawLinkKind,
+) -> Option<String> {
     let target = raw_target.trim();
 
     // Strip an optional ` "title"` / ` 'title'` suffix (CommonMark link title) — take
@@ -1119,13 +1459,28 @@ fn resolve_link_target(raw_target: &str, source_rel_path: &str) -> Option<String
         || lower.starts_with("https://")
         || lower.starts_with("mailto:")
         || target.starts_with('/')
+        || target.contains("://")
     {
         return None;
     }
 
-    if !target.ends_with(".md") {
+    // A wiki-style pipe-alias target (`[[target|Display text]]`) is not parsed
+    // apart from its target — see `extract_markdown_links`'s doc comment — so
+    // reject it outright rather than let the default-extension step below turn
+    // `guide.md|Alias` into a bogus resolved path like `guide.md|Alias.md`.
+    if kind == RawLinkKind::Wiki && target.contains('|') {
         return None;
     }
+
+    let with_ext: String;
+    let target = if target.ends_with(".md") {
+        target
+    } else if kind == RawLinkKind::Wiki {
+        with_ext = format!("{target}.md");
+        with_ext.as_str()
+    } else {
+        return None;
+    };
 
     resolve_relative_md_path(target, source_rel_path)
 }
@@ -2382,10 +2737,140 @@ mod tests {
                 &[],
             ),
             (
-                "reference-style links are NOT supported: [label][ref] has no (target) \
-                 immediately after the label, and no [ref]: definition is ever tracked, \
-                 so both lines here are silently ignored rather than partially resolved",
+                "reference-style [label][ref] resolves through a [ref]: definition that \
+                 appears AFTER its use site",
                 "[Guide][ref]\n\n[ref]: guide.md",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "reference-style resolves through a definition that appears BEFORE its \
+                 use site too",
+                "[ref]: guide.md\n\n[Guide][ref]",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "reference-style shortcut form [ref] (no separate label text) resolves",
+                "See [ref] for details.\n\n[ref]: guide.md",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "reference-style label matching is case-insensitive",
+                "[Guide][REF]\n\n[ref]: guide.md",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "a reference definition with no use site anywhere in the document is not a \
+                 link — CommonMark renders nothing for it either",
+                "[ref]: guide.md",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "multiple uses of one reference definition still produce one edge",
+                "[A][ref] and [B][ref] and [ref]\n\n[ref]: guide.md",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "a duplicate reference definition is shadowed by the FIRST one, per \
+                 CommonMark",
+                "[Guide][ref]\n\n[ref]: guide.md\n[ref]: other.md",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "reference-style definitions inside a fenced code block are not tracked, \
+                 and the use site outside the fence resolves nothing without them",
+                "[Guide][ref]\n\n```md\n[ref]: guide.md\n```\n",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "a reference definition wholly wrapped in an inline code span is not a \
+                 real definition",
+                "[Guide][ref]\n\n`[ref]: guide.md`\n",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "wiki-style [[target]] resolves like inline, sibling directory",
+                "[[guide]]",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "wiki-style [[target.md]] with an explicit extension is not double-appended",
+                "[[guide.md]]",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "wiki-style resolves ./ and ../ the same way inline targets do",
+                "[[../top]]",
+                "docs/sub/page.md",
+                &["docs/top.md"],
+            ),
+            (
+                "wiki-style pipe-alias form is not specially handled and is dropped",
+                "[[guide.md|Display Text]]",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "wiki-style links inside a fenced code block are not real links",
+                "```md\n[[guide]]\n```",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "wiki-style links inside an inline code span are not real links",
+                "Use `[[guide]]` literally.",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "autolink <target.md> resolves like inline",
+                "See <guide.md> for details.",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "autolink with a trailing #fragment resolves like inline",
+                "<guide.md#installation>",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "an HTML tag with attributes (whitespace) is not an autolink",
+                "<div>",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "an absolute-URI autolink is not a document link, even ending in .md",
+                "<https://example.com/x.md>",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "a bare non-path autolink is not a document link",
+                "<not-a-path>",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "autolinks inside a fenced code block are not real links",
+                "```md\n<guide.md>\n```",
+                "docs/page.md",
+                &[],
+            ),
+            (
+                "autolinks inside an inline code span are not real links",
+                "Use `<guide.md>` literally.",
                 "docs/page.md",
                 &[],
             ),
@@ -2477,6 +2962,136 @@ mod tests {
         assert_eq!(occurrence.span.start, expected_start);
         assert_eq!(occurrence.span.end, expected_start + "guide.md".len());
         assert_eq!(&body[occurrence.span.clone()], "guide.md");
+    }
+
+    #[test]
+    fn find_markdown_link_occurrences_reference_style_span_is_the_definition_not_use_sites() {
+        // Three use sites (explicit label, another explicit label, and the bare
+        // shortcut) all sharing one definition must yield exactly ONE occurrence,
+        // spanning the DEFINITION's target text — never any use site's — per
+        // `scan_link_occurrences`'s documented rewrite-target decision: rewriting
+        // the definition once is what fixes every use at once.
+        let body = "[A][ref] and [B][ref] and [ref] too.\n\n[ref]: guide.md \"Title\"\n";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "three use sites sharing one definition must collapse to one occurrence, got: \
+             {occurrences:?}"
+        );
+
+        let occurrence = &occurrences[0];
+        assert_eq!(occurrence.raw, "guide.md");
+        assert_eq!(occurrence.resolved, "docs/guide.md");
+
+        let expected_start = body
+            .find("guide.md")
+            .expect("the definition's target text must appear in body");
+        assert_eq!(
+            occurrence.span,
+            expected_start..expected_start + "guide.md".len(),
+            "the span must cover the definition's target text, not a use site"
+        );
+        assert_eq!(&body[occurrence.span.clone()], "guide.md");
+    }
+
+    #[test]
+    fn find_markdown_link_occurrences_wiki_multibyte_utf8_span() {
+        let body = "Café résumé — π ≈ 3.14: see [[guide]] for the recipe.";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+        assert_eq!(occurrences.len(), 1);
+
+        let occurrence = &occurrences[0];
+        assert_eq!(occurrence.raw, "guide");
+        assert_eq!(occurrence.resolved, "docs/guide.md");
+
+        let expected_start = body
+            .find("guide]]")
+            .expect("target text must appear in body");
+        assert_eq!(occurrence.span.start, expected_start);
+        assert_eq!(occurrence.span.end, expected_start + "guide".len());
+        assert_eq!(&body[occurrence.span.clone()], "guide");
+    }
+
+    #[test]
+    fn find_markdown_link_occurrences_autolink_multibyte_utf8_span() {
+        let body = "Café résumé — π ≈ 3.14: see <guide.md> for the recipe.";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+        assert_eq!(occurrences.len(), 1);
+
+        let occurrence = &occurrences[0];
+        assert_eq!(occurrence.raw, "guide.md");
+        assert_eq!(occurrence.resolved, "docs/guide.md");
+
+        let expected_start = body
+            .find("guide.md>")
+            .expect("target text must appear in body");
+        assert_eq!(occurrence.span.start, expected_start);
+        assert_eq!(occurrence.span.end, expected_start + "guide.md".len());
+        assert_eq!(&body[occurrence.span.clone()], "guide.md");
+    }
+
+    #[test]
+    fn find_markdown_link_occurrences_reference_definition_multibyte_utf8_span() {
+        // Multi-byte UTF-8 text before the use site AND before the definition line
+        // itself (in the label), proving the definition-line parser
+        // (`parse_reference_definition`) computes byte-correct spans too, not just
+        // the char-array-based general scanner.
+        let body = "Café résumé — π ≈ 3.14: see [Guide][réf] too.\n\n[réf]: guide.md\n";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+        assert_eq!(occurrences.len(), 1, "got: {occurrences:?}");
+
+        let occurrence = &occurrences[0];
+        assert_eq!(occurrence.raw, "guide.md");
+        assert_eq!(occurrence.resolved, "docs/guide.md");
+
+        let expected_start = body
+            .rfind("guide.md")
+            .expect("the definition's target text must appear in body");
+        assert_eq!(occurrence.span.start, expected_start);
+        assert_eq!(occurrence.span.end, expected_start + "guide.md".len());
+        assert_eq!(&body[occurrence.span.clone()], "guide.md");
+    }
+
+    #[test]
+    fn find_markdown_link_occurrences_wiki_and_autolink_skip_fence_and_code_span() {
+        let body = "[[real]]\n\n\
+                     ```md\n[[fenced]]\n<fenced.md>\n```\n\n\
+                     Use `[[coded]]` and `<coded.md>` literally.\n\n\
+                     Also <real2.md>.\n";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+        let raws: Vec<&str> = occurrences.iter().map(|o| o.raw.as_str()).collect();
+        assert_eq!(
+            raws,
+            vec!["real", "real2.md"],
+            "only the two real constructs outside the fence/code-span should be reported"
+        );
+        for occurrence in &occurrences {
+            assert_eq!(&body[occurrence.span.clone()], occurrence.raw);
+        }
+    }
+
+    #[test]
+    fn find_markdown_link_occurrences_html_like_autolinks_produce_no_occurrences() {
+        let body = "<div> and <https://example.com/x.md> and <not-a-path> and <a href=\"x.md\">";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+        assert_eq!(
+            occurrences,
+            vec![],
+            "none of these should be treated as document-link autolinks"
+        );
     }
 
     // -- relativize_md_path -------------------------------------------------------

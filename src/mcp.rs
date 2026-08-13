@@ -3141,13 +3141,14 @@ impl KbSearchServer {
         exist; this tool never overwrites. Frontmatter is validated against the DESTINATION \
         directory's schema, which may differ from the source directory's — call get_schema on \
         the destination path first if you are not sure what it requires. Moving a document \
-        also automatically updates inline Markdown links in OTHER documents that point at it, \
-        committing those documents in the SAME commit as the move; the updated paths are \
-        reported back in rewritten_paths. LIMITATION: only inline links in the form \
-        [text](path.md) are rewritten. Reference-style links ([text][ref]), wiki-style \
-        [[path]] links, and autolinks (<path.md>) are invisible to this system's link index \
-        and are NOT rewritten — if the knowledge base uses those styles, they need manual \
-        follow-up after a move.\n\
+        also automatically updates every recognized link in OTHER documents that point at it — \
+        inline [text](path.md), reference-style [text][ref] and the shortcut [ref] (the \
+        [ref]: path.md definition is rewritten once; the use sites are left untouched), \
+        wiki-style [[path]] (an extension-less target is treated as path.md), and autolinks \
+        <path.md> — committing those documents in the SAME commit as the move; the updated \
+        paths are reported back in rewritten_paths. LIMITATION: the wiki pipe-alias form \
+        [[path|Display text]] is not recognized as a link at all — write [[path]] without an \
+        alias if you need it tracked.\n\
         \n\
         At least one of {content, old_string+new_string, new_path} must be provided — a call \
         with none of them changes nothing and is rejected.\n\
@@ -3428,11 +3429,13 @@ impl KbSearchServer {
         target, with only its relative spelling updated for the mover's new location. \
         Documents OUTSIDE the moved subtree that link INTO it also have those links \
         rewritten to the new location, committed in the SAME commit as the move — the \
-        rewritten paths are reported back in rewritten_paths. LIMITATION: only inline \
-        links in the form [text](path.md) are rewritten. Reference-style links \
-        ([text][ref]), wiki-style [[path]] links, and autolinks (<path.md>) are invisible \
-        to this system's link index and are NOT rewritten — if the knowledge base uses \
-        those styles, they need manual follow-up after a move.\n\
+        rewritten paths are reported back in rewritten_paths. Every recognized link syntax \
+        is covered: inline [text](path.md), reference-style [text][ref] and the shortcut \
+        [ref] (the [ref]: path.md definition is rewritten once; the use sites are left \
+        untouched), wiki-style [[path]] (an extension-less target is treated as path.md), \
+        and autolinks <path.md>. LIMITATION: the wiki pipe-alias form [[path|Display text]] \
+        is not recognized as a link at all — write [[path]] without an alias if you need it \
+        tracked.\n\
         \n\
         Returns the number of documents moved (with their old -> new paths) and every \
         rewritten path. Indexing of every moved and rewritten document is queued in the \
