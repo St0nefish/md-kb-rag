@@ -7,10 +7,13 @@
 //! for a service whose whole job is keeping an index in sync.
 //!
 //! This module keeps that state in memory so `/status` and `/metrics` can answer in one
-//! call. It is deliberately process-global, mirroring [`crate::reindex::REINDEX_QUEUE`]:
-//! `index_paths` is the sole index mutator per process (the reindex worker is the only
-//! thing that calls it in `serve` mode), and threading a handle through every call site
-//! and every test mock would buy nothing.
+//! call. It is deliberately process-global: `index_paths` is the sole index mutator per
+//! process (the reindex worker is the only thing that calls it in `serve` mode), and
+//! nothing here is written from more than one call site the way `reindex::ReindexQueue`
+//! used to be reached from every write tool, the webhook handler, and the worker at
+//! once — see that module's doc comment on why an ambient global was the wrong shape
+//! for something with that many independent writers, and why it is now an injected
+//! `Arc<ReindexQueue>` instead.
 //!
 //! Nothing here is persisted. A restart resets the run history, which is correct — the
 //! interesting question is almost always "what has this process done", and the durable

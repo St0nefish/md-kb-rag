@@ -90,6 +90,12 @@ pub struct UiState {
     /// for `server::StatusState` in `run_server` — a second lazily-opened pool onto
     /// the same SQLite file is pointless duplication, not extra safety.
     state_db: Arc<tokio::sync::OnceCell<StateDb>>,
+    /// The same `ReindexQueue` `server::run_server` hands to `KbSearchServer`,
+    /// `WebhookState`, and `reindex::run_worker` — the UI's write routes must
+    /// land on the one queue the worker actually drains. See
+    /// `reindex::ReindexQueue`'s doc comment on `run_worker` for why there is
+    /// no ambient default to fall back on.
+    reindex_queue: Arc<crate::reindex::ReindexQueue>,
 }
 
 /// Build an include `GlobSet` for the UI's document-serving routes.
@@ -123,6 +129,7 @@ impl UiState {
         rerank_client: Option<Arc<RerankClient>>,
         schema_cache: SharedSchemaCache,
         state_db: Arc<tokio::sync::OnceCell<StateDb>>,
+        reindex_queue: Arc<crate::reindex::ReindexQueue>,
     ) -> Self {
         Self {
             config,
@@ -134,6 +141,7 @@ impl UiState {
             rerank_client,
             schema_cache,
             state_db,
+            reindex_queue,
         }
     }
 
@@ -201,6 +209,7 @@ impl UiState {
             token: token.as_deref(),
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
+            queue: &self.reindex_queue,
             state: state_db,
         }
     }
@@ -1447,6 +1456,7 @@ mod tests {
             None,
             test_schema_cache(&config),
             Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::reindex::ReindexQueue::new()),
         )
     }
 
@@ -2063,6 +2073,7 @@ mod tests {
             None,
             schema_cache,
             Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::reindex::ReindexQueue::new()),
         );
 
         let app = ui_router(state);
@@ -2336,6 +2347,7 @@ mod tests {
             None,
             test_schema_cache(&config),
             Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::reindex::ReindexQueue::new()),
         )
     }
 
