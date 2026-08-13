@@ -4622,6 +4622,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn move_rewrites_a_wiki_link_and_a_reference_definition_across_a_depth_change() {
+        // Companion to `move_rewrites_a_non_self_link_across_a_depth_change`, but for
+        // the two syntaxes that function predates: a wiki-style `[[target]]` link and
+        // a reference-style definition, both pointing at a document that stays put
+        // while the mover's own depth changes. Both must have their relative
+        // spelling recomputed exactly like an inline link does — this is the "new
+        // syntax exercised across a move with a depth change" case called for
+        // alongside the inline-only depth-change test above.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        std::fs::create_dir_all(work.path().join("shared")).unwrap();
+        std::fs::write(
+            work.path().join("shared/doc.md"),
+            "---\ntitle: Shared\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Shared\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "shared/doc.md", "add shared/doc.md");
+
+        let source_original = "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [[../shared/doc]] and [Shared][ref] too.\n\n[ref]: ../shared/doc.md\n";
+        std::fs::write(work.path().join("old/a.md"), source_original).unwrap();
+        git_commit_all(&work, "old/a.md", "add old/a.md");
+
+        let harness = git_backed_harness(&work);
+
+        let req = make_move_req(
+            "old/a.md",
+            "new/deep/a.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        let dest_content = std::fs::read_to_string(work.path().join("new/deep/a.md")).unwrap();
+        let occurrences =
+            crate::ingest::find_markdown_link_occurrences(&dest_content, "new/deep/a.md");
+        assert_eq!(
+            occurrences.len(),
+            2,
+            "expected exactly one wiki-link occurrence and one reference-definition \
+             occurrence, got: {dest_content}"
+        );
+        assert!(
+            occurrences.iter().all(|o| o.resolved == "shared/doc.md"),
+            "both must still resolve to shared/doc.md after the move, got: {occurrences:?}"
+        );
+
+        // The wiki link's bracketed target is rewritten the same way an inline
+        // link's parenthesized target is: `relativize_md_path` always emits the
+        // full `.md`-suffixed path, so the extension the author omitted is now
+        // explicit — the link still resolves identically either way.
+        assert!(
+            dest_content.contains("[[../../shared/doc.md]]"),
+            "expected the wiki link's climb to deepen from ../ to ../../, got: {dest_content}"
+        );
+        // The reference DEFINITION is rewritten once...
+        assert!(
+            dest_content.contains("[ref]: ../../shared/doc.md"),
+            "expected the reference definition's climb to deepen from ../ to ../../, got: \
+             {dest_content}"
+        );
+        // ...and the use site is left completely untouched.
+        assert!(
+            dest_content.contains("[Shared][ref]"),
+            "the reference use site's text must be untouched, got: {dest_content}"
+        );
+    }
+
+    #[tokio::test]
     async fn move_rewrites_a_non_self_link_across_a_sibling_directory_change() {
         let bare = crate::git::tests::create_bare_repo("master");
         let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
