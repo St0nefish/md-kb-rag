@@ -718,6 +718,107 @@ pub fn store_shared(shared: &SharedSchemaCache, new: SchemaCache) {
     }
 }
 
+/// Merge a set of already-parsed schema files, keyed by governing directory, into
+/// the per-directory resolved schema tree — the shallow-first sort, per-scope
+/// `nearest_schema` lookup, and the root replace-vs-merge special case that used
+/// to be inlined in [`SchemaCache::build`].
+///
+/// Pure: no filesystem access (`files` must already hold fully parsed content —
+/// this never reads a schema file off disk), and no state beyond the `warn!` calls
+/// [`ResolvedSchema::merged_with`] itself already makes. This is what makes it
+/// reusable for two different callers that arrive at a `(governing_dir ->
+/// SchemaFile)` map by different means: [`SchemaCache::build`] gets there by
+/// walking disk and separately tracking parse failures (irreducibly a filesystem
+/// concern, so that bookkeeping stays in `build` rather than here — see its doc
+/// comment), and [`SchemaCache::with_remapped_scopes`] gets there by rekeying an
+/// existing cache's already-parsed `raw` map, entirely in memory. Compare
+/// [`SchemaCache::resolve_with_candidate`], which does similar in-memory
+/// ancestor-chain rebuilding for a single substituted directory but — unlike this
+/// — cannot relocate entries, only replace one directory's content in place.
+///
+/// A root entry (governing directory `""`) REPLACES the config-derived root
+/// outright rather than merging onto it — see [`SchemaCache::build`]'s doc
+/// comment for why; that policy is cascade-merge logic, not disk-walk logic, so
+/// it lives here.
+fn merge_cascade(
+    files: &BTreeMap<PathBuf, SchemaFile>,
+    config_root: &ResolvedSchema,
+) -> Vec<(PathBuf, ResolvedSchema)> {
+    // Shallowest first so each merge sees its parent already resolved, then by path
+    // so two scopes at the same depth resolve in a stable order. Depth alone would
+    // leave a `BTreeMap`'s lexicographic key order in charge of siblings, which
+    // does not track depth — a field declared with conflicting types in two
+    // sibling scopes could otherwise silently pick a different index kind
+    // depending on how their paths happen to sort.
+    let mut order: Vec<&PathBuf> = files.keys().collect();
+    order.sort_by(|a, b| {
+        a.components()
+            .count()
+            .cmp(&b.components().count())
+            .then_with(|| a.cmp(b))
+    });
+
+    let mut scopes: Vec<(PathBuf, ResolvedSchema)> = Vec::new();
+    let mut root_file_found = false;
+
+    for rel_dir in order {
+        let file = &files[rel_dir];
+        let origin = rel_dir.join(SCHEMA_FILE_NAME).to_string_lossy().to_string();
+        let is_root = rel_dir.as_os_str().is_empty();
+        let merged = if is_root {
+            root_file_found = true;
+            if !config_root.fields.is_empty() {
+                // Loud, not silent: config.yaml declares root rules that are about
+                // to stop applying. This fires on every cascade build (like the
+                // "conflicting types" and "malformed schema" warnings elsewhere in
+                // this module), not once — a build runs on every write and every
+                // reconcile sweep, so an operator tailing logs sees it consistently
+                // rather than only at the one moment it first became true.
+                warn!(
+                    "a root {} exists at the knowledge-base root; config.yaml's \
+                     `frontmatter` block no longer applies there — its \
+                     required/indexed_fields/defaults/allowed entries are ignored \
+                     unless the same fields are also declared in the root {}. Move \
+                     anything still needed into it.",
+                    SCHEMA_FILE_NAME, SCHEMA_FILE_NAME
+                );
+            }
+            // Replaces, not merges: an empty base, not `config_root`.
+            ResolvedSchema::default().merged_with(file, &origin)
+        } else {
+            let parent = nearest_schema(&scopes, rel_dir).unwrap_or(config_root);
+            parent.merged_with(file, &origin)
+        };
+        scopes.push((rel_dir.clone(), merged));
+    }
+
+    if !root_file_found && !config_root.fields.is_empty() {
+        // The deprecated fallback: no root `.kb-schema.yaml` in this map, so
+        // config.yaml's `frontmatter` block is standing in as the root schema.
+        // Still fully supported (see module docs), but this is the direction we
+        // want deployments to move away from — flag it every time this runs, same
+        // as the "config overridden" warning above, so it stays visible for as
+        // long as it is true rather than only at startup.
+        warn!(
+            "no root {} found; falling back to the deprecated `frontmatter` block \
+             in config.yaml for root-level rules. This still works, but a root {} \
+             is the non-deprecated way to declare them — see deploy/USAGE.md.",
+            SCHEMA_FILE_NAME, SCHEMA_FILE_NAME
+        );
+    }
+
+    // Longest paths last so prefix lookup can scan backwards for the deepest match,
+    // with path as a stable tiebreaker among equal depths.
+    scopes.sort_by(|(a, _), (b, _)| {
+        a.components()
+            .count()
+            .cmp(&b.components().count())
+            .then_with(|| a.cmp(b))
+    });
+
+    scopes
+}
+
 impl SchemaCache {
     /// Walk `data_path` for schema files and precompute every directory's merged schema.
     ///
@@ -732,30 +833,22 @@ impl SchemaCache {
     /// is deployment config on the container host, and a KB that brings its own root
     /// schema file must not have that schema silently blended with whatever
     /// `frontmatter` block the current host's `config.yaml` happens to declare.
+    ///
+    /// A thin wrapper around [`merge_cascade`]: this function's own job is just the
+    /// disk walk and per-file parse/validate, which is also the only place a schema
+    /// file can be discovered as [`SchemaCache::broken`] — a parse failure needs the
+    /// underlying I/O error, which an in-memory cascade merge (see
+    /// [`SchemaCache::with_remapped_scopes`], the merge algorithm's other caller) has
+    /// no way to produce, since it starts from content that already parsed.
     pub fn build(data_path: &Path, fallback: &FrontmatterConfig) -> Self {
         let config_root = ResolvedSchema::from_config(fallback);
         let mut discovered: Vec<(PathBuf, PathBuf)> = Vec::new();
         collect_schema_files(data_path, data_path, &mut discovered);
 
-        // Shallowest first so each merge sees its parent already resolved, then by path
-        // so two scopes at the same depth resolve in a stable order. Depth alone would
-        // leave siblings in `read_dir` order, which is not guaranteed — a field declared
-        // with conflicting types in two sibling scopes could silently pick a different
-        // index kind on different hosts or runs.
-        discovered.sort_by(|(a, _), (b, _)| {
-            a.components()
-                .count()
-                .cmp(&b.components().count())
-                .then_with(|| a.cmp(b))
-        });
-
-        let mut scopes: Vec<(PathBuf, ResolvedSchema)> = Vec::new();
         let mut raw: BTreeMap<PathBuf, SchemaFile> = BTreeMap::new();
         let mut broken: BTreeMap<PathBuf, String> = BTreeMap::new();
-        let mut root_file_found = false;
 
         for (rel_dir, abs_file) in discovered {
-            let origin = rel_dir.join(SCHEMA_FILE_NAME).to_string_lossy().to_string();
             let parsed = std::fs::metadata(&abs_file)
                 .map_err(|e| format!("could not stat: {e}"))
                 .and_then(|meta| {
@@ -780,35 +873,8 @@ impl SchemaCache {
 
             match parsed {
                 Ok(file) => {
-                    let is_root = rel_dir.as_os_str().is_empty();
-                    let merged = if is_root {
-                        root_file_found = true;
-                        if !config_root.fields.is_empty() {
-                            // Loud, not silent: config.yaml declares root rules that are
-                            // about to stop applying. This fires on every build (like
-                            // the "conflicting types" and "malformed schema" warnings
-                            // below), not once — a build runs on every write and every
-                            // reconcile sweep, so an operator tailing logs sees it
-                            // consistently rather than only at the one moment it first
-                            // became true.
-                            warn!(
-                                "a root {} exists at the knowledge-base root; config.yaml's \
-                                 `frontmatter` block no longer applies there — its \
-                                 required/indexed_fields/defaults/allowed entries are \
-                                 ignored unless the same fields are also declared in the \
-                                 root {}. Move anything still needed into it.",
-                                SCHEMA_FILE_NAME, SCHEMA_FILE_NAME
-                            );
-                        }
-                        // Replaces, not merges: an empty base, not `config_root`.
-                        ResolvedSchema::default().merged_with(&file, &origin)
-                    } else {
-                        let parent = nearest_schema(&scopes, &rel_dir).unwrap_or(&config_root);
-                        parent.merged_with(&file, &origin)
-                    };
                     debug!(scope = %rel_dir.display(), "loaded schema");
-                    raw.insert(rel_dir.clone(), file);
-                    scopes.push((rel_dir, merged));
+                    raw.insert(rel_dir, file);
                 }
                 Err(e) => {
                     warn!(
@@ -821,29 +887,7 @@ impl SchemaCache {
             }
         }
 
-        if !root_file_found && !config_root.fields.is_empty() {
-            // The deprecated fallback: no root `.kb-schema.yaml` anywhere, so
-            // config.yaml's `frontmatter` block is standing in as the root schema.
-            // Still fully supported (see module docs), but this is the direction we
-            // want deployments to move away from — flag it every build, same as the
-            // "config overridden" warning above, so it stays visible for as long as it
-            // is true rather than only at startup.
-            warn!(
-                "no root {} found; falling back to the deprecated `frontmatter` block \
-                 in config.yaml for root-level rules. This still works, but a root {} \
-                 is the non-deprecated way to declare them — see deploy/USAGE.md.",
-                SCHEMA_FILE_NAME, SCHEMA_FILE_NAME
-            );
-        }
-
-        // Longest paths last so prefix lookup can scan backwards for the deepest match,
-        // with path as a stable tiebreaker among equal depths.
-        scopes.sort_by(|(a, _), (b, _)| {
-            a.components()
-                .count()
-                .cmp(&b.components().count())
-                .then_with(|| a.cmp(b))
-        });
+        let scopes = merge_cascade(&raw, &config_root);
 
         Self {
             scopes,
@@ -851,6 +895,55 @@ impl SchemaCache {
             broken,
             root: config_root,
             root_path: data_path.to_path_buf(),
+        }
+    }
+
+    /// A NEW, detached cache with every schema file's governing directory passed
+    /// through `remap`: `Some(new_dir)` relocates that file's declarations to
+    /// `new_dir` (and, since the whole tree is rebuilt from scratch below, changes
+    /// what every OTHER scope under either the old or new directory resolves to,
+    /// not just the relocated one); `None` leaves it exactly where it is.
+    ///
+    /// Purely in-memory: `raw` already holds fully parsed content, so this never
+    /// touches the filesystem and never discovers a NEW parse failure — `broken`
+    /// carries over from `self` completely unchanged (a directory that was
+    /// unparseable before a remap is still not present in `raw` to relocate, and a
+    /// directory that parsed fine before is not going to stop parsing just because
+    /// its key moved). The result is never registered into a [`SharedSchemaCache`]
+    /// — it is a local value for exactly one hypothetical-resolution pass (see
+    /// `write::move_directory`'s use of it), the same "in-memory, not-for-storage"
+    /// role [`SchemaCache::resolve_with_candidate`] plays for a single substituted
+    /// scope, generalized to relocating any number of scopes at once.
+    ///
+    /// Origin provenance ([`ResolvedSchema::origin`]) comes out correct for free:
+    /// [`merge_cascade`] derives each field's origin from the governing directory
+    /// key it is merging under, and `raw` is rekeyed to the NEW directory before
+    /// the merge runs — so a relocated field's origin names its new home, not its
+    /// old one.
+    ///
+    /// `remap` must not send two distinct entries to the same directory, and must
+    /// not send an entry onto a directory some OTHER, non-relocated entry already
+    /// occupies — either collision silently drops one schema file's declarations
+    /// via `BTreeMap` insertion order. `write::move_directory`'s caller satisfies
+    /// this: it only ever relocates directories under the moved source subtree by
+    /// the same injective prefix substitution the move itself applies to every
+    /// document, onto a destination prefix its own guards have already confirmed
+    /// is completely empty.
+    pub fn with_remapped_scopes(&self, remap: impl Fn(&Path) -> Option<PathBuf>) -> SchemaCache {
+        let mut raw: BTreeMap<PathBuf, SchemaFile> = BTreeMap::new();
+        for (dir, file) in &self.raw {
+            let key = remap(dir).unwrap_or_else(|| dir.clone());
+            raw.insert(key, file.clone());
+        }
+
+        let scopes = merge_cascade(&raw, &self.root);
+
+        SchemaCache {
+            scopes,
+            raw,
+            broken: self.broken.clone(),
+            root: self.root.clone(),
+            root_path: self.root_path.clone(),
         }
     }
 
@@ -2350,6 +2443,162 @@ mod tests {
         assert!(
             check_values_lenient(&json!(5), Some(&permitted)).is_ok(),
             "lenient check exempts numbers entirely, matching pre-cascade `allowed` semantics"
+        );
+    }
+
+    // -- with_remapped_scopes ------------------------------------------------
+
+    #[test]
+    fn with_remapped_scopes_relocates_a_schema_files_governing_directory() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let remapped = cache.with_remapped_scopes(|d| {
+            if d == Path::new("old") {
+                Some(PathBuf::from("new"))
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            remapped
+                .resolve_for(Path::new("new/doc.md"))
+                .fields
+                .contains_key("x"),
+            "the relocated directory now governs the field"
+        );
+        assert!(
+            !remapped
+                .resolve_for(Path::new("old/doc.md"))
+                .fields
+                .contains_key("x"),
+            "the old directory no longer does"
+        );
+        // The live cache is untouched — `with_remapped_scopes` returns a detached copy.
+        assert!(
+            cache
+                .resolve_for(Path::new("old/doc.md"))
+                .fields
+                .contains_key("x")
+        );
+    }
+
+    #[test]
+    fn with_remapped_scopes_recomputes_descendants_of_a_relocated_scope() {
+        // A schema file two levels deep under the relocated directory must still
+        // see the relocated parent's rules — relocating a scope has to re-cascade
+        // its whole subtree, not just patch the one entry that moved.
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
+        write_schema(
+            dir.path(),
+            "old/child",
+            "fields:\n  y:\n    indexed: true\n",
+        );
+        write_schema(
+            dir.path(),
+            "dest",
+            "fields:\n  z:\n    type: text\n    default: hi\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let remapped = cache.with_remapped_scopes(|d| {
+            if d == Path::new("old") || d.starts_with("old") {
+                let suffix = d.strip_prefix("old").unwrap();
+                Some(Path::new("dest/moved").join(suffix))
+            } else {
+                None
+            }
+        });
+
+        let resolved = remapped.resolve_for(Path::new("dest/moved/child/doc.md"));
+        assert!(
+            resolved.fields["x"].required,
+            "inherited from the moved root"
+        );
+        assert!(resolved.fields["y"].indexed, "the child scope's own field");
+        assert_eq!(
+            resolved.fields["z"].default,
+            Some(json!("hi")),
+            "the moved subtree also picks up whatever already governed its new parent"
+        );
+    }
+
+    #[test]
+    fn with_remapped_scopes_updates_origin_to_the_new_path() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let remapped = cache.with_remapped_scopes(|d| {
+            if d == Path::new("old") {
+                Some(PathBuf::from("new"))
+            } else {
+                None
+            }
+        });
+
+        let resolved = remapped.resolve_for(Path::new("new/doc.md"));
+        assert_eq!(
+            resolved.origin["x"],
+            Path::new("new")
+                .join(SCHEMA_FILE_NAME)
+                .to_string_lossy()
+                .to_string(),
+            "provenance must name the field's NEW governing file, not the old one"
+        );
+    }
+
+    #[test]
+    fn with_remapped_scopes_leaves_broken_scopes_untouched() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
+        write_schema(dir.path(), "bad", "fields:\n  y:\n    values: [$oops]\n");
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        assert!(cache.is_frozen(Path::new("bad/doc.md")).is_some());
+
+        let remapped = cache.with_remapped_scopes(|d| {
+            if d == Path::new("old") {
+                Some(PathBuf::from("new"))
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            remapped.is_frozen(Path::new("bad/doc.md")).is_some(),
+            "broken scopes carry over unchanged — remapping never re-parses anything"
+        );
+    }
+
+    #[test]
+    fn with_remapped_scopes_leaves_unmatched_directories_in_place() {
+        let dir = TempDir::new().unwrap();
+        write_schema(dir.path(), "old", "fields:\n  x:\n    required: true\n");
+        write_schema(
+            dir.path(),
+            "elsewhere",
+            "fields:\n  w:\n    required: true\n",
+        );
+
+        let cache = SchemaCache::build(dir.path(), &empty_config());
+        let remapped = cache.with_remapped_scopes(|d| {
+            if d == Path::new("old") {
+                Some(PathBuf::from("new"))
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            remapped
+                .resolve_for(Path::new("elsewhere/doc.md"))
+                .fields
+                .contains_key("w"),
+            "a scope the remap function declines still resolves exactly as before"
         );
     }
 }
