@@ -93,6 +93,12 @@ struct GetArgs {
     /// Output as JSON with path and content fields
     #[arg(long)]
     json: bool,
+    /// First line to print, 1-based and inclusive (default: the top of the document)
+    #[arg(long)]
+    start_line: Option<usize>,
+    /// Last line to print, 1-based and inclusive (default: the end of the document)
+    #[arg(long)]
+    end_line: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -396,6 +402,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Get(args) => {
+            // Validated before anything is opened or read, matching the MCP tool
+            // and the HTTP route: a malformed range is wrong no matter which
+            // document it was aimed at.
+            let range = retrieval::LineRange::new(args.start_line, args.end_line)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
             let embed_client = embed::EmbedClient::new(&cfg.embedding);
             let qdrant = qdrant::QdrantStore::new(&cfg.qdrant)?;
             let data_path = PathBuf::from(cfg.data_path());
@@ -451,14 +463,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                 })?;
 
+            let slice = retrieval::slice_or_whole(doc.content, range.as_ref())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
             if args.json {
                 let json = serde_json::json!({
                     "path": doc.path.to_string_lossy(),
-                    "content": doc.content,
+                    "content": slice.content,
+                    "start_line": slice.start_line,
+                    "end_line": slice.end_line,
+                    "total_lines": slice.total_lines,
+                    "partial": slice.partial(),
                 });
                 println!("{}", serde_json::to_string_pretty(&json)?);
             } else {
-                print!("{}", doc.content);
+                print!("{}", slice.content);
             }
         }
     }
@@ -600,6 +619,55 @@ fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid:
 mod tests {
     use super::*;
     use server::{FieldBreakdown, StatusResponse, StoreCounts, ValueCount};
+
+    // --- `get` argument parsing ---------------------------------------------
+
+    fn parse_get(argv: &[&str]) -> GetArgs {
+        let cli = Cli::parse_from(argv);
+        match cli.command {
+            Some(Commands::Get(args)) => args,
+            _ => panic!("expected the get subcommand"),
+        }
+    }
+
+    #[test]
+    fn get_line_bounds_are_optional() {
+        let args = parse_get(&["md-kb-rag", "get", "notes.md"]);
+        assert_eq!(args.path, "notes.md");
+        assert_eq!(args.start_line, None);
+        assert_eq!(args.end_line, None);
+    }
+
+    #[test]
+    fn get_accepts_line_bounds_together_or_alone() {
+        let both = parse_get(&[
+            "md-kb-rag",
+            "get",
+            "notes.md",
+            "--start-line",
+            "10",
+            "--end-line",
+            "20",
+        ]);
+        assert_eq!((both.start_line, both.end_line), (Some(10), Some(20)));
+
+        let start_only = parse_get(&["md-kb-rag", "get", "notes.md", "--start-line", "10"]);
+        assert_eq!(
+            (start_only.start_line, start_only.end_line),
+            (Some(10), None)
+        );
+
+        let end_only = parse_get(&["md-kb-rag", "get", "notes.md", "--end-line", "20"]);
+        assert_eq!((end_only.start_line, end_only.end_line), (None, Some(20)));
+    }
+
+    #[test]
+    fn get_rejects_a_negative_line_bound_at_parse_time() {
+        assert!(
+            Cli::try_parse_from(["md-kb-rag", "get", "notes.md", "--start-line", "-3"]).is_err(),
+            "a negative line number should never reach the range validator"
+        );
+    }
 
     fn render(status: &StatusResponse) -> String {
         let mut buf: Vec<u8> = Vec::new();

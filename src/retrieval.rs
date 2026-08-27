@@ -170,6 +170,178 @@ pub struct Document {
     pub content: String,
 }
 
+// ---------------------------------------------------------------------------
+// Line ranges
+// ---------------------------------------------------------------------------
+
+/// A caller-requested slice of a document, expressed in **1-based, inclusive**
+/// line numbers — the numbering an editor shows, so a caller can hand back the
+/// same numbers it read in a diff or a lint message without converting.
+///
+/// `end == None` means "to the end of the document". An `end` past the last
+/// line is clamped rather than rejected: asking for more document than exists
+/// is not a caller error, and clamping lets `end_line` in the response report
+/// what was actually served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRange {
+    pub start: usize,
+    pub end: Option<usize>,
+}
+
+/// Why a requested [`LineRange`] could not be served.
+///
+/// These are all caller mistakes (a malformed range, or one anchored past the
+/// end of the document), so every variant carries enough context for the
+/// message to say what the document actually offers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LineRangeError {
+    /// A line number of 0 was given. Lines are numbered from 1.
+    ZeroLine,
+    /// `end` is before `start`.
+    Inverted { start: usize, end: usize },
+    /// `start` is past the last line — including every range against an empty
+    /// document, which has no line 1 to anchor to.
+    StartPastEnd { start: usize, total_lines: usize },
+}
+
+impl std::fmt::Display for LineRangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroLine => write!(
+                f,
+                "line numbers are 1-based; start_line and end_line must be 1 or greater"
+            ),
+            Self::Inverted { start, end } => write!(
+                f,
+                "end_line ({end}) is before start_line ({start}); the range is empty"
+            ),
+            Self::StartPastEnd { start, total_lines } => write!(
+                f,
+                "start_line ({start}) is past the end of the document, which has {total_lines} line(s)"
+            ),
+        }
+    }
+}
+
+impl LineRange {
+    /// Build a range from the two optional parameters a tool surface exposes.
+    ///
+    /// Returns `Ok(None)` when neither bound was given — the "whole document"
+    /// request, kept distinct from a range so callers need not special-case a
+    /// synthetic `1..=total` on the common path. A lone `end_line` implies a
+    /// start of 1, and a lone `start_line` runs to the end of the document.
+    ///
+    /// Only the bounds' relationship to each other is checked here; whether
+    /// they land inside a particular document is [`slice_lines`]'s business,
+    /// since that needs the content. That split lets a caller reject a
+    /// malformed range before doing the work of resolving and reading a file.
+    pub fn new(
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    ) -> Result<Option<Self>, LineRangeError> {
+        if start_line.is_none() && end_line.is_none() {
+            return Ok(None);
+        }
+        if start_line == Some(0) || end_line == Some(0) {
+            return Err(LineRangeError::ZeroLine);
+        }
+        let start = start_line.unwrap_or(1);
+        if let Some(end) = end_line
+            && end < start
+        {
+            return Err(LineRangeError::Inverted { start, end });
+        }
+        Ok(Some(Self {
+            start,
+            end: end_line,
+        }))
+    }
+}
+
+/// The lines of a document that were actually served.
+///
+/// `start_line`/`end_line` describe the slice as delivered, not as requested —
+/// a clamped `end` reports the last line of the document — so a caller can tell
+/// from the response alone whether it reached the end without re-deriving it.
+#[derive(Debug)]
+pub struct LineSlice {
+    pub content: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub total_lines: usize,
+}
+
+impl LineSlice {
+    /// Whether any of the document was withheld. Derived from what was served
+    /// rather than from whether a range was requested, so a range that happens
+    /// to cover the whole document reports the same thing an unranged read does.
+    pub fn partial(&self) -> bool {
+        self.start_line > 1 || self.end_line < self.total_lines
+    }
+}
+
+/// Count the lines in a document, using the same rule [`slice_lines`] numbers
+/// by: a line is a run of text ending in `\n`, plus any unterminated remainder.
+/// A document with a trailing newline therefore does *not* count a phantom
+/// empty line after it, and an empty document has zero lines.
+pub fn count_lines(content: &str) -> usize {
+    content.split_inclusive('\n').count()
+}
+
+/// Extract a 1-based, inclusive line range from a document.
+///
+/// Slices on `split_inclusive('\n')`, so the returned content is a byte-exact
+/// substring of the original: line terminators (including CRLF) are preserved
+/// as they were, and a slice ending on an unterminated last line stays
+/// unterminated. Nothing is re-joined or normalized, which is what lets a
+/// caller feed the result straight back as an `edit_document` `old_string`.
+/// [`slice_lines`] for the callers that treat "no range given" as "the whole
+/// document" — every read surface does.
+///
+/// Returning the same [`LineSlice`] either way is the point: a response can then
+/// report `start_line`/`end_line`/`total_lines`/`partial` unconditionally, so a
+/// client never has to branch on their presence to learn how much document it is
+/// holding. Takes the content by value so the unranged path — the common one —
+/// hands the string straight through instead of copying it.
+pub fn slice_or_whole(
+    content: String,
+    range: Option<&LineRange>,
+) -> Result<LineSlice, LineRangeError> {
+    match range {
+        Some(range) => slice_lines(&content, range),
+        None => {
+            let total_lines = count_lines(&content);
+            Ok(LineSlice {
+                content,
+                start_line: 1,
+                end_line: total_lines,
+                total_lines,
+            })
+        }
+    }
+}
+
+pub fn slice_lines(content: &str, range: &LineRange) -> Result<LineSlice, LineRangeError> {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let total_lines = lines.len();
+
+    if range.start > total_lines {
+        return Err(LineRangeError::StartPastEnd {
+            start: range.start,
+            total_lines,
+        });
+    }
+    // Clamp rather than reject: see `LineRange`.
+    let end_line = range.end.unwrap_or(total_lines).min(total_lines);
+
+    Ok(LineSlice {
+        content: lines[range.start - 1..end_line].concat(),
+        start_line: range.start,
+        end_line,
+        total_lines,
+    })
+}
+
 /// Structured errors from `search`, distinguishing the failing stage so callers
 /// can surface stage-specific messages.
 #[derive(Debug)]
@@ -2238,5 +2410,246 @@ mod tests {
                 "explain=true + reranker active should set pre_rerank_score on every result"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Line-range tests
+    // -----------------------------------------------------------------------
+
+    /// Three terminated lines. Kept short so the assertions read as the slice
+    /// they describe rather than as index arithmetic.
+    const DOC: &str = "one\ntwo\nthree\n";
+
+    #[test]
+    fn line_range_new_returns_none_when_neither_bound_is_given() {
+        assert_eq!(LineRange::new(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn line_range_new_defaults_a_lone_end_to_start_at_one() {
+        let r = LineRange::new(None, Some(5)).unwrap().unwrap();
+        assert_eq!(r.start, 1);
+        assert_eq!(r.end, Some(5));
+    }
+
+    #[test]
+    fn line_range_new_leaves_a_lone_start_open_ended() {
+        let r = LineRange::new(Some(4), None).unwrap().unwrap();
+        assert_eq!(r.start, 4);
+        assert_eq!(r.end, None);
+    }
+
+    #[test]
+    fn line_range_new_rejects_line_zero_on_either_bound() {
+        assert_eq!(
+            LineRange::new(Some(0), Some(3)),
+            Err(LineRangeError::ZeroLine)
+        );
+        assert_eq!(
+            LineRange::new(None, Some(0)),
+            Err(LineRangeError::ZeroLine),
+            "a lone end_line=0 must not be read as the implicit start of 1"
+        );
+    }
+
+    #[test]
+    fn line_range_new_rejects_an_inverted_range() {
+        assert_eq!(
+            LineRange::new(Some(9), Some(3)),
+            Err(LineRangeError::Inverted { start: 9, end: 3 })
+        );
+    }
+
+    #[test]
+    fn count_lines_ignores_the_trailing_newline() {
+        assert_eq!(count_lines(""), 0);
+        assert_eq!(count_lines("a"), 1);
+        assert_eq!(
+            count_lines("a\n"),
+            1,
+            "no phantom line after a final newline"
+        );
+        assert_eq!(count_lines("a\nb"), 2);
+        assert_eq!(count_lines("a\n\nb\n"), 3, "a blank line is still a line");
+    }
+
+    #[test]
+    fn slice_lines_returns_an_inclusive_range() {
+        let s = slice_lines(
+            DOC,
+            &LineRange {
+                start: 1,
+                end: Some(2),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.content, "one\ntwo\n");
+        assert_eq!((s.start_line, s.end_line, s.total_lines), (1, 2, 3));
+    }
+
+    #[test]
+    fn slice_lines_serves_a_single_line() {
+        let s = slice_lines(
+            DOC,
+            &LineRange {
+                start: 2,
+                end: Some(2),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.content, "two\n");
+    }
+
+    #[test]
+    fn slice_lines_runs_to_eof_when_end_is_open() {
+        let s = slice_lines(
+            DOC,
+            &LineRange {
+                start: 2,
+                end: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.content, "two\nthree\n");
+        assert_eq!(s.end_line, 3);
+    }
+
+    #[test]
+    fn slice_lines_clamps_an_end_past_the_document_and_reports_the_clamp() {
+        let s = slice_lines(
+            DOC,
+            &LineRange {
+                start: 3,
+                end: Some(9999),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.content, "three\n");
+        assert_eq!(
+            s.end_line, 3,
+            "end_line must report what was served, not what was asked for"
+        );
+        assert_eq!(s.total_lines, 3);
+    }
+
+    #[test]
+    fn slice_lines_rejects_a_start_past_the_document() {
+        assert_eq!(
+            slice_lines(
+                DOC,
+                &LineRange {
+                    start: 4,
+                    end: None
+                }
+            )
+            .unwrap_err(),
+            LineRangeError::StartPastEnd {
+                start: 4,
+                total_lines: 3
+            }
+        );
+    }
+
+    #[test]
+    fn slice_lines_rejects_any_range_against_an_empty_document() {
+        assert_eq!(
+            slice_lines(
+                "",
+                &LineRange {
+                    start: 1,
+                    end: Some(1)
+                }
+            )
+            .unwrap_err(),
+            LineRangeError::StartPastEnd {
+                start: 1,
+                total_lines: 0
+            }
+        );
+    }
+
+    #[test]
+    fn slice_lines_preserves_the_exact_bytes_including_crlf() {
+        let crlf = "one\r\ntwo\r\nthree";
+        let s = slice_lines(
+            crlf,
+            &LineRange {
+                start: 1,
+                end: Some(2),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.content, "one\r\ntwo\r\n",
+            "line endings must survive the round trip so the slice can be an edit old_string"
+        );
+    }
+
+    #[test]
+    fn slice_lines_keeps_an_unterminated_last_line_unterminated() {
+        let s = slice_lines(
+            "one\ntwo",
+            &LineRange {
+                start: 2,
+                end: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.content, "two");
+        assert_eq!(s.total_lines, 2);
+    }
+
+    #[test]
+    fn slice_or_whole_without_a_range_serves_the_whole_document() {
+        let s = slice_or_whole(DOC.to_string(), None).unwrap();
+        assert_eq!(s.content, DOC);
+        assert_eq!((s.start_line, s.end_line, s.total_lines), (1, 3, 3));
+        assert!(!s.partial());
+    }
+
+    #[test]
+    fn slice_or_whole_without_a_range_handles_an_empty_document() {
+        // The one input `slice_lines` refuses; the unranged path must still serve it.
+        let s = slice_or_whole(String::new(), None).unwrap();
+        assert_eq!(s.content, "");
+        assert_eq!((s.start_line, s.end_line, s.total_lines), (1, 0, 0));
+        assert!(!s.partial());
+    }
+
+    #[test]
+    fn slice_or_whole_with_a_range_slices() {
+        let range = LineRange {
+            start: 2,
+            end: Some(2),
+        };
+        let s = slice_or_whole(DOC.to_string(), Some(&range)).unwrap();
+        assert_eq!(s.content, "two\n");
+        assert!(s.partial());
+    }
+
+    #[test]
+    fn partial_is_false_for_a_range_covering_every_line() {
+        let range = LineRange {
+            start: 1,
+            end: Some(3),
+        };
+        let s = slice_or_whole(DOC.to_string(), Some(&range)).unwrap();
+        assert!(
+            !s.partial(),
+            "an explicit full-document range must report the same as no range at all"
+        );
+    }
+
+    #[test]
+    fn slice_lines_over_the_whole_document_reproduces_it_byte_for_byte() {
+        let s = slice_lines(
+            DOC,
+            &LineRange {
+                start: 1,
+                end: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.content, DOC);
     }
 }
