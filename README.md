@@ -131,7 +131,7 @@ Missing required env vars are named together in a single startup error rather th
 
 For example, `webhook.secret_env: "WEBHOOK_SECRET"` tells the server to read the HMAC secret from the env var named `WEBHOOK_SECRET`. Change it in config if you want a different env var name.
 
-Everything else — `search`, `reranking`, `chunking`, `indexing`, `validation`, `write`, `rate_limit`, `frontmatter`, `mcp.instructions` — lives in `config.yaml` only, and can be changed without a restart via [Config reload](#config-reload). Startup logs and `GET /status` report where every setting came from (env, yaml, or default).
+Everything else — `search`, `reranking`, `chunking`, `indexing`, `validation`, `write`, `rate_limit`, `frontmatter`, `mcp.instructions` *(deprecated)*, `mcp.extensions_path` — lives in `config.yaml` only, and can be changed without a restart via [Config reload](#config-reload). Startup logs and `GET /status` report where every setting came from (env, yaml, or default).
 
 See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 
@@ -143,9 +143,9 @@ See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 - **qdrant** — Connection URL and collection name
 - **validation** — Strict/lenient mode, optional lint command
 - **webhook** — HMAC verification for Gitea/GitHub/GitLab (disabled if `WEBHOOK_SECRET` is unset)
-- **mcp** — Server port, bearer token authentication, and the instructions narrative
+- **mcp** — Server port, bearer token authentication, and `extensions_path` (where per-KB tool/server description policy lives in the served knowledge base; `instructions` is a deprecated narrative override — see [MCP Tools](#mcp-tools) below)
 - **write** — Behaviour of the write tools: near-duplicate detection (`dedup_enabled`, `dedup_threshold`) and the git commit identity
-- **search** — Retrieval behaviour: hybrid sparse+dense search with RRF fusion (`hybrid`, default `true`) and per-arm candidate count (`rrf_candidates`). Set `hybrid: false` for legacy dense-only search. See the migration note below.
+- **search** — Retrieval behaviour: hybrid sparse+dense search with RRF fusion (`hybrid`, default `true`) and per-arm candidate count (`rrf_candidates`). Set `hybrid: false` for legacy dense-only search. See the migration note below. Also `phrase` (default `true`) — exact-phrase matching for double-quoted spans in a `search` query, fused as a third RRF arm.
 
 > **Hybrid search migration:** collections now use named `dense` + `sparse` vectors. Upgrading a knowledge base that was indexed by a pre-hybrid version requires a one-time full reindex (`md-kb-rag index --full`) — the old single-unnamed-vector schema is incompatible. After that, toggling `search.hybrid` needs no reindex (both vectors are always stored).
 
@@ -251,23 +251,38 @@ Skip the bundled embedding service entirely. Point `EMBEDDING_BASE_URL` at any O
 
 ## MCP Tools
 
-The server exposes a full read/write surface over MCP. Read tools (`search`, `get_document`, `list_documents`, `get_schema`) are always safe; write tools (`create_document`, `edit_document`, `delete_document`, `update_schema`) mutate the knowledge base and commit to git.
+The server exposes exactly six MCP tools. Read tools (`search`, `get_document`, `get_schema`) are always safe; write tools (`write_document`, `delete_document`, `update_schema`) mutate the knowledge base and commit to git.
 
 **Path handling is unified across every tool that takes a `path`.** A leading `/` means the knowledge-base root, not a filesystem path — callers have no way to know where the KB actually lives inside the container, so `/food/recipes/chili.md` and `food/recipes/chili.md` address the same document. Path-escape protections still apply on top of that: `/../x` is rejected the same as `../x`. Partial paths resolve to a best match — `get_document` accepts a bare basename when it's unique across the index, and `get_schema`/`update_schema` accept a partial directory when it matches on trailing segments. A single match resolves silently; multiple matches are refused with the candidates listed rather than guessed at. `update_schema` is the one exception: when a partial directory matches *nothing* existing, it falls back to the literal path instead of erroring, since creating a schema for a directory that doesn't have one yet is the normal way to introduce one.
 
 ### Read
 
-**`search`** — semantic search; returns ranked chunks with title, score, snippet, and metadata.
+**`search`** — find documents. `query` is optional: with one, results are ranked (semantic, hybrid, or phrase — see below); without one, every match is returned in a stable order with an exact `total`/`has_more` for a *complete* enumeration. This one tool folds in the old `search` and `list_documents` tools; omitting `query` reproduces `list_documents`'s behavior exactly.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `query` | string | yes | Natural-language search query |
-| `domain` | string | no | Filter by domain — see note below |
-| `type` | string | no | Filter by document type |
-| `tags` | string[] | no | Filter by tags (match any) |
-| `limit` | integer | no | Max results (default: 10, max: 50) |
+| `query` | string | no | Natural-language search query. Omit to enumerate instead of rank |
+| `granularity` | string | no | `chunk` or `document`. Defaults to `chunk` when `query` is set, `document` when it isn't |
+| `filters` | object | no | Keyed by frontmatter field (dot-paths for nested fields, e.g. `planning.prep_minutes`). A scalar means equality (`{"type": "guide"}`); an array means any-of (`{"tags": ["recipe","dinner"]}`); an object means all-of or a numeric range (`{"tags": {"all_of": ["recipe","dinner"]}}`, `{"planning.prep_minutes": {"lt": 30}}`). Range operators: `gte`, `lte`, `gt`, `lt`. Also `any_of`, `all_of` |
+| `path_prefix` | string | no | Restrict to a folder, e.g. `lifestyle/kitchen/recipes/` |
+| `modified_after` / `modified_before` | string | no | Exclude documents outside this mtime range; works in both modes |
+| `limit` / `offset` | integer | no | Paging. Query mode: default 10, max 50 (`search.default_limit`/`search.max_limit`). Enumeration mode: default 100, max 1000 |
+| `order_by` / `descending` | string / boolean | no | Enumeration only: sort by `path` (default), `title`, `mtime`, `indexed_at` |
+| `min_score` | number | no | Query mode only: relevance floor |
+| `explain` | boolean | no | Query mode only: add a score-breakdown line per result |
+| `fields` | string[] | no | Frontmatter dot-paths to include per result; omit for all |
 
-**`domain` is derived, not authored.** `domain` is computed from each document's top-level folder name (a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`; a file at the KB root has no domain) and written into both the Qdrant payload and the SQLite metadata index — it is not read from a `domain:` frontmatter key. A `domain:` key an author writes anyway is overwritten on the next index run, and the server logs a warning when the two disagree. This changes where the value comes from, not how you filter on it: `domain=...` here, the CLI's `--domain` flag, and `list_documents(filters={"domain": ...})` all still work exactly as before.
+Per field, `filters` operators are **mutually exclusive**: set matching (`any_of`/`all_of`) *or* a numeric range (`gte`/`lte`/`gt`/`lt`), never both on the same field, and never `any_of` together with `all_of` — mixing them is a validation error, not silently-honor-one-of-them behavior. `title` and `description` are filterable too, matched against dedicated columns rather than the generic dot-path projection every other field goes through; since each holds a single scalar, `all_of` with more than one value on either can never match anything (zero results, not an error).
+
+**Query-mode `filters` can only name an indexed field.** Query mode runs the filter against Qdrant, which can only do that efficiently on a field it has a payload index for — naming an unindexed field is rejected by name with an actionable error (mark it `indexed: true` in the governing `.kb-schema.yaml`) rather than silently filtering more slowly than expected. Enumeration mode has no such limit: it runs against the SQLite `document_fields` projection, not Qdrant.
+
+**Phrase search:** a double-quoted span inside `query` matches as an exact phrase, fused as a third RRF arm alongside the dense and sparse ones (`search.phrase`, default `true` — see [Configuration](#configuration) below). This degrades gracefully — logged, not fatal — against a Qdrant server too old for phrase-matching text indexes.
+
+**`path_prefix` in query mode over-fetches** to try to still return a full page after filtering to the prefix, but for a narrow enough prefix it may still under-return; when the response can't prove it returned everything that matched, it sets `path_prefix_truncated: true`. Enumeration mode has no such caveat — it's exhaustive by construction.
+
+Returns both plain text and MCP `structured_content`: query mode returns ranked results plus `path_prefix_truncated`; enumeration mode returns `total`, `returned`, `offset`, `has_more`, `documents[]`. Truncation is never silent either way.
+
+**`domain` is derived, not authored.** `domain` is computed from each document's top-level folder name (a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`; a file at the KB root has no domain) and written into both the Qdrant payload and the SQLite metadata index — it is not read from a `domain:` frontmatter key. A `domain:` key an author writes anyway is overwritten on the next index run, and the server logs a warning when the two disagree. This changes where the value comes from, not how you filter on it: `search(filters={"domain": ...})` — in either mode — and the CLI's `--domain` flag still work exactly as before.
 
 **`get_document`** — fetch the raw markdown (including frontmatter) for one document, in full or by line range.
 
@@ -279,27 +294,9 @@ The server exposes a full read/write surface over MCP. Read tools (`search`, `ge
 
 Returns both plain text and `structured_content` with `path`, `content`, `content_hash`, `start_line`, `end_line`, `total_lines`, and `partial`. The line fields are always present, on a full read as well as a partial one, so paging through a long document never requires guessing where it ended.
 
-Line ranges are inclusive on both ends, and an `end_line` past the last line is clamped rather than rejected — `end_line` in the response reports what was actually served. A `start_line` past the last line *is* an error, and says how many lines the document has. Content is sliced byte-exactly: line endings and an unterminated final line survive, so a slice can be handed straight back to `edit_document` as an `old_string`.
+Line ranges are inclusive on both ends, and an `end_line` past the last line is clamped rather than rejected — `end_line` in the response reports what was actually served. A `start_line` past the last line *is* an error, and says how many lines the document has. Content is sliced byte-exactly: line endings and an unterminated final line survive, so a slice can be handed straight back to `write_document` as an `old_string`.
 
-**`content_hash` always covers the whole document, never the slice.** Its purpose is `edit_document`'s `expected_hash`, which guards the file on disk — so reading lines 40–60 of a document and then editing it works exactly as it does after a full read. The flip side is that it is not a checksum of the bytes you were handed.
-
-**`list_documents`** — lists documents by frontmatter, with no relevance ranking and no embedding call. Complements `search`, which returns ranked *chunks* and cannot reliably enumerate a complete set.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `filters` | object | no | Keyed by frontmatter field (dot-paths for nested fields, e.g. `planning.prep_minutes`). A scalar means equality (`{"type": "guide"}`); an array means any-of (`{"tags": ["recipe","dinner"]}`); an object means all-of or a numeric range (`{"tags": {"all_of": ["recipe","dinner"]}}`, `{"planning.prep_minutes": {"lt": 30}}`). Range operators: `gte`, `lte`, `gt`, `lt`. Also `any_of`, `all_of` |
-| `path_prefix` | string | no | Restrict to a folder, e.g. `lifestyle/kitchen/recipes/` |
-| `order_by` | string | no | `path` (default), `title`, `mtime`, `indexed_at` |
-| `descending` | boolean | no | Reverse sort order |
-| `limit` | integer | no | Max results (default: 100, max: 1000) |
-| `offset` | integer | no | Paging offset |
-| `fields` | string[] | no | Frontmatter dot-paths to return per document; omit for all |
-
-Per field, the operators are **mutually exclusive**: use set matching (`any_of`/`all_of`) *or* a numeric range (`gte`/`lte`/`gt`/`lt`), never both on the same field, and never `any_of` together with `all_of`. Mixing them is a validation error, not silently-honor-one-of-them behavior.
-
-`title` and `description` are filterable too — they're matched against dedicated columns rather than the generic dot-path projection every other frontmatter field goes through. Since each holds a single scalar, `all_of` with more than one value on `title` or `description` can never match anything (it returns zero results rather than erroring).
-
-Returns both plain text and MCP `structured_content` with `total`, `returned`, `offset`, `has_more`, and `documents[]` — truncation is never silent.
+**`content_hash` always covers the whole document, never the slice.** Its purpose is `write_document`'s `expected_hash`, which guards the file on disk — so reading lines 40–60 of a document and then editing it works exactly as it does after a full read. The flip side is that it is not a checksum of the bytes you were handed.
 
 **`get_schema`** — show the fully merged frontmatter rules governing a path, with per-field provenance (which `.kb-schema.yaml` declared each field). See [`.kb-schema.yaml` Directory Schemas](#kb-schemayaml-directory-schemas) below for how the cascade works.
 
@@ -313,29 +310,28 @@ Returns plain text plus `structured_content` (`path`, `frozen`, `frozen_reason`,
 
 ### Write
 
-All three write tools share the same pipeline: **path-safety guard** (no `..`, no symlink escapes, must match `indexing.include`) → **frontmatter validation** → **filesystem write** → **git commit with provenance trailers** (`Tool: md-kb-rag`, `Operation: <tool>`) → **push to the remote** → **incremental reindex** (serialized against webhook reindexes via an internal lock). Each returns a summary line with the commit SHA plus a unified diff. Commits are authored under the `write.commit_author_*` identity so tool edits are easy to spot in `git log`.
+Both write tools share the same pipeline: **path-safety guard** (no `..`, no symlink escapes, must match `indexing.include`) → **frontmatter validation** (against the *destination* directory's schema, for a move) → **filesystem write** → **git commit with provenance trailers** (`Tool: md-kb-rag`, `Operation: <tool>`) → **push to the remote** → **incremental reindex** (serialized against webhook reindexes via an internal lock). Each returns a summary line with the commit SHA plus a unified diff. Commits are authored under the `write.commit_author_*` identity so tool edits are easy to spot in `git log`.
 
-**`create_document`** — create a new file. Validates that the document doesn't already exist, then runs a **near-duplicate check**: it embeds the content and, if an existing document scores above `write.dedup_threshold`, refuses the write and names the match (pass `force_new: true` to override). That score is always a dense cosine similarity — the check is pinned to dense-only retrieval with reranking detached, so it is unaffected by `search.hybrid` and `reranking.enabled`.
+**`write_document`** — create, edit, and/or move a document. It's an upsert: `content` creates `path` when it's new and replaces it when it already exists. This one tool replaces the old `create_document`, `edit_document`, and `move_directory` tools.
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `path` | string | yes | Path of the new document, relative to the KB root (e.g. `sysadmin/docker/foo.md`); a leading `/` also means the KB root |
-| `content` | string | yes | Full markdown including YAML frontmatter |
-| `message` | string | no | Commit subject (default: `docs: add <path>`) |
-| `force_new` | boolean | no | Skip the duplicate-detection gate (default: `false`) |
+- **Full-replace** — `content`: the whole file, including frontmatter. Creates on a new path, replaces on an existing one.
+- **Surgical** — `old_string` + `new_string`: replaces a single unique occurrence (Claude Code-style) instead of resending the whole file. Errors if `old_string` is missing or appears more than once. Mutually exclusive with `content`.
+- **Move** — `new_path`: relocates the document. Combines with either edit mode above (edit-then-move, one commit), or stands alone for a pure move (the server reads the current body itself). Links pointing at the document are rewritten. If `path` is a directory, its *whole subtree* moves — this is what replaces `move_directory`.
 
-**`edit_document`** — modify an existing file. Two mutually-exclusive modes:
-
-- **Surgical** — `old_string` + `new_string`: replaces a single unique occurrence (Claude Code-style). Errors if `old_string` is missing or appears more than once.
-- **Full-replace** — `content`: swaps the entire file (must include valid frontmatter).
+On create, a **near-duplicate check** runs first: it embeds the content and, if an existing document scores above `write.dedup_threshold`, refuses the write and names the match (pass `force_new: true` to override). That score is always a dense cosine similarity — the check is pinned to dense-only retrieval with reranking detached, so it is unaffected by `search.hybrid` and `reranking.enabled`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `path` | string | yes | Resolved like `get_document` |
+| `path` | string | yes | Document or directory to write to, relative to the KB root; a leading `/` also means the KB root |
+| `content` | string | conditional | Full-replace mode: whole file, including frontmatter |
 | `old_string` | string | conditional | Surgical mode: exact text to find (must be unique) |
 | `new_string` | string | conditional | Surgical mode: replacement text |
-| `content` | string | conditional | Full-replace mode: entire new file content |
-| `message` | string | no | Commit subject (default: `docs: update <path>`) |
+| `new_path` | string | no | Relocate here; combines with either edit mode, or stands alone for a pure move (or directory move) |
+| `expected_hash` | string | no | Stale-read guard: `content_hash` from a prior `get_document` |
+| `message` | string | no | Commit subject (default depends on what changed) |
+| `force_new` | boolean | no | Skip the duplicate-detection gate on create (default: `false`) |
+
+At least one of `content`, `old_string`+`new_string`, or `new_path` is required. `content` and `old_string`/`new_string` are mutually exclusive with each other; `new_path` is orthogonal to both and may combine with either.
 
 **`delete_document`** — remove a file. Commits the deletion (with provenance trailers) and pushes, then purges the document's vectors from Qdrant and its row from the state DB directly.
 
@@ -360,7 +356,7 @@ All three write tools share the same pipeline: **path-safety guard** (no `..`, n
 
 When validation fails, write tools return a structured error whose `data.field_errors` array names each offending `field`, the `rule` it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`), and — for closed-set fields — the value it `got` and the values it `expected`, so an agent can self-correct.
 
-The server also advertises **dynamic instructions** to connected clients: the configured `mcp.instructions` narrative, the distinct filter values (domains, types, tags) discovered in the live index, and a write-authoring section listing the required frontmatter fields and any fixed allowed values. See the [`write` and `mcp` sections of the config reference](deploy/config.example.yaml) and [deploy/USAGE.md](deploy/USAGE.md#agent-write-tools) for details.
+Server and tool descriptions are assembled from three layers, in order: mechanics true of every deployment (compiled into the binary), mechanics that depend on this deployment's config (e.g. whether `search.hybrid`/`search.phrase` are on, plus the distinct filter values and write-authoring rules discovered in the live index), and this knowledge base's own policy — what belongs here, tagging conventions, writing style — loaded at runtime from `<mcp.extensions_path>/` in the served repo (default `meta/mcp`) and refreshed on `mcp.metadata_refresh_secs`. The per-KB layer is append-only: editing it is a normal `write_document` call, no restart required. `mcp.instructions` is a deprecated narrative override that still works but is superseded by `<extensions_path>/server.md` when both are set. See the [`mcp` section of the config reference](deploy/config.example.yaml) and [deploy/USAGE.md](deploy/USAGE.md#agent-write-tools) for details.
 
 ## `.kb-schema.yaml` Directory Schemas
 
@@ -469,7 +465,7 @@ curl -X POST -H "Authorization: Bearer $MCP_BEARER_TOKEN" http://localhost:8001/
 
 The response reports exactly what happened, bucketed by whether the change actually took effect:
 
-- **`applied`** — read fresh by the code that uses it (an MCP tool call, a webhook request, the reindex worker's next drain, a periodic timer's next tick), so the very next read observes the new value. `search.*`, `write.*`, `webhook.provider`, `indexing.include`/`exclude`, `frontmatter.*`, `validation.*`, `mcp.instructions`, and more fall here.
+- **`applied`** — read fresh by the code that uses it (an MCP tool call, a webhook request, the reindex worker's next drain, a periodic timer's next tick), so the very next read observes the new value. `search.*`, `write.*`, `webhook.provider`, `indexing.include`/`exclude`, `frontmatter.*`, `validation.*`, `mcp.instructions`, `mcp.extensions_path`, and more fall here.
 - **`restart_required`** — baked into a value or service built once at server startup (the embedding client's `reqwest::Client` timeout, the MCP path-filter `GlobSet`, the rate limiter, anything security-critical like the bearer token or `allow_unauthenticated`). The swap updates what everything else sees, but this particular consumer keeps behaving exactly as it did before the reload.
 - **`reindex_required`** — `chunking.*`. The indexer reads the new value on its next run, but only for documents that run touches; existing Qdrant chunks keep the old boundaries. Run `md-kb-rag index --full` for a consistent corpus.
 

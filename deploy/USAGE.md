@@ -44,9 +44,9 @@ A complete sample file is available at [`docs/sample-document.md`](../docs/sampl
 | `domain` | **Not a frontmatter field.** Derived automatically from the document's top-level folder — see below. Still filterable in MCP search |
 | `tags` | List of tags; filterable in MCP search (match-any) |
 
-**`domain` is derived, not authored.** `domain` is computed from the document's top-level folder name (e.g. a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`) and written into both the Qdrant payload and the SQLite metadata index — it is *not* read from a `domain:` key in frontmatter. If you write one anyway, it's overwritten on the next index run and the server logs a warning when the two disagree. Documents sitting directly at the knowledge-base root (no top-level folder) have no domain at all. This only changes where the value comes from: `search(domain=...)`, the CLI's `--domain` flag, and `list_documents(filters={"domain": ...})` all still work exactly as before.
+**`domain` is derived, not authored.** `domain` is computed from the document's top-level folder name (e.g. a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`) and written into both the Qdrant payload and the SQLite metadata index — it is *not* read from a `domain:` key in frontmatter. If you write one anyway, it's overwritten on the next index run and the server logs a warning when the two disagree. Documents sitting directly at the knowledge-base root (no top-level folder) have no domain at all. This only changes where the value comes from: `search(filters={"domain": ...})` — whether ranking or enumerating — and the CLI's `--domain` flag all still work exactly as before.
 
-You can add any other fields you like. Only fields listed in `frontmatter.indexed_fields` are stored as Qdrant payload for filtering by `search`. All frontmatter fields, however, are stored (as JSON, and projected into a filterable dot-path index) in the state DB, so any field — indexed or not — can be filtered, ranged, and sorted on via the `list_documents` MCP tool.
+You can add any other fields you like. Only fields listed in `frontmatter.indexed_fields` are stored as Qdrant payload for filtering by `search`. All frontmatter fields, however, are stored (as JSON, and projected into a filterable dot-path index) in the state DB, so any field — indexed or not — can be filtered, ranged, and sorted on via `search`'s enumeration mode (omit `query`).
 
 ## How Chunking Works
 
@@ -220,23 +220,23 @@ Either way, `get_schema` (omit `path` for the root) tells you exactly what's in 
 
 Under the hood, each indexed file now also tracks a `schema_hash` fingerprint (a new `indexed_files` column, added automatically via a guarded `ALTER TABLE ... ADD COLUMN` — no manual migration step). The incremental indexer skips a file only when both its content hash *and* schema fingerprint are unchanged, since editing a schema doesn't touch a document's bytes. Two practical consequences:
 
-- The **first index run after upgrading** to a version with schema support revalidates every file once, to backfill the fingerprint. This is also the run where every document's `domain` gets (re)computed from its folder and written to Qdrant and the state DB — see [Sample Document](#sample-document) above. If a document's old, hand-authored `domain:` disagreed with its folder, its effective `domain` value changes at that point, and any saved `search`/`list_documents` filters built around the old value will need updating. Remove now-redundant `domain:` keys from your frontmatter — they're ignored either way.
+- The **first index run after upgrading** to a version with schema support revalidates every file once, to backfill the fingerprint. This is also the run where every document's `domain` gets (re)computed from its folder and written to Qdrant and the state DB — see [Sample Document](#sample-document) above. If a document's old, hand-authored `domain:` disagreed with its folder, its effective `domain` value changes at that point, and any saved `search` filters built around the old value will need updating. Remove now-redundant `domain:` keys from your frontmatter — they're ignored either way.
 - Editing a **root-level** schema revalidates the entire knowledge base on the next run.
 
-If you only need to rebuild the `list_documents` metadata projection (e.g. after changing a field-projection rule) without a full reindex, `md-kb-rag reproject-fields` does that from the frontmatter JSON already stored in the state DB — no markdown re-read, no re-embedding. It's safe to run against a live server: each document's frontmatter is re-read inside the same transaction that rewrites it, so it retries past contention with a running index or write tool rather than reverting a concurrent update. A document whose stored frontmatter is unparseable is skipped with a warning instead of aborting the run, and the command reports how many documents were reprojected. Note also that a full reindex (`index --full`) clears the metadata index along with the vector collection, so a file deleted from disk since the last full run can't leave a phantom `list_documents` entry behind.
+If you only need to rebuild the document metadata projection backing `search`'s enumeration mode (e.g. after changing a field-projection rule) without a full reindex, `md-kb-rag reproject-fields` does that from the frontmatter JSON already stored in the state DB — no markdown re-read, no re-embedding. It's safe to run against a live server: each document's frontmatter is re-read inside the same transaction that rewrites it, so it retries past contention with a running index or write tool rather than reverting a concurrent update. A document whose stored frontmatter is unparseable is skipped with a warning instead of aborting the run, and the command reports how many documents were reprojected. Note also that a full reindex (`index --full`) clears the metadata index along with the vector collection, so a file deleted from disk since the last full run can't leave a phantom entry behind in that projection.
 
-Declared fields also get typed Qdrant payload indexes (Integer/Float/Bool for numeric and boolean fields, instead of a blanket Keyword index), which is what makes `list_documents` range filters (`gte`/`lte`/`gt`/`lt`) usable on them. The same applies to the built-in `mtime` index used by `search`'s `modified_after`/`modified_before` filters. If a payload index fails to create — most often because a field's declared type changed and Qdrant is still holding an index of the old kind — it's logged as an error but never aborts startup or indexing; filters on that field keep returning correct results, just more slowly until you delete the stale payload index in Qdrant and reindex.
+Declared fields also get typed Qdrant payload indexes (Integer/Float/Bool for numeric and boolean fields, instead of a blanket Keyword index). Query-mode `search` filters run against Qdrant, so a range filter (`gte`/`lte`/`gt`/`lt`) on a field there needs this — an unindexed field is rejected by name rather than filtered slowly. Enumeration mode (no `query`) filters against the SQLite `document_fields` projection instead, which every frontmatter field lands in regardless of `indexed: true`, so its range filters need no Qdrant index at all. The same Qdrant indexing applies to the built-in `mtime` index used by `search`'s `modified_after`/`modified_before` filters in query mode. If a payload index fails to create — most often because a field's declared type changed and Qdrant is still holding an index of the old kind — it's logged as an error but never aborts startup or indexing; a query-mode filter on that field is still accepted (the schema still declares it indexed) and returns correct results, just more slowly via a full scan, until you delete the stale payload index in Qdrant and reindex.
 
 ## Agent Write Tools
 
-Beyond read-only search, the MCP server lets a connected agent **author the knowledge base directly**: `create_document`, `edit_document`, and `delete_document`. This turns the KB into a living document store that an assistant can curate as it learns, rather than a static index you maintain by hand.
+Beyond read-only search, the MCP server lets a connected agent **author the knowledge base directly**: `write_document` and `delete_document`. This turns the KB into a living document store that an assistant can curate as it learns, rather than a static index you maintain by hand.
 
 ### What a write call does
 
-All three tools run the same pipeline server-side:
+Both tools run the same pipeline server-side:
 
 1. **Resolve and guard the path** — relative to the KB root, or a unique basename. A leading `/` is also accepted, and means the KB root, not a filesystem path: a caller has no way to know where the KB actually lives inside the container, so `/food/chili.md` and `food/chili.md` resolve to the same file. `..` components and symlinked ancestors that escape the data root are still rejected — `/../x` is refused exactly like `../x` — as are paths that don't match `indexing.include` (a file the indexer would never pick up).
-2. **Validate frontmatter** — required fields, `allowed` enums, and any `validation.lint_command`. Failures come back as structured `field_errors` (see [Frontmatter Validation](#frontmatter-validation)) so the agent can self-correct.
+2. **Validate frontmatter** — required fields, `allowed` enums, and any `validation.lint_command`, against the *destination* directory's schema when the call also relocates the document. Failures come back as structured `field_errors` (see [Frontmatter Validation](#frontmatter-validation)) so the agent can self-correct.
 3. **Write to disk** — in the container-owned KB clone.
 4. **Commit with provenance** — the commit message gets `Tool: md-kb-rag` and `Operation: <tool>` trailers, authored under the `write.commit_author_*` identity. Tool-authored commits are trivially distinguishable from your own in `git log`.
 5. **Push to the remote** — `add → commit → fetch → rebase → push`, so the KB's git host stays the source of truth.
@@ -246,8 +246,14 @@ Each tool returns a one-line summary with the commit SHA plus a unified diff of 
 
 ### The tools
 
-- **`create_document`** — new file only (errors if it already exists). Before writing, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. The score is always a **dense cosine similarity** — this check is pinned to dense-only retrieval with reranking detached, regardless of `search.hybrid` and `reranking.enabled`, because hybrid RRF scores (~0.01–0.03) and cross-encoder relevance scores are not on the same scale as the threshold. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations). The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
-- **`edit_document`** — existing file only. **Surgical mode** (`old_string` + `new_string`) replaces a single unique occurrence; **full-replace mode** (`content`) swaps the whole file and re-validates its frontmatter. The two modes are mutually exclusive.
+- **`write_document`** — upserts, edits, and/or moves a document, replacing the old `create_document`, `edit_document`, and `move_directory` tools:
+  - **Full-replace** (`content`) — the whole file, including frontmatter. Creates `path` if it's new, replaces it if it already exists.
+  - **Surgical** (`old_string` + `new_string`) — replaces a single unique occurrence instead of resending the whole file. Mutually exclusive with `content`.
+  - **Move** (`new_path`) — relocates a document. Combines with either edit mode above (edit-then-move, one commit), or stands alone for a pure move — the server reads the current body itself and revalidates it against the destination schema. If `path` names a *directory* instead, `write_document` detects that and moves the whole subtree there in one commit, no `content`/`old_string`/`new_string` allowed — this replaces the old `move_directory` tool. Links pointing at whatever moved are rewritten either way.
+
+  On create, it runs a **near-duplicate check**: it embeds the content and searches the collection; if an existing document scores at or above `write.dedup_threshold`, the write is refused and the close match is named. The score is always a **dense cosine similarity** — this check is pinned to dense-only retrieval with reranking detached, regardless of `search.hybrid` and `reranking.enabled`, because hybrid RRF scores (~0.01–0.03) and cross-encoder relevance scores are not on the same scale as the threshold. Pass `force_new: true` to create anyway. Disable the check globally with `write.dedup_enabled: false` (useful during bulk migrations). The check fails open — if the embedder or Qdrant is unreachable, the write proceeds.
+
+  Pass `expected_hash` (a `content_hash` from a prior `get_document`) to reject an edit built on a stale read.
 - **`delete_document`** — removes the file, commits and pushes the deletion, then purges the document's vectors from Qdrant and its row from the state DB directly (no full reindex needed).
 
 ### Schema tools
@@ -265,7 +271,7 @@ The `write` section of `config.yaml` (see [config.example.yaml](config.example.y
 
 ```yaml
 write:
-  dedup_enabled: true            # near-duplicate check on create_document
+  dedup_enabled: true            # near-duplicate check on write_document's create path
   dedup_threshold: 0.80          # dense cosine similarity at/above which a create is refused
   commit_author_name: "md-kb-rag"
   commit_author_email: "md-kb-rag@localhost"
@@ -275,20 +281,32 @@ For writes to push successfully, the container needs a writable, non-shallow clo
 
 ### Telling the agent what the KB is for
 
-The server advertises **dynamic instructions** to MCP clients on connect (and refreshes them periodically). They combine three pieces:
+Server and tool descriptions are assembled from three layers, appended in this order:
 
-1. Your `mcp.instructions` narrative — a short description of what this knowledge base covers. If omitted, a generic read+write description is used.
-2. The distinct filter values (domains, types, tags) discovered in the live index, so the agent knows what's already in use.
-3. A write-authoring section listing the required frontmatter fields and any fixed `allowed` values.
+1. **Compiled mechanics** — what's true of *every* deployment this binary could ever serve (how paths resolve, that there's no regex, what `write_document`'s parameters mean). Baked into the binary from `assets/mcp/`; you can't change this short of a fork.
+2. **Config-derived mechanics** — short sentences generated from your live config and corpus: whether search is hybrid and/or phrase-matching (`search.hybrid`/`search.phrase`), the distinct filter values (domains, types, tags) discovered in the live index, and a write-authoring section listing required frontmatter fields and any fixed `allowed` values.
+3. **Your knowledge base's own policy** — what this KB is for, what belongs in it, tagging conventions, writing style. This is yours to write, and it lives in the *served knowledge base itself*, not in `config.yaml`.
 
-Independently of this, the `create_document` and `edit_document` tool descriptions state that the knowledge base is for durable, long-lived reference knowledge and must not be used as a scratchpad for session notes, intermediate analysis, or task state. That wording is compiled in and always reaches the client. If you want the same boundary stated in the server instructions — worth doing, since a client reads those before it reads any tool description — add it to your `mcp.instructions` narrative yourself; the narrative is yours to write, so nothing is prepended to it.
+**Nothing about what a knowledge base is for, or what belongs in it, is compiled in or config-derived — that's layer 3, and it's entirely up to you to write.** One binary may serve several knowledge bases with contradictory policies (a durable-reference KB and a scratch-space KB, say), so the compiled and config layers can only ever state what's true of *every* KB the binary might serve. If you want the connected agent to know this KB holds durable reference knowledge only, or that it should tag things a certain way, or anything else about *this* KB specifically — write it yourself, in `<mcp.extensions_path>/` (default `meta/mcp`, relative to the knowledge base root):
 
-Keep `mcp.instructions` short — the dynamic sections supply the detail. Example:
+- `server.md` — appended to the server instructions (layers 1+2 above).
+- `tools/<tool>.md` — appended to that one tool's description, e.g. `tools/write_document.md`.
+
+Both are ordinary indexed KB documents (frontmatter included, stripped before the body reaches a description) — so editing them is a normal `write_document` call, no ssh, no restart: the change is picked up on the next `mcp.metadata_refresh_secs` tick (default 300s), or immediately after a `POST /admin/reload`. Extensions are **append-only** — they can add policy but never suppress or contradict a compiled or config-derived sentence.
 
 ```yaml
-mcp:
-  instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document/list_documents; write with create_document, edit_document, delete_document."
+# meta/mcp/server.md, in the served knowledge base
+---
+title: MCP server policy
+type: reference
+status: active
+---
+
+This knowledge base holds durable, long-lived reference knowledge only. Do not use it
+as a scratchpad for session notes, intermediate analysis, or task state.
 ```
+
+`mcp.instructions` in `config.yaml` is a **deprecated** narrative override — still honored (logged as deprecated at startup), but a `server.md` extension file, if present, wins over it entirely. New deployments should write policy into `<extensions_path>/server.md` instead; it travels with the knowledge base rather than living on the deploying host.
 
 ## Knowledge Base Storage
 
