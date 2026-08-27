@@ -422,6 +422,11 @@ pub struct McpConfig {
     #[serde(default)]
     pub allow_unauthenticated: bool,
     /// Custom narrative for MCP server instructions.
+    ///
+    /// Deprecated: replaced by a `server.md` file under `mcp.extensions_path`
+    /// in the served knowledge base, which is editable through `write_document`
+    /// without a restart. Still honored when set — logged once at startup as
+    /// deprecated — but a `server.md` extension file, if present, wins.
     pub instructions: Option<String>,
     /// How often (in seconds) to refresh discovered metadata from Qdrant.
     #[serde(default = "default_metadata_refresh_secs")]
@@ -439,6 +444,17 @@ pub struct McpConfig {
     /// the container's address — the proxy forwards the original `Host`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Where per-KB MCP tool/server description extensions live: `server.md`
+    /// and `tools/<tool>.md`, appended to the compiled description after any
+    /// config-derived sentences — see `descriptions.rs`.
+    ///
+    /// A RELATIVE value (the default, `"meta/mcp"`) resolves against
+    /// `source.data_path`, the served knowledge base root — which is what
+    /// makes these files editable through `write_document`. An ABSOLUTE value
+    /// is accepted but is not reachable through `write_document`; this is
+    /// logged once at startup. Empty disables extension loading entirely.
+    #[serde(default = "default_extensions_path")]
+    pub extensions_path: String,
 }
 
 impl Default for McpConfig {
@@ -449,6 +465,7 @@ impl Default for McpConfig {
             instructions: None,
             metadata_refresh_secs: default_metadata_refresh_secs(),
             allowed_hosts: Vec::new(),
+            extensions_path: default_extensions_path(),
         }
     }
 }
@@ -464,6 +481,7 @@ pub struct ResolvedMcpConfig {
     pub instructions: Option<String>,
     pub metadata_refresh_secs: u64,
     pub allowed_hosts: Vec<String>,
+    pub extensions_path: String,
 }
 
 impl Default for ResolvedMcpConfig {
@@ -475,12 +493,17 @@ impl Default for ResolvedMcpConfig {
             instructions: None,
             metadata_refresh_secs: default_metadata_refresh_secs(),
             allowed_hosts: Vec::new(),
+            extensions_path: default_extensions_path(),
         }
     }
 }
 
 fn default_metadata_refresh_secs() -> u64 {
     300
+}
+
+fn default_extensions_path() -> String {
+    "meta/mcp".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -588,6 +611,16 @@ pub struct SearchConfig {
     /// Higher values improve recall at the cost of latency.
     #[serde(default = "default_rrf_candidates")]
     pub rrf_candidates: usize,
+    /// Enable exact-phrase matching for double-quoted spans in a query (e.g.
+    /// `"node:ares"`). Adds a phrase-filtered prefetch arm fused via the same RRF
+    /// as dense/sparse, independent of `hybrid`. Requires a Qdrant server new
+    /// enough to support `phrase_matching` text indexes — `ensure_collection`
+    /// degrades gracefully (logs and disables phrase matching for the process)
+    /// when an older server rejects it, so this never fails startup. When
+    /// `false`, quoted text is treated as literal characters and no phrase index
+    /// is created.
+    #[serde(default = "default_true")]
+    pub phrase: bool,
     /// Global minimum relevance score floor. Results below this threshold are
     /// dropped before returning. `None` (the default) disables the floor.
     /// Note: RRF scores are ~0.01–0.03 — set accordingly when hybrid is true.
@@ -630,6 +663,7 @@ impl Default for SearchConfig {
         Self {
             hybrid: true,
             rrf_candidates: default_rrf_candidates(),
+            phrase: default_true(),
             min_score: None,
             diversity_max_per_document: default_diversity_max_per_document(),
             default_limit: default_search_limit(),
@@ -829,6 +863,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("mcp.instructions", "mcp"),
     ("mcp.metadata_refresh_secs", "mcp"),
     ("mcp.allowed_hosts", "mcp"),
+    ("mcp.extensions_path", "mcp"),
     ("rate_limit.enabled", "rate_limit"),
     ("rate_limit.per_second", "rate_limit"),
     ("rate_limit.burst_size", "rate_limit"),
@@ -838,6 +873,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("write.commit_author_email", "write"),
     ("search.hybrid", "search"),
     ("search.rrf_candidates", "search"),
+    ("search.phrase", "search"),
     ("search.min_score", "search"),
     ("search.diversity_max_per_document", "search"),
     ("reranking.enabled", "reranking"),
@@ -1300,6 +1336,7 @@ impl Config {
                 instructions: self.mcp.instructions,
                 metadata_refresh_secs: self.mcp.metadata_refresh_secs,
                 allowed_hosts: self.mcp.allowed_hosts,
+                extensions_path: self.mcp.extensions_path,
             },
             rate_limit: self.rate_limit,
             write: self.write,
@@ -2019,6 +2056,7 @@ mcp:
         let cfg = Config::from_str_raw("{}").unwrap();
         assert!(cfg.mcp.instructions.is_none());
         assert_eq!(cfg.mcp.metadata_refresh_secs, 300);
+        assert_eq!(cfg.mcp.extensions_path, "meta/mcp");
     }
 
     #[test]
@@ -2027,6 +2065,7 @@ mcp:
 mcp:
   instructions: "My custom KB description."
   metadata_refresh_secs: 60
+  extensions_path: "meta/mcp-ext"
 "#;
         let cfg = Config::from_str_raw(yaml).unwrap();
         assert_eq!(
@@ -2034,6 +2073,29 @@ mcp:
             Some("My custom KB description.")
         );
         assert_eq!(cfg.mcp.metadata_refresh_secs, 60);
+        assert_eq!(cfg.mcp.extensions_path, "meta/mcp-ext");
+    }
+
+    #[test]
+    fn mcp_extensions_path_empty_string_parses_fine() {
+        // Empty disables extension loading entirely (descriptions::resolve_extensions_dir);
+        // this only checks that config parsing itself accepts it.
+        let yaml = "mcp:\n  extensions_path: \"\"\n";
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.mcp.extensions_path, "");
+    }
+
+    #[test]
+    fn mcp_extensions_path_passes_through_to_resolved_config() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let yaml = "mcp:\n  extensions_path: \"custom/ext\"\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let resolved = Config::load(&path).unwrap();
+        assert_eq!(resolved.mcp.extensions_path, "custom/ext");
+        clear_required_env();
     }
 
     #[test]
@@ -2054,17 +2116,29 @@ mcp:
         // Verify search section round-trips from the example config
         assert!(cfg.search.hybrid);
         assert_eq!(cfg.search.rrf_candidates, 50);
+        assert!(cfg.search.phrase);
         assert_eq!(cfg.search.diversity_max_per_document, Some(3));
     }
 
     #[test]
     fn search_config_defaults() {
         // A config with no `search` section gets hybrid=true, rrf_candidates=50,
-        // diversity_max_per_document=Some(3) — issue #86's default-on diversity cap.
+        // phrase=true, diversity_max_per_document=Some(3) — issue #86's
+        // default-on diversity cap.
         let cfg = Config::from_str_raw("{}").unwrap();
         assert!(cfg.search.hybrid);
         assert_eq!(cfg.search.rrf_candidates, 50);
+        assert!(cfg.search.phrase);
         assert_eq!(cfg.search.diversity_max_per_document, Some(3));
+    }
+
+    #[test]
+    fn search_config_phrase_explicit_false() {
+        let yaml = "search:\n  phrase: false\n";
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert!(!cfg.search.phrase);
+        // Untouched siblings keep their own defaults.
+        assert!(cfg.search.hybrid);
     }
 
     #[test]

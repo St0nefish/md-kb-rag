@@ -12,7 +12,7 @@ use crate::{
     chunk,
     config::{IndexingConfig, ResolvedConfig, SemanticEdgesConfig},
     embed::{EmbedClient, EmbedStore},
-    qdrant::{IndexedField, QdrantPoint, QdrantStore, SearchResult, VectorStore},
+    qdrant::{QdrantPoint, QdrantStore, SearchResult, VectorStore},
     schema::{ResolvedSchema, SchemaCache},
     state::{IndexedFile, StateDb},
     status::{INDEX_STATUS, Phase, RunMode, Trigger},
@@ -1558,21 +1558,6 @@ pub(crate) fn relativize_md_path(source_rel_path: &str, target_rel_path: &str) -
     parts.join("/")
 }
 
-/// Payload fields to index, unioning the schema tree with the legacy config list.
-///
-/// `config.effective_indexed_fields()` still contributes `file_path`, which is not a
-/// frontmatter field but is needed for path lookups.
-fn merge_indexed_fields(config: &ResolvedConfig, schemas: &SchemaCache) -> Vec<IndexedField> {
-    let mut fields = schemas.all_indexed_fields();
-    for name in config.effective_indexed_fields() {
-        if !fields.iter().any(|f| f.name == name) {
-            fields.push(IndexedField::keyword(name));
-        }
-    }
-    fields.sort_by(|a, b| a.name.cmp(&b.name));
-    fields
-}
-
 /// Fill in document metadata for files the incremental pass skipped.
 ///
 /// Runs when a file is unchanged by content hash but its metadata row is missing or
@@ -2023,7 +2008,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     // Union of every `indexed` dot-path across the whole schema tree. Payload indexes
     // are collection-wide, so a field declared only in a deep scope still has to be
     // registered here or filtering on it silently fails.
-    let indexed_fields = merge_indexed_fields(config, &schemas);
+    let indexed_fields = crate::qdrant::all_indexed_fields(config, &schemas);
 
     // A full reindex drops the collection and rebuilds it, but frozen documents are
     // skipped during the rebuild — so their vectors would be deleted and never
@@ -2054,7 +2039,12 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     }
 
     store
-        .ensure_collection(collection, vector_size, &indexed_fields)
+        .ensure_collection(
+            collection,
+            vector_size,
+            &indexed_fields,
+            config.search.phrase,
+        )
         .await
         .context("Failed to ensure Qdrant collection")?;
 
@@ -3400,7 +3390,7 @@ mod tests {
         };
         let schemas = SchemaCache::build(dir.path(), &config.frontmatter);
 
-        let fields = merge_indexed_fields(&config, &schemas);
+        let fields = crate::qdrant::all_indexed_fields(&config, &schemas);
         let named = |n: &str| fields.iter().find(|f| f.name == n);
 
         assert!(named("tags").is_some(), "legacy config field survives");
@@ -4197,6 +4187,7 @@ mod tests {
             _collection: &str,
             _vector_size: u64,
             _indexed_fields: &[crate::qdrant::IndexedField],
+            _enable_phrase: bool,
         ) -> Result<()> {
             Ok(())
         }
@@ -4270,6 +4261,7 @@ mod tests {
             _collection: &str,
             _vector_size: u64,
             _indexed_fields: &[crate::qdrant::IndexedField],
+            _enable_phrase: bool,
         ) -> Result<()> {
             *self.ensure_collection_calls.lock().unwrap() += 1;
             Ok(())
@@ -4685,6 +4677,7 @@ mod tests {
             pre_rerank_score: None,
             dense_score: Some(score),
             sparse_score: None,
+            phrase_score: None,
             payload,
         }
     }

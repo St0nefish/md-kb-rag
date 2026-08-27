@@ -322,15 +322,14 @@ mcp:
   # allowed_hosts:
   #   - "kb.example.com"
 
-  # Custom narrative for MCP server instructions. Tells agents what this
-  # knowledge base covers. If omitted, a generic read+write description is used.
-  # The server automatically appends discovered filter values (domains, types,
-  # tags, etc.) from the indexed data, then a write-authoring section that lists
-  # required frontmatter fields and any fixed allowed values from the config.
-  # Keep this short — the dynamic sections add the detail.
+  # DEPRECATED: custom narrative for MCP server instructions. Replaced by a
+  # server.md file under mcp.extensions_path in the served knowledge base,
+  # which is editable through write_document without a restart — see
+  # extensions_path below. Still honored if set (logged once at startup as
+  # deprecated), but a server.md extension file, if present, wins.
   # Live-reloadable: picked up by the periodic metadata-refresh timer below,
   # so it takes effect within metadata_refresh_secs of a POST /admin/reload.
-  # instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document; write with create_document, edit_document, delete_document."
+  # instructions: "Homelab infrastructure wiki covering networking, Docker, storage, and monitoring. Read with search/get_document; write with write_document, delete_document."
 
   # How often (in seconds) to refresh discovered metadata (filter values)
   # from Qdrant. Appended to the instructions so agents know what filters
@@ -339,9 +338,24 @@ mcp:
   # how long until the following refresh, not the one already in progress.
   # metadata_refresh_secs: 300
 
+  # Where per-KB MCP tool/server description extensions live, relative to the
+  # knowledge base root: server.md and tools/<tool>.md, appended to each
+  # compiled description after any config-derived sentences (e.g. the
+  # retrieval-mode sentence generated from search.hybrid/search.phrase).
+  # These files are indexed KB documents like any other — they carry
+  # frontmatter to satisfy the KB's own schema, which is stripped before the
+  # body reaches a tool description — and are editable through write_document
+  # since this default is relative to source.data_path.
+  # An absolute value is accepted but is NOT reachable through write_document
+  # (logged once at startup). Empty ("") disables extension loading entirely.
+  # Live-reloadable: re-resolved by the periodic metadata-refresh timer below,
+  # so a change takes effect within metadata_refresh_secs of a POST
+  # /admin/reload.
+  # extensions_path: "meta/mcp"
+
 
 # ----------------------------------------------------------------------------
-# write — behaviour of the create_document / edit_document MCP write tools
+# write — behaviour of the write_document MCP write tool
 # ----------------------------------------------------------------------------
 write:
 
@@ -362,8 +376,8 @@ write:
   # shorter or more domain-specific documents.
   dedup_threshold: 0.80
 
-  # Git author identity used for commits made by the write tools (create_document,
-  # edit_document). Setting these to a bot identity makes tool-authored commits
+  # Git author identity used for commits made by the write tools (write_document,
+  # delete_document). Setting these to a bot identity makes tool-authored commits
   # easy to distinguish from your own hand-made commits in `git log`.
   commit_author_name: "md-kb-rag"
   commit_author_email: "md-kb-rag@localhost"
@@ -416,6 +430,15 @@ search:
   # Candidates fetched from each arm (dense + sparse) before RRF fusion.
   # Higher values improve recall at the cost of query latency.
   rrf_candidates: 50
+
+  # Enable exact-phrase matching for double-quoted spans in a query, e.g.
+  # `deploy notes for "node:ares" rocm` — adds a phrase-filtered prefetch arm
+  # fused via the same RRF as dense/sparse, independent of `hybrid`. Requires
+  # a Qdrant server new enough to support `phrase_matching` text indexes;
+  # ensure_collection degrades gracefully (logs and disables phrase matching
+  # for the process) against an older server, so this never fails startup.
+  # Set to false to treat quotes as literal characters and skip the index.
+  phrase: true
 
   # Per-document result diversity (issue #86): the maximum number of chunks
   # from a single document allowed to occupy the final result set. Without

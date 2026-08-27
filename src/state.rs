@@ -81,6 +81,10 @@ pub struct DocumentQuery {
     pub offset: u64,
     /// Dot-paths to include in each result's frontmatter. `None` returns all of it.
     pub fields: Option<Vec<String>>,
+    /// Exclude documents whose `mtime` is before this Unix timestamp.
+    pub mtime_after: Option<i64>,
+    /// Exclude documents whose `mtime` is after this Unix timestamp.
+    pub mtime_before: Option<i64>,
 }
 
 impl Default for DocumentQuery {
@@ -93,6 +97,8 @@ impl Default for DocumentQuery {
             limit: 100,
             offset: 0,
             fields: None,
+            mtime_after: None,
+            mtime_before: None,
         }
     }
 }
@@ -134,6 +140,23 @@ pub trait DocumentIndex: Send + Sync {
     /// holds exactly that — one row per successfully indexed file — so this is a
     /// plain local `SELECT`, no cap and no round trip to the vector store required.
     async fn all_paths(&self) -> Result<Vec<String>>;
+
+    /// Document summaries for exactly these paths, in unspecified order.
+    ///
+    /// Backs `retrieval::search`'s query+document (grouped) mode: Qdrant's
+    /// `query_groups` collapses each document to its single best-scoring chunk, whose
+    /// payload carries only that chunk's fields — not the whole-document metadata
+    /// (`title`/`description`/`mtime`/full `frontmatter`) a document-shaped result
+    /// needs. The caller re-associates each returned summary with its Qdrant score by
+    /// `file_path` and restores the score-descending order itself; this method makes
+    /// no ordering promise and may return fewer rows than `paths` if the metadata
+    /// index is transiently behind Qdrant (same consistency caveat as
+    /// `get_document`'s fuzzy fallback).
+    async fn get_summaries_by_paths(
+        &self,
+        paths: &[String],
+        fields: Option<&[String]>,
+    ) -> Result<Vec<DocumentSummary>>;
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1005,6 +1028,15 @@ impl StateDb {
             builder.push(" ESCAPE '\\'");
         }
 
+        if let Some(after) = query.mtime_after {
+            builder.push(" AND d.mtime >= ");
+            builder.push_bind(after);
+        }
+        if let Some(before) = query.mtime_before {
+            builder.push(" AND d.mtime <= ");
+            builder.push_bind(before);
+        }
+
         for (field, filter) in &query.filters {
             // `title` and `description` live in dedicated columns and are deliberately
             // excluded from the projection, so filter them directly rather than letting
@@ -1321,11 +1353,55 @@ impl DocumentIndex for StateDb {
             .await?;
         Ok(rows.into_iter().map(|(file_path,)| file_path).collect())
     }
+
+    async fn get_summaries_by_paths(
+        &self,
+        paths: &[String],
+        fields: Option<&[String]>,
+    ) -> Result<Vec<DocumentSummary>> {
+        let mut out = Vec::with_capacity(paths.len());
+        for chunk in paths.chunks(SQLITE_MAX_PARAMS_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "SELECT file_path, title, description, mtime, indexed_at, frontmatter \
+                 FROM documents WHERE file_path IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for path in chunk {
+                separated.push_bind(path);
+            }
+            builder.push(")");
+
+            let rows: Vec<DocumentRow> = builder.build_query_as().fetch_all(&self.pool).await?;
+            out.extend(rows.into_iter().map(
+                |(file_path, title, description, mtime, indexed_at, frontmatter_json)| {
+                    let frontmatter: Value = serde_json::from_str(&frontmatter_json)
+                        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+                    let frontmatter = match fields {
+                        Some(fields) => project_fields(&frontmatter, fields),
+                        None => frontmatter,
+                    };
+                    DocumentSummary {
+                        file_path,
+                        title,
+                        description,
+                        mtime,
+                        indexed_at,
+                        frontmatter,
+                    }
+                },
+            ));
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qdrant;
     use tempfile::TempDir;
 
     async fn test_db() -> (StateDb, TempDir) {
@@ -2169,6 +2245,340 @@ mod tests {
         let result = db.query_documents(&query).await.unwrap();
 
         assert_eq!(paths(&result), vec!["kitchen/recipes/chili.md"]);
+    }
+
+    // ------------------------------------------------------------------
+    // query mode / enumeration mode: filter semantics must agree
+    // ------------------------------------------------------------------
+    //
+    // `search`'s query-mode filters lower to Qdrant conditions via
+    // `qdrant::lower_field_filters`; its enumeration-mode filters lower to SQL
+    // via `push_where`, exercised here through the real `query_documents` path.
+    // No live Qdrant is available in this environment to run the lowered
+    // conditions for real (see `qdrant::tests::qdrant_filters_agree_with_the_offline_prediction`
+    // for the `#[ignore]`d live counterpart), so this section evaluates the
+    // lowered `Condition` tree directly against the same frontmatter this
+    // SQLite fixture was seeded from, using a small interpreter that only needs
+    // to understand the shapes `lower_field_filters` can actually produce
+    // (`Match`/`Range` field conditions, and a `Filter::should` OR for
+    // multi-value boolean equality) — anything else means this test's
+    // evaluator is out of date with production, so it panics rather than
+    // silently passing.
+
+    fn equivalence_frontmatter(
+        type_: &str,
+        tags: &[&str],
+        prep_minutes: i64,
+        tested: bool,
+        rating: f64,
+    ) -> HashMap<String, Value> {
+        let json = serde_json::json!({
+            "title": type_,
+            "type": type_,
+            "tags": tags,
+            "rating": rating,
+            "planning": { "prep_minutes": prep_minutes, "tested": tested }
+        });
+        match json {
+            Value::Object(map) => map.into_iter().collect(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn equivalence_docs() -> Vec<(&'static str, HashMap<String, Value>)> {
+        vec![
+            (
+                "a.md",
+                equivalence_frontmatter("guide", &["recipe", "dinner"], 20, true, 4.5),
+            ),
+            (
+                "b.md",
+                equivalence_frontmatter("recipe", &["recipe", "breakfast"], 45, true, 3.0),
+            ),
+            (
+                "c.md",
+                equivalence_frontmatter("reference", &["recipe", "dinner", "zfs"], 45, false, 4.5),
+            ),
+            (
+                "d.md",
+                equivalence_frontmatter("guide", &["zfs"], 15, true, 2.0),
+            ),
+        ]
+    }
+
+    async fn equivalence_db() -> (StateDb, TempDir) {
+        let (db, dir) = test_db().await;
+        for (path, fm) in equivalence_docs() {
+            db.upsert_document_metadata(path, &fm, 100, "h", 1)
+                .await
+                .unwrap();
+        }
+        (db, dir)
+    }
+
+    /// Navigate a dot-path into a JSON object the same way Qdrant addresses a
+    /// nested payload field natively.
+    fn payload_at<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
+        let mut cur = payload;
+        for part in key.split('.') {
+            cur = cur.as_object()?.get(part)?;
+        }
+        Some(cur)
+    }
+
+    fn qdrant_range_matches(val: &Value, range: &qdrant_client::qdrant::Range) -> bool {
+        let n = match val {
+            Value::Number(n) => n.as_f64(),
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            _ => None,
+        };
+        let Some(n) = n else { return false };
+        if let Some(gte) = range.gte
+            && n < gte
+        {
+            return false;
+        }
+        if let Some(lte) = range.lte
+            && n > lte
+        {
+            return false;
+        }
+        if let Some(gt) = range.gt
+            && n <= gt
+        {
+            return false;
+        }
+        if let Some(lt) = range.lt
+            && n >= lt
+        {
+            return false;
+        }
+        true
+    }
+
+    fn qdrant_match_matches(val: &Value, m: &qdrant_client::qdrant::Match) -> bool {
+        use qdrant_client::qdrant::r#match::MatchValue;
+        let Some(mv) = &m.match_value else {
+            return false;
+        };
+        // Qdrant matches an array-valued payload field by checking whether any
+        // element matches, not by comparing the whole array as one value.
+        let candidates: Vec<&Value> = match val {
+            Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        candidates.into_iter().any(|c| match mv {
+            MatchValue::Keyword(s) => c.as_str() == Some(s.as_str()),
+            MatchValue::Integer(i) => c.as_i64() == Some(*i),
+            MatchValue::Boolean(b) => c.as_bool() == Some(*b),
+            MatchValue::Keywords(ks) => ks.strings.iter().any(|s| c.as_str() == Some(s.as_str())),
+            MatchValue::Integers(is) => is.integers.iter().any(|i| c.as_i64() == Some(*i)),
+            other => panic!(
+                "equivalence test's evaluator does not model match variant {other:?} — \
+                 lower_field_filters should not be producing this shape"
+            ),
+        })
+    }
+
+    fn qdrant_condition_matches(cond: &qdrant_client::qdrant::Condition, payload: &Value) -> bool {
+        use qdrant_client::qdrant::condition::ConditionOneOf;
+        match cond
+            .condition_one_of
+            .as_ref()
+            .expect("every lowered condition sets one variant")
+        {
+            ConditionOneOf::Field(fc) => {
+                let Some(val) = payload_at(payload, &fc.key) else {
+                    return false;
+                };
+                if let Some(range) = &fc.range {
+                    qdrant_range_matches(val, range)
+                } else if let Some(m) = &fc.r#match {
+                    qdrant_match_matches(val, m)
+                } else {
+                    panic!(
+                        "equivalence test's evaluator only models match/range field \
+                         conditions"
+                    )
+                }
+            }
+            ConditionOneOf::Filter(f) => {
+                // The only `Filter` shape `lower_field_filters` produces is a bare
+                // `should` OR (multi-value boolean equality) — must/must_not/
+                // min_should here would mean this evaluator is out of date.
+                assert!(
+                    f.must.is_empty() && f.must_not.is_empty() && f.min_should.is_none(),
+                    "unexpected Filter shape from lower_field_filters: {f:?}"
+                );
+                f.should
+                    .iter()
+                    .any(|c| qdrant_condition_matches(c, payload))
+            }
+            other => panic!(
+                "equivalence test's evaluator does not model condition variant {other:?} — \
+                 lower_field_filters should not be producing this shape"
+            ),
+        }
+    }
+
+    /// Seed [`equivalence_db`], run `filters` through both the real
+    /// enumeration-mode SQL path (`StateDb::query_documents`) and
+    /// `qdrant::lower_field_filters` (evaluated offline against the same
+    /// fixture's frontmatter — see this section's header comment), then assert
+    /// both name exactly the same document set.
+    async fn assert_query_and_enumeration_modes_agree(
+        filters: Vec<(String, FieldFilter)>,
+        indexed: HashMap<String, qdrant::IndexKind>,
+        expected: &[&str],
+    ) {
+        let (db, _dir) = equivalence_db().await;
+
+        let sql_result = db
+            .query_documents(&DocumentQuery {
+                filters: filters.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut sql_paths: Vec<&str> = sql_result
+            .documents
+            .iter()
+            .map(|d| d.file_path.as_str())
+            .collect();
+        sql_paths.sort();
+
+        let conditions = qdrant::lower_field_filters(&filters, &indexed)
+            .expect("query mode should accept this filter");
+        let mut qdrant_paths: Vec<&str> = equivalence_docs()
+            .into_iter()
+            .filter(|(_, fm)| {
+                let payload = Value::Object(fm.clone().into_iter().collect());
+                conditions
+                    .iter()
+                    .all(|c| qdrant_condition_matches(c, &payload))
+            })
+            .map(|(path, _)| path)
+            .collect();
+        qdrant_paths.sort();
+
+        let mut expected_sorted: Vec<&str> = expected.to_vec();
+        expected_sorted.sort();
+
+        assert_eq!(
+            sql_paths, expected_sorted,
+            "enumeration mode (SQL) produced a different document set than expected"
+        );
+        assert_eq!(
+            qdrant_paths, expected_sorted,
+            "query mode (Qdrant conditions) produced a different document set than expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_and_enumeration_agree_on_scalar_equality() {
+        assert_query_and_enumeration_modes_agree(
+            vec![("type".into(), FieldFilter::AnyOf(vec!["guide".into()]))],
+            HashMap::from([("type".to_string(), qdrant::IndexKind::Keyword)]),
+            &["a.md", "d.md"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn query_and_enumeration_agree_on_any_of() {
+        assert_query_and_enumeration_modes_agree(
+            vec![(
+                "tags".into(),
+                FieldFilter::AnyOf(vec!["breakfast".into(), "zfs".into()]),
+            )],
+            HashMap::from([("tags".to_string(), qdrant::IndexKind::Keyword)]),
+            &["b.md", "c.md", "d.md"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn query_and_enumeration_agree_on_all_of() {
+        assert_query_and_enumeration_modes_agree(
+            vec![(
+                "tags".into(),
+                FieldFilter::AllOf(vec!["recipe".into(), "dinner".into()]),
+            )],
+            HashMap::from([("tags".to_string(), qdrant::IndexKind::Keyword)]),
+            &["a.md", "c.md"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn query_and_enumeration_agree_on_numeric_range() {
+        assert_query_and_enumeration_modes_agree(
+            vec![(
+                "planning.prep_minutes".into(),
+                FieldFilter::Range {
+                    gte: Some(10.0),
+                    lte: None,
+                    gt: None,
+                    lt: Some(45.0),
+                },
+            )],
+            HashMap::from([(
+                "planning.prep_minutes".to_string(),
+                qdrant::IndexKind::Integer,
+            )]),
+            &["a.md", "d.md"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn query_and_enumeration_agree_on_a_nested_dot_path_field() {
+        assert_query_and_enumeration_modes_agree(
+            vec![(
+                "planning.tested".into(),
+                FieldFilter::AnyOf(vec!["true".into()]),
+            )],
+            HashMap::from([("planning.tested".to_string(), qdrant::IndexKind::Bool)]),
+            &["a.md", "b.md", "d.md"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn query_mode_rejects_float_equality_that_enumeration_mode_accepts() {
+        // Deliberate divergence, not a bug: exact float equality is unreliable,
+        // so query mode refuses it outright (`lower_field_filters` -> `Err`)
+        // while enumeration mode's SQL just does a text comparison and accepts
+        // it. Pin both halves so a future change can't silently narrow or widen
+        // either side without this test noticing.
+        let (db, _dir) = equivalence_db().await;
+        let filters = vec![("rating".to_string(), FieldFilter::AnyOf(vec!["4.5".into()]))];
+
+        let sql_result = db
+            .query_documents(&DocumentQuery {
+                filters: filters.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut sql_paths: Vec<&str> = sql_result
+            .documents
+            .iter()
+            .map(|d| d.file_path.as_str())
+            .collect();
+        sql_paths.sort();
+        assert_eq!(
+            sql_paths,
+            vec!["a.md", "c.md"],
+            "enumeration mode must still allow float equality"
+        );
+
+        let indexed = HashMap::from([("rating".to_string(), qdrant::IndexKind::Float)]);
+        let err = qdrant::lower_field_filters(&filters, &indexed).unwrap_err();
+        assert!(
+            err.contains("float"),
+            "query mode must reject float equality; got: {err}"
+        );
     }
 
     #[tokio::test]

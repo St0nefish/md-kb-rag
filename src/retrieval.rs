@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use globset::GlobSet;
+use qdrant_client::qdrant::Condition;
 use tracing::{debug, warn};
 
 use crate::{
     embed::QueryEmbedder,
     qdrant::{RetrievalStore, SearchResult},
     rerank::Reranker,
-    state::{DocumentIndex, DocumentQuery, DocumentQueryResult},
+    state::{DocumentIndex, DocumentQuery, DocumentQueryResult, DocumentSummary},
 };
 
 /// How many "did you mean?" suggestions to include when no basename matches.
@@ -47,11 +48,44 @@ pub struct RetrievalDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     pub reranker: Option<&'a (dyn Reranker + Send + Sync)>,
 }
 
-/// Filters to apply when searching.
+/// Filters to apply when searching, already lowered to Qdrant conditions.
+///
+/// The MCP `search` tool's rich `filters` (see `state::FieldFilter`) get here via
+/// `qdrant::lower_field_filters`, after the tool handler has checked every named
+/// field carries a payload index; the web UI's plain `domain`/`type`/`tags` query
+/// params build their conditions directly (`qdrant::Condition::matches`) with no such
+/// check, exactly as they always have. Either way, `search`/`search_grouped` below
+/// treat this as an opaque, already-valid set of extra conditions to AND onto the
+/// query — this module has no opinion on where a `Condition` came from.
+#[derive(Default)]
 pub struct SearchFilters {
-    pub domain: Option<String>,
-    pub r#type: Option<String>,
-    pub tags: Option<Vec<String>>,
+    pub conditions: Vec<Condition>,
+}
+
+/// Build `SearchFilters` from the plain `domain`/`type`/`tags` parameters the CLI
+/// `search` subcommand and the web UI's `/api/search` both accept — the shape
+/// neither has reason to change now that the MCP `search` tool has moved on to the
+/// richer `filters` model. Each becomes a single-field Qdrant match condition
+/// exactly as `retrieval::search` built them inline before this function existed;
+/// an absent value, or an empty `tags` list, contributes nothing.
+pub fn plain_search_filters(
+    domain: Option<&str>,
+    r#type: Option<&str>,
+    tags: Option<&[String]>,
+) -> SearchFilters {
+    let mut conditions = Vec::new();
+    if let Some(d) = domain {
+        conditions.push(Condition::matches("domain", d.to_string()));
+    }
+    if let Some(t) = r#type {
+        conditions.push(Condition::matches("type", t.to_string()));
+    }
+    if let Some(tags) = tags
+        && !tags.is_empty()
+    {
+        conditions.push(Condition::matches("tags", tags.to_vec()));
+    }
+    SearchFilters { conditions }
 }
 
 /// Options controlling search behaviour.
@@ -62,14 +96,34 @@ pub struct SearchOptions {
     /// dense-only. Sourced from `search.hybrid`.
     pub hybrid: bool,
     /// Candidates fetched from each arm before RRF fusion. Sourced from
-    /// `search.rrf_candidates`. Only consulted when `hybrid` is true.
+    /// `search.rrf_candidates`. Consulted whenever any fused arm is in play —
+    /// sparse (when `hybrid` is true) or phrase (when `phrase` is true and the
+    /// query has a quoted span) — not only when `hybrid` is true.
     pub rrf_candidates: u64,
+    /// When true, double-quoted spans in `query` become exact-phrase conditions
+    /// (see [`extract_phrases`]), added as a third fused prefetch arm alongside
+    /// dense/sparse — independent of `hybrid`. The caller (not this module) is
+    /// responsible for ANDing in whether the phrase-matching payload index is
+    /// actually available on the server right now (`search.phrase` config AND
+    /// `status::IndexStatus::phrase_matching_available`), so this flag alone is
+    /// the single source of truth for "attempt phrase parsing" — `search`/
+    /// `search_grouped` never touch global state to decide. When `false`, quoted
+    /// text is treated as literal characters and the query is used unmodified,
+    /// which keeps an unquoted query's behavior identical either way.
+    pub phrase: bool,
     /// When true, surface per-result score breakdown metadata (pre-rerank score when applicable).
     pub explain: bool,
     /// Exclude documents with `mtime` payload below this Unix timestamp.
     pub modified_after: Option<i64>,
     /// Exclude documents with `mtime` payload above this Unix timestamp.
     pub modified_before: Option<i64>,
+    /// Restrict to results whose `file_path` (KB-relative) starts with this prefix.
+    /// Applied as a post-fetch filter (see `apply_path_prefix`) — query mode
+    /// over-fetches from Qdrant first (`path_prefix_fetch_limit`) to make a
+    /// shortfall against `limit` unlikely, but a very selective prefix can still
+    /// exhaust the over-fetch ceiling; see `SearchOutcome`/`GroupedSearchOutcome`'s
+    /// `path_prefix_truncated`.
+    pub path_prefix: Option<String>,
     /// When reranking is enabled, the number of candidates to fetch before reranking.
     /// Ignored when `reranker` is None on RetrievalDeps.
     pub rerank_candidate_limit: Option<u64>,
@@ -96,6 +150,157 @@ pub struct SearchOptions {
 /// number before they're all sent to a paid, latency-bound reranker call — most
 /// of which could never survive the final cap regardless of their rerank score.
 const PRERANK_DIVERSITY_MULTIPLIER: usize = 4;
+
+/// Build the `mtime__gte`/`mtime__lte` sentinel entries [`crate::qdrant::build_conditions`]
+/// special-cases, from [`SearchOptions`]'s recency filters. Shared by [`search`] and
+/// [`search_grouped`] so the two don't drift on how a recency filter lowers.
+fn mtime_filter_map(opts: &SearchOptions) -> HashMap<String, serde_json::Value> {
+    let mut filter_map = HashMap::new();
+    // mtime range filter — documents indexed before mtime was stored may have
+    // mtime=0 or no mtime field and will be excluded silently by this filter.
+    if opts.modified_after.is_some() || opts.modified_before.is_some() {
+        debug!("mtime filter active — documents without mtime in payload will be excluded");
+    }
+    if let Some(after) = opts.modified_after {
+        filter_map.insert("mtime__gte".to_string(), serde_json::json!(after));
+    }
+    if let Some(before) = opts.modified_before {
+        filter_map.insert("mtime__lte".to_string(), serde_json::json!(before));
+    }
+    filter_map
+}
+
+/// Pull double-quoted spans out of `query` as exact-phrase conditions, returning
+/// `(flattened_query, phrases)`: `flattened_query` is `query` with only the paired
+/// quote *delimiters* removed (everything else — including the phrase words
+/// themselves and all original whitespace — is preserved byte-for-byte in place),
+/// and `phrases` is each non-blank phrase's trimmed text, in order. Multiple
+/// quoted spans each become a separate entry — callers AND them together.
+///
+/// `flattened_query`, not the raw `query`, is what should still feed the dense
+/// embedding and the sparse tokenizer: `deploy notes for "node:ares" rocm` flattens
+/// to `deploy notes for node:ares rocm`, so the words inside a phrase keep
+/// contributing to ordinary term/semantic retrieval, not just the phrase filter.
+///
+/// An unterminated quote (no matching close before the end of the string) is not
+/// an error — the dangling `"` is left as a literal character and contributes no
+/// phrase, exactly as an unquoted query would. This is also why a query with no
+/// `"` at all returns `query` completely unchanged: no delimiter is ever found, so
+/// nothing is removed and nothing is trimmed — an unquoted query's behavior is
+/// identical whether or not phrase parsing runs at all.
+pub fn extract_phrases(query: &str) -> (String, Vec<String>) {
+    let chars: Vec<char> = query.chars().collect();
+    let n = chars.len();
+    let mut is_delimiter = vec![false; n];
+    let mut phrases = Vec::new();
+
+    let mut i = 0;
+    while i < n {
+        if chars[i] == '"'
+            && let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '"')
+        {
+            let end = i + 1 + rel_end;
+            is_delimiter[i] = true;
+            is_delimiter[end] = true;
+            let phrase: String = chars[i + 1..end].iter().collect();
+            let trimmed = phrase.trim();
+            if !trimmed.is_empty() {
+                phrases.push(trimmed.to_string());
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    if phrases.is_empty() {
+        // No pair was matched (either no quotes, or only dangling ones) — return
+        // the original string untouched rather than an equal-but-rebuilt copy.
+        return (query.to_string(), phrases);
+    }
+
+    let flattened: String = chars
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !is_delimiter[*idx])
+        .map(|(_, c)| *c)
+        .collect();
+    (flattened, phrases)
+}
+
+/// How much larger than the caller's requested fetch size to ask Qdrant for when
+/// `path_prefix` is set in query mode, before [`apply_path_prefix`] retains only
+/// the matching subset. `path_prefix` has no native Qdrant filter primitive (see
+/// that function's doc comment), so a selective prefix can otherwise discard most
+/// of a `limit`-sized page and hand back far fewer than `limit` results even when
+/// plenty more exist. Over-fetching makes that far less likely without changing
+/// the fundamentally best-effort nature of the retain.
+const PATH_PREFIX_OVERFETCH_MULTIPLIER: u64 = 5;
+
+/// Absolute ceiling on the over-fetched size computed via
+/// `PATH_PREFIX_OVERFETCH_MULTIPLIER`, so a large `limit` (or a reranker's
+/// `rerank_candidate_limit`) cannot turn into an unbounded Qdrant fetch.
+const PATH_PREFIX_OVERFETCH_CEILING: u64 = 500;
+
+/// Scale `fetch_limit` up for the `path_prefix` over-fetch when a prefix is set,
+/// otherwise return it unchanged. Shared by [`search`] and [`search_grouped`] so
+/// the two apply the same policy.
+fn path_prefix_fetch_limit(fetch_limit: u64, path_prefix: Option<&str>) -> u64 {
+    if path_prefix.is_some() {
+        fetch_limit
+            .saturating_mul(PATH_PREFIX_OVERFETCH_MULTIPLIER)
+            .min(PATH_PREFIX_OVERFETCH_CEILING)
+    } else {
+        fetch_limit
+    }
+}
+
+/// Restrict `results` to those whose (KB-relative) `file_path` starts with `prefix`,
+/// when one is given. A post-fetch filter, not a Qdrant condition — matching a
+/// literal path prefix has no native Qdrant filter primitive on a keyword-indexed
+/// field, so this accepts the same "may return fewer than `limit`" tradeoff already
+/// established for `min_score` just below it, rather than leaving `path_prefix`
+/// silently unimplemented for query mode.
+///
+/// Query mode compensates by over-fetching before this retain runs (see
+/// `PATH_PREFIX_OVERFETCH_MULTIPLIER`/`PATH_PREFIX_OVERFETCH_CEILING` and
+/// `path_prefix_fetch_limit`), and callers report when they could not prove the
+/// retain kept everything the caller asked for (`path_prefix_truncated` on
+/// [`SearchOutcome`]/[`GroupedSearchOutcome`]). This remains a best-effort
+/// mitigation, not a fix: the proper fix is indexing an ancestor-path keyword
+/// array at ingest time so a prefix match becomes a native, exact Qdrant
+/// condition instead of a post-fetch retain — out of scope here because it needs
+/// a payload/schema change and a reindex.
+fn apply_path_prefix(results: &mut Vec<SearchResult>, prefix: Option<&str>, data_root: &Path) {
+    let Some(prefix) = prefix else { return };
+    results.retain(|r| {
+        r.payload
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .is_some_and(|fp| relative_to_data(fp, data_root).starts_with(prefix))
+    });
+}
+
+/// True when a `path_prefix` retain may have discarded matches beyond what was
+/// fetched, rather than genuinely running out of them.
+///
+/// `pre_retain_count` is how many hits Qdrant returned for the (possibly
+/// over-fetched) `fetch_limit` requested, *before* [`apply_path_prefix`] ran;
+/// `post_retain_count` is the count immediately after. When Qdrant returned fewer
+/// than `fetch_limit`, the fetch was exhaustive — there was nothing more to find —
+/// so under-return relative to `limit` is proven benign. Only when Qdrant filled
+/// the full (over-fetched) page do we have no way to tell whether more
+/// prefix-matching documents exist past the cutoff, so a post-retain shortfall
+/// against `limit` must be surfaced rather than silently returned.
+fn path_prefix_truncated(
+    path_prefix: Option<&str>,
+    limit: u64,
+    fetch_limit: u64,
+    pre_retain_count: u64,
+    post_retain_count: u64,
+) -> bool {
+    path_prefix.is_some() && post_retain_count < limit && pre_retain_count >= fetch_limit
+}
 
 /// Apply a per-document cap to an already-ranked (best-first) result list,
 /// dropping entries once a document (identified by its `file_path` payload
@@ -350,6 +555,9 @@ pub enum SearchError {
     Embed(anyhow::Error),
     /// The Qdrant search call failed.
     Search(anyhow::Error),
+    /// [`search_grouped`]'s document-metadata hydration (the `DocumentIndex` lookup)
+    /// failed.
+    Document(anyhow::Error),
 }
 
 /// Structured errors from `get_document`.
@@ -480,6 +688,29 @@ pub(crate) fn resolve_within_data(
 // Public retrieval functions
 // ---------------------------------------------------------------------------
 
+/// The results of [`search`] plus whether a `path_prefix` filter may have
+/// under-returned relative to `limit` (`path_prefix_truncated` — see
+/// `retrieval::path_prefix_truncated` and `apply_path_prefix`'s doc comment).
+///
+/// Implements [`IntoIterator`] over `results` (yielding owned [`SearchResult`]s,
+/// same as the `Vec<SearchResult>` this replaced) so a caller that only wants the
+/// result list — e.g. `write.rs`'s dedup gate, which never sets `path_prefix` —
+/// needs no change at the call site.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub path_prefix_truncated: bool,
+}
+
+impl IntoIterator for SearchOutcome {
+    type Item = SearchResult;
+    type IntoIter = std::vec::IntoIter<SearchResult>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.results.into_iter()
+    }
+}
+
 /// Embed the query, apply filters, search Qdrant, apply min_score floor, and
 /// return raw results. Does NOT format any output — callers do that.
 pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
@@ -487,95 +718,98 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
     query: &str,
     filters: &SearchFilters,
     opts: &SearchOptions,
-) -> Result<Vec<SearchResult>, SearchError> {
+) -> Result<SearchOutcome, SearchError> {
+    // Double-quoted spans become phrase conditions; the flattened (dequoted) text
+    // still feeds the embedding and the sparse tokenizer below. When `opts.phrase`
+    // is false this is a no-op: `flat_query` is `query` unchanged and `phrases` is
+    // empty, so an unquoted query's behavior — and a quoted one, when the caller
+    // has decided phrase matching isn't available — is untouched.
+    let (flat_query, phrases) = if opts.phrase {
+        extract_phrases(query)
+    } else {
+        (query.to_string(), Vec::new())
+    };
+
     let embed_start = std::time::Instant::now();
     let vector = deps
         .embed_client
-        .embed_query(query)
+        .embed_query(&flat_query)
         .await
         .map_err(SearchError::Embed)?;
     let embed_ms = embed_start.elapsed().as_millis();
 
-    let mut filter_map: HashMap<String, serde_json::Value> = HashMap::new();
-
-    // Collapse three near-identical scalar-filter insertions with a local helper.
-    // We borrow each field directly from `filters` and move the String value into
-    // the map rather than cloning it separately — the struct fields are owned and
-    // not used after this point.
-    let mut insert_str = |key: &str, opt: &Option<String>| {
-        if let Some(v) = opt {
-            filter_map.insert(key.to_string(), serde_json::Value::String(v.clone()));
-        }
-    };
-    insert_str("domain", &filters.domain);
-    insert_str("type", &filters.r#type);
-
-    // Empty tags list = no filter; avoid sending an empty match_any to Qdrant.
-    if let Some(tags) = &filters.tags
-        && !tags.is_empty()
-    {
-        let tag_values: Vec<serde_json::Value> = tags
-            .iter()
-            .map(|t| serde_json::Value::String(t.clone()))
-            .collect();
-        filter_map.insert("tags".to_string(), serde_json::Value::Array(tag_values));
-    }
-
-    // mtime range filter — documents indexed before mtime was stored may have
-    // mtime=0 or no mtime field and will be excluded silently by this filter.
-    if opts.modified_after.is_some() || opts.modified_before.is_some() {
-        debug!("mtime filter active — documents without mtime in payload will be excluded");
-    }
-    if let Some(after) = opts.modified_after {
-        filter_map.insert("mtime__gte".to_string(), serde_json::json!(after));
-    }
-    if let Some(before) = opts.modified_before {
-        filter_map.insert("mtime__lte".to_string(), serde_json::json!(before));
-    }
+    let filter_map = mtime_filter_map(opts);
 
     let fetch_limit = if deps.reranker.is_some() {
         opts.rerank_candidate_limit.unwrap_or(opts.limit)
     } else {
         opts.limit
     };
+    let fetch_limit = path_prefix_fetch_limit(fetch_limit, opts.path_prefix.as_deref());
 
     let search_start = std::time::Instant::now();
-    let mut results = if opts.hybrid {
-        // Tokenize the raw query into a sparse vector and fuse with the dense arm.
-        // Fall back to dense-only if the query produces an empty sparse vector
-        // (e.g. all-punctuation queries) to avoid sending an empty vector to Qdrant.
-        let sparse = crate::sparse::tokenize(query);
+    // Tokenize the flattened query into a sparse vector when hybrid is on; an
+    // empty result (e.g. an all-punctuation query) is treated the same as hybrid
+    // being off, to avoid sending an empty vector to Qdrant.
+    let sparse = if opts.hybrid {
+        let sparse = crate::sparse::tokenize(&flat_query);
         if sparse.0.is_empty() {
             if opts.explain {
                 debug!(
                     "hybrid sparse-fallback: empty sparse vector, explain scores reflect dense-only"
                 );
             }
-            deps.qdrant
-                .search(deps.collection, vector, filter_map, fetch_limit)
-                .await
-                .map_err(SearchError::Search)?
+            None
         } else {
-            deps.qdrant
-                .hybrid_search(
-                    deps.collection,
-                    vector,
-                    sparse,
-                    filter_map,
-                    fetch_limit,
-                    opts.rrf_candidates,
-                    opts.explain,
-                )
-                .await
-                .map_err(SearchError::Search)?
+            Some(sparse)
         }
     } else {
+        None
+    };
+
+    let mut results = if sparse.is_none() && phrases.is_empty() {
+        // Neither arm needed — the plain dense-only query, unchanged from before
+        // hybrid/phrase existed.
         deps.qdrant
-            .search(deps.collection, vector, filter_map, fetch_limit)
+            .search(
+                deps.collection,
+                vector,
+                filter_map,
+                filters.conditions.clone(),
+                fetch_limit,
+            )
+            .await
+            .map_err(SearchError::Search)?
+    } else {
+        // Fused retrieval: sparse when hybrid produced one, phrase when requested
+        // — independent of each other, so this also covers "phrase only, hybrid
+        // off" (dense + phrase, two arms).
+        deps.qdrant
+            .hybrid_search(
+                deps.collection,
+                vector,
+                sparse,
+                &phrases,
+                filter_map,
+                filters.conditions.clone(),
+                fetch_limit,
+                opts.rrf_candidates,
+                opts.explain,
+            )
             .await
             .map_err(SearchError::Search)?
     };
     let search_ms = search_start.elapsed().as_millis();
+
+    let pre_prefix_count = results.len() as u64;
+    apply_path_prefix(&mut results, opts.path_prefix.as_deref(), deps.data_path);
+    let path_prefix_truncated = path_prefix_truncated(
+        opts.path_prefix.as_deref(),
+        opts.limit,
+        fetch_limit,
+        pre_prefix_count,
+        results.len() as u64,
+    );
 
     // Apply min_score floor only when Some — None is a no-op, preserving
     // current behaviour.
@@ -629,7 +863,10 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
                 results = apply_diversity_cap(results, max_per_document);
             }
             results.truncate(top_k);
-            return Ok(results);
+            return Ok(SearchOutcome {
+                results,
+                path_prefix_truncated,
+            });
         }
         match reranker.rerank(query, &docs).await {
             Ok(ranked) => {
@@ -694,7 +931,157 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
         "search timing"
     );
 
-    Ok(results)
+    Ok(SearchOutcome {
+        results,
+        path_prefix_truncated,
+    })
+}
+
+/// One document from a query+document (grouped) search: Qdrant's best-scoring chunk
+/// for that document, hydrated to document-shaped metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupedDocument {
+    pub score: f32,
+    pub summary: DocumentSummary,
+}
+
+/// The results of [`search_grouped`] plus whether a `path_prefix` filter may have
+/// under-returned relative to `limit` — same meaning as [`SearchOutcome`]'s field
+/// of the same name, just for grouped-document results instead of chunks.
+#[derive(Debug, Clone)]
+pub struct GroupedSearchOutcome {
+    pub documents: Vec<GroupedDocument>,
+    pub path_prefix_truncated: bool,
+}
+
+/// Semantic search collapsed to one result per document — the `search` tool's
+/// query+document granularity. Groups a Qdrant query by `file_path` with
+/// `group_size` 1, so each group's single hit already IS that document's
+/// best-scoring chunk, then hydrates every hit's title/description/mtime/
+/// frontmatter from `document_index`: Qdrant's own payload only carries the
+/// winning chunk's fields, not the whole-document metadata `list_documents` uses.
+///
+/// Runs the SAME dense/sparse/phrase retrieval arms as [`search`] (honoring
+/// `opts.hybrid` and `opts.phrase` identically), fused via server-side RRF and
+/// then grouped — see [`crate::qdrant::QdrantStore::search_grouped`]'s doc comment
+/// for why: grouped and chunk results must differ only in shape, one row per
+/// document vs one per chunk, never in which documents are retrievable. Does not
+/// run a reranker, matching `search`'s own reranker-free path when hybrid/phrase
+/// fusion order is the only relevance signal available. Also carries no
+/// exhaustive total: grouped vector search has no notion of "how many documents
+/// match", so the `search` tool's response for this combination reports `returned`
+/// but omits `total`/`has_more` rather than claim a count this path cannot back up.
+pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>(
+    deps: &RetrievalDeps<'_, E, Q>,
+    document_index: &D,
+    query: &str,
+    filters: &SearchFilters,
+    opts: &SearchOptions,
+    fields: Option<&[String]>,
+) -> Result<GroupedSearchOutcome, SearchError> {
+    // See `search`'s identical block above — same phrase-flattening contract.
+    let (flat_query, phrases) = if opts.phrase {
+        extract_phrases(query)
+    } else {
+        (query.to_string(), Vec::new())
+    };
+
+    let vector = deps
+        .embed_client
+        .embed_query(&flat_query)
+        .await
+        .map_err(SearchError::Embed)?;
+
+    let sparse = if opts.hybrid {
+        let sparse = crate::sparse::tokenize(&flat_query);
+        if sparse.0.is_empty() {
+            None
+        } else {
+            Some(sparse)
+        }
+    } else {
+        None
+    };
+
+    let filter_map = mtime_filter_map(opts);
+    let fetch_limit = path_prefix_fetch_limit(opts.limit, opts.path_prefix.as_deref());
+
+    let mut results = deps
+        .qdrant
+        .search_grouped(
+            deps.collection,
+            vector,
+            sparse,
+            &phrases,
+            filter_map,
+            filters.conditions.clone(),
+            "file_path",
+            1,
+            fetch_limit,
+            opts.rrf_candidates,
+        )
+        .await
+        .map_err(SearchError::Search)?;
+
+    let pre_prefix_count = results.len() as u64;
+    apply_path_prefix(&mut results, opts.path_prefix.as_deref(), deps.data_path);
+    let path_prefix_truncated = path_prefix_truncated(
+        opts.path_prefix.as_deref(),
+        opts.limit,
+        fetch_limit,
+        pre_prefix_count,
+        results.len() as u64,
+    );
+
+    if let Some(s) = opts.min_score {
+        results.retain(|r| r.score >= s);
+    }
+
+    // Preserve Qdrant's score-descending order through the SQLite round trip below:
+    // record each hit's (relative path, score) here, look summaries up in whatever
+    // order `get_summaries_by_paths` returns them, then re-walk this ranked list to
+    // reassemble the final order — rather than trust the SQL result's row order.
+    let ranked_paths: Vec<(String, f32)> = results
+        .iter()
+        .filter_map(|r| {
+            let raw = r.payload.get("file_path").and_then(|v| v.as_str())?;
+            Some((relative_to_data(raw, deps.data_path), r.score))
+        })
+        .collect();
+
+    let paths: Vec<String> = ranked_paths.iter().map(|(p, _)| p.clone()).collect();
+    let summaries = document_index
+        .get_summaries_by_paths(&paths, fields)
+        .await
+        .map_err(SearchError::Document)?;
+    let mut by_path: HashMap<String, DocumentSummary> = summaries
+        .into_iter()
+        .map(|s| (s.file_path.clone(), s))
+        .collect();
+
+    // A path absent from `by_path` (the metadata index transiently behind Qdrant —
+    // same caveat as `get_document`'s fuzzy fallback) is skipped rather than
+    // fabricated: a document search that can't back its own claim with real
+    // metadata about it.
+    let mut documents: Vec<GroupedDocument> = ranked_paths
+        .into_iter()
+        .filter_map(|(path, score)| {
+            by_path
+                .remove(&path)
+                .map(|summary| GroupedDocument { score, summary })
+        })
+        .collect();
+
+    // `fetch_limit` above may be an over-fetch (path_prefix multiplies it up to
+    // 500), and prefix/min_score filtering can leave more survivors than the
+    // caller actually asked for. Truncate here, mirroring `search`'s own
+    // truncation to `opts.limit` in both its reranker and no-reranker branches.
+    documents.truncate(opts.limit as usize);
+
+    Ok(GroupedSearchOutcome {
+        documents,
+        path_prefix_truncated,
+    })
 }
 
 /// Resolve a document path and return its full content.
@@ -872,6 +1259,61 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // extract_phrases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn extract_phrases_unquoted_query_is_returned_completely_unchanged() {
+        // The main regression risk: an unquoted query must behave EXACTLY as it
+        // did before phrase parsing existed. Includes leading/trailing/internal
+        // whitespace to prove nothing gets trimmed or rebuilt along the way.
+        let query = "  deploy notes for node:ares rocm  ";
+        let (flat, phrases) = extract_phrases(query);
+        assert_eq!(flat, query);
+        assert!(phrases.is_empty());
+    }
+
+    #[test]
+    fn extract_phrases_pulls_a_single_quoted_span() {
+        let (flat, phrases) = extract_phrases(r#"deploy notes for "node:ares" rocm"#);
+        assert_eq!(flat, "deploy notes for node:ares rocm");
+        assert_eq!(phrases, vec!["node:ares".to_string()]);
+    }
+
+    #[test]
+    fn extract_phrases_collects_multiple_quoted_spans_in_order() {
+        let (flat, phrases) = extract_phrases(r#""node:ares" and "rocm driver" notes"#);
+        assert_eq!(flat, "node:ares and rocm driver notes");
+        assert_eq!(
+            phrases,
+            vec!["node:ares".to_string(), "rocm driver".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_phrases_trims_whitespace_inside_a_phrase() {
+        let (_, phrases) = extract_phrases(r#""  node:ares  ""#);
+        assert_eq!(phrases, vec!["node:ares".to_string()]);
+    }
+
+    #[test]
+    fn extract_phrases_unterminated_quote_is_a_literal_character_not_an_error() {
+        let query = r#"deploy notes for "node:ares rocm"#;
+        let (flat, phrases) = extract_phrases(query);
+        assert_eq!(
+            flat, query,
+            "a dangling quote with no close must leave the string untouched"
+        );
+        assert!(phrases.is_empty());
+    }
+
+    #[test]
+    fn extract_phrases_blank_quoted_span_contributes_no_phrase() {
+        let (_, phrases) = extract_phrases(r#"hello "" world"#);
+        assert!(phrases.is_empty());
+    }
+
+    // ------------------------------------------------------------------
     // levenshtein
     // ------------------------------------------------------------------
 
@@ -1009,6 +1451,7 @@ mod tests {
             pre_rerank_score: None,
             dense_score: None,
             sparse_score: None,
+            phrase_score: None,
             payload: HashMap::new(),
         }
     }
@@ -1193,22 +1636,32 @@ mod tests {
     struct MockEmbedder {
         err: Option<String>,
         ok: Vec<f32>,
+        /// The exact string `embed_query` was last called with — lets phrase tests
+        /// assert the flattened (dequoted) text is what gets embedded, not the raw
+        /// query.
+        last_query: std::sync::Mutex<Option<String>>,
     }
 
     impl MockEmbedder {
         fn ok(v: Vec<f32>) -> Self {
-            Self { err: None, ok: v }
+            Self {
+                err: None,
+                ok: v,
+                last_query: std::sync::Mutex::new(None),
+            }
         }
         fn err(msg: &str) -> Self {
             Self {
                 err: Some(msg.to_string()),
                 ok: vec![],
+                last_query: std::sync::Mutex::new(None),
             }
         }
     }
 
     impl QueryEmbedder for MockEmbedder {
-        async fn embed_query(&self, _q: &str) -> anyhow::Result<Vec<f32>> {
+        async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
+            *self.last_query.lock().unwrap() = Some(q.to_string());
             if let Some(ref msg) = self.err {
                 anyhow::bail!("{}", msg);
             }
@@ -1220,10 +1673,16 @@ mod tests {
         search_err: Option<String>,
         search_ok: Vec<SearchResult>,
         received_filters: std::sync::Mutex<Option<HashMap<String, serde_json::Value>>>,
-        /// Sparse vector captured by `hybrid_search` (None until called).
+        /// Sparse vector captured by `hybrid_search`/`search_grouped` (None until
+        /// called, or if called with no sparse arm).
         received_sparse: std::sync::Mutex<Option<(Vec<u32>, Vec<f32>)>>,
-        /// Which method was last invoked: "search" or "hybrid_search".
+        /// Phrases captured by `hybrid_search`/`search_grouped` (empty until called
+        /// with a non-empty phrase list).
+        received_phrases: std::sync::Mutex<Vec<String>>,
+        /// Which method was last invoked: "search", "hybrid_search", or "search_grouped".
         last_call: std::sync::Mutex<Option<&'static str>>,
+        /// `extra_conditions` captured by whichever method was last invoked.
+        received_conditions: std::sync::Mutex<Option<Vec<Condition>>>,
     }
 
     impl MockRetrievalStore {
@@ -1233,7 +1692,9 @@ mod tests {
                 search_ok: results,
                 received_filters: std::sync::Mutex::new(None),
                 received_sparse: std::sync::Mutex::new(None),
+                received_phrases: std::sync::Mutex::new(Vec::new()),
                 last_call: std::sync::Mutex::new(None),
+                received_conditions: std::sync::Mutex::new(None),
             }
         }
         fn with_search_err(msg: &str) -> Self {
@@ -1242,7 +1703,9 @@ mod tests {
                 search_ok: Vec::new(),
                 received_filters: std::sync::Mutex::new(None),
                 received_sparse: std::sync::Mutex::new(None),
+                received_phrases: std::sync::Mutex::new(Vec::new()),
                 last_call: std::sync::Mutex::new(None),
+                received_conditions: std::sync::Mutex::new(None),
             }
         }
     }
@@ -1253,10 +1716,12 @@ mod tests {
             _collection: &str,
             _vector: Vec<f32>,
             filters: HashMap<String, serde_json::Value>,
+            extra_conditions: Vec<Condition>,
             _limit: u64,
         ) -> anyhow::Result<Vec<SearchResult>> {
             *self.last_call.lock().unwrap() = Some("search");
             *self.received_filters.lock().unwrap() = Some(filters);
+            *self.received_conditions.lock().unwrap() = Some(extra_conditions);
             if let Some(ref msg) = self.search_err {
                 anyhow::bail!("{}", msg);
             }
@@ -1267,39 +1732,87 @@ mod tests {
             &self,
             _collection: &str,
             _dense: Vec<f32>,
-            sparse: (Vec<u32>, Vec<f32>),
+            sparse: Option<(Vec<u32>, Vec<f32>)>,
+            phrases: &[String],
             filters: HashMap<String, serde_json::Value>,
+            extra_conditions: Vec<Condition>,
             _limit: u64,
             _rrf_candidates: u64,
             _explain: bool,
         ) -> anyhow::Result<Vec<SearchResult>> {
             *self.last_call.lock().unwrap() = Some("hybrid_search");
             *self.received_filters.lock().unwrap() = Some(filters);
-            *self.received_sparse.lock().unwrap() = Some(sparse);
+            *self.received_sparse.lock().unwrap() = sparse;
+            *self.received_phrases.lock().unwrap() = phrases.to_vec();
+            *self.received_conditions.lock().unwrap() = Some(extra_conditions);
             if let Some(ref msg) = self.search_err {
                 anyhow::bail!("{}", msg);
             }
             Ok(self.search_ok.clone())
         }
+
+        async fn search_grouped(
+            &self,
+            _collection: &str,
+            _vector: Vec<f32>,
+            sparse: Option<(Vec<u32>, Vec<f32>)>,
+            phrases: &[String],
+            filters: HashMap<String, serde_json::Value>,
+            extra_conditions: Vec<Condition>,
+            _group_by: &str,
+            _group_size: u64,
+            limit: u64,
+            _rrf_candidates: u64,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            *self.last_call.lock().unwrap() = Some("search_grouped");
+            *self.received_filters.lock().unwrap() = Some(filters);
+            *self.received_sparse.lock().unwrap() = sparse;
+            *self.received_phrases.lock().unwrap() = phrases.to_vec();
+            *self.received_conditions.lock().unwrap() = Some(extra_conditions);
+            if let Some(ref msg) = self.search_err {
+                anyhow::bail!("{}", msg);
+            }
+            // Real Qdrant never returns more groups than the requested `limit` —
+            // match that here so a test that over-configures `search_ok` still
+            // reflects the (possibly over-fetched) count `search_grouped` actually
+            // asked for, rather than silently handing back everything preconfigured.
+            let mut results = self.search_ok.clone();
+            results.truncate(limit as usize);
+            Ok(results)
+        }
     }
 
-    /// `DocumentIndex` mock for `get_document`'s fuzzy-fallback tests. Only
-    /// `all_paths` is on that code path — `query_documents` backs `list_documents`
-    /// instead and is unused here, so it stubs out rather than duplicating
-    /// `state.rs`'s real query logic.
+    /// `DocumentIndex` mock for `get_document`'s fuzzy-fallback tests and
+    /// `search_grouped`'s hydration tests.
     struct MockDocumentIndex {
         paths: Vec<String>,
         err: Option<String>,
+        /// Summaries `get_summaries_by_paths` filters down to the requested paths —
+        /// `query_documents` and `all_paths` don't need this, so it stays empty for
+        /// the fuzzy-fallback tests that only ever construct `with_paths`/`with_err`.
+        summaries: Vec<DocumentSummary>,
     }
 
     impl MockDocumentIndex {
         fn with_paths(paths: Vec<String>) -> Self {
-            Self { paths, err: None }
+            Self {
+                paths,
+                err: None,
+                summaries: Vec::new(),
+            }
         }
         fn with_err(msg: &str) -> Self {
             Self {
                 paths: Vec::new(),
                 err: Some(msg.to_string()),
+                summaries: Vec::new(),
+            }
+        }
+        fn with_summaries(summaries: Vec<DocumentSummary>) -> Self {
+            Self {
+                paths: Vec::new(),
+                err: None,
+                summaries,
             }
         }
     }
@@ -1317,6 +1830,22 @@ mod tests {
                 anyhow::bail!("{}", msg);
             }
             Ok(self.paths.clone())
+        }
+
+        async fn get_summaries_by_paths(
+            &self,
+            paths: &[String],
+            _fields: Option<&[String]>,
+        ) -> anyhow::Result<Vec<DocumentSummary>> {
+            if let Some(ref msg) = self.err {
+                anyhow::bail!("{}", msg);
+            }
+            Ok(self
+                .summaries
+                .iter()
+                .filter(|s| paths.contains(&s.file_path))
+                .cloned()
+                .collect())
         }
     }
 
@@ -1348,9 +1877,11 @@ mod tests {
             min_score: None,
             hybrid: false,
             rrf_candidates: 50,
+            phrase: false,
             explain: false,
             modified_after: None,
             modified_before: None,
+            path_prefix: None,
             rerank_candidate_limit: None,
             // Off by default in this shared test fixture, even though the shipped
             // config default is `Some(3)` — existing tests built on `default_opts()`
@@ -1361,68 +1892,416 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // path_prefix over-fetch / path_prefix_truncated (pure, no network)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn path_prefix_fetch_limit_multiplies_and_caps() {
+        assert_eq!(path_prefix_fetch_limit(10, Some("x")), 50);
+        assert_eq!(
+            path_prefix_fetch_limit(200, Some("x")),
+            PATH_PREFIX_OVERFETCH_CEILING,
+            "a large base fetch_limit must still be capped at the ceiling"
+        );
+        assert_eq!(
+            path_prefix_fetch_limit(10, None),
+            10,
+            "no path_prefix means no over-fetch at all"
+        );
+    }
+
+    #[test]
+    fn path_prefix_truncated_true_when_overfetch_saturated_and_short_of_limit() {
+        // 10 hits came back for a 10-slot over-fetched page (saturated — no proof
+        // the corpus doesn't hold more), and only 3 of those survived the retain,
+        // short of the caller's limit of 5.
+        assert!(path_prefix_truncated(Some("x"), 5, 10, 10, 3));
+    }
+
+    #[test]
+    fn path_prefix_truncated_false_when_the_fetch_proved_exhaustion() {
+        // Qdrant returned fewer hits (3) than the over-fetched limit (10) — there
+        // was genuinely nothing more to find, so a post-retain shortfall against
+        // `limit` is proven benign rather than a possible blind spot.
+        assert!(!path_prefix_truncated(Some("x"), 5, 10, 3, 3));
+    }
+
+    #[test]
+    fn path_prefix_truncated_false_when_enough_results_survived_the_retain() {
+        assert!(!path_prefix_truncated(Some("x"), 5, 10, 10, 5));
+    }
+
+    #[test]
+    fn path_prefix_truncated_false_with_no_path_prefix() {
+        assert!(!path_prefix_truncated(None, 5, 10, 10, 3));
+    }
+
+    // ------------------------------------------------------------------
     // search() unit tests with mocks
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn search_filters_passed_through() {
+    async fn search_path_prefix_truncated_set_when_overfetch_is_saturated() {
+        // limit=2, no reranker, so fetch_limit = path_prefix_fetch_limit(2) = 10.
+        // Qdrant hands back exactly 10 hits (the full over-fetched page — saturated),
+        // of which only 1 matches the prefix: fewer than `limit` survive the retain,
+        // and the saturated fetch means that shortfall is not provably exhaustive.
+        let mut results: Vec<SearchResult> = (0..9)
+            .map(|i| make_result_for(&format!("skip/{i}.md"), 0.9 - i as f32 * 0.01))
+            .collect();
+        results.push(make_result_for("keep/only.md", 0.1));
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 2,
+            path_prefix: Some("keep/".to_string()),
+            ..default_opts()
+        };
+        let outcome = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        assert!(
+            outcome.path_prefix_truncated,
+            "10 hits filling a 10-slot over-fetched page proves nothing about \
+             whether more prefix matches exist beyond it"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_path_prefix_truncated_clear_when_fetch_was_exhaustive() {
+        // limit=5, no reranker, so fetch_limit = path_prefix_fetch_limit(5) = 25.
+        // Qdrant returns only 2 hits total — nowhere near the 25-slot page — so the
+        // fetch is proven exhaustive even though only 1 result survives the retain.
+        let results = vec![
+            make_result_for("keep/a.md", 0.9),
+            make_result_for("skip/b.md", 0.8),
+        ];
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 5,
+            path_prefix: Some("keep/".to_string()),
+            ..default_opts()
+        };
+        let outcome = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        assert!(
+            !outcome.path_prefix_truncated,
+            "Qdrant returned far fewer hits than the over-fetch limit — exhaustion \
+             is proven, so the shortfall must not be reported as truncation"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // path_prefix_truncated interaction with later result-shrinking stages
+    // ------------------------------------------------------------------
+    //
+    // `path_prefix_truncated` is computed right after the path_prefix retain —
+    // strictly before min_score filtering, reranking, and the diversity cap
+    // ever run. Each pair below fixes the SAME pre-shrink saturation/exhaustion
+    // state as the two tests just above, then adds one later stage that shrinks
+    // (even to zero) the results that stage sees. The flag must track only the
+    // pre-shrink state, in both directions.
+
+    fn make_result_with_content(file_path: &str, score: f32, content: &str) -> SearchResult {
+        let mut r = make_result_for(file_path, score);
+        r.payload
+            .insert("content".into(), serde_json::json!(content));
+        r
+    }
+
+    #[tokio::test]
+    async fn search_path_prefix_truncated_stays_true_despite_min_score_emptying_the_page() {
+        // Same saturated setup as `..._true_when_overfetch_is_saturated` above,
+        // but min_score now removes the one surviving "keep" result entirely.
+        let mut results: Vec<SearchResult> = (0..9)
+            .map(|i| make_result_for(&format!("skip/{i}.md"), 0.9 - i as f32 * 0.01))
+            .collect();
+        results.push(make_result_for("keep/only.md", 0.1));
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 2,
+            min_score: Some(0.5),
+            path_prefix: Some("keep/".to_string()),
+            ..default_opts()
+        };
+        let outcome = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.results.is_empty(),
+            "min_score should have dropped the one keep/ result"
+        );
+        assert!(
+            outcome.path_prefix_truncated,
+            "the saturated over-fetch is still unresolved; min_score emptying the \
+             page afterward must not clear the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_path_prefix_truncated_stays_false_despite_min_score_dropping_below_limit() {
+        // limit=2, fetch_limit=10 (saturated: exactly 10 raw hits fill the
+        // over-fetched page). Three "keep/" results survive the prefix retain —
+        // already >= limit, so the flag is correctly false BEFORE min_score
+        // ever runs, regardless of the saturation. min_score then knocks two of
+        // the three below the floor, leaving only one — below `limit`. A flag
+        // computed from the post-min_score count instead of the post-retain
+        // count would wrongly flip this to true.
+        let mut results: Vec<SearchResult> = (0..7)
+            .map(|i| make_result_for(&format!("skip/{i}.md"), 0.5 - i as f32 * 0.01))
+            .collect();
+        results.push(make_result_for("keep/a.md", 0.9));
+        results.push(make_result_for("keep/b.md", 0.5));
+        results.push(make_result_for("keep/c.md", 0.1));
+        assert_eq!(
+            results.len(),
+            10,
+            "must exactly saturate the over-fetched page"
+        );
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 2,
+            min_score: Some(0.6),
+            path_prefix: Some("keep/".to_string()),
+            ..default_opts()
+        };
+        let outcome = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.results.len(),
+            1,
+            "min_score should have knocked out keep/b.md and keep/c.md"
+        );
+        assert!(
+            !outcome.path_prefix_truncated,
+            "three keep/ results already survived the retain — enough to satisfy \
+             limit — before min_score thinned them further; that later thinning \
+             must not spuriously set the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_path_prefix_truncated_stays_false_despite_diversity_thinning_survivors_below_limit()
+     {
+        // limit=2, fetch_limit=10 (saturated: exactly 10 raw hits). Both
+        // "keep/only.md" hits survive the prefix retain, already satisfying
+        // `limit` on their own — a correctly-false case BEFORE diversity ever
+        // runs, regardless of the saturation. They share one file_path, so a
+        // diversity cap of 1 thins them to 1 — below `limit`. A flag computed
+        // from the post-diversity count instead of the post-retain count would
+        // wrongly flip this to true.
+        let mut results: Vec<SearchResult> = (0..8)
+            .map(|i| make_result_for(&format!("skip/{i}.md"), 0.5 - i as f32 * 0.01))
+            .collect();
+        results.push(make_result_for("keep/only.md", 0.9));
+        results.push(make_result_for("keep/only.md", 0.8));
+        assert_eq!(
+            results.len(),
+            10,
+            "must exactly saturate the over-fetched page"
+        );
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 2,
+            path_prefix: Some("keep/".to_string()),
+            diversity_max_per_document: Some(1),
+            ..default_opts()
+        };
+        let outcome = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.results.len(),
+            1,
+            "the diversity cap should have thinned the two same-document survivors to one"
+        );
+        assert!(
+            !outcome.path_prefix_truncated,
+            "the path_prefix retain already produced enough matches to satisfy limit, \
+             and the fetch was exhaustive — the diversity cap thinning that further \
+             must not turn the flag on"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_path_prefix_truncated_stays_true_despite_diversity_thinning_further() {
+        // Saturated fetch (15 hits filling a 15-slot over-fetched page for
+        // limit=3): only 2 of them match the prefix, short of `limit`, so the
+        // flag is already true before diversity runs. Both survivors share one
+        // file_path, so a diversity cap of 1 thins them further, to 1.
+        let mut results: Vec<SearchResult> = (0..13)
+            .map(|i| make_result_for(&format!("skip/{i}.md"), 0.9 - i as f32 * 0.01))
+            .collect();
+        results.push(make_result_for("keep/only.md", 0.5));
+        results.push(make_result_for("keep/only.md", 0.4));
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            limit: 3,
+            path_prefix: Some("keep/".to_string()),
+            diversity_max_per_document: Some(1),
+            ..default_opts()
+        };
+        let outcome = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        assert!(
+            outcome.path_prefix_truncated,
+            "the saturated over-fetch is still unresolved; the diversity cap thinning \
+             the survivors further must not clear the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_path_prefix_truncated_stays_true_through_the_reranker_branch() {
+        // Same saturated shape as the plain-search "true" test above, but with a
+        // reranker configured — a different code path (rerank_candidate_limit
+        // feeds fetch_limit instead of limit, and results flow through
+        // `reranker.rerank` before the final truncate) that must not recompute
+        // or corrupt a flag already settled before it ever runs.
+        let mut results: Vec<SearchResult> = (0..9)
+            .map(|i| make_result_with_content(&format!("skip/{i}.md"), 0.9 - i as f32 * 0.01, "s"))
+            .collect();
+        results.push(make_result_with_content("keep/only.md", 0.1, "k"));
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 2,
+            rerank_candidate_limit: None,
+            path_prefix: Some("keep/".to_string()),
+            ..default_opts()
+        };
+        let outcome = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        assert!(
+            outcome.path_prefix_truncated,
+            "the saturated over-fetch is still unresolved; taking the reranker \
+             branch must not clear the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_path_prefix_truncated_stays_false_through_the_reranker_branch() {
+        // Same exhaustive shape as the plain-search "false" test above, but with
+        // a reranker configured.
+        let results = vec![
+            make_result_with_content("keep/only.md", 0.9, "k1"),
+            make_result_with_content("keep/only.md", 0.8, "k2"),
+            make_result_with_content("skip/other.md", 0.1, "s"),
+        ];
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 5,
+            rerank_candidate_limit: None,
+            path_prefix: Some("keep/".to_string()),
+            ..default_opts()
+        };
+        let outcome = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.results.len(), 2);
+        assert!(
+            !outcome.path_prefix_truncated,
+            "the fetch was already proven exhaustive; taking the reranker branch \
+             must not spuriously set the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_conditions_passed_through_unchanged() {
+        // `SearchFilters` carries already-lowered Qdrant conditions now — building
+        // and validating them is the caller's job (mcp.rs's rich `filters`, or
+        // web.rs's plain domain/type/tags); `search` itself just ANDs whatever it's
+        // handed onto the query, unexamined.
         let embed = MockEmbedder::ok(vec![0.1, 0.2, 0.3]);
         let store = MockRetrievalStore::with_results(vec![]);
         let gs = make_md_globset();
         let data_path = Path::new("/data");
         let deps = make_deps(&embed, &store, data_path, &gs);
 
+        let conditions = vec![
+            Condition::matches("domain", "engineering".to_string()),
+            Condition::matches("type", "guide".to_string()),
+            Condition::matches("tags", vec!["rust".to_string(), "rag".to_string()]),
+        ];
         let filters = SearchFilters {
-            domain: Some("engineering".to_string()),
-            r#type: Some("guide".to_string()),
-            tags: Some(vec!["rust".to_string(), "rag".to_string()]),
+            conditions: conditions.clone(),
         };
 
         let _ = search(&deps, "query", &filters, &default_opts())
             .await
             .unwrap();
 
-        let received = store.received_filters.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            received.get("domain").and_then(|v| v.as_str()),
-            Some("engineering"),
-            "domain filter should be passed through"
-        );
-        assert_eq!(
-            received.get("type").and_then(|v| v.as_str()),
-            Some("guide"),
-            "type filter should be passed through"
-        );
-        let tags = received
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .expect("tags should be an array");
-        assert_eq!(tags.len(), 2);
-        assert!(tags.iter().any(|t| t.as_str() == Some("rust")));
-        assert!(tags.iter().any(|t| t.as_str() == Some("rag")));
-    }
-
-    #[tokio::test]
-    async fn search_empty_tags_not_sent_as_filter() {
-        let embed = MockEmbedder::ok(vec![0.1]);
-        let store = MockRetrievalStore::with_results(vec![]);
-        let gs = make_md_globset();
-        let data_path = Path::new("/data");
-        let deps = make_deps(&embed, &store, data_path, &gs);
-
-        let filters = SearchFilters {
-            domain: None,
-            r#type: None,
-            tags: Some(vec![]), // empty — should not be sent
-        };
-
-        let _ = search(&deps, "q", &filters, &default_opts()).await.unwrap();
-
-        let received = store.received_filters.lock().unwrap().clone().unwrap();
-        assert!(
-            !received.contains_key("tags"),
-            "empty tags list should not produce a filter key"
-        );
+        let received = store.received_conditions.lock().unwrap().clone().unwrap();
+        assert_eq!(received, conditions);
     }
 
     #[tokio::test]
@@ -1433,17 +2312,7 @@ mod tests {
         let data_path = Path::new("/data");
         let deps = make_deps(&embed, &store, data_path, &gs);
 
-        let result = search(
-            &deps,
-            "query",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &default_opts(),
-        )
-        .await;
+        let result = search(&deps, "query", &SearchFilters::default(), &default_opts()).await;
         assert!(
             matches!(result, Err(SearchError::Embed(_))),
             "embed failure should map to SearchError::Embed"
@@ -1458,17 +2327,7 @@ mod tests {
         let data_path = Path::new("/data");
         let deps = make_deps(&embed, &store, data_path, &gs);
 
-        let result = search(
-            &deps,
-            "query",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &default_opts(),
-        )
-        .await;
+        let result = search(&deps, "query", &SearchFilters::default(), &default_opts()).await;
         assert!(
             matches!(result, Err(SearchError::Search(_))),
             "store failure should map to SearchError::Search"
@@ -1492,18 +2351,10 @@ mod tests {
             min_score: Some(0.6),
             ..default_opts()
         };
-        let returned = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let returned = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
         assert_eq!(returned.len(), 1);
         assert_eq!(returned[0].score, 0.9);
     }
@@ -1521,18 +2372,10 @@ mod tests {
         let data_path = Path::new("/data");
         let deps = make_deps(&embed, &store, data_path, &gs);
 
-        let returned = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &default_opts(),
-        )
-        .await
-        .unwrap();
+        let returned = search(&deps, "q", &SearchFilters::default(), &default_opts())
+            .await
+            .unwrap()
+            .results;
         assert_eq!(returned.len(), 3, "None min_score should keep all results");
     }
 
@@ -1544,18 +2387,10 @@ mod tests {
         let data_path = Path::new("/data");
         let deps = make_deps(&embed, &store, data_path, &gs);
 
-        let returned = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &default_opts(),
-        )
-        .await
-        .unwrap();
+        let returned = search(&deps, "q", &SearchFilters::default(), &default_opts())
+            .await
+            .unwrap()
+            .results;
         assert!(returned.is_empty());
     }
 
@@ -1586,18 +2421,10 @@ mod tests {
             diversity_max_per_document: Some(2),
             ..default_opts()
         };
-        let returned = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let returned = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
 
         assert_eq!(
             file_paths_of(&returned),
@@ -1629,18 +2456,10 @@ mod tests {
             diversity_max_per_document: None,
             ..default_opts()
         };
-        let returned = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let returned = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
 
         assert_eq!(
             file_paths_of(&returned),
@@ -1677,18 +2496,10 @@ mod tests {
             diversity_max_per_document: Some(2),
             ..default_opts()
         };
-        let returned = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let returned = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
 
         assert_eq!(returned.len(), 2, "capped to 2 of the 3 a.md chunks");
         let get_lines = |r: &SearchResult| {
@@ -1729,9 +2540,7 @@ mod tests {
         let deps = make_deps(&embed, &store, data_path, &gs);
 
         let filters = SearchFilters {
-            domain: Some("sysadmin".to_string()),
-            r#type: None,
-            tags: None,
+            conditions: vec![Condition::matches("domain", "sysadmin".to_string())],
         };
 
         let query = "node:ares state.db";
@@ -1761,12 +2570,13 @@ mod tests {
             "sparse vector must come from the raw query"
         );
 
-        // Filters carried into the hybrid path.
-        let received = store.received_filters.lock().unwrap().clone().unwrap();
+        // Filters carried into the hybrid path as extra conditions, not the legacy
+        // filter map (that map now carries only the mtime__gte/mtime__lte sentinels).
+        let received = store.received_conditions.lock().unwrap().clone().unwrap();
         assert_eq!(
-            received.get("domain").and_then(|v| v.as_str()),
-            Some("sysadmin"),
-            "filters must be carried into hybrid_search"
+            received,
+            vec![Condition::matches("domain", "sysadmin".to_string())],
+            "filters must be carried into hybrid_search unchanged"
         );
     }
 
@@ -1781,11 +2591,7 @@ mod tests {
         let _ = search(
             &deps,
             "anything",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
+            &SearchFilters::default(),
             &default_opts(), // hybrid: false
         )
         .await
@@ -1818,24 +2624,176 @@ mod tests {
         let data_path = Path::new("/data");
         let deps = make_deps(&embed, &store, data_path, &gs);
 
-        let results = search(
-            &deps,
-            "ares",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &hybrid_opts(),
-        )
-        .await
-        .unwrap();
+        let results = search(&deps, "ares", &SearchFilters::default(), &hybrid_opts())
+            .await
+            .unwrap()
+            .results;
 
         assert_eq!(results.len(), 2);
         assert_eq!(
             results[0].payload.get("file_path").and_then(|v| v.as_str()),
             Some("sysadmin/ares.md"),
             "hybrid result should surface the keyword chunk first"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // phrase search routing tests
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn search_quoted_span_routes_to_hybrid_search_with_the_phrase_even_when_hybrid_is_off() {
+        let embed = MockEmbedder::ok(vec![0.1, 0.2, 0.3]);
+        let store = MockRetrievalStore::with_results(vec![make_search_result(0.9)]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            phrase: true,
+            ..default_opts() // hybrid: false
+        };
+        let _ = search(
+            &deps,
+            r#"deploy notes for "node:ares" rocm"#,
+            &SearchFilters::default(),
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *store.last_call.lock().unwrap(),
+            Some("hybrid_search"),
+            "a quoted span must route to the fused path independent of hybrid"
+        );
+        assert_eq!(
+            *store.received_phrases.lock().unwrap(),
+            vec!["node:ares".to_string()]
+        );
+        assert!(
+            store.received_sparse.lock().unwrap().is_none(),
+            "hybrid=false must not add a sparse arm even with a phrase present"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_embeds_the_flattened_dequoted_text_not_the_raw_query() {
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = SearchOptions {
+            phrase: true,
+            ..default_opts()
+        };
+        let _ = search(
+            &deps,
+            r#"deploy notes for "node:ares" rocm"#,
+            &SearchFilters::default(),
+            &opts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *embed.last_query.lock().unwrap(),
+            Some("deploy notes for node:ares rocm".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn search_with_phrase_disabled_treats_quotes_as_literal_characters() {
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let query = r#"deploy notes for "node:ares" rocm"#;
+        let opts = SearchOptions {
+            phrase: false,
+            ..default_opts()
+        };
+        let _ = search(&deps, query, &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *embed.last_query.lock().unwrap(),
+            Some(query.to_string()),
+            "phrase: false must leave the raw query — quotes included — untouched"
+        );
+        assert_eq!(
+            *store.last_call.lock().unwrap(),
+            Some("search"),
+            "phrase: false must not add a phrase arm, so this stays the plain dense path"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_unquoted_query_is_unaffected_by_phrase_being_enabled() {
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let query = "deploy notes for node:ares rocm";
+        let opts = SearchOptions {
+            phrase: true,
+            ..default_opts()
+        };
+        let _ = search(&deps, query, &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(*embed.last_query.lock().unwrap(), Some(query.to_string()));
+        assert_eq!(
+            *store.last_call.lock().unwrap(),
+            Some("search"),
+            "no quotes means no phrase, so this must stay the plain dense path"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_grouped_honors_hybrid_and_phrase_like_search_does() {
+        // Part 1's regression: grouped search used to be hard-wired dense-only
+        // regardless of `opts.hybrid`/`opts.phrase`. It must now build the same
+        // arms `search` does.
+        let embed = MockEmbedder::ok(vec![0.1, 0.2, 0.3]);
+        let store = MockRetrievalStore::with_results(vec![make_grouped_hit("a.md", 0.9)]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+        let index = MockDocumentIndex::with_summaries(vec![]);
+
+        let opts = SearchOptions {
+            hybrid: true,
+            phrase: true,
+            ..default_opts()
+        };
+        let _ = search_grouped(
+            &deps,
+            &index,
+            r#"deploy notes for "node:ares" rocm"#,
+            &SearchFilters::default(),
+            &opts,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*store.last_call.lock().unwrap(), Some("search_grouped"));
+        assert!(
+            store.received_sparse.lock().unwrap().is_some(),
+            "hybrid=true must still add a sparse arm at document granularity"
+        );
+        assert_eq!(
+            *store.received_phrases.lock().unwrap(),
+            vec!["node:ares".to_string()]
         );
     }
 
@@ -2132,18 +3090,10 @@ mod tests {
             ..default_opts()
         };
 
-        let results = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
 
         // MockReranker reverses order: last doc gets highest score
         assert_eq!(results.len(), 3);
@@ -2184,18 +3134,10 @@ mod tests {
             ..default_opts()
         };
 
-        let results = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
 
         // Should still return results (fail-soft), in original fused order
         assert_eq!(results.len(), 2);
@@ -2256,18 +3198,10 @@ mod tests {
             ..default_opts()
         };
 
-        let results = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
 
         assert_eq!(
             file_paths_of(&results),
@@ -2293,18 +3227,9 @@ mod tests {
             modified_after: Some(1_000_000),
             ..default_opts()
         };
-        let _ = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let _ = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
 
         let received = store.received_filters.lock().unwrap().clone().unwrap();
         assert!(
@@ -2334,18 +3259,9 @@ mod tests {
             modified_before: Some(2_000_000),
             ..default_opts()
         };
-        let _ = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let _ = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
 
         let received = store.received_filters.lock().unwrap().clone().unwrap();
         assert!(
@@ -2387,18 +3303,10 @@ mod tests {
             rerank_candidate_limit: Some(10),
             ..default_opts()
         };
-        let results = search(
-            &deps,
-            "q",
-            &SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            },
-            &opts,
-        )
-        .await
-        .unwrap();
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
 
         assert!(
             !results.is_empty(),
@@ -2410,6 +3318,151 @@ mod tests {
                 "explain=true + reranker active should set pre_rerank_score on every result"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // search_grouped: query+document granularity
+    // -----------------------------------------------------------------------
+
+    fn make_grouped_hit(file_path: &str, score: f32) -> SearchResult {
+        let mut payload = HashMap::new();
+        payload.insert(
+            "file_path".to_string(),
+            serde_json::json!(format!("/data/{file_path}")),
+        );
+        SearchResult {
+            score,
+            pre_rerank_score: None,
+            dense_score: Some(score),
+            sparse_score: None,
+            phrase_score: None,
+            payload,
+        }
+    }
+
+    fn make_summary(file_path: &str, title: &str) -> DocumentSummary {
+        DocumentSummary {
+            file_path: file_path.to_string(),
+            title: Some(title.to_string()),
+            description: None,
+            mtime: 100,
+            indexed_at: "2024-01-01T00:00:00Z".to_string(),
+            frontmatter: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_grouped_returns_one_row_per_document_hydrated_and_ranked() {
+        // Qdrant's grouped query already collapsed each document to its best chunk;
+        // `search_grouped` must hydrate each with document metadata and preserve
+        // Qdrant's score-descending order through the SQLite round trip.
+        let embed = MockEmbedder::ok(vec![0.1, 0.2]);
+        let store = MockRetrievalStore::with_results(vec![
+            make_grouped_hit("a.md", 0.9),
+            make_grouped_hit("b.md", 0.7),
+        ]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+        let index = MockDocumentIndex::with_summaries(vec![
+            // Deliberately out of score order, to prove `search_grouped` re-sorts by
+            // Qdrant's ranking rather than trusting the index's own row order.
+            make_summary("b.md", "B"),
+            make_summary("a.md", "A"),
+        ]);
+
+        let documents = search_grouped(
+            &deps,
+            &index,
+            "query",
+            &SearchFilters::default(),
+            &default_opts(),
+            None,
+        )
+        .await
+        .unwrap()
+        .documents;
+
+        assert_eq!(documents.len(), 2, "one row per document, not per chunk");
+        assert_eq!(documents[0].summary.file_path, "a.md");
+        assert_eq!(documents[0].score, 0.9);
+        assert_eq!(documents[1].summary.file_path, "b.md");
+        assert_eq!(documents[1].score, 0.7);
+    }
+
+    #[tokio::test]
+    async fn search_grouped_skips_a_hit_missing_from_the_metadata_index() {
+        // The metadata index can transiently lag Qdrant (same caveat as
+        // `get_document`'s fuzzy fallback) — a hit with no matching summary is
+        // dropped rather than fabricated or panicking.
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(vec![make_grouped_hit("gone.md", 0.9)]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+        let index = MockDocumentIndex::with_summaries(vec![]);
+
+        let documents = search_grouped(
+            &deps,
+            &index,
+            "query",
+            &SearchFilters::default(),
+            &default_opts(),
+            None,
+        )
+        .await
+        .unwrap()
+        .documents;
+
+        assert!(documents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_grouped_truncates_to_limit() {
+        // `path_prefix` over-fetches (up to `limit * 5`, capped) before filtering
+        // by prefix, so it is easy for more than `opts.limit` documents to survive
+        // the prefix/min_score filters. `search_grouped` must still cap its final
+        // output at `opts.limit`, the same way chunk-granularity `search` does.
+        let embed = MockEmbedder::ok(vec![0.1, 0.2]);
+        let store = MockRetrievalStore::with_results(vec![
+            make_grouped_hit("docs/a.md", 0.9),
+            make_grouped_hit("docs/b.md", 0.8),
+            make_grouped_hit("docs/c.md", 0.7),
+            make_grouped_hit("docs/d.md", 0.6),
+            make_grouped_hit("docs/e.md", 0.5),
+        ]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+        let index = MockDocumentIndex::with_summaries(vec![
+            make_summary("docs/a.md", "A"),
+            make_summary("docs/b.md", "B"),
+            make_summary("docs/c.md", "C"),
+            make_summary("docs/d.md", "D"),
+            make_summary("docs/e.md", "E"),
+        ]);
+
+        let mut opts = default_opts();
+        opts.limit = 2;
+        opts.path_prefix = Some("docs/".to_string());
+
+        let documents = search_grouped(
+            &deps,
+            &index,
+            "query",
+            &SearchFilters::default(),
+            &opts,
+            None,
+        )
+        .await
+        .unwrap()
+        .documents;
+
+        assert_eq!(
+            documents.len(),
+            2,
+            "search_grouped must truncate to opts.limit like search() does"
+        );
     }
 
     // -----------------------------------------------------------------------

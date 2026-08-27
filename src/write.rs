@@ -101,9 +101,13 @@ pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
         hybrid: false,
         // Unused in the dense-only path, which performs no RRF fusion.
         rrf_candidates: 0,
+        // Same reasoning as `hybrid` above: phrase matching adds a third fused
+        // arm, which this dense-only comparison has no use for.
+        phrase: false,
         explain: false,
         modified_after: None,
         modified_before: None,
+        path_prefix: None,
         rerank_candidate_limit: None,
         // The dedup gate wants the single closest existing chunk, full stop — not
         // a diversified page of results (limit: 1 above makes a per-document cap
@@ -706,11 +710,7 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                 rel_path
             );
         } else {
-            let empty_filters = SearchFilters {
-                domain: None,
-                r#type: None,
-                tags: None,
-            };
+            let empty_filters = SearchFilters::default();
             // Detach the reranker: `dedup_threshold` is a cosine similarity, and a
             // cross-encoder relevance score is not comparable to it.
             let dedup_deps = RetrievalDeps {

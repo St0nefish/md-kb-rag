@@ -616,8 +616,9 @@ async fn run_search<E: QueryEmbedder, Q: RetrievalStore>(
     filters: &SearchFilters,
     opts: &SearchOptions,
 ) -> Result<Vec<ApiSearchResult>, retrieval::SearchError> {
-    let results = retrieval::search(deps, query, filters, opts).await?;
-    Ok(results
+    let outcome = retrieval::search(deps, query, filters, opts).await?;
+    Ok(outcome
+        .results
         .iter()
         .map(|r| to_api_result(r, deps.data_path))
         .collect())
@@ -637,6 +638,16 @@ fn search_error_response(err: &retrieval::SearchError) -> (StatusCode, serde_jso
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 serde_json::json!({"error": "search query failed"}),
+            )
+        }
+        // Unreachable from this endpoint — `/api/search` only ever calls
+        // `retrieval::search`, never `retrieval::search_grouped` (the only source
+        // of this variant) — kept so this match stays exhaustive if that changes.
+        retrieval::SearchError::Document(e) => {
+            error!("web search: document metadata lookup failed: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": "document metadata lookup failed"}),
             )
         }
     }
@@ -702,21 +713,24 @@ async fn search_handler(
         .min(config.search.max_limit)
         .max(1);
 
-    let filters = SearchFilters {
-        domain: params.domain,
-        r#type: params.r#type,
-        tags,
-    };
-    // Same defaults `KbSearchServer::search` resolves from config — explain and
-    // the mtime range filters are not exposed by this endpoint's query params.
+    let filters = retrieval::plain_search_filters(
+        params.domain.as_deref(),
+        params.r#type.as_deref(),
+        tags.as_deref(),
+    );
+    // Same defaults `KbSearchServer::search` resolves from config — explain, the
+    // mtime range filters, and path_prefix are not exposed by this endpoint's query
+    // params.
     let opts = SearchOptions {
         limit,
         min_score: config.search.min_score,
         hybrid: config.search.hybrid,
         rrf_candidates: config.search.rrf_candidates as u64,
+        phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
         explain: false,
         modified_after: None,
         modified_before: None,
+        path_prefix: None,
         rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
         diversity_max_per_document: config.search.diversity_max_per_document,
     };
@@ -1435,6 +1449,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use qdrant_client::qdrant::Condition;
     use std::collections::HashMap;
     use std::sync::RwLock;
     use tower::ServiceExt;
@@ -1524,6 +1539,7 @@ mod tests {
             _collection: &str,
             _vector: Vec<f32>,
             _filters: HashMap<String, serde_json::Value>,
+            _extra_conditions: Vec<Condition>,
             _limit: u64,
         ) -> anyhow::Result<Vec<SearchResult>> {
             Ok(self.0.clone())
@@ -1533,11 +1549,29 @@ mod tests {
             &self,
             _collection: &str,
             _dense: Vec<f32>,
-            _sparse: (Vec<u32>, Vec<f32>),
+            _sparse: Option<(Vec<u32>, Vec<f32>)>,
+            _phrases: &[String],
             _filters: HashMap<String, serde_json::Value>,
+            _extra_conditions: Vec<Condition>,
             _limit: u64,
             _rrf_candidates: u64,
             _explain: bool,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            Ok(self.0.clone())
+        }
+
+        async fn search_grouped(
+            &self,
+            _collection: &str,
+            _vector: Vec<f32>,
+            _sparse: Option<(Vec<u32>, Vec<f32>)>,
+            _phrases: &[String],
+            _filters: HashMap<String, serde_json::Value>,
+            _extra_conditions: Vec<Condition>,
+            _group_by: &str,
+            _group_size: u64,
+            _limit: u64,
+            _rrf_candidates: u64,
         ) -> anyhow::Result<Vec<SearchResult>> {
             Ok(self.0.clone())
         }
@@ -1555,9 +1589,11 @@ mod tests {
             min_score: None,
             hybrid: false,
             rrf_candidates: 50,
+            phrase: false,
             explain: false,
             modified_after: None,
             modified_before: None,
+            path_prefix: None,
             rerank_candidate_limit: None,
             diversity_max_per_document: None,
         }
@@ -1736,6 +1772,7 @@ mod tests {
             pre_rerank_score: None,
             dense_score: None,
             sparse_score: None,
+            phrase_score: None,
             payload,
         };
 
@@ -1751,11 +1788,7 @@ mod tests {
             include_patterns: &include,
             reranker: None,
         };
-        let filters = SearchFilters {
-            domain: None,
-            r#type: None,
-            tags: None,
-        };
+        let filters = SearchFilters::default();
 
         let results = run_search(&deps, "query", &filters, &default_opts())
             .await
@@ -1776,6 +1809,7 @@ mod tests {
             pre_rerank_score: None,
             dense_score: None,
             sparse_score: None,
+            phrase_score: None,
             payload: HashMap::new(),
         };
         let embed = MockEmbedder(vec![0.1]);
@@ -1790,11 +1824,7 @@ mod tests {
             include_patterns: &include,
             reranker: None,
         };
-        let filters = SearchFilters {
-            domain: None,
-            r#type: None,
-            tags: None,
-        };
+        let filters = SearchFilters::default();
 
         let results = run_search(&deps, "query", &filters, &default_opts())
             .await

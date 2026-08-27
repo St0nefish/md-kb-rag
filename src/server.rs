@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,11 +24,12 @@ use tower_governor::{
 use tracing::{debug, info, warn};
 
 use crate::config::{self, FrontmatterConfig, ResolvedConfig, SharedConfig};
+use crate::descriptions;
 use crate::embed::EmbedClient;
 use crate::git;
 use crate::ingest;
-use crate::mcp::{self, KbSearchServer};
-use crate::qdrant::{IndexedField, QdrantStore};
+use crate::mcp::KbSearchServer;
+use crate::qdrant::QdrantStore;
 use crate::rerank::RerankClient;
 use crate::schema::{self, SchemaCache};
 use crate::webhook::{self, WebhookState};
@@ -966,21 +968,6 @@ fn mcp_transport_config(
     }
 }
 
-/// Payload fields to index at server startup.
-///
-/// Mirrors what `ingest::index_paths` registers, so a server that boots before the
-/// first index run still creates the right indexes for every scope's declared fields.
-fn indexed_fields_for(config: &ResolvedConfig, schemas: &SchemaCache) -> Vec<IndexedField> {
-    let mut fields = schemas.all_indexed_fields();
-    for name in config.effective_indexed_fields() {
-        if !fields.iter().any(|f| f.name == name) {
-            fields.push(IndexedField::keyword(name));
-        }
-    }
-    fields.sort_by(|a, b| a.name.cmp(&b.name));
-    fields
-}
-
 /// Sanitize a single facet value before embedding it into MCP instructions.
 ///
 /// - Replaces control characters (including newlines and tabs) with a single space.
@@ -1008,26 +995,25 @@ pub(crate) fn sanitize_facet_value(s: &str) -> String {
 
 /// Build the write-authoring section of MCP instructions from frontmatter config.
 ///
-/// Always names the write tools so agents know they exist. Conditionally adds:
+/// Does NOT name any tool — `tools/list` already transmits tool names and
+/// descriptions as structured data, so naming them here again would be a tool
+/// tour that inevitably drifts (this function used to open with a sentence
+/// naming `create_document`/`edit_document`, both long gone). What this
+/// function generates is genuinely config-derived and belongs nowhere else:
 /// - A "Required frontmatter fields" line when `frontmatter.required` is non-empty.
 /// - Per-field "must be one of" clauses for every entry in `frontmatter.allowed`,
 ///   iterated in stable (sorted) order so output is deterministic.
+/// - The "do NOT write a `domain` field" rule, unconditionally — see its own
+///   comment below for why that one is a real mechanic, not authoring advice.
 ///
 /// This section is APPENDED to any base instructions (custom or default), so a
 /// custom `mcp.instructions` override cannot suppress the authoring guidance.
 pub fn build_authoring_section(frontmatter: &FrontmatterConfig) -> String {
-    let mut s = String::new();
-
-    s.push_str(
-        "\n\nWriting documents: use create_document (new file), \
-         edit_document (modify — surgical old_string/new_string or full content), \
-         and delete_document (remove). \
-         New/edited documents must include valid YAML frontmatter.",
-    );
+    let mut lines: Vec<String> = Vec::new();
 
     if !frontmatter.required.is_empty() {
-        s.push_str(&format!(
-            "\nRequired frontmatter fields: {}.",
+        lines.push(format!(
+            "Required frontmatter fields: {}.",
             frontmatter.required.join(", ")
         ));
     }
@@ -1041,13 +1027,14 @@ pub fn build_authoring_section(frontmatter: &FrontmatterConfig) -> String {
             .into_iter()
             .map(|(field, values)| format!("{field} must be one of: {}", values.join(", ")))
             .collect();
-        s.push_str(&format!("\nFixed-value fields — {}.", clauses.join("; ")));
+        lines.push(format!("Fixed-value fields — {}.", clauses.join("; ")));
     }
 
     if !frontmatter.required.is_empty() || !frontmatter.allowed.is_empty() {
-        s.push_str(
-            "\nOther fields (e.g. tags) are open; \
-             see the \"Available ...\" lines above for values already in use.",
+        lines.push(
+            "Other fields (e.g. tags) are open; see the \"Available ...\" lines above \
+             for values already in use."
+                .to_string(),
         );
     }
 
@@ -1058,13 +1045,14 @@ pub fn build_authoring_section(frontmatter: &FrontmatterConfig) -> String {
     // resulting `domain:` key is invisible to search but fails the knowledge base's own
     // frontmatter lint, so an MCP-authored document plants a pre-commit failure that
     // surfaces later in an unrelated commit.
-    s.push_str(
-        "\nDo NOT write a `domain` field. It is derived from the document's top-level \
+    lines.push(
+        "Do NOT write a `domain` field. It is derived from the document's top-level \
          folder — putting the file in the right directory is what sets it. It remains a \
-         search filter, but authoring it is an error.",
+         search filter, but authoring it is an error."
+            .to_string(),
     );
 
-    s
+    format!("\n\n{}", lines.join("\n"))
 }
 
 /// Top-level folder names, which are what the knowledge base's areas actually are now
@@ -1117,7 +1105,8 @@ async fn build_instructions(
     if !areas.is_empty() {
         instructions.push_str(&format!(
             "\nTop-level areas of this knowledge base: {}. \
-             Use list_documents with path_prefix to enumerate one.",
+             Use search with path_prefix (and no query, for an exhaustive listing) \
+             to enumerate one.",
             areas.join(", ")
         ));
     }
@@ -1206,6 +1195,80 @@ async fn build_instructions(
 
     instructions.push_str(&build_authoring_section(frontmatter));
     instructions
+}
+
+/// Compose the full MCP server instructions for the current config/corpus —
+/// the compiled mechanics and config-derived retrieval-mode sentence
+/// (`descriptions::compose_server_mechanics`), then the corpus-dependent parts
+/// of category 2 ([`build_instructions`]: facet vocabularies, schema scopes,
+/// authoring rules), then the KB's `server.md` extension — or, failing that,
+/// the deprecated `mcp.instructions` — appended last via
+/// `descriptions::append_extension`. See `descriptions.rs`'s module doc for
+/// why the KB extension must come after everything else.
+///
+/// Called once at startup and again on every metadata-refresh tick, so every
+/// input here must be read fresh from `config`/`schemas` rather than captured
+/// once — this is what makes `mcp.extensions_path`, `mcp.instructions`,
+/// `search.hybrid`, and `search.phrase` observe a `POST /admin/reload` within
+/// `mcp.metadata_refresh_secs` instead of requiring a restart.
+async fn compose_server_instructions(
+    config: &ResolvedConfig,
+    qdrant: &QdrantStore,
+    data_path: &Path,
+    schemas: &SchemaCache,
+) -> String {
+    // Effective, not raw: same `config AND confirmed-available` gate the
+    // per-tool overlay below and the search handlers in `mcp.rs` use, so the
+    // instructions never assert quoted-phrase support the server can't back up
+    // (e.g. an older Qdrant that rejected the phrase-matching text index).
+    let phrase_effective =
+        config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available();
+    let mechanics = descriptions::compose_server_mechanics(config.search.hybrid, phrase_effective);
+    let full = build_instructions(
+        &mechanics,
+        qdrant,
+        &config.qdrant.collection,
+        data_path,
+        schemas,
+        &config.frontmatter,
+    )
+    .await;
+
+    // The only filesystem access left in this function: resolving the
+    // extensions directory (a canonicalize of its ancestors) and reading
+    // `server.md` from it, both synchronous. Run off the async executor
+    // thread via `spawn_blocking` — see the refresh loop's doc comment below
+    // for why this matters even though each file is capped at 8 KB.
+    let data_path_owned = data_path.to_path_buf();
+    let extensions_path = config.mcp.extensions_path.clone();
+    let mcp_instructions = config.mcp.instructions.clone();
+    let effective_extension = tokio::task::spawn_blocking(move || {
+        let extensions_dir =
+            descriptions::resolve_extensions_dir(&data_path_owned, &extensions_path);
+        let file_extension = descriptions::load_server_extension(extensions_dir.as_deref());
+        descriptions::effective_server_extension(file_extension, mcp_instructions.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| {
+        // Degrade the same way `read_extension_body` degrades any other
+        // unreadable/missing extension: never fail a refresh tick over this.
+        warn!("extension-loading blocking task panicked: {e}");
+        None
+    });
+    descriptions::append_extension(&full, effective_extension.as_deref())
+}
+
+/// Compose the current per-tool description overlay — every tool's compiled
+/// base, the phrase-syntax sentence when applicable, then that tool's
+/// `tools/<tool>.md` extension from the KB. Called once at startup and again
+/// on every metadata-refresh tick, same reload contract as
+/// [`compose_server_instructions`].
+fn compose_tool_overlay(config: &ResolvedConfig, data_path: &Path) -> HashMap<String, String> {
+    let extensions_dir =
+        descriptions::resolve_extensions_dir(data_path, &config.mcp.extensions_path);
+    let phrase_effective =
+        config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available();
+    descriptions::compose_tool_descriptions(extensions_dir.as_deref(), phrase_effective)
 }
 
 /// Periodic safety-net sweep loop: sleep for `indexing.reconcile_interval_secs`
@@ -1350,36 +1413,46 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         .ensure_collection(
             &config.qdrant.collection,
             config.embedding.vector_size,
-            &indexed_fields_for(&config, &schemas),
+            &crate::qdrant::all_indexed_fields(&config, &schemas),
+            config.search.phrase,
         )
         .await
         .context("Failed to ensure Qdrant collection")?;
 
-    // Build dynamic MCP instructions
-    let base_instructions = config
-        .mcp
-        .instructions
-        .as_deref()
-        .unwrap_or(mcp::DEFAULT_INSTRUCTIONS);
-    // The cascade itself is refreshed by the reindex worker, not by this call or the
-    // timer below — both now just read whatever `shared_schema_cache` currently
-    // holds. A schema file added after boot is still picked up without a restart,
-    // just via the worker's dirty-path detection instead of a walk here.
-    let initial_instructions = build_instructions(
-        base_instructions,
-        &qdrant,
-        &config.qdrant.collection,
-        &instructions_data_path,
-        &schemas,
-        &config.frontmatter,
-    )
-    .await;
+    // Build dynamic MCP instructions and the per-tool description overlay —
+    // see `descriptions.rs` for the three-layer composition this implements
+    // (compiled mechanics, config-derived sentences, KB extension). The
+    // cascade itself is refreshed by the reindex worker, not by this call or
+    // the timer below — both now just read whatever `shared_schema_cache`
+    // currently holds. A schema file added after boot is still picked up
+    // without a restart, just via the worker's dirty-path detection instead of
+    // a walk here.
+    let initial_instructions =
+        compose_server_instructions(&config, &qdrant, &instructions_data_path, &schemas).await;
     let shared_instructions = Arc::new(RwLock::new(initial_instructions));
+
+    let initial_overlay = compose_tool_overlay(&config, &instructions_data_path);
+    let shared_description_overlay = Arc::new(RwLock::new(initial_overlay));
+
+    // One-time startup advisories for `mcp.instructions`/`mcp.extensions_path` —
+    // see their doc comments in `descriptions.rs` for why these do NOT
+    // re-log on every refresh tick (the composed content itself still updates
+    // every tick regardless; only the advisory logging is startup-only).
+    let startup_extensions_dir =
+        descriptions::resolve_extensions_dir(&instructions_data_path, &config.mcp.extensions_path);
+    let startup_file_extension_present =
+        descriptions::load_server_extension(startup_extensions_dir.as_deref()).is_some();
+    descriptions::log_instructions_deprecation(
+        config.mcp.instructions.as_deref(),
+        startup_file_extension_present,
+        &config.mcp.extensions_path,
+    );
+    descriptions::log_absolute_extensions_path_advisory(&config.mcp.extensions_path);
 
     // Spawn metadata refresh task
     let refresh_instructions = Arc::clone(&shared_instructions);
+    let refresh_overlay = Arc::clone(&shared_description_overlay);
     let refresh_qdrant = Arc::clone(&qdrant);
-    let refresh_collection = config.qdrant.collection.clone();
     let refresh_data_path = instructions_data_path.clone();
     let refresh_schema_cache = Arc::clone(&shared_schema_cache);
     // Live handle, not a captured `mcp.instructions`/`frontmatter`/
@@ -1441,8 +1514,14 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
             // This used to re-walk the whole KB (in `spawn_blocking`, since a
             // recursive read_dir is blocking filesystem work) on every tick. Now it
             // just reads whatever the reindex worker last swapped in — a lock
-            // acquisition and an `Arc` clone, no filesystem access at all. The timer
-            // still polls rather than being woken by the worker: `build_instructions`
+            // acquisition and an `Arc` clone — for the corpus-dependent parts.
+            // `compose_server_instructions`/`compose_tool_overlay` below still do
+            // their own small, synchronous `std::fs::read`/`canonicalize` to load
+            // the KB's `server.md`/`tools/<tool>.md` extension files; each is capped
+            // at 8 KB (see `descriptions::MAX_EXTENSION_BODY_BYTES`), so the impact
+            // of running it on this async task's thread is low, and the read itself
+            // is wrapped in `spawn_blocking` to keep it off the executor regardless.
+            // The timer still polls rather than being woken by the worker: `build_instructions`
             // also re-fetches Qdrant facet values (tag/type/domain vocabularies),
             // which drift with ordinary indexing independent of any schema change, so
             // something has to poll regardless — collapsing this into a
@@ -1450,33 +1529,46 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
             // facet-drift case, for the cost of a second notification channel.
             //
             // Read again (post-sleep) rather than reusing the pre-sleep snapshot
-            // above: a reload may have landed during the sleep, and `mcp.instructions`
-            // / `frontmatter` should reflect whatever is live AT refresh time, not
-            // whatever was live when this iteration started waiting.
+            // above: a reload may have landed during the sleep, and
+            // `mcp.instructions`/`mcp.extensions_path`/`frontmatter`/`search.*`
+            // should reflect whatever is live AT refresh time, not whatever was
+            // live when this iteration started waiting.
             let live_config = config::load_shared_config(&refresh_shared_config);
-            let base = live_config
-                .mcp
-                .instructions
-                .as_deref()
-                .unwrap_or(mcp::DEFAULT_INSTRUCTIONS);
             let refreshed_schemas = schema::load_shared(&refresh_schema_cache);
-            let updated = build_instructions(
-                base,
+            let updated_instructions = compose_server_instructions(
+                &live_config,
                 &refresh_qdrant,
-                &refresh_collection,
                 &refresh_data_path,
                 &refreshed_schemas,
-                &live_config.frontmatter,
             )
             .await;
             match refresh_instructions.write() {
-                Ok(mut guard) => *guard = updated,
+                Ok(mut guard) => *guard = updated_instructions,
                 Err(poisoned) => {
                     warn!("Instructions RwLock poisoned on write; recovering");
-                    *poisoned.into_inner() = updated;
+                    *poisoned.into_inner() = updated_instructions;
                 }
             }
-            debug!("Refreshed MCP instructions metadata");
+
+            let overlay_config = Arc::clone(&live_config);
+            let overlay_data_path = refresh_data_path.clone();
+            let updated_overlay = tokio::task::spawn_blocking(move || {
+                compose_tool_overlay(&overlay_config, &overlay_data_path)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                warn!("tool-description overlay blocking task panicked: {e}");
+                HashMap::new()
+            });
+            match refresh_overlay.write() {
+                Ok(mut guard) => *guard = updated_overlay,
+                Err(poisoned) => {
+                    warn!("Description overlay RwLock poisoned on write; recovering");
+                    *poisoned.into_inner() = updated_overlay;
+                }
+            }
+
+            debug!("Refreshed MCP instructions and tool description metadata");
         }
     });
 
@@ -1534,6 +1626,7 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         Arc::clone(&shared_schema_cache),
         rerank_for_mcp,
         Arc::clone(&reindex_queue),
+        Arc::clone(&shared_description_overlay),
     )?;
 
     if !config.mcp.allowed_hosts.is_empty() {
@@ -2742,14 +2835,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut config = mcp::make_test_resolved_config(dir.path());
+        let mut config = crate::mcp::make_test_resolved_config(dir.path());
         Arc::make_mut(&mut config).frontmatter = FrontmatterConfig {
             indexed_fields: vec!["tags".into()],
             ..Default::default()
         };
 
         let schemas = SchemaCache::build(dir.path(), &config.frontmatter);
-        let fields = indexed_fields_for(&config, &schemas);
+        let fields = crate::qdrant::all_indexed_fields(&config, &schemas);
         let named = |n: &str| fields.iter().find(|f| f.name == n);
 
         assert!(named("tags").is_some(), "legacy config field survives");
@@ -2813,6 +2906,59 @@ mod tests {
         assert!(
             !instructions.contains("Available tags"),
             "an undeclared field falls back to facets, which are unreachable here: {instructions}"
+        );
+    }
+
+    // --- compose_server_instructions phrase-flag gating (effective, not raw) ---
+
+    /// Regression: `compose_server_instructions` must gate the phrase-syntax
+    /// sentence on the EFFECTIVE flag (config AND the confirmed-available "text"
+    /// payload index), the same as `compose_tool_overlay` and the search
+    /// handlers in `mcp.rs` — not the raw `config.search.phrase` value. On an
+    /// older Qdrant where the phrase-matching text index failed to build,
+    /// `INDEX_STATUS.phrase_matching_available()` is false; the instructions
+    /// must not then claim quoted-phrase support just because the config flag
+    /// is on.
+    #[tokio::test]
+    async fn compose_server_instructions_respects_effective_phrase_flag_not_raw_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::mcp::make_test_resolved_config(dir.path());
+        Arc::make_mut(&mut config).search.phrase = true;
+
+        let qdrant = QdrantStore::new(&crate::config::ResolvedQdrantConfig {
+            url: "http://127.0.0.1:1".into(),
+            collection: "unused".into(),
+        })
+        .expect("client construction is lazy and must not require a live server");
+        let schemas = SchemaCache::build(dir.path(), &config.frontmatter);
+
+        // This test relies on the fail-safe default rather than mutating the
+        // process-global `INDEX_STATUS` itself: see
+        // `index_paths_records_a_failed_run_in_the_global_status` in `ingest.rs`
+        // for why only one test in the suite is allowed to drive that global,
+        // and nothing in the default (non-`#[ignore]`d) test run ever records a
+        // "text" payload index outcome, so this reads as false throughout.
+        assert!(
+            !crate::status::INDEX_STATUS.phrase_matching_available(),
+            "test relies on the fail-safe default: nothing in this suite records \
+             a 'text' payload index outcome"
+        );
+
+        let instructions =
+            compose_server_instructions(&config, &qdrant, dir.path(), &schemas).await;
+
+        // `retrieval_mode_sentence(true, true)` (the raw-flag, buggy result) is the
+        // only one of the four hybrid x phrase combinations containing "exact
+        // phrase"; `retrieval_mode_sentence(true, false)` (the effective, fixed
+        // result — hybrid stays on, phrase is unavailable) does not.
+        assert!(
+            !instructions.contains("exact phrase"),
+            "phrase syntax must not be advertised when phrase matching is unavailable, \
+             even though config.search.phrase is true: {instructions}"
+        );
+        assert!(
+            instructions.contains(descriptions::retrieval_mode_sentence(true, false)),
+            "instructions must use the hybrid-on/phrase-off sentence: {instructions}"
         );
     }
 
@@ -3175,10 +3321,13 @@ mod tests {
             tmp.path().to_path_buf(),
             &["**/*.md".to_string()],
             instructions,
-            config::shared_config(mcp::make_test_resolved_config(tmp.path())),
-            mcp::empty_test_schema_cache(),
+            config::shared_config(crate::mcp::make_test_resolved_config(tmp.path())),
+            crate::mcp::empty_test_schema_cache(),
             None,
             Arc::new(crate::reindex::ReindexQueue::new()),
+            Arc::new(RwLock::new(descriptions::compose_tool_descriptions(
+                None, false,
+            ))),
         )
         .unwrap();
 
@@ -3281,22 +3430,48 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let names: Vec<&str> = json["result"]["tools"]
+        let tools = json["result"]["tools"]
             .as_array()
-            .expect("tools/list result should contain a tools array")
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        for expected in [
-            "search",
-            "get_document",
-            "create_document",
-            "edit_document",
+            .expect("tools/list result should contain a tools array");
+        let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+
+        // Pins the exact registered set: `list_documents` merged into `search` (one
+        // tool covers both semantic retrieval and exhaustive enumeration now), and
+        // `create_document`/`edit_document`/`move_directory` merged into
+        // `write_document` earlier — so this must be exactly six, not "at least".
+        let mut expected = vec![
             "delete_document",
-        ] {
-            assert!(
-                names.contains(&expected),
-                "expected tool '{expected}' in {names:?}"
+            "get_document",
+            "get_schema",
+            "search",
+            "update_schema",
+            "write_document",
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            names, expected,
+            "registered tool set must be exactly these six"
+        );
+
+        // Every tool's description reaches the real `tools/list` response
+        // composed — not compiled onto the `#[tool(...)]` attribute (there is
+        // none any more), but installed at runtime via the description
+        // overlay `test_mcp_router_with_hosts` builds from
+        // `descriptions::compose_tool_descriptions`. This is the end-to-end
+        // half of the overlay contract; `mcp.rs`'s unit tests exercise
+        // `overlay_description`/`get_tool` directly.
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let description = tool["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("tool '{name}' has no description in tools/list"));
+            let expected_description =
+                crate::descriptions::compose_tool_description(name, false, None)
+                    .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
+            assert_eq!(
+                description, expected_description,
+                "tool '{name}' description should match the composed overlay"
             );
         }
     }
@@ -3417,18 +3592,11 @@ mod tests {
 
         let section = build_authoring_section(&fm);
 
-        // Always names the write tools.
+        // No tool tour — see this function's doc comment. `tools/list` already
+        // transmits tool names as structured data.
         assert!(
-            section.contains("create_document"),
-            "should mention create_document: {section}"
-        );
-        assert!(
-            section.contains("edit_document"),
-            "should mention edit_document: {section}"
-        );
-        assert!(
-            section.contains("delete_document"),
-            "should mention delete_document: {section}"
+            !section.contains("create_document") && !section.contains("edit_document"),
+            "must not name tools that no longer exist: {section}"
         );
 
         // Required fields line.
@@ -3474,18 +3642,11 @@ mod tests {
 
         let section = build_authoring_section(&fm);
 
-        // Write tools always advertised.
+        // The domain rule is unconditional, so the section is never blank even
+        // when required/allowed are both empty.
         assert!(
-            section.contains("create_document"),
-            "should still mention create_document: {section}"
-        );
-        assert!(
-            section.contains("edit_document"),
-            "should still mention edit_document: {section}"
-        );
-        assert!(
-            section.contains("delete_document"),
-            "should still mention delete_document: {section}"
+            section.contains("Do NOT write a `domain` field"),
+            "domain rule should still be present: {section}"
         );
 
         // No required or fixed-value lines when config is empty.
