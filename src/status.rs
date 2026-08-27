@@ -452,6 +452,27 @@ impl IndexStatus {
         });
     }
 
+    /// Whether the phrase-matching text index on the `text` payload field is known
+    /// to be present and working, per the last `ensure_collection` outcome recorded
+    /// via [`Self::record_payload_index`] for `"text"`.
+    ///
+    /// `false` until an outcome has been recorded at all (config disabled, an older
+    /// Qdrant server rejected `phrase_matching`, or `ensure_collection` simply
+    /// hasn't run yet) — the fail-safe default, since sending a phrase filter to a
+    /// server that never confirmed support would error instead of gracefully
+    /// degrading. A caller wanting "disabled for the process lifetime" semantics
+    /// should read this once per request rather than caching it further; it only
+    /// flips back to `true` if a later `ensure_collection` run succeeds, which is
+    /// the same self-healing behavior every other payload index already has.
+    pub fn phrase_matching_available(&self) -> bool {
+        self.read(|inner| {
+            matches!(
+                inner.payload_indexes.get("text"),
+                Some(PayloadIndexState::Ok)
+            )
+        })
+    }
+
     pub fn snapshot(&self) -> StatusSnapshot {
         self.read(|inner| StatusSnapshot {
             indexing: inner.current.is_some(),
@@ -687,6 +708,56 @@ mod tests {
         assert!(!last.success);
         assert_eq!(last.error.as_deref(), Some("qdrant unreachable"));
         assert_eq!(last.mode, RunMode::Full);
+    }
+
+    #[test]
+    fn phrase_matching_available_is_false_before_any_outcome_is_recorded() {
+        // Fail-safe default: nothing has confirmed the phrase-matching text index
+        // exists yet (config disabled, an older Qdrant server rejected it, or
+        // `ensure_collection` just hasn't run), so a caller must not attempt a
+        // phrase arm against a server that never confirmed support.
+        let s = IndexStatus::new();
+        assert!(!s.phrase_matching_available());
+    }
+
+    #[test]
+    fn phrase_matching_available_true_after_a_successful_index_creation() {
+        let s = IndexStatus::new();
+        s.record_payload_index("text", None);
+        assert!(s.phrase_matching_available());
+    }
+
+    #[test]
+    fn phrase_matching_available_false_after_a_failed_index_creation() {
+        // Models an older Qdrant server rejecting `phrase_matching` —
+        // `ensure_collection` records the failure and must not fail startup over
+        // it; this is what then keeps phrase matching disabled for the process.
+        let s = IndexStatus::new();
+        s.record_payload_index("text", Some("phrase_matching is not supported".into()));
+        assert!(!s.phrase_matching_available());
+    }
+
+    #[test]
+    fn phrase_matching_available_flips_back_on_a_later_success() {
+        // Same self-healing behavior every other payload index already has: a
+        // later successful `ensure_collection` run clears a previous failure
+        // rather than looking permanently broken.
+        let s = IndexStatus::new();
+        s.record_payload_index("text", Some("old server".into()));
+        assert!(!s.phrase_matching_available());
+        s.record_payload_index("text", None);
+        assert!(s.phrase_matching_available());
+    }
+
+    #[test]
+    fn phrase_matching_available_is_unaffected_by_other_fields_failing() {
+        let s = IndexStatus::new();
+        s.record_payload_index("text", None);
+        s.record_payload_index("tags", Some("wrong index type".into()));
+        assert!(
+            s.phrase_matching_available(),
+            "an unrelated field's failure must not affect the text index's own status"
+        );
     }
 
     #[test]

@@ -444,6 +444,18 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
              built (server.rs mcp_transport_config, invoked once from run_server).",
         );
     }
+    if old.mcp.extensions_path != new.mcp.extensions_path {
+        r.record(
+            ReloadEffect::Applied,
+            "mcp.extensions_path",
+            d(&old.mcp.extensions_path),
+            d(&new.mcp.extensions_path),
+            "the metadata-refresh timer (server.rs run_server) re-resolves this fresh \
+             from the live config every tick and recomposes both the server \
+             instructions and every tool's description overlay from it; takes effect \
+             on the next tick, within mcp.metadata_refresh_secs seconds.",
+        );
+    }
 
     // ── rate_limit ───────────────────────────────────────────────────────────
     // The whole section is restart-required: whether GovernorLayer is even added to

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -7,8 +8,8 @@ use chrono::{DateTime, NaiveDate};
 use anyhow::Context as _;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
-    ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*, schemars,
-    tool, tool_handler, tool_router,
+    ErrorData as McpError, RoleServer, ServerHandler, handler::server::wrapper::Parameters,
+    model::*, schemars, service::RequestContext, tool, tool_handler, tool_router,
 };
 use tracing::{debug, error, warn};
 
@@ -17,7 +18,7 @@ use crate::{
     document_fields,
     embed::EmbedClient,
     git,
-    qdrant::QdrantStore,
+    qdrant::{IndexKind, QdrantStore},
     rerank::RerankClient,
     retrieval::{
         self, DocumentIndexDeps, GetDocumentError, RetrievalDeps, SearchFilters, SearchOptions,
@@ -34,8 +35,6 @@ use crate::{
 const MAX_QUERY_LEN: usize = 4096;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
-const MAX_TAG_COUNT: usize = 20;
-const MAX_TAG_LEN: usize = 256;
 const MAX_CONTENT_LEN: usize = 512 * 1024; // 512 KB
 
 /// Resolve a caller's requested `limit` against the configured default and ceiling.
@@ -416,14 +415,27 @@ fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilte
     use serde_json::Value;
 
     // Scalar values go through the same canonicalization as the write path, so a JSON
-    // `false` matches a stored boolean and `45` matches a stored integer.
+    // `false` matches a stored boolean and `45` matches a stored integer. Also caps
+    // each value's length — master enforced this per-value (domain_too_long_is_rejected
+    // et al.); folding those scalar params into this generic `filters` map must not
+    // lose it, since an unbounded value is still a durable cost against Qdrant/SQLite
+    // regardless of which filter form carried it in.
     let canonical = |value: &Value| -> Result<String, String> {
-        document_fields::canonical_text(value).ok_or_else(|| {
+        let text = document_fields::canonical_text(value).ok_or_else(|| {
             format!(
                 "filter '{}': expected a string, number, or boolean, got {}",
                 field, value
             )
-        })
+        })?;
+        if text.len() > MAX_FILTER_STR_LEN {
+            return Err(format!(
+                "filter '{}': value too long ({} chars, max {})",
+                field,
+                text.len(),
+                MAX_FILTER_STR_LEN
+            ));
+        }
+        Ok(text)
     };
 
     // One place enforces the value cap, so no filter form can slip past it. `all_of`
@@ -524,12 +536,16 @@ fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilte
     }
 }
 
-/// Build a validated [`DocumentQuery`] from tool parameters.
-fn build_document_query(params: &ListDocumentsParams) -> Result<DocumentQuery, McpError> {
+/// Parse a `search` call's raw `filters` map into the typed representation shared by
+/// both backends: SQLite (`state::StateDb::push_where`, enumeration mode) and Qdrant
+/// (`qdrant::lower_field_filters`, query mode).
+fn parse_filters(
+    raw_filters: &Option<serde_json::Map<String, serde_json::Value>>,
+) -> Result<Vec<(String, FieldFilter)>, McpError> {
     let invalid = |msg: String| McpError::invalid_params(msg, None);
 
     let mut filters = Vec::new();
-    if let Some(raw_filters) = &params.filters {
+    if let Some(raw_filters) = raw_filters {
         if raw_filters.len() > MAX_LIST_FILTERS {
             return Err(invalid(format!(
                 "too many filters: {} (max {})",
@@ -553,31 +569,72 @@ fn build_document_query(params: &ListDocumentsParams) -> Result<DocumentQuery, M
         // Deterministic order keeps generated SQL stable across calls.
         filters.sort_by(|a, b| a.0.cmp(&b.0));
     }
+    Ok(filters)
+}
+
+/// Shared length check for `path_prefix`, used by both enumeration mode
+/// ([`build_document_query`]) and query mode ([`KbSearchServer::search`]).
+fn validate_path_prefix(path_prefix: &Option<String>) -> Result<(), McpError> {
+    if let Some(prefix) = path_prefix
+        && prefix.len() > MAX_FILTER_STR_LEN
+    {
+        return Err(McpError::invalid_params(
+            format!(
+                "path_prefix too long: {} chars (max {})",
+                prefix.len(),
+                MAX_FILTER_STR_LEN
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Shared count check for `fields`, used by both enumeration mode
+/// ([`build_document_query`]) and query+document mode ([`KbSearchServer::search`]).
+fn validate_fields_count(fields: &Option<Vec<String>>) -> Result<(), McpError> {
+    if let Some(fields) = fields
+        && fields.len() > MAX_LIST_FILTERS
+    {
+        return Err(McpError::invalid_params(
+            format!(
+                "too many fields requested: {} (max {})",
+                fields.len(),
+                MAX_LIST_FILTERS
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Build a validated [`DocumentQuery`] from tool parameters — the `search` tool's
+/// document-granularity, no-query (enumeration) combination.
+fn build_document_query(params: &SearchParams) -> Result<DocumentQuery, McpError> {
+    let invalid = |msg: String| McpError::invalid_params(msg, None);
+
+    let filters = parse_filters(&params.filters)?;
 
     let order_by = match &params.order_by {
         Some(raw) => OrderBy::parse(raw).map_err(invalid)?,
         None => OrderBy::default(),
     };
 
-    if let Some(fields) = &params.fields
-        && fields.len() > MAX_LIST_FILTERS
-    {
-        return Err(invalid(format!(
-            "too many fields requested: {} (max {})",
-            fields.len(),
-            MAX_LIST_FILTERS
-        )));
-    }
+    validate_fields_count(&params.fields)?;
+    validate_path_prefix(&params.path_prefix)?;
 
-    if let Some(prefix) = &params.path_prefix
-        && prefix.len() > MAX_FILTER_STR_LEN
-    {
-        return Err(invalid(format!(
-            "path_prefix too long: {} chars (max {})",
-            prefix.len(),
-            MAX_FILTER_STR_LEN
-        )));
-    }
+    let mtime_after = params
+        .modified_after
+        .as_deref()
+        .map(parse_date_to_timestamp)
+        .transpose()
+        .map_err(invalid)?;
+    let mtime_before = params
+        .modified_before
+        .as_deref()
+        .map(parse_date_to_timestamp)
+        .transpose()
+        .map_err(invalid)?;
 
     Ok(DocumentQuery {
         filters,
@@ -590,302 +647,255 @@ fn build_document_query(params: &ListDocumentsParams) -> Result<DocumentQuery, M
             .clamp(1, MAX_LIST_LIMIT),
         offset: params.offset.unwrap_or(0),
         fields: params.fields.clone(),
+        mtime_after,
+        mtime_before,
     })
 }
 
+/// Parse `search`'s `filters` for query mode (chunk or grouped-document
+/// granularity, both against Qdrant) and lower them to Qdrant conditions.
+///
+/// Every named field must carry a payload index — checked here against
+/// [`crate::qdrant::all_indexed_fields`] (the union of schema-declared and legacy
+/// config-declared fields, i.e. the real Qdrant index set) and rejected by name
+/// otherwise: Qdrant can filter an unindexed field, just by a full scan rather than
+/// an index, and silently doing that would return more than what was asked for.
+/// This is the one piece of validation [`crate::qdrant::lower_field_filters`]
+/// deliberately leaves to its caller — see that function's doc comment.
+fn build_query_conditions(
+    params: &SearchParams,
+    config: &ResolvedConfig,
+    schemas: &SchemaCache,
+) -> Result<Vec<qdrant_client::qdrant::Condition>, McpError> {
+    let filters = parse_filters(&params.filters)?;
+
+    let indexed: std::collections::HashMap<String, IndexKind> =
+        crate::qdrant::all_indexed_fields(config, schemas)
+            .into_iter()
+            .map(|f| (f.name, f.kind))
+            .collect();
+
+    if let Some((field, _)) = filters.iter().find(|(f, _)| !indexed.contains_key(f)) {
+        return Err(McpError::invalid_params(
+            format!(
+                "filter '{field}' is not indexed for Qdrant queries; mark it `indexed: true` \
+                 in the governing .kb-schema.yaml to filter on it with a search query"
+            ),
+            None,
+        ));
+    }
+
+    crate::qdrant::lower_field_filters(&filters, &indexed)
+        .map_err(|e| McpError::invalid_params(e, None))
+}
+
+/// Which kind of result `search` returns: one row per chunk, or one per document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Granularity {
+    Chunk,
+    Document,
+}
+
+/// Parse a caller-supplied `granularity`, rejecting anything unrecognized.
+fn parse_granularity(raw: &str) -> Result<Granularity, McpError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "chunk" => Ok(Granularity::Chunk),
+        "document" => Ok(Granularity::Document),
+        other => Err(McpError::invalid_params(
+            format!("unknown granularity '{other}': expected 'chunk' or 'document'"),
+            None,
+        )),
+    }
+}
+
+/// Resolve the effective granularity for a `search` call: the caller's explicit
+/// choice if given, otherwise `chunk` when a query is present and `document` when it
+/// is not — reproducing the old `search` and `list_documents` tools' behaviour
+/// exactly. Pure and I/O-free so the default-in-both-directions property is
+/// unit-testable without a live index.
+fn resolve_granularity(
+    query_present: bool,
+    requested: Option<&str>,
+) -> Result<Granularity, McpError> {
+    match requested {
+        Some(raw) => parse_granularity(raw),
+        None if query_present => Ok(Granularity::Chunk),
+        None => Ok(Granularity::Document),
+    }
+}
+
+/// Whether `search`'s `query` should be treated as present. A blank/whitespace-only
+/// string is treated the same as an absent query — there is nothing to embed —
+/// rather than sent to the embedder as a no-op vector search.
+fn query_is_present(query: &Option<String>) -> bool {
+    query.as_deref().is_some_and(|q| !q.trim().is_empty())
+}
+
 fn validate_search_params(params: &SearchParams) -> Result<(), McpError> {
-    if params.query.len() > MAX_QUERY_LEN {
+    if let Some(query) = &params.query
+        && query.len() > MAX_QUERY_LEN
+    {
         return Err(McpError::invalid_params(
             format!("query exceeds maximum length of {MAX_QUERY_LEN} characters"),
             None,
         ));
     }
-    if let Some(domain) = &params.domain
-        && domain.len() > MAX_FILTER_STR_LEN
-    {
-        return Err(McpError::invalid_params(
-            format!("domain exceeds maximum length of {MAX_FILTER_STR_LEN} characters"),
-            None,
-        ));
-    }
-    if let Some(doc_type) = &params.r#type
-        && doc_type.len() > MAX_FILTER_STR_LEN
-    {
-        return Err(McpError::invalid_params(
-            format!("type exceeds maximum length of {MAX_FILTER_STR_LEN} characters"),
-            None,
-        ));
-    }
-    if let Some(tags) = &params.tags {
-        if tags.len() > MAX_TAG_COUNT {
-            return Err(McpError::invalid_params(
-                format!("tags list exceeds maximum of {MAX_TAG_COUNT} entries"),
-                None,
-            ));
-        }
-        for tag in tags {
-            if tag.len() > MAX_TAG_LEN {
-                return Err(McpError::invalid_params(
-                    format!("tag exceeds maximum length of {MAX_TAG_LEN} characters"),
-                    None,
-                ));
-            }
-        }
-    }
     Ok(())
 }
 
-/// Parameters for the `get_document` tool.
+/// Parameters for `get_document`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentParams {
-    /// Path of the document to retrieve. Accepts paths relative to the
-    /// knowledge-base root (e.g. `lifestyle/vehicles/foo.md`, as returned by
-    /// the `search` tool), or just a basename when it's unique across the
-    /// index. Absolute paths are also accepted for backwards compatibility.
+    /// Relative path, unique basename, or absolute path.
     pub path: String,
-    /// First line to return, 1-based and inclusive. Omit to start at the top of
-    /// the document. Given without `end_line`, the rest of the document is
-    /// returned.
+    /// First line to return (1-based, inclusive).
     #[serde(default)]
     pub start_line: Option<usize>,
-    /// Last line to return, 1-based and inclusive. Omit to read to the end of
-    /// the document. Given without `start_line`, reading starts at line 1. A
-    /// value past the last line is clamped, not an error.
+    /// Last line to return (1-based, inclusive).
     #[serde(default)]
     pub end_line: Option<usize>,
 }
 
-/// Parameters for the `list_documents` tool.
-///
-/// Every field is optional: with no arguments at all the tool pages through the whole
-/// knowledge base.
-#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
-pub struct ListDocumentsParams {
-    /// Frontmatter criteria, keyed by field name. Nested fields use dot-paths
-    /// (`planning.prep_minutes`). Values may be:
-    /// a scalar for equality (`{"type": "guide"}`), an array for any-of
-    /// (`{"tags": ["recipe", "dinner"]}`), or an object for all-of and numeric
-    /// comparison (`{"tags": {"all_of": ["recipe", "dinner"]}}`,
-    /// `{"planning.prep_minutes": {"lt": 30}}`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filters: Option<serde_json::Map<String, serde_json::Value>>,
-
-    /// Restrict to documents whose path starts with this prefix, e.g.
-    /// `lifestyle/kitchen/recipes/`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path_prefix: Option<String>,
-
-    /// Sort key: `path` (default), `title`, `mtime`, or `indexed_at`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub order_by: Option<String>,
-
-    /// Sort descending instead of ascending.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub descending: Option<bool>,
-
-    /// Maximum documents to return (default 100, max 1000). The response always
-    /// reports the full match count, so truncation is never silent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u64>,
-
-    /// Number of documents to skip, for paging.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-
-    /// Frontmatter fields to include per document (dot-paths). Omit for all of them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fields: Option<Vec<String>>,
-}
-
-/// Parameters for the `get_schema` tool.
+/// Parameters for `get_schema`.
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetSchemaParams {
-    /// Directory or document path whose governing rules to resolve. Omit for the root.
+    /// Directory or document path; omit for the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
-    /// Only report these fields (dot-paths). Omit for all of them.
+    /// Only report these fields (dot-paths).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
 
-    /// Only report fields that declare a closed value set — the vocabulary view.
+    /// Only fields with a closed value set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values_only: Option<bool>,
 }
 
-/// Parameters for the `update_schema` tool.
+/// Parameters for `update_schema`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateSchemaParams {
-    /// Directory whose schema to edit, e.g. `lifestyle/kitchen/recipes`. Empty or
-    /// omitted edits the knowledge-base root.
+    /// Directory to edit; omit for the KB root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
-    /// What to change: `add_values`, `remove_values`, `set_field`, or `remove_field`.
+    /// Which operation to perform.
     pub operation: String,
 
-    /// Field this operation targets. Nested fields use dot-paths.
+    /// Field this operation targets (dot-path).
     pub field: String,
 
-    /// Values, for `add_values` and `remove_values`.
+    /// Values, for add_values/remove_values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
 
-    /// Field definition, for `set_field`: a JSON object with the same keys as a
-    /// `.kb-schema.yaml` entry — `type`, `required`, `indexed`, `values`, `extend`,
-    /// `default`, `open` — all optional. As a fallback for clients that stringify
-    /// nested-object arguments, a JSON string containing that same object is also
-    /// accepted, though the object form is what this schema describes and what a
-    /// conforming client should send.
+    /// Field definition for set_field; a JSON string also works.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<FieldDefinitionInput>,
 
-    /// Report what the change would do without writing anything, including which
-    /// existing documents it would invalidate. Never refuses — it always succeeds and
-    /// reports. When false (the default), a change that would invalidate existing
-    /// documents is refused unless `force` is set.
+    /// Preview the change without writing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<bool>,
 
-    /// Apply even when existing documents would fail the new rules.
+    /// Apply even if existing documents would fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
 
-    /// Required to let `add_values`, `set_field`, or `remove_field` apply against the
-    /// knowledge-base root scope (path omitted/empty). Root-scope mutations are guarded
-    /// per the KB's `meta/schema-tag-policy.md` — pass `true` only when the change is a
-    /// deliberate design decision consistent with that policy, not as a routine default.
-    /// Not needed for `remove_values`, for `dry_run` calls, or for any non-root path.
+    /// Required for root-scope changes; see schema-tag-policy.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledge_root_change: Option<bool>,
 }
 
-/// Parameters for the `search` tool.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// Parameters for `search` (also covers enumeration).
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
-    /// The natural-language search query.
-    pub query: String,
-
-    /// Optional: filter results to a specific domain.
+    /// Semantic query. Omit to enumerate everything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain: Option<String>,
+    pub query: Option<String>,
 
-    /// Optional: filter results by document type.
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
-
-    /// Optional: filter results to documents that have any of these tags.
+    /// Frontmatter criteria by field (dot-paths).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
+    pub filters: Option<serde_json::Map<String, serde_json::Value>>,
 
-    /// Maximum number of results to return (default: 10, max: 50).
+    /// Restrict to paths starting with this prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+
+    /// "chunk" or "document"; defaults per query presence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<String>,
+
+    /// Maximum results to return.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 
-    /// Minimum relevance score floor (0.0–1.0 for dense; ~0.01–0.03 for hybrid
-    /// RRF scores). Results below this threshold are dropped. Overrides the
-    /// global `search.min_score` config when provided.
+    /// Number to skip, for paging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+
+    /// Sort key, enumeration only: path/title/mtime/indexed_at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<String>,
+
+    /// Sort descending (enumeration only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descending: Option<bool>,
+
+    /// Relevance floor (query only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_score: Option<f32>,
 
-    /// When true, include a score-breakdown line per result showing retrieval
-    /// mode and, when reranking was active, the pre-rerank score.
+    /// Add a score-breakdown line per result (query only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<bool>,
 
-    /// Exclude documents whose `mtime` is before this date. Accepts RFC 3339
-    /// datetimes (e.g. `2024-01-15T00:00:00Z`) or date-only (e.g. `2024-01-15`).
-    /// Documents indexed before mtime tracking was introduced may be excluded.
+    /// Frontmatter fields to include (dot-paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+
+    /// Exclude docs modified before this date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_after: Option<String>,
 
-    /// Exclude documents whose `mtime` is after this date. Accepts the same
-    /// formats as `modified_after`.
+    /// Exclude docs modified after this date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_before: Option<String>,
 }
 
-/// Parameters for the `create_document` tool.
+/// Parameters for `write_document`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct CreateDocumentParams {
-    /// Path of the new document, relative to the knowledge base root, e.g. "sysadmin/docker/foo.md"
+pub struct WriteDocumentParams {
+    /// Document or directory path, relative to the KB root.
     pub path: String,
-    /// Full markdown content of the document, INCLUDING YAML frontmatter
-    pub content: String,
-    /// Optional commit message; if omitted, a message is generated from the path
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Whole file content, including frontmatter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Surgical edit: exact text to replace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_string: Option<String>,
+    /// Surgical edit: its replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_string: Option<String>,
+    /// Relocate here; combines with an edit, or stands alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_path: Option<String>,
+    /// Commit message; a default is generated if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Skip the duplicate-detection check and create the document even if a
-    /// similar one exists. Use this when you have verified the existing document
-    /// is sufficiently different and want to create a distinct entry anyway.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Stale-read guard: content_hash from a prior get_document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<String>,
+    /// Skip the near-duplicate check when creating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_new: Option<bool>,
 }
 
-/// Parameters for the `edit_document` tool.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct EditDocumentParams {
-    /// Path of the document to edit. Resolved like get_document (relative to the KB
-    /// root, a unique basename, or absolute).
-    pub path: String,
-    /// Surgical edit: exact text to find. Must occur EXACTLY ONCE in the document.
-    /// Provide together with new_string. Mutually exclusive with `content`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub old_string: Option<String>,
-    /// Surgical edit: text that replaces old_string. Provide together with old_string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_string: Option<String>,
-    /// Full replace: the entire new content of the document, including YAML
-    /// frontmatter. Mutually exclusive with old_string/new_string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// Optional commit message; defaults to "docs: update {path}".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    /// Optional stale-read guard: the SHA-256 hex digest of the document's full
-    /// content (frontmatter included) at the time you read it — the same
-    /// `content_hash` `get_document` returns in `structured_content`, and the same
-    /// hashing this project already uses to detect changed files. When set, the edit
-    /// is refused with an explicit "changed since you read it" error if the file's
-    /// current content hash does not match, instead of a confusing old_string/content
-    /// mismatch. Omit to skip this check.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_hash: Option<String>,
-    /// Relocate the document to this new repo-relative path in the same commit as
-    /// the edit. The destination must not already exist. The server reads the
-    /// document's CURRENT content itself — you never need to re-send the document
-    /// body just to move it. Combines with either edit mode (surgical or
-    /// full-replace) to relocate AND change content in one commit, or may be
-    /// provided with neither old_string/new_string nor content for a pure move
-    /// that leaves the content unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_path: Option<String>,
-}
-
-/// Parameters for the `delete_document` tool.
+/// Parameters for `delete_document`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DeleteDocumentParams {
-    /// Path of the document to delete. Resolved like get_document (relative to the
-    /// KB root, a unique basename, or absolute).
+    /// Relative path, unique basename, or absolute path.
     pub path: String,
     /// Optional commit message; defaults to "docs: delete {path}".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-/// Parameters for the `move_directory` tool.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct MoveDirectoryParams {
-    /// Source directory prefix, relative to the knowledge base root (e.g.
-    /// "sysadmin/old-project"). Every document under this prefix, at any depth,
-    /// is moved. Must exist and contain at least one indexable document.
-    pub source_path: String,
-    /// Destination directory prefix, relative to the knowledge base root. Must
-    /// not already have any file living under it — this tool never merges into
-    /// or overwrites an existing prefix.
-    pub dest_path: String,
-    /// Optional commit message; if omitted, a message is generated from the two
-    /// prefixes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -899,15 +909,15 @@ pub enum EditMode {
     Full { content: String },
 }
 
-/// Parse and validate the mode fields of `EditDocumentParams`, returning a
-/// typed `Option<EditMode>` or a human-readable error string.
+/// Parse and validate the content-edit fields of `WriteDocumentParams`,
+/// returning a typed `Option<EditMode>` or a human-readable error string.
 ///
 /// Rules:
 /// - SURGICAL = `old_string` AND `new_string` both `Some`, `content` is `None`.
 /// - FULL = `content` is `Some`, both `old_string` and `new_string` are `None`.
 /// - Neither SURGICAL nor FULL, but `new_path` is `Some`: `Ok(None)` — a pure
-///   move with content left unchanged. The caller (`edit_document`) reads the
-///   document's current content itself and passes it through untouched.
+///   move with content left unchanged. The caller (`write_document`'s edit path)
+///   reads the document's current content itself and passes it through unchanged.
 /// - Neither SURGICAL nor FULL, and `new_path` is also `None`: rejected — at
 ///   least one of the three (surgical, full-replace, move) must be requested.
 /// - SURGICAL and FULL together are always rejected, regardless of `new_path` —
@@ -915,7 +925,7 @@ pub enum EditMode {
 ///   an orthogonal, independent axis that may combine with either one (or
 ///   neither).
 /// - Surgical with `old_string == new_string` is rejected (no-op).
-pub fn parse_edit_mode(params: &EditDocumentParams) -> Result<Option<EditMode>, String> {
+pub fn parse_edit_mode(params: &WriteDocumentParams) -> Result<Option<EditMode>, String> {
     let has_content = params.content.is_some();
     let has_old = params.old_string.is_some();
     let has_new = params.new_string.is_some();
@@ -1111,7 +1121,7 @@ pub fn apply_surgical(
 }
 
 /// The definitive, machine-readable outcome of a write tool call
-/// (`create_document`/`edit_document`/`delete_document`), exposed via
+/// (`write_document`/`delete_document`), exposed via
 /// `CallToolResult::structured_content` under the `"outcome"` key so a caller can
 /// branch on `result.structured_content["outcome"]` instead of pattern-matching the
 /// human-readable summary text.
@@ -1158,7 +1168,7 @@ fn with_outcome(mut result: CallToolResult, outcome: WriteOutcome) -> CallToolRe
     result
 }
 
-/// Like [`with_outcome`], but for `create_document`/`edit_document` specifically:
+/// Like [`with_outcome`], but for `write_document`'s create/edit path specifically:
 /// also attaches `rewritten_paths`, the repo-relative paths of OTHER documents a
 /// MOVE rewrote incoming links in (always `[]` for a non-move write, or a move
 /// with nothing to rewrite). A move that silently edits other documents without
@@ -1254,11 +1264,11 @@ fn create_edit_success_to_result(
 /// against `rel_path`, matching what the tool surface's other errors already do.
 ///
 /// `dest_path` is `Some` only when this call is (or was attempting to be) a
-/// document MOVE — i.e. `edit_document` was called with `new_path` set. It
+/// document MOVE — i.e. `write_document` was called with `new_path` set. It
 /// disambiguates the `AlreadyExists` arm, which for a move reports a collision
 /// at the DESTINATION, not at `rel_path` (the source, which — for a move — is
-/// expected to already exist). `create_document`'s own TOCTOU race, and every
-/// non-move `edit_document` call, pass `None` here, preserving the original
+/// expected to already exist). The create path's own TOCTOU race, and every
+/// non-move edit call, pass `None` here, preserving the original
 /// `AlreadyExists` wording keyed on `rel_path`.
 fn create_edit_error_to_mcp_error(
     err: WriteError,
@@ -1294,7 +1304,7 @@ fn create_edit_error_to_mcp_error(
             format!(
                 "A similar document already exists: '{}' \
                  (similarity {:.2} ≥ threshold {:.2}). \
-                 Edit it with edit_document, or pass \
+                 Edit it with write_document, or pass \
                  force_new=true to create a new document anyway.",
                 duplicate_of, similarity, threshold
             ),
@@ -1313,8 +1323,8 @@ fn create_edit_error_to_mcp_error(
         WriteError::Internal { msg } => McpError::invalid_params(msg, None),
         // Two distinct races share this variant:
         //
-        // 1. `create_document`'s own pre-check (`abs_path.exists()`) already
-        //    passed, so the file was created between that check and
+        // 1. `write_document`'s own create-path pre-check (`abs_path.exists()`)
+        //    already passed, so the file was created between that check and
         //    `write::write_document`'s `create_new` open. Restored to the
         //    pre-`write.rs`-extraction wording, which reported the absolute
         //    filesystem path rather than the repo-relative one — reconstructed
@@ -1323,15 +1333,13 @@ fn create_edit_error_to_mcp_error(
         //    match needs no change to accommodate this). `dest_path` is `None`
         //    here, so this is the arm that runs.
         //
-        // 2. `edit_document` was called with `new_path` set (a MOVE, possibly
-        //    combined with a content edit) and the DESTINATION already exists —
-        //    previously impossible for `edit_document`, which had no way to
-        //    reach `AlreadyExists` before moves existed. `rel_path` here is the
-        //    move's SOURCE (which legitimately exists — that's what made this an
-        //    edit rather than a create), so reporting the collision against
-        //    `rel_path` would misdirect the caller at the wrong file. `dest_path`
-        //    disambiguates: when it's `Some`, this arm names the DESTINATION as
-        //    what collided, not the source.
+        // 2. `write_document` was called with `new_path` set (a MOVE, possibly
+        //    combined with a content edit) and the DESTINATION already exists.
+        //    `rel_path` here is the move's SOURCE (which legitimately exists —
+        //    that's what made this an edit rather than a create), so reporting
+        //    the collision against `rel_path` would misdirect the caller at the
+        //    wrong file. `dest_path` disambiguates: when it's `Some`, this arm
+        //    names the DESTINATION as what collided, not the source.
         WriteError::AlreadyExists => {
             if let Some(dest) = dest_path {
                 let abs_dest = crate::write::resolve_safe_write_path(canonical_data_path, dest)
@@ -1356,7 +1364,7 @@ fn create_edit_error_to_mcp_error(
                     });
                 McpError::invalid_params(
                     format!(
-                        "File '{}' already exists; use edit_document to modify it",
+                        "File '{}' already exists; use write_document to modify it",
                         abs_path.display()
                     ),
                     None,
@@ -1736,6 +1744,17 @@ pub struct KbSearchServer {
     include_patterns: Arc<GlobSet>,
     /// Dynamic MCP server instructions, refreshed periodically with discovered metadata.
     instructions: Arc<RwLock<String>>,
+    /// Per-tool description overlay, keyed by tool name, applied over the
+    /// router's own `Tool` entries in `list_tools`/`get_tool` (see this
+    /// module's hand-written `ServerHandler` impl). `#[tool_handler]`
+    /// regenerates the router from `Self::tool_router()` on every call, so a
+    /// description baked into a `#[tool(...)]` attribute can never be swapped
+    /// at runtime — this overlay is what makes `descriptions::compose_all`
+    /// (recomputed by the same periodic refresh that updates `instructions`
+    /// above) actually reach `tools/list` and `tools/get` without a restart.
+    /// `std::sync::RwLock`, not tokio's: `get_tool` is generated as a
+    /// non-async fn by the trait, so it cannot `.await` a tokio lock.
+    description_overlay: Arc<RwLock<HashMap<String, String>>>,
     /// Live config handle. Every tool call fetches its own fresh snapshot via
     /// [`Self::config`] rather than caching one at construction, so `POST
     /// /admin/reload` is observed by the very next call — see that method's doc
@@ -1806,6 +1825,7 @@ impl KbSearchServer {
         schema_cache: crate::schema::SharedSchemaCache,
         rerank_client: Option<Arc<RerankClient>>,
         reindex_queue: Arc<crate::reindex::ReindexQueue>,
+        description_overlay: Arc<RwLock<HashMap<String, String>>>,
     ) -> anyhow::Result<Self> {
         let canonical_data_path = data_path.canonicalize().with_context(|| {
             format!("Failed to canonicalize data path: {}", data_path.display())
@@ -1826,6 +1846,7 @@ impl KbSearchServer {
             rerank_client,
             state_db: Arc::new(tokio::sync::OnceCell::new()),
             reindex_queue,
+            description_overlay,
         })
     }
 
@@ -1835,6 +1856,23 @@ impl KbSearchServer {
     /// `POST /admin/reload` swap is observed starting with the very next call.
     fn config(&self) -> Arc<ResolvedConfig> {
         crate::config::load_shared_config(&self.config)
+    }
+
+    /// Apply the live description overlay to one router-provided `Tool`,
+    /// recovering from a poisoned lock the same way `get_info` does for
+    /// `instructions`. A tool name absent from the overlay (should not
+    /// happen — every tool in `tool_router()` is one of `descriptions::TOOL_NAMES`)
+    /// is left with whatever the router itself produced, which is `None`
+    /// since every `#[tool(...)]` attribute below carries no `description`.
+    fn overlay_description(&self, mut tool: Tool) -> Tool {
+        let overlay = self.description_overlay.read().unwrap_or_else(|poisoned| {
+            warn!("Description overlay RwLock poisoned on read; using last value");
+            poisoned.into_inner()
+        });
+        if let Some(desc) = overlay.get(tool.name.as_ref()) {
+            tool.description = Some(std::borrow::Cow::Owned(desc.clone()));
+        }
+        tool
     }
 
     /// Write a non-document file into the KB, commit it, and queue a full reconcile.
@@ -2146,51 +2184,55 @@ impl KbSearchServer {
         }
     }
 
-    #[tool(
-        description = "Search the knowledge base using a natural-language query. \
-        Returns ranked document chunks with title, relevance score, text snippet, and metadata.\n\
-        \n\
-        Filters: domain, type, tags — narrow results to matching documents.\n\
-        \n\
-        Quality controls:\n\
-        - min_score: drop results below a relevance floor (float). Hybrid RRF scores are \
-          ~0.01–0.03; dense cosine scores are 0.0–1.0. Set accordingly.\n\
-        - explain: add a per-result score-breakdown line showing retrieval mode and, when \
-          reranking was active, the pre-rerank score.\n\
-        \n\
-        Recency filters (ISO 8601 date or datetime, e.g. \"2024-01-15\" or \
-        \"2024-01-15T00:00:00Z\"):\n\
-        - modified_after: exclude documents with mtime before this date.\n\
-        - modified_before: exclude documents with mtime after this date.\n\
-        Note: documents indexed before mtime tracking was introduced may be excluded."
-    )]
+    #[tool]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
         validate_search_params(&params)?;
 
+        let query_present = query_is_present(&params.query);
+        let granularity = resolve_granularity(query_present, params.granularity.as_deref())?;
+
+        debug!(
+            query_present,
+            granularity = ?granularity,
+            has_filters = params.filters.is_some(),
+            "search called"
+        );
+
+        match (query_present, granularity) {
+            (false, Granularity::Chunk) => Err(McpError::invalid_params(
+                "chunk granularity requires a query; omit granularity (or set it to \
+                 'document') to enumerate without one"
+                    .to_string(),
+                None,
+            )),
+            (false, Granularity::Document) => self.search_enumerate(&params).await,
+            (true, Granularity::Chunk) => self.search_chunks(&params).await,
+            (true, Granularity::Document) => self.search_grouped(&params).await,
+        }
+    }
+
+    /// query+chunk: the original `search` tool's behavior, unchanged output shape.
+    async fn search_chunks(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
+        let query = params.query.as_deref().unwrap_or_default();
+
+        validate_path_prefix(&params.path_prefix)?;
+        let schemas = crate::schema::load_shared(&self.schema_cache);
+        // Fetched once per call so every field below — including
+        // reranking.candidate_limit — reflects the same live snapshot, rather than
+        // racing a concurrent `POST /admin/reload` mid-request.
         let config = self.config();
+        let conditions = build_query_conditions(params, &config, &schemas)?;
+
         let limit = resolve_limit(
             params.limit,
             config.search.default_limit,
             config.search.max_limit,
         );
 
-        debug!(
-            query = %&params.query.chars().take(100).collect::<String>(),
-            limit,
-            has_domain = params.domain.is_some(),
-            has_type = params.r#type.is_some(),
-            has_tags = params.tags.is_some(),
-            "search called"
-        );
-
-        let filters = SearchFilters {
-            domain: params.domain,
-            r#type: params.r#type,
-            tags: params.tags,
-        };
+        let filters = SearchFilters { conditions };
 
         let modified_after = params
             .modified_after
@@ -2204,25 +2246,32 @@ impl KbSearchServer {
             .map(parse_date_to_timestamp)
             .transpose()
             .map_err(|e| McpError::invalid_params(e, None))?;
-
-        // Fetched once per call so every field below — including
-        // reranking.candidate_limit — reflects the same live snapshot, rather than
-        // racing a concurrent `POST /admin/reload` mid-request.
-        let config = self.config();
         let explain = params.explain.unwrap_or(false);
         let opts = SearchOptions {
             limit,
             min_score: params.min_score.or(config.search.min_score),
             hybrid: config.search.hybrid,
             rrf_candidates: config.search.rrf_candidates as u64,
+            // Config-enabled AND confirmed available on this server right now —
+            // see `status::IndexStatus::phrase_matching_available`'s doc comment
+            // for why an unconfirmed index must not attempt a phrase arm.
+            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
             explain,
             modified_after,
             modified_before,
+            path_prefix: params.path_prefix.clone(),
             rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
             diversity_max_per_document: config.search.diversity_max_per_document,
         };
 
-        let results = retrieval::search(&self.deps(), &params.query, &filters, &opts)
+        // The `explain` mode label must describe the query that actually ran, not
+        // the config that permitted it. An enabled phrase arm only fires when the
+        // query carries a quoted span, and with `hybrid` off a phrase query is
+        // still a two-arm RRF fusion — reporting that as "dense cosine" would be a
+        // lie in exactly the situation someone turned `explain` on to diagnose.
+        let phrase_arm_ran = opts.phrase && !retrieval::extract_phrases(query).1.is_empty();
+
+        let outcome = retrieval::search(&self.deps(), query, &filters, &opts)
             .await
             .map_err(|e| match e {
                 retrieval::SearchError::Embed(err) => {
@@ -2233,14 +2282,32 @@ impl KbSearchServer {
                     error!("Qdrant search failed: {:#}", err);
                     McpError::internal_error("Search query failed".to_string(), None)
                 }
+                retrieval::SearchError::Document(err) => {
+                    error!("Document metadata lookup failed: {:#}", err);
+                    McpError::internal_error("Document metadata lookup failed".to_string(), None)
+                }
             })?;
+        let path_prefix_truncated = outcome.path_prefix_truncated;
+        let results = outcome.results;
 
-        debug!(result_count = results.len(), "search returned results");
+        debug!(
+            result_count = results.len(),
+            path_prefix_truncated, "search returned results"
+        );
 
         if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No results found.",
-            )]));
+            let mut text = "No results found.".to_string();
+            if path_prefix_truncated {
+                text.push_str(
+                    "\n\nNote: path_prefix matched more candidates than could be over-fetched, \
+                     so this may not be exhaustive — narrow the prefix or lower limit to be sure.",
+                );
+            }
+            let mut call_result = CallToolResult::success(vec![Content::text(text)]);
+            call_result.structured_content = Some(serde_json::json!({
+                "path_prefix_truncated": path_prefix_truncated,
+            }));
+            return Ok(call_result);
         }
 
         // Format results as text content
@@ -2318,10 +2385,11 @@ impl KbSearchServer {
             ));
 
             if explain {
-                let mode = if config.search.hybrid {
-                    "hybrid RRF"
-                } else {
-                    "dense cosine"
+                let mode = match (config.search.hybrid, phrase_arm_ran) {
+                    (true, true) => "hybrid RRF + phrase",
+                    (true, false) => "hybrid RRF",
+                    (false, true) => "dense + phrase RRF",
+                    (false, false) => "dense cosine",
                 };
                 let mut breakdown = if let Some(pre) = result.pre_rerank_score {
                     format!(
@@ -2339,6 +2407,14 @@ impl KbSearchServer {
                 }
                 if let Some(s) = result.sparse_score {
                     breakdown.push_str(&format!(", sparse={s:.4}"));
+                }
+                // Presence, not magnitude, is the signal: the phrase arm's "score" is
+                // just the dense-ranked query re-run under a phrase filter, so its
+                // value carries no information beyond dense=. What a caller actually
+                // wants to know is whether this result matched every requested
+                // phrase at all.
+                if result.phrase_score.is_some() {
+                    breakdown.push_str(", phrase=matched");
                 }
                 breakdown.push('\n');
                 output.push_str(&breakdown);
@@ -2362,22 +2438,246 @@ impl KbSearchServer {
             output.push('\n');
         }
 
-        Ok(CallToolResult::success(vec![Content::text(output.trim())]))
+        if path_prefix_truncated {
+            output.push_str(
+                "\nNote: path_prefix matched more candidates than could be over-fetched, so \
+                 fewer results than `limit` were returned and more may exist — narrow the \
+                 prefix or lower limit to be sure this is exhaustive.\n",
+            );
+        }
+
+        let mut call_result = CallToolResult::success(vec![Content::text(output.trim())]);
+        call_result.structured_content = Some(serde_json::json!({
+            "path_prefix_truncated": path_prefix_truncated,
+        }));
+        Ok(call_result)
     }
 
-    #[tool(
-        description = "Show the frontmatter rules governing a path. Schemas cascade by \
-        directory: a .kb-schema.yaml applies to its folder and everything beneath it, \
-        with deeper files refining shallower ones. This returns the fully MERGED result \
-        for the path you ask about, plus which schema file contributed each field.\n\
-        \n\
-        Call this before creating or editing a document — the rules in the server \
-        instructions are root-level only and may not be complete for a given folder.\n\
-        \n\
-        - path: directory or document path; omit for the knowledge-base root\n\
-        - fields: only report these dot-paths\n\
-        - values_only: only report fields with a closed set of permitted values"
-    )]
+    /// query+document: Qdrant grouped by `file_path`, collapsed to each document's
+    /// best-scoring chunk, hydrated with document-level metadata from `StateDb`. New
+    /// combination — there is no output shape to preserve, only the two the design
+    /// specifies: the document shape `search_enumerate` returns, plus a per-document
+    /// `score`, and no `total`/`has_more` (grouped vector search cannot back either).
+    async fn search_grouped(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
+        let query = params.query.as_deref().unwrap_or_default();
+
+        validate_path_prefix(&params.path_prefix)?;
+        validate_fields_count(&params.fields)?;
+        let schemas = crate::schema::load_shared(&self.schema_cache);
+        let config = self.config();
+        let conditions = build_query_conditions(params, &config, &schemas)?;
+
+        let limit = resolve_limit(
+            params.limit,
+            config.search.default_limit,
+            config.search.max_limit,
+        );
+
+        let filters = SearchFilters { conditions };
+
+        let modified_after = params
+            .modified_after
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let modified_before = params
+            .modified_before
+            .as_deref()
+            .map(parse_date_to_timestamp)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let opts = SearchOptions {
+            limit,
+            min_score: params.min_score.or(config.search.min_score),
+            // Grouped queries now share `search_chunks`'s dense/sparse/phrase arms
+            // (see `retrieval::search_grouped`'s doc comment) — a query only the
+            // sparse or phrase arm can find must be just as retrievable at
+            // document granularity as at chunk granularity. Reranking and
+            // diversity still don't apply here: there is one row per document
+            // already, so per-document diversity is a no-op and there is no
+            // per-chunk candidate pool for a cross-encoder to rerank.
+            hybrid: config.search.hybrid,
+            rrf_candidates: config.search.rrf_candidates as u64,
+            phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
+            explain: params.explain.unwrap_or(false),
+            modified_after,
+            modified_before,
+            path_prefix: params.path_prefix.clone(),
+            rerank_candidate_limit: None,
+            diversity_max_per_document: None,
+        };
+
+        let index = self.state_db().await.map_err(|e| {
+            error!(
+                "search (query+document) could not open the metadata index: {:#}",
+                e
+            );
+            McpError::internal_error(format!("Document index unavailable: {}", e), None)
+        })?;
+
+        let outcome = retrieval::search_grouped(
+            &self.deps(),
+            index,
+            query,
+            &filters,
+            &opts,
+            params.fields.as_deref(),
+        )
+        .await
+        .map_err(|e| match e {
+            retrieval::SearchError::Embed(err) => {
+                error!("Embedding query failed: {:#}", err);
+                McpError::internal_error("Failed to generate query embedding".to_string(), None)
+            }
+            retrieval::SearchError::Search(err) => {
+                error!("Qdrant grouped search failed: {:#}", err);
+                McpError::internal_error("Search query failed".to_string(), None)
+            }
+            retrieval::SearchError::Document(err) => {
+                error!("Document metadata lookup failed: {:#}", err);
+                McpError::internal_error("Document metadata lookup failed".to_string(), None)
+            }
+        })?;
+        let path_prefix_truncated = outcome.path_prefix_truncated;
+        let documents = outcome.documents;
+
+        let returned = documents.len();
+
+        let structured = serde_json::json!({
+            "returned": returned,
+            "path_prefix_truncated": path_prefix_truncated,
+            "documents": documents
+                .iter()
+                .map(|d| serde_json::json!({
+                    "file_path": d.summary.file_path,
+                    "title": d.summary.title,
+                    "description": d.summary.description,
+                    "mtime": d.summary.mtime,
+                    "frontmatter": d.summary.frontmatter,
+                    "score": d.score,
+                }))
+                .collect::<Vec<_>>(),
+        });
+
+        let mut text = if returned == 0 {
+            "No documents matched.".to_string()
+        } else {
+            format!("{returned} document(s) matched, ranked by relevance.\n\n")
+        };
+
+        for doc in &documents {
+            text.push_str(&format!(
+                "- {} (score {:.4})",
+                doc.summary.file_path, doc.score
+            ));
+            if let Some(title) = &doc.summary.title {
+                text.push_str(&format!(" — {}", title));
+            }
+            text.push('\n');
+            if let Some(description) = &doc.summary.description {
+                text.push_str(&format!("  {}\n", description.trim()));
+            }
+        }
+
+        if path_prefix_truncated {
+            text.push_str(
+                "\nNote: path_prefix matched more candidates than could be over-fetched, so \
+                 fewer results than `limit` were returned and more may exist — narrow the \
+                 prefix or lower limit to be sure this is exhaustive.\n",
+            );
+        }
+
+        let mut call_result = CallToolResult::success(vec![Content::text(text.trim_end())]);
+        call_result.structured_content = Some(structured);
+        Ok(call_result)
+    }
+
+    /// document, no query: the former `list_documents` tool's behavior, unchanged
+    /// output shape (`{total, returned, offset, has_more, documents}`).
+    async fn search_enumerate(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
+        let query = build_document_query(params)?;
+
+        let index = self.state_db().await.map_err(|e| {
+            error!(
+                "search (enumerate) could not open the metadata index: {:#}",
+                e
+            );
+            McpError::internal_error(format!("Document index unavailable: {}", e), None)
+        })?;
+
+        let result = retrieval::list_documents(&DocumentIndexDeps { index }, &query)
+            .await
+            .map_err(|e| {
+                error!("search (enumerate) failed: {:#}", e);
+                McpError::internal_error(format!("Failed to list documents: {}", e), None)
+            })?;
+
+        let has_more = result.has_more(query.offset);
+        let returned = result.documents.len();
+
+        let structured = serde_json::json!({
+            "total": result.total,
+            "returned": returned,
+            "offset": query.offset,
+            "has_more": has_more,
+            "documents": result
+                .documents
+                .iter()
+                .map(|d| serde_json::json!({
+                    "file_path": d.file_path,
+                    "title": d.title,
+                    "description": d.description,
+                    "mtime": d.mtime,
+                    "frontmatter": d.frontmatter,
+                }))
+                .collect::<Vec<_>>(),
+        });
+
+        let mut text = if result.total == 0 {
+            "No documents match those criteria.".to_string()
+        } else if returned == 0 {
+            format!(
+                "{} document(s) match, but offset {} is past the end.",
+                result.total, query.offset
+            )
+        } else {
+            format!(
+                "{} document(s) match; showing {}–{}.\n\n",
+                result.total,
+                query.offset + 1,
+                query.offset + returned as u64
+            )
+        };
+
+        for doc in &result.documents {
+            text.push_str(&format!("- {}", doc.file_path));
+            if let Some(title) = &doc.title {
+                text.push_str(&format!(" — {}", title));
+            }
+            text.push('\n');
+            if let Some(description) = &doc.description {
+                text.push_str(&format!("  {}\n", description.trim()));
+            }
+        }
+
+        if has_more {
+            text.push_str(&format!(
+                "\n{} more document(s) match. Page with offset={} to continue.",
+                result.total - query.offset - returned as u64,
+                query.offset + returned as u64
+            ));
+        }
+
+        // Plain text keeps parity with the other tools; the structured half is what a
+        // consuming skill checks to detect truncation without parsing prose.
+        let mut call_result = CallToolResult::success(vec![Content::text(text.trim_end())]);
+        call_result.structured_content = Some(structured);
+        Ok(call_result)
+    }
+
+    #[tool]
     async fn get_schema(
         &self,
         Parameters(params): Parameters<GetSchemaParams>,
@@ -2502,20 +2802,7 @@ impl KbSearchServer {
         Ok(result)
     }
 
-    #[tool(
-        description = "Change the frontmatter rules for a directory, editing its \
-        .kb-schema.yaml. Use this when a new document warrants a new tag or field \
-        rather than working around the rules.\n\
-        \n\
-        Operations: add_values / remove_values (adjust a field's permitted set), \
-        set_field (declare or replace a field definition), remove_field.\n\
-        \n\
-        Every change is checked against the documents that already exist under this \
-        scope BEFORE anything is written. If the change would invalidate any of them, \
-        it is refused and they are listed — pass force to apply anyway. Pass dry_run to \
-        see the effect without writing. The file is committed and pushed like any \
-        document edit."
-    )]
+    #[tool]
     async fn update_schema(
         &self,
         Parameters(params): Parameters<UpdateSchemaParams>,
@@ -2663,7 +2950,7 @@ impl KbSearchServer {
         // happens out of band on the worker's own schedule and cannot be relied on to
         // win the race against whatever the calling agent does next. The scenario this
         // guards against: an agent calls `update_schema` to permit a new value, then
-        // immediately calls `create_document`/`edit_document` relying on that new rule
+        // immediately calls `write_document` relying on that new rule
         // — if the write path read a stale cache, it would validate against the schema
         // this very call just replaced and wrongly reject a now-valid document. Wrapped
         // in `spawn_blocking` because the walk itself is blocking filesystem work, not
@@ -2733,123 +3020,7 @@ impl KbSearchServer {
         Ok(result)
     }
 
-    #[tool(
-        description = "List documents by their frontmatter, without relevance ranking. \
-        Use this instead of `search` whenever you need a COMPLETE set — every recipe, \
-        every config document, all docs of a given type. `search` returns ranked chunks \
-        and several may come from one document, so it cannot enumerate reliably.\n\
-        \n\
-        All parameters are optional; with none, it pages through the whole knowledge base.\n\
-        - filters: frontmatter criteria keyed by field. Nested fields use dot-paths. \
-        A scalar means equality ({\"type\": \"guide\"}), an array means any-of \
-        ({\"tags\": [\"recipe\", \"dinner\"]}), and an object means all-of or a numeric \
-        range ({\"tags\": {\"all_of\": [\"recipe\", \"dinner\"]}}, \
-        {\"planning.prep_minutes\": {\"lt\": 30}}).\n\
-        - path_prefix: restrict to a folder, e.g. 'lifestyle/kitchen/recipes/'.\n\
-        - order_by: path (default), title, mtime, or indexed_at; descending flips it.\n\
-        - limit / offset: page size (default 100, max 1000) and starting position.\n\
-        - fields: which frontmatter fields to return per document; omit for all.\n\
-        \n\
-        The response always reports the total number of matching documents, so \
-        truncation is never silent — if has_more is true, page with offset."
-    )]
-    async fn list_documents(
-        &self,
-        Parameters(params): Parameters<ListDocumentsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let query = build_document_query(&params)?;
-
-        let index = self.state_db().await.map_err(|e| {
-            error!("list_documents could not open the metadata index: {:#}", e);
-            McpError::internal_error(format!("Document index unavailable: {}", e), None)
-        })?;
-
-        let result = retrieval::list_documents(&DocumentIndexDeps { index }, &query)
-            .await
-            .map_err(|e| {
-                error!("list_documents failed: {:#}", e);
-                McpError::internal_error(format!("Failed to list documents: {}", e), None)
-            })?;
-
-        let has_more = result.has_more(query.offset);
-        let returned = result.documents.len();
-
-        let structured = serde_json::json!({
-            "total": result.total,
-            "returned": returned,
-            "offset": query.offset,
-            "has_more": has_more,
-            "documents": result
-                .documents
-                .iter()
-                .map(|d| serde_json::json!({
-                    "file_path": d.file_path,
-                    "title": d.title,
-                    "description": d.description,
-                    "mtime": d.mtime,
-                    "frontmatter": d.frontmatter,
-                }))
-                .collect::<Vec<_>>(),
-        });
-
-        let mut text = if result.total == 0 {
-            "No documents match those criteria.".to_string()
-        } else if returned == 0 {
-            format!(
-                "{} document(s) match, but offset {} is past the end.",
-                result.total, query.offset
-            )
-        } else {
-            format!(
-                "{} document(s) match; showing {}–{}.\n\n",
-                result.total,
-                query.offset + 1,
-                query.offset + returned as u64
-            )
-        };
-
-        for doc in &result.documents {
-            text.push_str(&format!("- {}", doc.file_path));
-            if let Some(title) = &doc.title {
-                text.push_str(&format!(" — {}", title));
-            }
-            text.push('\n');
-            if let Some(description) = &doc.description {
-                text.push_str(&format!("  {}\n", description.trim()));
-            }
-        }
-
-        if has_more {
-            text.push_str(&format!(
-                "\n{} more document(s) match. Page with offset={} to continue.",
-                result.total - query.offset - returned as u64,
-                query.offset + returned as u64
-            ));
-        }
-
-        // Plain text keeps parity with the other tools; the structured half is what a
-        // consuming skill checks to detect truncation without parsing prose.
-        let mut call_result = CallToolResult::success(vec![Content::text(text.trim_end())]);
-        call_result.structured_content = Some(structured);
-        Ok(call_result)
-    }
-
-    #[tool(
-        description = "Retrieve the full raw content of a document by file path. \
-        Accepts paths relative to the knowledge base root (e.g. \
-        'lifestyle/vehicles/foo.md', as returned by the `search` tool) or just \
-        the basename if it's unique across the index. Returns the complete \
-        markdown including frontmatter, in both the text content and \
-        structured_content.content. \
-        Pass start_line and/or end_line (1-based, inclusive) to read only part of \
-        a long document; structured_content always reports start_line, end_line, \
-        total_lines, and partial, so you can tell what you got and page through \
-        the rest. \
-        structured_content.content_hash is a SHA-256 hex digest of the WHOLE \
-        document, not of the returned slice — pass it as edit_document's \
-        expected_hash to guard against editing stale content, whether you read the \
-        document in full or in part."
-    )]
+    #[tool]
     async fn get_document(
         &self,
         Parameters(params): Parameters<GetDocumentParams>,
@@ -2890,7 +3061,7 @@ impl KbSearchServer {
             Ok(doc) => {
                 debug!(path = %raw, "get_document served");
                 // Same hash indexed_files.content_hash already stores for this exact
-                // content, so a caller can round-trip it straight into edit_document's
+                // content, so a caller can round-trip it straight into write_document's
                 // expected_hash without this project introducing a second hash scheme.
                 // Hence hashing here, before any slicing, and always over the whole
                 // file: that expected_hash guards the document on disk, so hashing a
@@ -2966,7 +3137,7 @@ impl KbSearchServer {
         }
     }
 
-    /// Shared pipeline for create_document and edit_document.
+    /// Shared pipeline for `write_document`'s create and edit paths.
     ///
     /// Thin adapter over `write::write_document`: builds `WriteDeps`/`WriteRequest`
     /// from this server's fields and the current config snapshot, then maps the
@@ -2984,14 +3155,13 @@ impl KbSearchServer {
     /// * `message`     – optional custom commit message.
     /// * `default_verb`– verb for the default commit message, e.g. `"add"` or `"update"`.
     /// * `force_new`   – when `Some(true)`, bypasses the dedup gate on create paths.
-    /// * `operation`   – label for the `Operation:` git trailer, e.g. `"create_document"`.
+    /// * `operation`   – label for the `Operation:` git trailer, e.g. `"write_document"`.
     /// * `dest_path`   – when `Some`, turns this into a document MOVE: `rel_path` is
-    ///   the source, this is the destination. `None` (the default for every
-    ///   `create_document` call, and for a plain `edit_document` call with no
-    ///   `new_path`) is the existing create/edit behavior. See
-    ///   `write::WriteRequest::dest_path`.
+    ///   the source, this is the destination. `None` (the default for a plain
+    ///   create, and for an edit call with no `new_path`) is the existing
+    ///   create/edit behavior. See `write::WriteRequest::dest_path`.
     #[allow(clippy::too_many_arguments)]
-    async fn write_document(
+    async fn run_document_write(
         &self,
         old_content: &str,
         new_content: &str,
@@ -3062,7 +3232,7 @@ impl KbSearchServer {
             default_verb,
             force_new,
             operation,
-            // `edit_document` already enforces the stale-read guard itself, ahead
+            // The edit path already enforces the stale-read guard itself, ahead
             // of applying a surgical old_string/new_string replacement — so a
             // stale read surfaces as an explicit "changed since you read it"
             // error rather than a confusing old_string-not-found one. Passing
@@ -3088,187 +3258,177 @@ impl KbSearchServer {
         }
     }
 
-    #[tool(description = "Create a new document in the knowledge base. \
-        Writes the file, commits it to the git repository, and queues it for indexing \
-        (indexing happens in the background; the document becomes searchable shortly \
-        after this call returns, not necessarily immediately). \
-        The document must not already exist — use edit_document for existing files. \
-        Content must include valid YAML frontmatter. \
-        Required frontmatter fields and any fixed allowed values (e.g. for type/status) are \
-        listed in this server's instructions. \
-        If a very similar document already exists, the create is refused and the close match is \
-        reported — edit that document instead, or set force_new=true to create a new one anyway. \
-        SCOPE: only for durable, long-lived reference knowledge. NEVER create a document to hold \
-        session notes, intermediate analysis, task/TODO state, or scratch output — every write is \
-        committed, pushed, and permanently indexed. Write transient content to a local file instead.")]
-    async fn create_document(
+    /// `write_document`'s directory-move dispatch: `source_dir` resolved to an
+    /// existing directory, so this relocates the whole subtree via
+    /// `write::move_directory` instead of writing a single document. Mirrors the
+    /// old standalone `move_directory` tool.
+    ///
+    /// Every field that only makes sense for a single document (`content`,
+    /// `old_string`/`new_string`, `expected_hash`, `force_new`) is rejected here —
+    /// a directory move has no body to replace and no dedup gate to bypass.
+    /// `new_path` is required: it is the destination prefix.
+    async fn write_document_move_dir(
         &self,
-        Parameters(params): Parameters<CreateDocumentParams>,
+        params: &WriteDocumentParams,
+        source_dir: &str,
     ) -> Result<CallToolResult, McpError> {
+        let dest_dir = match params.new_path.as_deref().map(str::trim) {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                return Err(McpError::invalid_params(
+                    "new_path is required to move the directory at path".to_string(),
+                    None,
+                ));
+            }
+        };
+
+        for (field, is_set) in [
+            ("content", params.content.is_some()),
+            ("old_string", params.old_string.is_some()),
+            ("new_string", params.new_string.is_some()),
+            ("expected_hash", params.expected_hash.is_some()),
+            ("force_new", params.force_new.is_some()),
+        ] {
+            if is_set {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "{} is not valid when path is a directory: a directory move \
+                         only takes new_path (and optionally message)",
+                        field
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        let config = self.config();
+        let token = std::env::var(&config.source.git_token_env)
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        // Best-effort, same as `run_document_write`'s own lazy state-DB open for a
+        // single-document MOVE: a state DB that fails to open degrades the
+        // incoming-link rewrite to "skip it", not a failed move — see
+        // `WriteDeps::state`'s doc comment.
+        let state_db = self.state_db().await.ok();
+
+        let deps = WriteDeps {
+            retrieval: self.deps(),
+            canonical_data_path: &self.canonical_data_path,
+            schema_cache: &self.schema_cache,
+            validation: &config.validation,
+            prepend_description: config.chunking.prepend_description,
+            dedup_enabled: config.write.dedup_enabled,
+            dedup_threshold: config.write.dedup_threshold,
+            git_url: config.source.git_url.as_deref(),
+            branch: &config.source.branch,
+            token: token.as_deref(),
+            commit_author_name: &config.write.commit_author_name,
+            commit_author_email: &config.write.commit_author_email,
+            queue: &self.reindex_queue,
+            state: state_db,
+        };
+
+        match crate::write::move_directory(&deps, source_dir, dest_dir, params.message.as_deref())
+            .await
+        {
+            Ok(success) => Ok(move_directory_success_to_result(
+                success, source_dir, dest_dir,
+            )),
+            Err(err) => Err(move_directory_error_to_mcp_error(err, source_dir, dest_dir)),
+        }
+    }
+
+    /// `write_document`'s create path: `path` did not resolve to an existing,
+    /// permitted file. Mirrors the old standalone `create_document` tool.
+    async fn write_document_create(
+        &self,
+        params: WriteDocumentParams,
+        raw: &str,
+    ) -> Result<CallToolResult, McpError> {
+        if params.old_string.is_some() || params.new_string.is_some() {
+            return Err(McpError::invalid_params(
+                "cannot surgically edit a document that does not exist".to_string(),
+                None,
+            ));
+        }
+        if params.new_path.is_some() {
+            return Err(McpError::invalid_params(
+                "new_path is not valid when creating a new document — there is \
+                 nothing at path yet to move; create it directly at the final path"
+                    .to_string(),
+                None,
+            ));
+        }
+        let Some(content) = params.content.as_deref() else {
+            return Err(McpError::invalid_params(
+                "content is required to create a new document".to_string(),
+                None,
+            ));
+        };
+
         // Resolve path: must be relative, no traversal, not already existing.
         let data_root = self.canonical_data_path.clone();
-        let abs_path = crate::write::resolve_safe_write_path(&data_root, &params.path)
+        let abs_path = crate::write::resolve_safe_write_path(&data_root, raw)
             .map_err(|e| McpError::invalid_params(e, None))?;
 
         // The include-pattern eligibility guard is enforced inside
         // `write::write_document` itself too — see that module's
         // `check_include_pattern` — so every caller of the shared write pipeline
-        // (this tool, `edit_document`/`delete_document` via `resolve_within_data`,
-        // and the HTTP UI in `web.rs`) gets it for free instead of each transport
-        // maintaining its own copy that a future caller could forget. It is ALSO
-        // run here, explicitly, ahead of the `exists()` pre-check just below:
-        // pre-refactor, a path that both exists on disk and fails this check was
-        // reported with the include-pattern message, not "already exists; use
-        // edit_document" — which, for such a path, is misleading circular
-        // guidance, since edit_document would then reject the same path as not
-        // permitted. Running `write::write_document`'s check later is not
-        // sufficient to restore that priority on its own, since the `exists()`
-        // check below returns before ever reaching it. Same message text as
-        // `write::write_document`'s own check (see `create_edit_error_to_mcp_error`'s
-        // `UnsafePath` arm), so existing callers see the exact same wording.
-        crate::write::check_include_pattern_against(&self.include_patterns, &params.path).map_err(
-            |e| {
-                create_edit_error_to_mcp_error(
-                    e,
-                    &params.path,
-                    true,
-                    &self.canonical_data_path,
-                    None,
-                )
-            },
-        )?;
+        // (this tool, the HTTP UI in `web.rs`) gets it for free instead of each
+        // transport maintaining its own copy that a future caller could forget. It
+        // is ALSO run here, explicitly, ahead of the `exists()` pre-check just
+        // below: a path that both exists on disk and fails this check must be
+        // reported with the include-pattern message, not "already exists" — which,
+        // for such a path, is misleading circular guidance, since a retry would
+        // reject the same path as not permitted right back. Running
+        // `write::write_document`'s check later is not sufficient to restore that
+        // priority on its own, since the `exists()` check below returns before
+        // ever reaching it. Same message text as `write::write_document`'s own
+        // check (see `create_edit_error_to_mcp_error`'s `UnsafePath` arm), so
+        // existing callers see the exact same wording.
+        crate::write::check_include_pattern_against(&self.include_patterns, raw).map_err(|e| {
+            create_edit_error_to_mcp_error(e, raw, true, &self.canonical_data_path, None)
+        })?;
 
         // File must not already exist for create.
         if abs_path.exists() {
             return Err(McpError::invalid_params(
                 format!(
-                    "File '{}' already exists. Use edit_document to modify existing files.",
-                    params.path
+                    "File '{}' already exists. Call write_document again without \
+                     old_string/new_string to edit it in place.",
+                    raw
                 ),
                 None,
             ));
         }
 
-        self.write_document(
+        self.run_document_write(
             "", // old_content: empty for new files
-            &params.content,
-            &params.path,
+            content,
+            raw,
             true, // is_create
             params.message.as_deref(),
             "add",
             params.force_new,
-            "create_document",
-            None, // create_document never moves a document
+            "write_document",
+            None, // a create never moves a document
         )
         .await
     }
 
-    #[tool(
-        description = "Edit an existing document in the knowledge base, optionally also \
-        relocating it. Content changes and relocation are independent axes: pick zero or one \
-        content mode, and independently choose whether to also move the document.\n\
-        \n\
-        SURGICAL MODE — provide old_string and new_string (mutually exclusive with content):\n\
-        Finds old_string in the document (must appear exactly once) and replaces it with \
-        new_string. Ideal for small, targeted edits without sending the whole file. \
-        old_string must be unique in the document; include more surrounding context if the \
-        tool reports multiple occurrences.\n\
-        \n\
-        FULL-REPLACE MODE — provide content (mutually exclusive with old_string/new_string):\n\
-        Replaces the entire file content with the provided content, which must include valid \
-        YAML frontmatter. Required frontmatter fields and any fixed allowed values \
-        (e.g. for type/status) are listed in this server's instructions.\n\
-        \n\
-        MOVE MODE — provide new_path to relocate the document to a different repo-relative \
-        path, in the same commit as any content change:\n\
-        Unlike SURGICAL and FULL-REPLACE, which are mutually exclusive with EACH OTHER, MOVE \
-        may be combined with either one — or with neither, for a pure relocation that leaves \
-        content unchanged. Pass new_path alone to move the document as-is; pass it together \
-        with old_string+new_string or content to fix up the document and relocate it in one \
-        atomic commit. You never need to re-send the document body just to move it — the \
-        server reads its current content itself. The destination (new_path) must not already \
-        exist; this tool never overwrites. Frontmatter is validated against the DESTINATION \
-        directory's schema, which may differ from the source directory's — call get_schema on \
-        the destination path first if you are not sure what it requires. Moving a document \
-        also automatically updates every recognized link in OTHER documents that point at it — \
-        inline [text](path.md), reference-style [text][ref] and the shortcut [ref] (the \
-        [ref]: path.md definition is rewritten once; the use sites are left untouched), \
-        wiki-style [[path]] (an extension-less target is treated as path.md), and autolinks \
-        <path.md> — committing those documents in the SAME commit as the move; the updated \
-        paths are reported back in rewritten_paths. LIMITATION: the wiki pipe-alias form \
-        [[path|Display text]] is not recognized as a link at all — write [[path]] without an \
-        alias if you need it tracked.\n\
-        \n\
-        At least one of {content, old_string+new_string, new_path} must be provided — a call \
-        with none of them changes nothing and is rejected.\n\
-        \n\
-        In every mode the result is validated, committed, and queued for indexing in the \
-        background (the change becomes searchable shortly after this call returns, not \
-        necessarily immediately). The path parameter (the SOURCE) is resolved like \
-        get_document: relative to the KB root, a unique basename, or absolute. The document at \
-        path must already exist — use create_document for new files. new_path, by contrast, is \
-        taken literally as a repo-relative destination and must NOT already exist.\n\
-        \n\
-        OPTIONAL STALE-READ GUARD — expected_hash:\n\
-        Pass the content_hash get_document returned in structured_content when you read this \
-        document, and the edit is refused with an explicit error if the file has changed since \
-        then, instead of a confusing old_string/content mismatch. Applies to moves too, guarding \
-        against a stale read of the source.\n\
-        \n\
-        SCOPE: this knowledge base holds durable reference knowledge only. NEVER append session \
-        notes, task state, or other transient content to a document."
-    )]
-    async fn edit_document(
+    /// `write_document`'s edit path: `path` resolved to an existing, permitted
+    /// file. Mirrors the old standalone `edit_document` tool.
+    async fn write_document_edit(
         &self,
-        Parameters(params): Parameters<EditDocumentParams>,
+        params: WriteDocumentParams,
+        canonical: PathBuf,
     ) -> Result<CallToolResult, McpError> {
         // Parse and validate the content-edit mode (surgical vs full-replace vs
         // neither). `new_path` is an orthogonal axis handled below, independent of
         // this — see `parse_edit_mode`'s doc comment.
         let mode = parse_edit_mode(&params).map_err(|e| McpError::invalid_params(e, None))?;
         let dest_path = params.new_path.as_deref();
-
-        // Resolve the path using the get_document resolver (forgiving: relative/
-        // absolute/basename, canonicalized, include-pattern + containment checked).
-        let raw = params.path.trim();
-        if raw.is_empty() {
-            return Err(McpError::invalid_params(
-                "path parameter is empty".to_string(),
-                None,
-            ));
-        }
-
-        let canonical = match retrieval::resolve_within_data(
-            raw,
-            &self.canonical_data_path,
-            &self.include_patterns,
-        ) {
-            Ok(c) => c,
-            Err(retrieval::ResolveErr::NotFound) => {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "Document '{}' does not exist. Use create_document to create new files.",
-                        raw
-                    ),
-                    None,
-                ));
-            }
-            Err(retrieval::ResolveErr::Outside) => {
-                return Err(McpError::invalid_params(
-                    "File path is outside the data directory".to_string(),
-                    None,
-                ));
-            }
-            Err(retrieval::ResolveErr::NotPermitted) => {
-                return Err(McpError::invalid_params(
-                    "File type not permitted".to_string(),
-                    None,
-                ));
-            }
-            Err(retrieval::ResolveErr::Other(msg)) => {
-                return Err(McpError::invalid_params(msg, None));
-            }
-        };
 
         // Derive the repo-relative path from the canonical absolute path.
         let rel_path = canonical
@@ -3287,7 +3447,7 @@ impl KbSearchServer {
         // edit on, refuse up front when the file has since changed, rather than let a
         // shifted `old_string` fail with a confusing (and, for a full replace, silent)
         // mismatch. Same hash `get_document` reports back as `content_hash` and
-        // `indexed_files.content_hash` already uses — see `EditDocumentParams::expected_hash`.
+        // `indexed_files.content_hash` already uses — see `WriteDocumentParams::expected_hash`.
         if let Some(expected) = params.expected_hash.as_deref() {
             let actual = crate::ingest::compute_hash_from_bytes(old_content.as_bytes());
             if !expected.trim().eq_ignore_ascii_case(&actual) {
@@ -3311,13 +3471,13 @@ impl KbSearchServer {
         // content, byte-for-byte, since `write::write_document` never reads
         // `rel_path`'s content itself, move or not.
         let (new_content, operation) = match mode {
-            None => (old_content.clone(), "edit_document (move)"),
+            None => (old_content.clone(), "write_document (move)"),
             Some(EditMode::Full { content }) => (
                 content,
                 if dest_path.is_some() {
-                    "edit_document (full replace + move)"
+                    "write_document (full replace + move)"
                 } else {
-                    "edit_document (full replace)"
+                    "write_document (full replace)"
                 },
             ),
             Some(EditMode::Surgical { old, new }) => {
@@ -3326,15 +3486,15 @@ impl KbSearchServer {
                 (
                     result,
                     if dest_path.is_some() {
-                        "edit_document (surgical replace + move)"
+                        "write_document (surgical replace + move)"
                     } else {
-                        "edit_document (surgical replace)"
+                        "write_document (surgical replace)"
                     },
                 )
             }
         };
 
-        self.write_document(
+        self.run_document_write(
             &old_content,
             &new_content,
             &rel_path,
@@ -3348,16 +3508,70 @@ impl KbSearchServer {
         .await
     }
 
-    #[tool(description = "Delete a document from the knowledge base. \
-        Removes the file from disk, commits the deletion to git with provenance trailers \
-        (just like create_document/edit_document), pushes the commit, and queues removal of \
-        the document's vectors from the Qdrant search index and its state-DB row (this \
-        happens in the background; the document stops being searchable shortly after this \
-        call returns, not necessarily immediately). \
-        The path resolves like get_document: relative to the KB root \
-        (e.g. 'sysadmin/guide.md'), a unique basename, or absolute. \
-        The document must already exist — use search to find the correct path. \
-        Returns a summary line with the commit SHA and a unified diff of the removed content.")]
+    #[tool]
+    async fn write_document(
+        &self,
+        Parameters(params): Parameters<WriteDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let raw = params.path.trim().to_string();
+        if raw.is_empty() {
+            return Err(McpError::invalid_params(
+                "path parameter is empty".to_string(),
+                None,
+            ));
+        }
+
+        // Branch 1: a directory move. Detected via the literal (non-fuzzy)
+        // resolver — a directory can never satisfy `resolve_within_data`'s
+        // include-pattern check, so that resolver cannot be used for this test.
+        if let Ok(abs) = crate::write::resolve_safe_write_path(&self.canonical_data_path, &raw)
+            && abs.is_dir()
+        {
+            return self.write_document_move_dir(&params, &raw).await;
+        }
+
+        // Branch 2: a document create or edit. `resolve_within_data` (the same
+        // resolver `get_document` uses to try a literal path before its own
+        // basename fallback, which lives only there, not here) tells them apart:
+        // a path that resolves to an existing, permitted file is an edit;
+        // `NotFound` (nothing there yet) or `NotPermitted` (something exists
+        // there, but of a non-indexable type) falls through to create, which
+        // re-validates the path itself via `resolve_safe_write_path` and
+        // `check_include_pattern_against` — independent, literal, KB-root-relative
+        // checks that do not share `resolve_within_data`'s "try the raw absolute
+        // path against the real filesystem first" ambiguity. That re-validation is
+        // what makes it safe to fall through for those two cases rather than treat
+        // every non-success as a hard failure, and it is also what restores the
+        // pre-merge priority: a path that both exists on disk and fails the
+        // include-pattern check is reported with that specific message, not a
+        // generic "not found" one.
+        //
+        // `Outside` and `Other` are different: `resolve_within_data` only returns
+        // `Outside` when the literal absolute path actually EXISTS outside the
+        // data root (see its doc comment) — falling through to create would strip
+        // the leading `/` and join it KB-relative, silently writing a *new* file
+        // inside the KB at a path the caller never asked for while reporting
+        // success. `Other` (a real I/O error resolving the path) has no safe
+        // fallback interpretation either. Both are hard errors here, same as
+        // `delete_document`'s handling of the same resolver just above.
+        match retrieval::resolve_within_data(
+            &raw,
+            &self.canonical_data_path,
+            &self.include_patterns,
+        ) {
+            Ok(canonical) => self.write_document_edit(params, canonical).await,
+            Err(retrieval::ResolveErr::NotFound) | Err(retrieval::ResolveErr::NotPermitted) => {
+                self.write_document_create(params, &raw).await
+            }
+            Err(retrieval::ResolveErr::Outside) => Err(McpError::invalid_params(
+                "File path is outside the data directory".to_string(),
+                None,
+            )),
+            Err(retrieval::ResolveErr::Other(msg)) => Err(McpError::invalid_params(msg, None)),
+        }
+    }
+
+    #[tool]
     async fn delete_document(
         &self,
         Parameters(params): Parameters<DeleteDocumentParams>,
@@ -3373,7 +3587,7 @@ impl KbSearchServer {
         }
 
         // Resolve the path (must already exist on disk). This is the same fuzzy
-        // resolver `get_document`/`edit_document` use — relative to the KB root, a
+        // resolver `get_document`/`write_document` use — relative to the KB root, a
         // unique basename, or absolute — and produces this tool's richer NotFound
         // text. It stays here rather than in `write::delete_document`, which does
         // its own plain existence check as a defense-in-depth fallback for callers
@@ -3443,121 +3657,7 @@ impl KbSearchServer {
             Err(err) => Err(delete_error_to_mcp_error(err, &rel_path)),
         }
     }
-
-    #[tool(
-        description = "Relocate every document under a source directory prefix to a \
-        destination prefix, as ONE atomic commit. Use this to reorganize a whole subtree \
-        at once — for a single document, use edit_document's MOVE MODE instead; this tool \
-        has no content-editing ability (no body, no expected_hash, no surgical/full-replace \
-        modes).\n\
-        \n\
-        ALL-OR-NOTHING: every moved document's frontmatter is validated against the \
-        DESTINATION path's schema (which may differ per document, since each keeps its \
-        position under the destination prefix) BEFORE anything is written. If even one \
-        document fails that validation, the whole move is refused and nothing is \
-        mutated — the response names every document that failed, not just the first.\n\
-        \n\
-        PRECONDITIONS: source_path must exist and contain at least one indexable document. \
-        dest_path must not already have any file living under it — this tool never merges \
-        into or overwrites an existing prefix.\n\
-        \n\
-        SCHEMA FILES: a source subtree containing its own .kb-schema.yaml is supported — the \
-        schema file moves along with the documents it governs. But relocating it re-parents \
-        its cascade: its own declarations are unchanged, but they now merge onto whatever \
-        governs the DESTINATION instead of the source, per field and per attribute. If the \
-        destination's ancestors declare different required fields, values sets, defaults, or \
-        types than the source's did, that difference reaches every document under the moved \
-        subtree — so a document that was valid at the source can legitimately fail validation \
-        at the destination, even though its own content and its own schema file's declarations \
-        never changed. This is checked BEFORE anything is written (see ALL-OR-NOTHING above), \
-        and the error names which schema file relocated and why. An unparseable \
-        .kb-schema.yaml anywhere in the source subtree blocks the move outright — rules that \
-        cannot be read cannot be verified safe to relocate.\n\
-        \n\
-        LINK REWRITING: a link between two documents that are BOTH moving keeps pointing \
-        at each other post-move; a link to a document that stays in place keeps that exact \
-        target, with only its relative spelling updated for the mover's new location. \
-        Documents OUTSIDE the moved subtree that link INTO it also have those links \
-        rewritten to the new location, committed in the SAME commit as the move — the \
-        rewritten paths are reported back in rewritten_paths. Every recognized link syntax \
-        is covered: inline [text](path.md), reference-style [text][ref] and the shortcut \
-        [ref] (the [ref]: path.md definition is rewritten once; the use sites are left \
-        untouched), wiki-style [[path]] (an extension-less target is treated as path.md), \
-        and autolinks <path.md>. LIMITATION: the wiki pipe-alias form [[path|Display text]] \
-        is not recognized as a link at all — write [[path]] without an alias if you need it \
-        tracked.\n\
-        \n\
-        Returns the number of documents moved (with their old -> new paths) and every \
-        rewritten path. Indexing of every moved and rewritten document is queued in the \
-        background — the changes become searchable shortly after this call returns, not \
-        necessarily immediately."
-    )]
-    async fn move_directory(
-        &self,
-        Parameters(params): Parameters<MoveDirectoryParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let config = self.config();
-
-        let source_dir = params.source_path.trim();
-        let dest_dir = params.dest_path.trim();
-        if source_dir.is_empty() {
-            return Err(McpError::invalid_params(
-                "source_path parameter is empty".to_string(),
-                None,
-            ));
-        }
-        if dest_dir.is_empty() {
-            return Err(McpError::invalid_params(
-                "dest_path parameter is empty".to_string(),
-                None,
-            ));
-        }
-
-        let token = std::env::var(&config.source.git_token_env)
-            .ok()
-            .filter(|s| !s.is_empty());
-
-        // Best-effort, same as `write_document`'s own lazy state-DB open for a
-        // single-document MOVE: a state DB that fails to open degrades the
-        // incoming-link rewrite to "skip it", not a failed move — see
-        // `WriteDeps::state`'s doc comment.
-        let state_db = self.state_db().await.ok();
-
-        let deps = WriteDeps {
-            retrieval: self.deps(),
-            canonical_data_path: &self.canonical_data_path,
-            schema_cache: &self.schema_cache,
-            validation: &config.validation,
-            prepend_description: config.chunking.prepend_description,
-            dedup_enabled: config.write.dedup_enabled,
-            dedup_threshold: config.write.dedup_threshold,
-            git_url: config.source.git_url.as_deref(),
-            branch: &config.source.branch,
-            token: token.as_deref(),
-            commit_author_name: &config.write.commit_author_name,
-            commit_author_email: &config.write.commit_author_email,
-            queue: &self.reindex_queue,
-            state: state_db,
-        };
-
-        match crate::write::move_directory(&deps, source_dir, dest_dir, params.message.as_deref())
-            .await
-        {
-            Ok(success) => Ok(move_directory_success_to_result(
-                success, source_dir, dest_dir,
-            )),
-            Err(err) => Err(move_directory_error_to_mcp_error(err, source_dir, dest_dir)),
-        }
-    }
 }
-
-/// Default instructions used when no custom instructions are configured.
-/// The server appends discovered filter values ("Available ...") and a full
-/// write-authoring section after this base, so keep this short.
-pub const DEFAULT_INSTRUCTIONS: &str = "Knowledge base server. \
-Read with `search` (natural-language query; optional domain/type/tags filters) \
-and `get_document`. \
-Write with `create_document`, `edit_document`, and `delete_document`.";
 
 #[tool_handler]
 impl ServerHandler for KbSearchServer {
@@ -3573,6 +3673,34 @@ impl ServerHandler for KbSearchServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(instructions)
+    }
+
+    // Hand-written rather than left for `#[tool_handler]` to generate: the
+    // macro regenerates the tool list from `Self::tool_router()` (and its
+    // compile-time `#[tool(...)]` attributes) on every call, so a description
+    // that needs to change at runtime — per `descriptions.rs`'s whole point —
+    // cannot be baked into that attribute. These two methods apply this
+    // server's live `description_overlay` on top of the router's own `Tool`
+    // entries; `call_tool` is left for the macro to generate unchanged, since
+    // dispatch itself does not depend on the description text.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let tools = Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| self.overlay_description(tool))
+            .collect();
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        Self::tool_router()
+            .get(name)
+            .cloned()
+            .map(|tool| self.overlay_description(tool))
     }
 }
 
@@ -3625,6 +3753,15 @@ pub(crate) fn empty_test_schema_cache() -> crate::schema::SharedSchemaCache {
     Arc::new(RwLock::new(Arc::new(crate::schema::SchemaCache::default())))
 }
 
+/// An empty description overlay, for tests that exercise a `KbSearchServer` but
+/// do not care about tool descriptions — `list_tools`/`get_tool` fall back to
+/// whatever the router itself produced (`None`, since no `#[tool(...)]`
+/// attribute carries one) when a tool has no overlay entry.
+#[cfg(test)]
+pub(crate) fn empty_test_description_overlay() -> Arc<RwLock<HashMap<String, String>>> {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3642,8 +3779,8 @@ mod tests {
 
     // --- list_documents filter parsing ---
 
-    fn filters_from(json: serde_json::Value) -> ListDocumentsParams {
-        ListDocumentsParams {
+    fn filters_from(json: serde_json::Value) -> SearchParams {
+        SearchParams {
             filters: Some(json.as_object().unwrap().clone()),
             ..Default::default()
         }
@@ -3766,7 +3903,7 @@ mod tests {
 
     #[test]
     fn list_defaults_are_applied_when_nothing_is_supplied() {
-        let query = build_document_query(&ListDocumentsParams::default()).unwrap();
+        let query = build_document_query(&SearchParams::default()).unwrap();
         assert_eq!(query.limit, DEFAULT_LIST_LIMIT);
         assert_eq!(query.offset, 0);
         assert_eq!(query.order_by, OrderBy::Path);
@@ -3778,14 +3915,14 @@ mod tests {
 
     #[test]
     fn list_limit_is_clamped_to_the_cap() {
-        let query = build_document_query(&ListDocumentsParams {
+        let query = build_document_query(&SearchParams {
             limit: Some(999_999),
             ..Default::default()
         })
         .unwrap();
         assert_eq!(query.limit, MAX_LIST_LIMIT);
 
-        let query = build_document_query(&ListDocumentsParams {
+        let query = build_document_query(&SearchParams {
             limit: Some(0),
             ..Default::default()
         })
@@ -3795,7 +3932,7 @@ mod tests {
 
     #[test]
     fn invalid_order_by_is_rejected() {
-        let err = build_document_query(&ListDocumentsParams {
+        let err = build_document_query(&SearchParams {
             order_by: Some("file_path; DROP TABLE documents".into()),
             ..Default::default()
         })
@@ -3819,7 +3956,7 @@ mod tests {
         for i in 0..(MAX_LIST_FILTERS + 1) {
             map.insert(format!("field{i}"), serde_json::json!("x"));
         }
-        let err = build_document_query(&ListDocumentsParams {
+        let err = build_document_query(&SearchParams {
             filters: Some(map),
             ..Default::default()
         })
@@ -3829,12 +3966,337 @@ mod tests {
 
     #[test]
     fn overlong_path_prefix_is_rejected() {
-        let err = build_document_query(&ListDocumentsParams {
+        let err = build_document_query(&SearchParams {
             path_prefix: Some("a".repeat(MAX_FILTER_STR_LEN + 1)),
             ..Default::default()
         })
         .unwrap_err();
         assert!(format!("{:?}", err).contains("path_prefix too long"));
+    }
+
+    // --- search: granularity resolution ---
+
+    #[test]
+    fn granularity_defaults_to_chunk_when_a_query_is_present() {
+        assert_eq!(resolve_granularity(true, None).unwrap(), Granularity::Chunk);
+    }
+
+    #[test]
+    fn granularity_defaults_to_document_when_no_query_is_present() {
+        assert_eq!(
+            resolve_granularity(false, None).unwrap(),
+            Granularity::Document
+        );
+    }
+
+    #[test]
+    fn explicit_granularity_overrides_the_default_either_direction() {
+        assert_eq!(
+            resolve_granularity(true, Some("document")).unwrap(),
+            Granularity::Document
+        );
+        assert_eq!(
+            resolve_granularity(false, Some("chunk")).unwrap(),
+            Granularity::Chunk
+        );
+    }
+
+    #[test]
+    fn unknown_granularity_is_rejected() {
+        let err = resolve_granularity(true, Some("paragraph")).unwrap_err();
+        assert!(format!("{:?}", err).contains("unknown granularity"));
+    }
+
+    #[test]
+    fn blank_query_is_treated_as_absent_for_granularity_purposes() {
+        assert!(!query_is_present(&Some("   ".to_string())));
+        assert!(!query_is_present(&None));
+        assert!(query_is_present(&Some("pasta".to_string())));
+    }
+
+    #[tokio::test]
+    async fn chunk_granularity_without_a_query_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                granularity: Some("chunk".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("requires a query"),
+            "got: {err:?}"
+        );
+    }
+
+    // --- search: search_grouped adapter, through the real tool entry point ---
+    //
+    // A live embeddings endpoint and a live Qdrant are both unavailable in this
+    // environment (and `EmbedClient`'s retry/backoff classifies a refused local
+    // connection as transient, retrying for up to two minutes — see
+    // `embed::embed_backoff` — so even a deliberate connection failure is too
+    // slow to use as a fast test signal). These tests therefore cover only what
+    // is reachable BEFORE `retrieval::search_grouped` ever calls the embedder:
+    // routing, and that `modified_after`/`fields` are parsed by this specific
+    // branch rather than silently dropped. The response-shape assembly and
+    // `min_score` forwarding (which has no offline-observable effect) need a
+    // live Qdrant + embeddings stack to verify; see this module's Report for
+    // that gap.
+
+    #[tokio::test]
+    async fn search_grouped_routes_a_document_query_to_the_grouped_path_not_enumeration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "notes/a.md",
+            serde_json::json!({ "title": "A", "random_field": "x" }),
+        )
+        .await;
+
+        let mut filters = serde_json::Map::new();
+        filters.insert("random_field".into(), serde_json::json!("x"));
+
+        // Control: enumeration mode (no query) accepts this filter fine, since
+        // it never requires a Qdrant payload index — so the divergence below is
+        // attributable to routing, not to the filter being universally invalid.
+        let enumerate_result = server
+            .search(Parameters(SearchParams {
+                filters: Some(filters.clone()),
+                ..Default::default()
+            }))
+            .await
+            .expect("enumeration mode does not require a Qdrant payload index");
+        assert_eq!(
+            enumerate_result.structured_content.unwrap()["total"],
+            serde_json::json!(1)
+        );
+
+        // The same filter, with a query AND an explicit `document` granularity,
+        // must route to the grouped (query+document) path — which DOES require
+        // every filter field to carry a Qdrant payload index — not silently
+        // fall back to enumeration.
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("document".to_string()),
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("not indexed for Qdrant queries"),
+            "a query+document search must route to the grouped path, which rejects an \
+             unindexed filter field before ever reaching Qdrant; got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_grouped_parses_modified_after_before_reaching_qdrant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("document".to_string()),
+                modified_after: Some("not-a-date".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("invalid date"),
+            "the grouped adapter must parse modified_after itself rather than dropping \
+             it before retrieval::search_grouped ever runs; got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_grouped_validates_fields_count_before_reaching_qdrant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("document".to_string()),
+                fields: Some(
+                    (0..(MAX_LIST_FILTERS + 1))
+                        .map(|i| format!("f{i}"))
+                        .collect(),
+                ),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("too many fields requested"),
+            "the grouped adapter must validate fields itself, proving the param actually \
+             reaches this branch rather than being silently dropped; got: {err:?}"
+        );
+    }
+
+    // --- search: query-mode filter lowering ---
+
+    /// A `ResolvedConfig` (with `frontmatter.indexed_fields` set to `fields`) paired
+    /// with the `SchemaCache` built from that same config with no `.kb-schema.yaml`
+    /// on disk, whose root schema falls back to `config.indexed_fields` (see
+    /// `SchemaCache::build`'s doc comment) — enough to exercise
+    /// `build_query_conditions`'s indexed-field check (now the
+    /// `qdrant::all_indexed_fields` union) without a real KB tree. Callers that
+    /// want to exercise the *config-only* (legacy) half of that union build a
+    /// `SchemaCache` from an empty field list directly instead.
+    fn schema_cache_with_indexed(fields: &[&str]) -> (Arc<ResolvedConfig>, SchemaCache) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_test_resolved_config(tmp.path());
+        Arc::make_mut(&mut config).frontmatter = crate::config::FrontmatterConfig {
+            indexed_fields: fields.iter().map(|f| f.to_string()).collect(),
+            ..Default::default()
+        };
+        let schemas = SchemaCache::build(tmp.path(), &config.frontmatter);
+        (config, schemas)
+    }
+
+    fn filters_param(json: serde_json::Value) -> SearchParams {
+        SearchParams {
+            filters: Some(json.as_object().unwrap().clone()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn query_mode_rejects_a_filter_on_a_field_with_no_payload_index() {
+        let (config, schemas) = schema_cache_with_indexed(&["type"]);
+        let err = build_query_conditions(
+            &filters_param(serde_json::json!({ "untracked_field": "x" })),
+            &config,
+            &schemas,
+        )
+        .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("untracked_field"), "got: {msg}");
+        assert!(msg.contains("indexed: true"), "got: {msg}");
+    }
+
+    #[test]
+    fn query_mode_accepts_a_filter_on_an_indexed_field() {
+        let (config, schemas) = schema_cache_with_indexed(&["type"]);
+        let conditions = build_query_conditions(
+            &filters_param(serde_json::json!({ "type": "guide" })),
+            &config,
+            &schemas,
+        )
+        .unwrap();
+        assert_eq!(conditions.len(), 1);
+    }
+
+    /// A field indexed only via the legacy `frontmatter.indexed_fields` config
+    /// list — never declared `indexed: true` in any `.kb-schema.yaml` — is
+    /// genuinely filterable in Qdrant (`qdrant::all_indexed_fields` unions both
+    /// sources when creating payload indexes), so `build_query_conditions` must
+    /// accept it too rather than rejecting it by name for only checking the
+    /// schema half of that union.
+    #[test]
+    fn query_mode_accepts_a_legacy_config_only_indexed_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_test_resolved_config(tmp.path());
+        Arc::make_mut(&mut config).frontmatter = crate::config::FrontmatterConfig {
+            indexed_fields: vec!["legacy_only".to_string()],
+            ..Default::default()
+        };
+        // Built from an empty field list: nothing is `indexed: true` in any schema,
+        // so the schema half of the union contributes nothing for this field.
+        let schemas = SchemaCache::build(tmp.path(), &crate::config::FrontmatterConfig::default());
+
+        let conditions = build_query_conditions(
+            &filters_param(serde_json::json!({ "legacy_only": "x" })),
+            &config,
+            &schemas,
+        )
+        .unwrap();
+        assert_eq!(conditions.len(), 1);
+    }
+
+    /// When the SAME field name is declared indexed by both a `.kb-schema.yaml`
+    /// (with an explicit type) and the legacy `frontmatter.indexed_fields` list,
+    /// `qdrant::all_indexed_fields` must let the schema's kind win — not fall
+    /// back to the legacy union's implicit keyword default — since that is
+    /// exactly what determines whether a numeric range filter on the field is
+    /// accepted here or rejected as "declared as Keyword".
+    #[test]
+    fn query_mode_accepts_a_range_filter_when_schema_kind_beats_the_legacy_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(crate::schema::SCHEMA_FILE_NAME),
+            "fields:\n  prep_minutes:\n    type: integer\n    indexed: true\n",
+        )
+        .unwrap();
+        let mut config = make_test_resolved_config(tmp.path());
+        Arc::make_mut(&mut config).frontmatter = crate::config::FrontmatterConfig {
+            indexed_fields: vec!["prep_minutes".to_string()],
+            ..Default::default()
+        };
+        let schemas = SchemaCache::build(tmp.path(), &config.frontmatter);
+
+        let conditions = build_query_conditions(
+            &filters_param(serde_json::json!({ "prep_minutes": { "gte": 10 } })),
+            &config,
+            &schemas,
+        )
+        .expect(
+            "a numeric range must be accepted once the schema's integer kind wins over \
+             the legacy keyword default",
+        );
+        assert_eq!(conditions.len(), 1);
+    }
+
+    #[test]
+    fn query_mode_filters_reproduce_the_old_domain_type_tags_conditions() {
+        // `filters` is the one and only path to narrowing a query-mode search now;
+        // this pins that {"domain": ..., "type": ..., "tags": [...]} through it
+        // produces the exact same Qdrant conditions the deleted domain/type/tags
+        // params used to build directly.
+        let (config, schemas) = schema_cache_with_indexed(&["domain", "type", "tags"]);
+        let conditions = build_query_conditions(
+            &filters_param(serde_json::json!({
+                "domain": "sysadmin",
+                "type": "guide",
+                "tags": ["rust", "rag"],
+            })),
+            &config,
+            &schemas,
+        )
+        .unwrap();
+
+        assert_eq!(conditions.len(), 3);
+        // Every keyword-kind `AnyOf` — regardless of value count — lowers through the
+        // same `Condition::matches(_, Vec<String>)` (match-any) shape the old
+        // `tags: Vec<String>` array filter always used; `domain`/`type` (formerly
+        // single-value scalar matches) now go through that same shape too, since
+        // `filters` no longer distinguishes "one value" from "any of these values".
+        assert!(
+            conditions.contains(&qdrant_client::qdrant::Condition::matches(
+                "domain",
+                vec!["sysadmin".to_string()]
+            ))
+        );
+        assert!(
+            conditions.contains(&qdrant_client::qdrant::Condition::matches(
+                "type",
+                vec!["guide".to_string()]
+            ))
+        );
+        assert!(
+            conditions.contains(&qdrant_client::qdrant::Condition::matches(
+                "tags",
+                vec!["rust".to_string(), "rag".to_string()]
+            ))
+        );
     }
 
     // --- schema tool helpers ---
@@ -4849,7 +5311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_documents_reports_total_and_truncation() {
+    async fn search_enumerate_reports_total_and_truncation() {
         let tmp = tempfile::tempdir().unwrap();
         let server = schema_tool_server(&tmp);
         for i in 0..5 {
@@ -4862,7 +5324,7 @@ mod tests {
         }
 
         let result = server
-            .list_documents(Parameters(ListDocumentsParams {
+            .search(Parameters(SearchParams {
                 limit: Some(2),
                 ..Default::default()
             }))
@@ -4880,7 +5342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_documents_filters_through_the_tool_surface() {
+    async fn search_enumerate_filters_through_the_tool_surface() {
         let tmp = tempfile::tempdir().unwrap();
         let server = schema_tool_server(&tmp);
         seed_document(
@@ -4899,7 +5361,7 @@ mod tests {
         let mut filters = serde_json::Map::new();
         filters.insert("prep".into(), serde_json::json!({ "lt": 30 }));
         let result = server
-            .list_documents(Parameters(ListDocumentsParams {
+            .search(Parameters(SearchParams {
                 filters: Some(filters),
                 ..Default::default()
             }))
@@ -4915,18 +5377,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_documents_reports_an_empty_result_clearly() {
+    async fn search_enumerate_reports_an_empty_result_clearly() {
         let tmp = tempfile::tempdir().unwrap();
         let server = schema_tool_server(&tmp);
 
         let result = server
-            .list_documents(Parameters(ListDocumentsParams::default()))
+            .search(Parameters(SearchParams::default()))
             .await
             .unwrap();
 
         assert_eq!(
             result.structured_content.unwrap()["total"],
             serde_json::json!(0)
+        );
+    }
+
+    /// Enumeration mode's `path_prefix` compiles to an exact SQL `LIKE prefix%`
+    /// (see `state::query_documents`) — never the query-mode post-fetch retain
+    /// the over-fetch/`path_prefix_truncated` fix exists for. A selective prefix
+    /// must still report an exact `total`/`returned`/`has_more`, and the response
+    /// must carry no `path_prefix_truncated` key at all: that concept only exists
+    /// where a fetch can come up short of what actually matches.
+    #[tokio::test]
+    async fn search_enumerate_path_prefix_is_unaffected_by_query_mode_overfetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        for i in 0..5 {
+            seed_document(
+                &server,
+                &format!("keep/{i}.md"),
+                serde_json::json!({ "title": format!("Doc {i}") }),
+            )
+            .await;
+        }
+        for i in 0..20 {
+            seed_document(
+                &server,
+                &format!("skip/{i}.md"),
+                serde_json::json!({ "title": format!("Other {i}") }),
+            )
+            .await;
+        }
+
+        let result = server
+            .search(Parameters(SearchParams {
+                path_prefix: Some("keep/".to_string()),
+                limit: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(
+            structured["total"],
+            serde_json::json!(5),
+            "an exact SQL LIKE prefix match, unaffected by the query-mode over-fetch \
+             even though far more non-matching documents exist elsewhere"
+        );
+        assert_eq!(structured["returned"], serde_json::json!(2));
+        assert_eq!(structured["has_more"], serde_json::json!(true));
+        assert!(
+            structured.get("path_prefix_truncated").is_none(),
+            "path_prefix_truncated is a query-mode-only concept"
         );
     }
 
@@ -4956,6 +5469,52 @@ mod tests {
         ))
         .unwrap_err();
         assert!(format!("{:?}", err).contains("too many values"));
+    }
+
+    #[test]
+    fn oversized_filter_scalar_value_is_rejected() {
+        // Master enforced MAX_FILTER_STR_LEN on each scalar filter value
+        // (domain_too_long_is_rejected et al., since folded into the generic
+        // `filters` map). `parse_filters`/`parse_field_filter` cap the field NAME
+        // length and the values COUNT, but a single value's length must be capped
+        // too, or one call can smuggle an arbitrarily large string into a Qdrant
+        // query / SQLite bound parameter.
+        let long = "x".repeat(MAX_FILTER_STR_LEN + 1);
+        let err = build_document_query(&filters_from(serde_json::json!({ "tags": long.clone() })))
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("too long"),
+            "scalar-equality value over MAX_FILTER_STR_LEN must be rejected: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn oversized_filter_any_of_value_is_rejected() {
+        let long = "x".repeat(MAX_FILTER_STR_LEN + 1);
+        let err = build_document_query(&filters_from(
+            serde_json::json!({ "tags": { "any_of": [long] } }),
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("too long"),
+            "an any_of value over MAX_FILTER_STR_LEN must be rejected: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn oversized_filter_all_of_value_is_rejected() {
+        let long = "x".repeat(MAX_FILTER_STR_LEN + 1);
+        let err = build_document_query(&filters_from(
+            serde_json::json!({ "tags": { "all_of": [long] } }),
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("too long"),
+            "an all_of value over MAX_FILTER_STR_LEN must be rejected: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -5128,15 +5687,8 @@ mod tests {
 
     fn make_params(query: &str) -> SearchParams {
         SearchParams {
-            query: query.to_string(),
-            domain: None,
-            r#type: None,
-            tags: None,
-            limit: None,
-            min_score: None,
-            explain: None,
-            modified_after: None,
-            modified_before: None,
+            query: Some(query.to_string()),
+            ..Default::default()
         }
     }
 
@@ -5159,47 +5711,9 @@ mod tests {
     }
 
     #[test]
-    fn domain_too_long_is_rejected() {
-        let params = SearchParams {
-            domain: Some("x".repeat(MAX_FILTER_STR_LEN + 1)),
-            ..make_params("query")
-        };
-        assert!(validate_search_params(&params).is_err());
-    }
-
-    #[test]
-    fn type_too_long_is_rejected() {
-        let params = SearchParams {
-            r#type: Some("x".repeat(MAX_FILTER_STR_LEN + 1)),
-            ..make_params("query")
-        };
-        assert!(validate_search_params(&params).is_err());
-    }
-
-    #[test]
-    fn too_many_tags_rejected() {
-        let params = SearchParams {
-            tags: Some(vec!["tag".to_string(); MAX_TAG_COUNT + 1]),
-            ..make_params("query")
-        };
-        assert!(validate_search_params(&params).is_err());
-    }
-
-    #[test]
-    fn tag_too_long_is_rejected() {
-        let params = SearchParams {
-            tags: Some(vec!["x".repeat(MAX_TAG_LEN + 1)]),
-            ..make_params("query")
-        };
-        assert!(validate_search_params(&params).is_err());
-    }
-
-    #[test]
-    fn max_tags_at_limit_accepted() {
-        let params = SearchParams {
-            tags: Some(vec!["tag".to_string(); MAX_TAG_COUNT]),
-            ..make_params("query")
-        };
+    fn no_query_is_accepted() {
+        // Enumeration mode: `query` is entirely optional now.
+        let params = SearchParams::default();
         assert!(validate_search_params(&params).is_ok());
     }
 
@@ -5257,6 +5771,7 @@ mod tests {
             empty_test_schema_cache(),
             None,
             Arc::new(crate::reindex::ReindexQueue::new()),
+            empty_test_description_overlay(),
         )
         .unwrap();
 
@@ -5299,6 +5814,7 @@ mod tests {
             empty_test_schema_cache(),
             None,
             Arc::new(crate::reindex::ReindexQueue::new()),
+            empty_test_description_overlay(),
         )
         .unwrap();
 
@@ -5331,46 +5847,190 @@ mod tests {
     }
 
     #[test]
-    fn default_instructions_constant_is_reasonable() {
-        assert!(DEFAULT_INSTRUCTIONS.contains("search"));
-        assert!(
-            DEFAULT_INSTRUCTIONS
-                .to_lowercase()
-                .contains("knowledge base")
-        );
+    fn write_document_tool_description_covers_every_mode() {
+        // The COMPILED description owns the API contract and nothing else: the
+        // three content modes and how they combine. What belongs in this KB —
+        // durable reference material, a shared scratchpad, anything else — is a
+        // property of the deployment, not of the binary, so it lives in the
+        // per-tool extension (`<kb>/meta/mcp/tools/write_document.md`) which is
+        // appended at runtime. One binary serves knowledge bases whose scope
+        // policies contradict each other; baking either one in here would ship a
+        // description that lies to half of them.
+        //
+        // The compiled description no longer lives on the `#[tool(...)]`
+        // attribute (see `descriptions.rs`) — every tool method carries a bare
+        // `#[tool]`, and `KbSearchServer::tool_router().list_all()` therefore
+        // returns `description: None` for all six. This asserts against the
+        // actual runtime source of the description instead.
+        let name = "write_document";
+        let description = crate::descriptions::compose_tool_description(name, false, None)
+            .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
+
+        for mode in ["content", "old_string", "new_path"] {
+            assert!(
+                description.contains(mode),
+                "'{name}' description should document the '{mode}' mode: {description}"
+            );
+        }
     }
 
     #[test]
-    fn write_tool_descriptions_assert_scope() {
-        let tools = KbSearchServer::tool_router().list_all();
-
-        // The write tools are the ones an agent can use to park transient content
-        // in the KB, so each must carry the scope boundary. Their descriptions are
-        // compiled in, unlike the server instructions, which a deployment overrides
-        // via `mcp.instructions`.
-        for name in ["create_document", "edit_document"] {
-            let tool = tools
-                .iter()
-                .find(|t| t.name == name)
-                .unwrap_or_else(|| panic!("tool '{name}' not registered"));
-            let description = tool
-                .description
-                .as_deref()
-                .unwrap_or_else(|| panic!("tool '{name}' has no description"));
-
+    fn tool_router_tools_carry_no_compiled_description() {
+        // Every `#[tool(...)]` attribute deliberately carries no `description`
+        // (and no doc comment that would leak in as one via the macro's
+        // fallback) — the description overlay in `list_tools`/`get_tool` is the
+        // only source of a tool's description. This guards against a future
+        // edit accidentally reintroducing one, which would silently bypass the
+        // overlay for that tool (`list_tools` always applies the overlay
+        // unconditionally, but a stray compiled description would still betray
+        // the "compiled layer can't state per-KB policy" rule the moment
+        // someone writes one back in).
+        for tool in KbSearchServer::tool_router().list_all() {
             assert!(
-                description.contains("SCOPE"),
-                "'{name}' description should carry a scope assertion: {description}"
-            );
-            assert!(
-                description.contains("NEVER"),
-                "'{name}' scope assertion should be emphatic: {description}"
-            );
-            assert!(
-                description.contains("session notes"),
-                "'{name}' should name the transient-content anti-pattern: {description}"
+                tool.description.is_none(),
+                "tool '{}' unexpectedly carries a compiled description: {:?}",
+                tool.name,
+                tool.description
             );
         }
+    }
+
+    // --- description overlay: list_tools / get_tool ---------------------
+
+    /// Build a bare-bones `KbSearchServer` for overlay tests — same
+    /// construction pattern as `get_document_rejects_overlong_path` below,
+    /// parameterized by the description overlay under test.
+    fn make_overlay_test_server(overlay: HashMap<String, String>) -> KbSearchServer {
+        let tmp = tempfile::tempdir().unwrap();
+        let instructions = Arc::new(RwLock::new("test".to_string()));
+        let config = crate::config::ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test".into(),
+        };
+        let qdrant = Arc::new(QdrantStore::new(&config).unwrap());
+        let embed_config = crate::config::ResolvedEmbeddingConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            model: "test".into(),
+            api_key: None,
+            vector_size: 768,
+            batch_size: 32,
+            request_timeout_secs: 60,
+            batch_concurrency: 4,
+        };
+        let embed = Arc::new(EmbedClient::new(&embed_config));
+        // `KbSearchServer::new` canonicalizes `tmp`'s path during construction
+        // but never touches the filesystem again afterward (neither does
+        // anything these overlay tests exercise — `get_tool`/`list_tools` are
+        // pure lock reads), so `tmp` can safely drop once construction
+        // returns.
+        let server = KbSearchServer::new(
+            embed,
+            qdrant,
+            "test".into(),
+            tmp.path().to_path_buf(),
+            &["**/*.md".to_string()],
+            instructions,
+            crate::config::shared_config(make_test_resolved_config(tmp.path())),
+            empty_test_schema_cache(),
+            None,
+            Arc::new(crate::reindex::ReindexQueue::new()),
+            Arc::new(RwLock::new(overlay)),
+        )
+        .unwrap();
+        drop(tmp);
+        server
+    }
+
+    #[test]
+    fn list_tools_returns_the_overlay_composed_descriptions() {
+        // `list_tools`'s hand-written body (see the `ServerHandler` impl) is
+        // exactly `tool_router().list_all().map(overlay_description)` behind a
+        // thin async/RequestContext wrapper the framework provides — `Peer`'s
+        // constructor needed to build that context is `pub(crate)` inside
+        // `rmcp` and unreachable from here, so this exercises the same overlay
+        // logic directly. The wrapper itself (real dispatch through the MCP
+        // transport) is covered end-to-end by
+        // `server::tests::tools_list_without_session_header_succeeds`
+        // and its sibling assertions on `tools/list` descriptions.
+        let overlay = crate::descriptions::compose_tool_descriptions(None, false);
+        let server = make_overlay_test_server(overlay.clone());
+
+        let tools: Vec<Tool> = KbSearchServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| server.overlay_description(tool))
+            .collect();
+
+        assert_eq!(tools.len(), crate::descriptions::TOOL_NAMES.len());
+        for tool in &tools {
+            let expected = overlay
+                .get(tool.name.as_ref())
+                .unwrap_or_else(|| panic!("no overlay entry for tool '{}'", tool.name));
+            assert_eq!(
+                tool.description.as_deref(),
+                Some(expected.as_str()),
+                "tool '{}' description mismatch",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn get_tool_returns_the_same_text_as_list_tools_would_for_that_tool() {
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "search".to_string(),
+            "Overlay search description.".to_string(),
+        );
+        let server = make_overlay_test_server(overlay);
+
+        let tool = server
+            .get_tool("search")
+            .expect("search tool should be registered");
+        assert_eq!(
+            tool.description.as_deref(),
+            Some("Overlay search description.")
+        );
+
+        // Same value the router itself produces, run through the same
+        // `overlay_description` path `list_tools` uses.
+        let router_tool = KbSearchServer::tool_router()
+            .get("search")
+            .cloned()
+            .unwrap();
+        let via_list_tools_path = server.overlay_description(router_tool);
+        assert_eq!(tool.description, via_list_tools_path.description);
+    }
+
+    #[test]
+    fn get_tool_returns_none_for_an_unknown_name() {
+        let server = make_overlay_test_server(HashMap::new());
+        assert!(server.get_tool("not_a_real_tool").is_none());
+    }
+
+    #[test]
+    fn description_overlay_recovers_from_a_poisoned_lock() {
+        use std::panic;
+
+        let mut overlay = HashMap::new();
+        overlay.insert("search".to_string(), "Before poison.".to_string());
+        let server = make_overlay_test_server(overlay);
+
+        let overlay_lock = Arc::clone(&server.description_overlay);
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _guard = overlay_lock.write().unwrap();
+            panic!("intentional panic to poison the description overlay lock");
+        }));
+        assert!(
+            overlay_lock.read().is_err(),
+            "overlay lock should be poisoned"
+        );
+
+        // get_tool must not panic, and must recover the last-good value.
+        let tool = server
+            .get_tool("search")
+            .expect("search tool should still be registered after recovery");
+        assert_eq!(tool.description.as_deref(), Some("Before poison."));
     }
 
     #[test]
@@ -5433,6 +6093,7 @@ mod tests {
             empty_test_schema_cache(),
             None,
             Arc::new(crate::reindex::ReindexQueue::new()),
+            empty_test_description_overlay(),
         )
         .unwrap();
 
@@ -5672,18 +6333,21 @@ mod tests {
             schema_cache,
             None,
             Arc::new(crate::reindex::ReindexQueue::new()),
+            empty_test_description_overlay(),
         )
         .unwrap()
     }
 
     #[tokio::test]
-    async fn edit_document_on_nonexistent_file_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = make_test_resolved_config(tmp.path());
-        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+    async fn write_document_on_nonexistent_path_upserts_as_a_create() {
+        // The merged tool UPSERTS: a `content` write against a path that does not
+        // exist creates it (as `create_document` used to), rather than the old
+        // standalone `edit_document`'s "does not exist" refusal.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
 
-        // edit_document now goes through resolve_within_data; NotFound → clear error.
-        let params = EditDocumentParams {
+        let params = WriteDocumentParams {
             path: "docs/nonexistent.md".to_string(),
             old_string: None,
             new_string: None,
@@ -5691,66 +6355,69 @@ mod tests {
             message: None,
             expected_hash: None,
             new_path: None,
+            force_new: Some(true),
         };
-        let result = server.edit_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
+        let result = result.expect("a write against a nonexistent path must create it");
+        let text = format!("{:?}", result.content);
         assert!(
-            result.is_err(),
-            "edit of non-existent file should return Err"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.message.contains("does not exist"),
-            "error message should mention 'does not exist', got: {}",
-            err.message
-        );
-        assert!(
-            err.message.contains("create_document"),
-            "error should mention create_document, got: {}",
-            err.message
+            text.contains("Created 'docs/nonexistent.md'"),
+            "a write against a nonexistent path is a CREATE: {text}"
         );
     }
 
     #[tokio::test]
-    async fn create_document_on_existing_file_returns_use_edit_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Pre-create the file
-        let sub = tmp.path().join("docs");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("existing.md"), "# Already here").unwrap();
+    async fn write_document_on_existing_path_upserts_as_an_edit() {
+        // The merged write_document tool UPSERTS: calling it with `content` against
+        // a path that already exists no longer refuses (as `create_document` used
+        // to) — it replaces the file, the same as an explicit edit would.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(
+            work.path().join("docs/existing.md"),
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "docs/existing.md", "add docs/existing.md");
+        let (server, _config) = make_git_backed_server(&work);
 
-        let config = make_test_resolved_config(tmp.path());
-        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
-
-        let params = CreateDocumentParams {
+        let params = WriteDocumentParams {
             path: "docs/existing.md".to_string(),
-            content: "---\ntitle: Test\n---\n# New content".to_string(),
+            content: Some(
+                "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n"
+                    .to_string(),
+            ),
+            old_string: None,
+            new_string: None,
+            new_path: None,
             message: None,
+            expected_hash: None,
             force_new: None,
         };
-        let result = server.create_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
-        assert!(result.is_err(), "create on existing file should return Err");
-        let err = result.unwrap_err();
+        let result =
+            result.expect("write_document must upsert rather than refuse an existing path");
+        let text = format!("{:?}", result.content);
         assert!(
-            err.message.contains("already exists"),
-            "error message should mention 'already exists', got: {}",
-            err.message
+            text.contains("Edited 'docs/existing.md'"),
+            "an upsert onto an existing path is an EDIT, not a create: {text}"
         );
-        assert!(
-            err.message.contains("edit_document"),
-            "error should mention edit_document, got: {}",
-            err.message
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("docs/existing.md")).unwrap(),
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n",
         );
     }
 
     #[tokio::test]
-    async fn create_document_on_existing_but_not_permitted_file_returns_include_pattern_error() {
-        // G3 regression: pre-refactor, a path that BOTH exists on disk AND fails
-        // the include-pattern check was reported with the include-pattern
-        // message, not "already exists" — reporting "already exists; use
-        // edit_document" here would be misleading circular guidance, since
-        // edit_document rejects the same path as not permitted right back.
+    async fn write_document_on_existing_but_not_permitted_file_returns_include_pattern_error() {
+        // G3 regression, preserved across the merge: a path that BOTH exists on
+        // disk AND fails the include-pattern check must be reported with the
+        // include-pattern message, not "already exists" — the latter would be
+        // misleading circular guidance, since a retry would reject the same path
+        // as not permitted right back.
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("docs");
         std::fs::create_dir_all(&sub).unwrap();
@@ -5761,15 +6428,19 @@ mod tests {
         let config = make_test_resolved_config(tmp.path());
         let server = make_write_test_server(&tmp, &["**/*.txt".to_string()], config);
 
-        let params = CreateDocumentParams {
+        let params = WriteDocumentParams {
             path: "docs/existing.md".to_string(),
-            content: "---\ntitle: Test\n---\n# New content".to_string(),
+            content: Some("---\ntitle: Test\n---\n# New content".to_string()),
+            old_string: None,
+            new_string: None,
+            new_path: None,
             message: None,
+            expected_hash: None,
             force_new: None,
         };
-        let result = server.create_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
-        assert!(result.is_err(), "create should be rejected");
+        assert!(result.is_err(), "write should be rejected");
         let err = result.unwrap_err();
         assert!(
             err.message.contains("indexable include pattern"),
@@ -5785,11 +6456,13 @@ mod tests {
 
     #[test]
     fn already_exists_race_error_reports_the_absolute_path() {
-        // `create_document`'s own pre-check (`abs_path.exists()`) catches the
-        // ordinary "already exists" case before ever reaching `write.rs` — see
-        // `create_document_on_existing_file_returns_use_edit_error` above. The
-        // `WriteError::AlreadyExists` arm this test drives is only reachable via
-        // a genuine TOCTOU race (the file appears between that pre-check and
+        // `write_document`'s own create-path pre-check (`abs_path.exists()`)
+        // catches the ordinary "already exists" case before ever reaching
+        // `write.rs` — see `write_document_on_existing_path_upserts_as_an_edit`
+        // above (which never reaches this arm at all, since resolving to an
+        // existing file routes to the edit path instead of the create path). The
+        // `WriteError::AlreadyExists` arm this test drives is only reachable via a
+        // genuine TOCTOU race (the file appears between that pre-check and
         // `write::write_document`'s `create_new` open), which pre-`write.rs`-
         // extraction code reported with the absolute filesystem path rather than
         // the repo-relative one — restore that wording (N2).
@@ -5813,8 +6486,8 @@ mod tests {
             err.message
         );
         assert!(
-            err.message.contains("edit_document"),
-            "error should still mention edit_document, got: {}",
+            err.message.contains("write_document"),
+            "error should still mention write_document, got: {}",
             err.message
         );
     }
@@ -5854,13 +6527,17 @@ mod tests {
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
         // Try to write a .txt file (not matched by **/*.md)
-        let params = CreateDocumentParams {
+        let params = WriteDocumentParams {
             path: "notes.txt".to_string(),
-            content: "Some plain text".to_string(),
+            content: Some("Some plain text".to_string()),
+            old_string: None,
+            new_string: None,
+            new_path: None,
             message: None,
+            expected_hash: None,
             force_new: None,
         };
-        let result = server.create_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
         assert!(
             result.is_err(),
@@ -5880,27 +6557,97 @@ mod tests {
         let config = make_test_resolved_config(tmp.path());
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
-        // Absolute path should be caught by the absolute-path guard before include check
-        let params = CreateDocumentParams {
+        // Absolute path should be caught by a guard before any write happens.
+        let params = WriteDocumentParams {
             path: "/etc/passwd".to_string(),
-            content: "# Evil".to_string(),
+            content: Some("# Evil".to_string()),
+            old_string: None,
+            new_string: None,
+            new_path: None,
             message: None,
+            expected_hash: None,
             force_new: None,
         };
-        let result = server.create_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
-        // A leading `/` now means the knowledge-base root, so this resolves to
-        // `<kb>/etc/passwd` — safely inside the KB — and is then rejected by the
-        // include-pattern guard because it is not an indexable markdown path.
+        // `/etc/passwd` really exists on the filesystem, so `resolve_within_data`
+        // resolves the literal absolute path first (see its doc comment) and
+        // returns `Outside` — a hard error from the dispatch above, caught before
+        // ever reaching create's include-pattern check. This differs from the
+        // "leading `/` means the KB root" convenience: that convenience only
+        // applies once the literal absolute path does NOT exist (see
+        // `write_document_on_absolute_path_to_real_file_outside_kb_is_hard_error`
+        // for that case, and for why the misrouted version of this dispatch used
+        // to make this test pass for the wrong reason — the include-pattern guard
+        // it originally meant to exercise never actually ran on this input).
         assert!(
             result.is_err(),
-            "a non-indexable path must still be rejected"
+            "an absolute path resolving to a real file outside the KB must be rejected"
         );
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("include pattern"),
-            "error should cite the include-pattern guard, got: {}",
+            err.message.contains("outside the data directory"),
+            "error should cite the outside-data-directory guard, got: {}",
             err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_on_absolute_path_to_real_file_outside_kb_is_hard_error() {
+        // `resolve_within_data` tries an absolute path literally first (see its
+        // doc comment). When that literal path EXISTS but is outside the data
+        // root, it returns `ResolveErr::Outside` — which the dispatch above must
+        // treat as a hard failure, not fall through to `write_document_create`.
+        // Falling through would strip the leading `/` and join it KB-relative,
+        // silently creating a *new* file inside the KB at a path the caller never
+        // asked for, while reporting success.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        // A real, existing .md file OUTSIDE the KB data root.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("real.md");
+        std::fs::write(&outside_file, "# Not part of the KB").unwrap();
+
+        let params = WriteDocumentParams {
+            path: outside_file.to_str().unwrap().to_string(),
+            content: Some("# Evil overwrite".to_string()),
+            old_string: None,
+            new_string: None,
+            new_path: None,
+            message: None,
+            expected_hash: None,
+            force_new: None,
+        };
+        let result = server.write_document(Parameters(params)).await;
+
+        assert!(
+            result.is_err(),
+            "a real absolute path outside the KB must be a hard error, not silently \
+             redirected into a create inside the KB"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("outside the data directory"),
+            "error should say the path is outside the data directory, got: {}",
+            err.message
+        );
+
+        // The file outside the KB must be untouched, and nothing must have been
+        // created inside the KB at the stripped-leading-slash path.
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "# Not part of the KB",
+            "the real file outside the KB must not be overwritten"
+        );
+        let bogus_created_path = tmp.path().join(crate::retrieval::kb_root_relative(
+            outside_file.to_str().unwrap(),
+        ));
+        assert!(
+            !bogus_created_path.exists(),
+            "a bogus file must not have been created inside the KB at {}",
+            bogus_created_path.display()
         );
     }
 
@@ -5953,13 +6700,17 @@ mod tests {
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
         // Content intentionally missing the "title" frontmatter field
-        let params = CreateDocumentParams {
+        let params = WriteDocumentParams {
             path: "guide/missing-title.md".to_string(),
-            content: "---\ntype: guide\n---\n# No title in frontmatter".to_string(),
+            content: Some("---\ntype: guide\n---\n# No title in frontmatter".to_string()),
+            old_string: None,
+            new_string: None,
+            new_path: None,
             message: None,
+            expected_hash: None,
             force_new: None,
         };
-        let result = server.create_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
         assert!(result.is_err(), "validation failure should return Err");
         let err = result.unwrap_err();
@@ -6204,13 +6955,17 @@ mod tests {
 
         // When dedup is disabled we should NOT get a dedup refusal.
         // The write will fail at git/reindex (no live services) — that's fine.
-        let params = CreateDocumentParams {
+        let params = WriteDocumentParams {
             path: "docs/new.md".to_string(),
-            content: "---\ntitle: Test Doc\n---\n# Content".to_string(),
+            content: Some("---\ntitle: Test Doc\n---\n# Content".to_string()),
+            old_string: None,
+            new_string: None,
+            new_path: None,
             message: None,
+            expected_hash: None,
             force_new: None,
         };
-        let result = server.create_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
         // We expect an error (git/reindex will fail in unit test), but it must
         // NOT be a dedup refusal — i.e. it should not mention "similar document".
@@ -6237,13 +6992,17 @@ mod tests {
         // With force_new=Some(true), the gate must be skipped even when dedup is
         // enabled.  The embed/qdrant will fail-open (no live services), so we will
         // reach git/reindex and fail there — but NOT with a dedup message.
-        let params = CreateDocumentParams {
+        let params = WriteDocumentParams {
             path: "docs/forced.md".to_string(),
-            content: "---\ntitle: Forced Doc\n---\n# Content".to_string(),
+            content: Some("---\ntitle: Forced Doc\n---\n# Content".to_string()),
+            old_string: None,
+            new_string: None,
+            new_path: None,
             message: None,
+            expected_hash: None,
             force_new: Some(true),
         };
-        let result = server.create_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
         if let Err(e) = result {
             assert!(
@@ -6271,7 +7030,7 @@ mod tests {
 
         // Edit path should never trigger the dedup gate.
         // It will fail at git/reindex — but NOT with a dedup message.
-        let params = EditDocumentParams {
+        let params = WriteDocumentParams {
             path: "docs/edit-me.md".to_string(),
             old_string: None,
             new_string: None,
@@ -6279,8 +7038,9 @@ mod tests {
             message: None,
             expected_hash: None,
             new_path: None,
+            force_new: None,
         };
-        let result = server.edit_document(Parameters(params)).await;
+        let result = server.write_document(Parameters(params)).await;
 
         if let Err(e) = result {
             assert!(
@@ -6428,8 +7188,8 @@ mod tests {
         old_string: Option<&str>,
         new_string: Option<&str>,
         new_path: Option<&str>,
-    ) -> EditDocumentParams {
-        EditDocumentParams {
+    ) -> WriteDocumentParams {
+        WriteDocumentParams {
             path: "docs/test.md".to_string(),
             content: content.map(|s| s.to_string()),
             old_string: old_string.map(|s| s.to_string()),
@@ -6437,6 +7197,7 @@ mod tests {
             message: None,
             expected_hash: None,
             new_path: new_path.map(|s| s.to_string()),
+            force_new: None,
         }
     }
 
@@ -6844,12 +7605,17 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let result = server
-            .create_document(Parameters(CreateDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "docs/queued.md".to_string(),
-                content:
+                content: Some(
                     "---\ntitle: Queued\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
                         .to_string(),
+                ),
+                old_string: None,
+                new_string: None,
+                new_path: None,
                 message: None,
+                expected_hash: None,
                 force_new: Some(true),
             }))
             .await;
@@ -6898,10 +7664,14 @@ mod tests {
         // Sanity check that the OLD schema really does reject "beta" — otherwise the
         // second half of this test would not be proving anything.
         let rejected = server
-            .create_document(Parameters(CreateDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "notes/before.md".to_string(),
-                content: "---\ntitle: Before\nstatus: beta\n---\n\n# Body\n".to_string(),
+                content: Some("---\ntitle: Before\nstatus: beta\n---\n\n# Body\n".to_string()),
+                old_string: None,
+                new_string: None,
+                new_path: None,
                 message: None,
+                expected_hash: None,
                 force_new: Some(true),
             }))
             .await;
@@ -6928,10 +7698,14 @@ mod tests {
 
         // Same server, same cached schema handle, next call: must see the new rule.
         let accepted = server
-            .create_document(Parameters(CreateDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "notes/after.md".to_string(),
-                content: "---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string(),
+                content: Some("---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string()),
+                old_string: None,
+                new_string: None,
+                new_path: None,
                 message: None,
+                expected_hash: None,
                 force_new: Some(true),
             }))
             .await;
@@ -7240,11 +8014,17 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let result = server
-            .create_document(Parameters(CreateDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "docs/new.md".to_string(),
-                content: "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
-                    .to_string(),
+                content: Some(
+                    "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
+                        .to_string(),
+                ),
+                old_string: None,
+                new_string: None,
+                new_path: None,
                 message: None,
+                expected_hash: None,
                 force_new: Some(true),
             }))
             .await;
@@ -7289,7 +8069,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let result = server
-            .edit_document(Parameters(EditDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "edit-me.md".to_string(),
                 old_string: None,
                 new_string: None,
@@ -7300,6 +8080,7 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 new_path: None,
+                force_new: None,
             }))
             .await;
 
@@ -7348,7 +8129,7 @@ mod tests {
         let new_content =
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
         let result = server
-            .edit_document(Parameters(EditDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "edit-me.md".to_string(),
                 old_string: None,
                 new_string: None,
@@ -7356,6 +8137,7 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 new_path: None,
+                force_new: None,
             }))
             .await;
 
@@ -7444,7 +8226,7 @@ mod tests {
         let stale_hash = crate::ingest::compute_hash_from_bytes(b"not the current content");
 
         let result = server
-            .edit_document(Parameters(EditDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "docs/edit-me.md".to_string(),
                 old_string: None,
                 new_string: None,
@@ -7452,6 +8234,7 @@ mod tests {
                 message: None,
                 expected_hash: Some(stale_hash),
                 new_path: None,
+                force_new: None,
             }))
             .await;
 
@@ -7490,7 +8273,7 @@ mod tests {
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
 
         let result = server
-            .edit_document(Parameters(EditDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "edit-me.md".to_string(),
                 old_string: None,
                 new_string: None,
@@ -7498,6 +8281,7 @@ mod tests {
                 message: None,
                 expected_hash: Some(correct_hash),
                 new_path: None,
+                force_new: None,
             }))
             .await;
 
@@ -7530,7 +8314,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let result = server
-            .edit_document(Parameters(EditDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "docs/old-home.md".to_string(),
                 old_string: None,
                 new_string: None,
@@ -7538,6 +8322,7 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 new_path: Some("docs/new-home.md".to_string()),
+                force_new: None,
             }))
             .await;
 
@@ -7574,7 +8359,7 @@ mod tests {
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
 
         let result = server
-            .edit_document(Parameters(EditDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "edit-me.md".to_string(),
                 old_string: None,
                 new_string: None,
@@ -7582,6 +8367,7 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 new_path: Some("archive/edit-me.md".to_string()),
+                force_new: None,
             }))
             .await;
 
@@ -7620,7 +8406,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let result = server
-            .edit_document(Parameters(EditDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "source.md".to_string(),
                 old_string: None,
                 new_string: None,
@@ -7628,6 +8414,7 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 new_path: Some("dest.md".to_string()),
+                force_new: None,
             }))
             .await;
 
@@ -7659,6 +8446,239 @@ mod tests {
             std::fs::read_to_string(work.path().join("dest.md")).unwrap(),
             dest_content
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // write_document: directory-move dispatch (path resolves to a directory)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_document_dispatches_to_directory_move_when_path_is_a_directory() {
+        // `path` resolving to an existing directory dispatches write_document to a
+        // whole-subtree move via `write::move_directory`, mirroring the old
+        // standalone `move_directory` tool.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old-project")).unwrap();
+        let doc_content = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old-project/a.md"), doc_content).unwrap();
+        git_commit_all(&work, "old-project/a.md", "add old-project/a.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "old-project".to_string(),
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: Some("archive/new-project".to_string()),
+                message: None,
+                expected_hash: None,
+                force_new: None,
+            }))
+            .await;
+
+        let result = result.expect("a directory path must dispatch to a directory move");
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("Moved 1 document(s)"),
+            "must report the directory move, not a single-document write: {text}"
+        );
+        assert!(
+            !work.path().join("old-project/a.md").exists(),
+            "the source directory's document must be gone after the move"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("archive/new-project/a.md")).unwrap(),
+            doc_content,
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_directory_move_requires_new_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("some-dir")).unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "some-dir".to_string(),
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: None,
+                message: None,
+                expected_hash: None,
+                force_new: None,
+            }))
+            .await;
+
+        let err = result.expect_err("a directory move without new_path must be rejected");
+        assert!(
+            err.message.contains("new_path"),
+            "error should name new_path as required, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_directory_move_rejects_single_document_fields() {
+        // Every field that only makes sense for a single document must be
+        // rejected, by name, when `path` resolves to a directory.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("some-dir")).unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let base = || WriteDocumentParams {
+            path: "some-dir".to_string(),
+            content: None,
+            old_string: None,
+            new_string: None,
+            new_path: Some("other-dir".to_string()),
+            message: None,
+            expected_hash: None,
+            force_new: None,
+        };
+
+        let cases: Vec<(&str, WriteDocumentParams)> = vec![
+            (
+                "content",
+                WriteDocumentParams {
+                    content: Some("x".to_string()),
+                    ..base()
+                },
+            ),
+            (
+                "old_string",
+                WriteDocumentParams {
+                    old_string: Some("x".to_string()),
+                    ..base()
+                },
+            ),
+            (
+                "new_string",
+                WriteDocumentParams {
+                    new_string: Some("x".to_string()),
+                    ..base()
+                },
+            ),
+            (
+                "expected_hash",
+                WriteDocumentParams {
+                    expected_hash: Some("deadbeef".to_string()),
+                    ..base()
+                },
+            ),
+            (
+                "force_new",
+                WriteDocumentParams {
+                    force_new: Some(true),
+                    ..base()
+                },
+            ),
+        ];
+
+        for (field, params) in cases {
+            let result = server.write_document(Parameters(params)).await;
+            let err = result.expect_err(&format!(
+                "a directory move with {field} set must be rejected"
+            ));
+            assert!(
+                err.message.contains(field),
+                "error should name '{field}' as the rejected field, got: {}",
+                err.message
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // write_document: create-path guards (surgical/content on a nonexistent path)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_document_surgical_edit_on_nonexistent_path_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "docs/nonexistent.md".to_string(),
+                content: None,
+                old_string: Some("old".to_string()),
+                new_string: Some("new".to_string()),
+                new_path: None,
+                message: None,
+                expected_hash: None,
+                force_new: None,
+            }))
+            .await;
+
+        let err = result.expect_err("a surgical edit against a nonexistent path must be rejected");
+        assert!(
+            err.message
+                .contains("cannot surgically edit a document that does not exist"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_create_without_content_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "docs/nonexistent.md".to_string(),
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: None,
+                message: None,
+                expected_hash: None,
+                force_new: None,
+            }))
+            .await;
+
+        let err = result.expect_err("a create with no content must be rejected");
+        assert!(
+            err.message
+                .contains("content is required to create a new document"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_new_path_on_a_create_is_rejected() {
+        // Not explicitly specced, but forced by `write::WriteRequest::dest_path`'s
+        // own contract: `is_create` must be `false` whenever `dest_path` is
+        // `Some`, since a create has no source to move from. write_document must
+        // reject this combination outright rather than silently drop new_path or
+        // pass an invalid request down to the write pipeline.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "docs/nonexistent.md".to_string(),
+                content: Some("---\ntitle: Test\n---\n# Body".to_string()),
+                old_string: None,
+                new_string: None,
+                new_path: Some("docs/elsewhere.md".to_string()),
+                message: None,
+                expected_hash: None,
+                force_new: None,
+            }))
+            .await;
+
+        let err = result.expect_err("new_path on a create must be rejected");
+        assert!(err.message.contains("new_path"), "got: {}", err.message);
     }
 
     // -----------------------------------------------------------------------
@@ -7876,10 +8896,14 @@ mod tests {
         // skipped the cache rebuild whenever the write wasn't a clean `Synced`, this
         // next call would wrongly reject "beta" against the stale pre-change schema.
         let accepted = server
-            .create_document(Parameters(CreateDocumentParams {
+            .write_document(Parameters(WriteDocumentParams {
                 path: "notes/after.md".to_string(),
-                content: "---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string(),
+                content: Some("---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string()),
+                old_string: None,
+                new_string: None,
+                new_path: None,
                 message: None,
+                expected_hash: None,
                 force_new: Some(true),
             }))
             .await;

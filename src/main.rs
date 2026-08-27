@@ -1,5 +1,6 @@
 mod chunk;
 mod config;
+mod descriptions;
 mod document_fields;
 mod embed;
 mod git;
@@ -367,19 +368,26 @@ async fn main() -> anyhow::Result<()> {
                     .map(|r| r as &(dyn rerank::Reranker + Send + Sync)),
             };
 
-            let filters = retrieval::SearchFilters {
-                domain: args.domain.clone(),
-                r#type: args.doc_type.clone(),
-                tags: args.tags.clone(),
-            };
+            let filters = retrieval::plain_search_filters(
+                args.domain.as_deref(),
+                args.doc_type.as_deref(),
+                args.tags.as_deref(),
+            );
             let opts = retrieval::SearchOptions {
                 limit: args.limit,
                 min_score: args.min_score.or(cfg.search.min_score),
                 hybrid: cfg.search.hybrid,
                 rrf_candidates: cfg.search.rrf_candidates as u64,
+                // This CLI path never runs `ensure_collection` itself, so the phrase
+                // index's availability is whatever this process has otherwise
+                // observed (nothing, typically) — config-enabled but unconfirmed
+                // degrades to ordinary retrieval, never an error. See
+                // `status::IndexStatus::phrase_matching_available`'s doc comment.
+                phrase: cfg.search.phrase && status::INDEX_STATUS.phrase_matching_available(),
                 explain: args.explain,
                 modified_after,
                 modified_before,
+                path_prefix: None,
                 rerank_candidate_limit: cfg.reranking.as_ref().map(|r| r.candidate_limit as u64),
                 diversity_max_per_document: cfg.search.diversity_max_per_document,
             };
@@ -393,7 +401,11 @@ async fn main() -> anyhow::Result<()> {
                     retrieval::SearchError::Search(err) => {
                         anyhow::anyhow!("search failed: {err:#}")
                     }
-                })?;
+                    retrieval::SearchError::Document(err) => {
+                        anyhow::anyhow!("document metadata lookup failed: {err:#}")
+                    }
+                })?
+                .results;
 
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
