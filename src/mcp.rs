@@ -643,6 +643,16 @@ pub struct GetDocumentParams {
     /// the `search` tool), or just a basename when it's unique across the
     /// index. Absolute paths are also accepted for backwards compatibility.
     pub path: String,
+    /// First line to return, 1-based and inclusive. Omit to start at the top of
+    /// the document. Given without `end_line`, the rest of the document is
+    /// returned.
+    #[serde(default)]
+    pub start_line: Option<usize>,
+    /// Last line to return, 1-based and inclusive. Omit to read to the end of
+    /// the document. Given without `start_line`, reading starts at line 1. A
+    /// value past the last line is clamped, not an error.
+    #[serde(default)]
+    pub end_line: Option<usize>,
 }
 
 /// Parameters for the `list_documents` tool.
@@ -2831,9 +2841,14 @@ impl KbSearchServer {
         the basename if it's unique across the index. Returns the complete \
         markdown including frontmatter, in both the text content and \
         structured_content.content. \
-        structured_content.content_hash is a SHA-256 hex digest of the returned \
-        content — pass it as edit_document's expected_hash to guard against editing \
-        stale content."
+        Pass start_line and/or end_line (1-based, inclusive) to read only part of \
+        a long document; structured_content always reports start_line, end_line, \
+        total_lines, and partial, so you can tell what you got and page through \
+        the rest. \
+        structured_content.content_hash is a SHA-256 hex digest of the WHOLE \
+        document, not of the returned slice — pass it as edit_document's \
+        expected_hash to guard against editing stale content, whether you read the \
+        document in full or in part."
     )]
     async fn get_document(
         &self,
@@ -2853,7 +2868,13 @@ impl KbSearchServer {
             ));
         }
 
-        debug!(path = %raw, "get_document called");
+        // Checked before the path is resolved: a malformed range is wrong no
+        // matter which document it was aimed at, so it should not cost a
+        // metadata-index open and a file read to say so.
+        let range = retrieval::LineRange::new(params.start_line, params.end_line)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        debug!(path = %raw, ?range, "get_document called");
 
         // The fuzzy-basename fallback resolves against the SQLite metadata index
         // rather than a Qdrant facet fetch, so the index has to be opened here.
@@ -2871,19 +2892,33 @@ impl KbSearchServer {
                 // Same hash indexed_files.content_hash already stores for this exact
                 // content, so a caller can round-trip it straight into edit_document's
                 // expected_hash without this project introducing a second hash scheme.
+                // Hence hashing here, before any slicing, and always over the whole
+                // file: that expected_hash guards the document on disk, so hashing a
+                // slice would hand back a token that can never match — turning every
+                // partial read into a dead end for the edit that motivated it.
                 let content_hash = crate::ingest::compute_hash_from_bytes(doc.content.as_bytes());
+                let slice = retrieval::slice_or_whole(doc.content, range.as_ref())
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
                 // structured_content must mirror the text block: MCP clients that
                 // prefer structuredContent render ONLY it, so a hash-only payload
                 // makes the document invisible to them (observed in practice).
+                //
+                // The line fields are reported unconditionally, including on a full
+                // read, so a client never has to branch on their presence to learn
+                // how much document it is holding.
                 let structured = serde_json::json!({
                     "path": retrieval::relative_to_data(
                         &doc.path.to_string_lossy(),
                         &self.canonical_data_path,
                     ),
-                    "content": &doc.content,
+                    "content": &slice.content,
                     "content_hash": content_hash,
+                    "start_line": slice.start_line,
+                    "end_line": slice.end_line,
+                    "total_lines": slice.total_lines,
+                    "partial": slice.partial(),
                 });
-                let mut result = CallToolResult::success(vec![Content::text(doc.content)]);
+                let mut result = CallToolResult::success(vec![Content::text(slice.content)]);
                 result.structured_content = Some(structured);
                 Ok(result)
             }
@@ -5404,9 +5439,191 @@ mod tests {
         let overlong_path = "a".repeat(MAX_PATH_LEN + 1);
         let params = GetDocumentParams {
             path: overlong_path,
+            start_line: None,
+            end_line: None,
         };
         let result = server.get_document(Parameters(params)).await;
         assert!(result.is_err(), "overlong path should return an error");
+    }
+
+    // --- get_document line ranges -------------------------------------------
+
+    /// Numbered lines so a failed assertion names the line it actually got.
+    const RANGE_DOC: &str = "l1\nl2\nl3\nl4\nl5\n";
+
+    /// Read `range_doc.md` through the real handler and return
+    /// (text content, structured_content).
+    async fn get_range(
+        server: &KbSearchServer,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    ) -> Result<(String, serde_json::Value), McpError> {
+        let result = server
+            .get_document(Parameters(GetDocumentParams {
+                path: "range_doc.md".into(),
+                start_line,
+                end_line,
+            }))
+            .await?;
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected a text content block, got {other:?}"),
+        };
+        Ok((text, result.structured_content.unwrap()))
+    }
+
+    fn range_test_server(tmp: &tempfile::TempDir) -> KbSearchServer {
+        std::fs::write(tmp.path().join("range_doc.md"), RANGE_DOC).unwrap();
+        schema_tool_server(tmp)
+    }
+
+    #[tokio::test]
+    async fn get_document_without_a_range_serves_the_whole_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (text, structured) = get_range(&server, None, None).await.unwrap();
+
+        assert_eq!(text, RANGE_DOC);
+        assert_eq!(structured["start_line"], 1);
+        assert_eq!(structured["end_line"], 5);
+        assert_eq!(structured["total_lines"], 5);
+        assert_eq!(
+            structured["partial"], false,
+            "a full read must not advertise itself as partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_serves_an_inclusive_line_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (text, structured) = get_range(&server, Some(2), Some(4)).await.unwrap();
+
+        assert_eq!(text, "l2\nl3\nl4\n");
+        assert_eq!(
+            structured["content"], "l2\nl3\nl4\n",
+            "structured_content must mirror the text block, sliced the same way"
+        );
+        assert_eq!(structured["start_line"], 2);
+        assert_eq!(structured["end_line"], 4);
+        assert_eq!(structured["total_lines"], 5);
+        assert_eq!(structured["partial"], true);
+    }
+
+    #[tokio::test]
+    async fn get_document_reads_to_eof_with_only_a_start_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (text, structured) = get_range(&server, Some(4), None).await.unwrap();
+
+        assert_eq!(text, "l4\nl5\n");
+        assert_eq!(structured["end_line"], 5);
+    }
+
+    #[tokio::test]
+    async fn get_document_reads_from_the_top_with_only_an_end_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (text, structured) = get_range(&server, None, Some(2)).await.unwrap();
+
+        assert_eq!(text, "l1\nl2\n");
+        assert_eq!(structured["start_line"], 1);
+    }
+
+    #[tokio::test]
+    async fn get_document_clamps_an_end_line_past_the_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (text, structured) = get_range(&server, Some(4), Some(900)).await.unwrap();
+
+        assert_eq!(text, "l4\nl5\n");
+        assert_eq!(structured["end_line"], 5);
+        assert_eq!(
+            structured["partial"], true,
+            "a clamped tail still omits the head of the document"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_covering_every_line_is_not_reported_as_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (_, structured) = get_range(&server, Some(1), Some(5)).await.unwrap();
+
+        assert_eq!(structured["partial"], false);
+    }
+
+    #[tokio::test]
+    async fn get_document_hashes_the_whole_document_even_for_a_partial_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let (_, full) = get_range(&server, None, None).await.unwrap();
+        let (_, partial) = get_range(&server, Some(2), Some(3)).await.unwrap();
+
+        assert_eq!(
+            partial["content_hash"], full["content_hash"],
+            "content_hash is edit_document's expected_hash: it must describe the file \
+             on disk, not the slice served"
+        );
+        assert_eq!(
+            partial["content_hash"],
+            crate::ingest::compute_hash_from_bytes(RANGE_DOC.as_bytes())
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_rejects_a_malformed_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        assert!(
+            get_range(&server, Some(0), None).await.is_err(),
+            "line 0 does not exist; lines are 1-based"
+        );
+        assert!(
+            get_range(&server, Some(4), Some(2)).await.is_err(),
+            "an inverted range should be refused, not silently swapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_rejects_a_start_line_past_the_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let err = get_range(&server, Some(99), None).await.unwrap_err();
+        assert!(
+            err.to_string().contains('5'),
+            "the error should say how many lines the document actually has, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_validates_the_range_before_resolving_the_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+
+        let err = server
+            .get_document(Parameters(GetDocumentParams {
+                path: "no/such/document.md".into(),
+                start_line: Some(9),
+                end_line: Some(2),
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            !err.contains("not found"),
+            "a bad range should be reported as such, not masked by the path lookup: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7183,6 +7400,8 @@ mod tests {
         let result = server
             .get_document(Parameters(GetDocumentParams {
                 path: "docs/guide.md".to_string(),
+                start_line: None,
+                end_line: None,
             }))
             .await
             .unwrap();

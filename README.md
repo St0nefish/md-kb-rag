@@ -88,6 +88,8 @@ md-kb-rag serve              # Start server (MCP + webhook endpoints)
 md-kb-rag index              # Incremental index (only changed files)
 md-kb-rag index --full       # Full re-index (clear state, re-embed everything)
 md-kb-rag validate           # Validate all markdown files without indexing
+md-kb-rag get PATH           # Print one document (path resolves like the MCP tool)
+md-kb-rag get PATH --start-line 40 --end-line 60   # ...or just those lines, 1-based inclusive
 md-kb-rag status             # Aggregate counts + metadata breakdown
 md-kb-rag status --json      # Same data as the server's /status endpoint
 md-kb-rag status --files     # List every indexed file instead
@@ -267,11 +269,19 @@ The server exposes a full read/write surface over MCP. Read tools (`search`, `ge
 
 **`domain` is derived, not authored.** `domain` is computed from each document's top-level folder name (a file at `infrastructure/docker-compose.md` gets `domain: infrastructure`; a file at the KB root has no domain) and written into both the Qdrant payload and the SQLite metadata index — it is not read from a `domain:` frontmatter key. A `domain:` key an author writes anyway is overwritten on the next index run, and the server logs a warning when the two disagree. This changes where the value comes from, not how you filter on it: `domain=...` here, the CLI's `--domain` flag, and `list_documents(filters={"domain": ...})` all still work exactly as before.
 
-**`get_document`** — fetch the full raw markdown (including frontmatter) for one document.
+**`get_document`** — fetch the raw markdown (including frontmatter) for one document, in full or by line range.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `path` | string | yes | Path relative to the KB root (as returned by `search`), or a unique basename. A leading `/` also means the KB root — see path handling above |
+| `start_line` | integer | no | First line to return, 1-based and inclusive. Omit to start at line 1 |
+| `end_line` | integer | no | Last line to return, 1-based and inclusive. Omit to read to the end |
+
+Returns both plain text and `structured_content` with `path`, `content`, `content_hash`, `start_line`, `end_line`, `total_lines`, and `partial`. The line fields are always present, on a full read as well as a partial one, so paging through a long document never requires guessing where it ended.
+
+Line ranges are inclusive on both ends, and an `end_line` past the last line is clamped rather than rejected — `end_line` in the response reports what was actually served. A `start_line` past the last line *is* an error, and says how many lines the document has. Content is sliced byte-exactly: line endings and an unterminated final line survive, so a slice can be handed straight back to `edit_document` as an `old_string`.
+
+**`content_hash` always covers the whole document, never the slice.** Its purpose is `edit_document`'s `expected_hash`, which guards the file on disk — so reading lines 40–60 of a document and then editing it works exactly as it does after a full read. The flip side is that it is not a checksum of the bytes you were handed.
 
 **`list_documents`** — lists documents by frontmatter, with no relevance ranking and no embedding call. Complements `search`, which returns ranked *chunks* and cannot reliably enumerate a complete set.
 

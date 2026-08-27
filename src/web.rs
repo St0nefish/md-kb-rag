@@ -772,10 +772,36 @@ fn get_doc_error_response(
     }
 }
 
+/// Optional `?start_line=&end_line=` on `GET /api/doc/{*path}`.
+///
+/// Both absent is the whole document — the shape every existing caller (the UI's
+/// doc view and editor) sends, so the range is purely additive here.
+#[derive(Debug, Deserialize)]
+struct DocQueryParams {
+    #[serde(default)]
+    start_line: Option<usize>,
+    #[serde(default)]
+    end_line: Option<usize>,
+}
+
 async fn get_doc_handler(
     State(state): State<UiState>,
     AxumPath(raw_path): AxumPath<String>,
+    Query(params): Query<DocQueryParams>,
 ) -> Response {
+    // Checked before the path is resolved, matching the MCP tool: a malformed
+    // range is wrong no matter which document it was aimed at.
+    let range = match retrieval::LineRange::new(params.start_line, params.end_line) {
+        Ok(range) => range,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
     let index = match state.state_db().await {
         Ok(db) => db,
         Err(e) => {
@@ -790,17 +816,34 @@ async fn get_doc_handler(
 
     match retrieval::get_document(&state.deps(), index, &raw_path).await {
         Ok(doc) => {
+            // Always over the whole file, never the slice: this is the hash the
+            // editor sends back as `expected_hash` on POST, which guards the
+            // document on disk. Same contract as the MCP tool.
             let content_hash = crate::ingest::compute_hash_from_bytes(doc.content.as_bytes());
             let rel = retrieval::relative_to_data(
                 &doc.path.to_string_lossy(),
                 &state.canonical_data_path,
             );
+            let slice = match retrieval::slice_or_whole(doc.content, range.as_ref()) {
+                Ok(slice) => slice,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response();
+                }
+            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "path": rel,
-                    "content": doc.content,
+                    "content": slice.content,
                     "content_hash": content_hash,
+                    "start_line": slice.start_line,
+                    "end_line": slice.end_line,
+                    "total_lines": slice.total_lines,
+                    "partial": slice.partial(),
                 })),
             )
                 .into_response()
@@ -2016,6 +2059,129 @@ mod tests {
         assert_eq!(json["path"], "a.md");
         assert!(json["content"].as_str().unwrap().contains("body"));
         assert!(!json["content_hash"].as_str().unwrap().is_empty());
+    }
+
+    /// Numbered lines so a failed assertion names the line it actually got.
+    const RANGE_DOC: &str = "l1\nl2\nl3\nl4\nl5\n";
+
+    /// `GET /api/doc/range_doc.md` with an optional query string, decoded.
+    async fn get_doc_range(canonical: &Path, query: &str) -> (StatusCode, serde_json::Value) {
+        std::fs::write(canonical.join("range_doc.md"), RANGE_DOC).unwrap();
+        let app = ui_router(test_state(canonical));
+        let req = Request::builder()
+            .uri(format!("/api/doc/range_doc.md{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_without_a_range_serves_the_whole_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_range(&canonical, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["content"], RANGE_DOC);
+        assert_eq!(json["start_line"], 1);
+        assert_eq!(json["end_line"], 5);
+        assert_eq!(json["total_lines"], 5);
+        assert_eq!(
+            json["partial"], false,
+            "the UI's existing unranged fetch must keep reporting a full document"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_serves_an_inclusive_line_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (status, json) = get_doc_range(&canonical, "?start_line=2&end_line=4").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["content"], "l2\nl3\nl4\n");
+        assert_eq!(json["start_line"], 2);
+        assert_eq!(json["end_line"], 4);
+        assert_eq!(json["total_lines"], 5);
+        assert_eq!(json["partial"], true);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_accepts_each_bound_alone_and_clamps_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (_, from_start) = get_doc_range(&canonical, "?start_line=4").await;
+        assert_eq!(from_start["content"], "l4\nl5\n");
+
+        let (_, to_end) = get_doc_range(&canonical, "?end_line=2").await;
+        assert_eq!(to_end["content"], "l1\nl2\n");
+
+        let (status, clamped) = get_doc_range(&canonical, "?start_line=4&end_line=900").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an end past EOF is clamped, not an error"
+        );
+        assert_eq!(clamped["end_line"], 5);
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_hashes_the_whole_document_even_for_a_partial_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let (_, full) = get_doc_range(&canonical, "").await;
+        let (_, partial) = get_doc_range(&canonical, "?start_line=2&end_line=3").await;
+
+        assert_eq!(
+            partial["content_hash"], full["content_hash"],
+            "content_hash is the editor's expected_hash: it must describe the file on \
+             disk, not the slice served"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_rejects_a_bad_range_with_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        for query in [
+            "?start_line=0",
+            "?start_line=4&end_line=2",
+            "?start_line=99",
+        ] {
+            let (status, json) = get_doc_range(&canonical, query).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{query} should be a 400, got {json}"
+            );
+            assert!(!json["error"].as_str().unwrap().is_empty(), "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_doc_handler_rejects_a_non_numeric_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        std::fs::write(canonical.join("range_doc.md"), RANGE_DOC).unwrap();
+
+        let app = ui_router(test_state(&canonical));
+        let req = Request::builder()
+            .uri("/api/doc/range_doc.md?start_line=two")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Axum's own `Query` rejection, which answers in plain text rather than the
+        // JSON envelope the handler uses — the same thing `/api/search?limit=abc`
+        // has always done, so the body is deliberately not asserted here.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
