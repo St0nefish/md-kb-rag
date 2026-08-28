@@ -29,7 +29,7 @@ use tracing::error;
 
 use crate::config::{ResolvedConfig, SharedConfig};
 use crate::embed::{EmbedClient, QueryEmbedder};
-use crate::qdrant::{QdrantStore, RetrievalStore, SearchResult};
+use crate::qdrant::{CHUNK_TEXT_KEY, QdrantStore, RetrievalStore, SearchResult};
 use crate::rerank::RerankClient;
 use crate::retrieval::{self, RetrievalDeps, SearchFilters, SearchOptions};
 use crate::schema::{self, SharedSchemaCache};
@@ -597,7 +597,7 @@ fn to_api_result(r: &SearchResult, data_path: &Path) -> ApiSearchResult {
             .to_string(),
         text: r
             .payload
-            .get("text")
+            .get(CHUNK_TEXT_KEY)
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),

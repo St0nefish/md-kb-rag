@@ -12,7 +12,7 @@ use crate::{
     chunk,
     config::{IndexingConfig, ResolvedConfig, SemanticEdgesConfig},
     embed::{EmbedClient, EmbedStore},
-    qdrant::{QdrantPoint, QdrantStore, SearchResult, VectorStore},
+    qdrant::{CHUNK_TEXT_KEY, QdrantPoint, QdrantStore, SearchResult, VectorStore},
     schema::{ResolvedSchema, SchemaCache},
     state::{IndexedFile, StateDb},
     status::{INDEX_STATUS, Phase, RunMode, Trigger},
@@ -474,7 +474,7 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
                 serde_json::Value::Number(chunk.index.into()),
             );
             payload.insert(
-                "text".to_string(),
+                CHUNK_TEXT_KEY.to_string(),
                 serde_json::Value::String(chunk.text.clone()),
             );
             payload.insert(

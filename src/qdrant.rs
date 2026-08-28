@@ -196,6 +196,26 @@ pub fn all_indexed_fields(
     fields
 }
 
+/// The Qdrant payload key under which a chunk's raw text is stored.
+///
+/// There is exactly one writer — `ingest::index_paths` — and it must be the only
+/// place that ever inserts this key. Every reader of chunk text off a
+/// `SearchResult`/`ScoredPoint` payload must go through this constant instead of
+/// a string literal:
+///
+///   - `retrieval::rerank_and_truncate` (builds the cross-encoder's input list)
+///   - `mcp::format_search_results` (the MCP search snippet formatter)
+///   - `web::to_search_hit` (the web UI search result formatter)
+///
+/// This exists because of the #61 regression: the writer and the reranker reader
+/// drifted to different literals (`"text"` vs `"content"`), so the reranker's
+/// input list was always empty and reranking silently no-op'd in production for
+/// every deployment since. Nothing caught it because the tests built fixture
+/// payloads with the same wrong key the reader used, instead of the key the
+/// writer actually writes. Route every writer and reader through this constant
+/// so that class of drift can't happen again.
+pub const CHUNK_TEXT_KEY: &str = "text";
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub score: f32,
