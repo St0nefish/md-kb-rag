@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::{
     embed::QueryEmbedder,
-    qdrant::{RetrievalStore, SearchResult},
+    qdrant::{CHUNK_TEXT_KEY, RetrievalStore, SearchResult},
     rerank::Reranker,
     state::{DocumentIndex, DocumentQuery, DocumentQueryResult, DocumentSummary},
 };
@@ -711,6 +711,26 @@ impl IntoIterator for SearchOutcome {
     }
 }
 
+/// Build the cross-encoder reranker's input list: each result's original index
+/// paired with its chunk text, for results that have one. Reads chunk text via
+/// [`CHUNK_TEXT_KEY`] — see that constant's doc comment for why the read key
+/// must never drift from `ingest`'s write key (the #61 regression this guards
+/// against). Pulled out of `search` so the writer/reader agreement can be
+/// pinned by a direct unit test rather than only indirectly through a full
+/// search call.
+fn docs_for_rerank(results: &[SearchResult]) -> Vec<(usize, &str)> {
+    results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            r.payload
+                .get(CHUNK_TEXT_KEY)
+                .and_then(|v| v.as_str())
+                .map(|s| (i, s))
+        })
+        .collect()
+}
+
 /// Embed the query, apply filters, search Qdrant, apply min_score floor, and
 /// return raw results. Does NOT format any output — callers do that.
 pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
@@ -846,16 +866,7 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
             None
         };
 
-        let docs_with_indices: Vec<(usize, &str)> = results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                r.payload
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(|s| (i, s))
-            })
-            .collect();
+        let docs_with_indices: Vec<(usize, &str)> = docs_for_rerank(&results);
         let docs: Vec<&str> = docs_with_indices.iter().map(|(_, s)| *s).collect();
         let top_k = opts.limit as usize;
         if docs.is_empty() {
@@ -2019,7 +2030,7 @@ mod tests {
     fn make_result_with_content(file_path: &str, score: f32, content: &str) -> SearchResult {
         let mut r = make_result_for(file_path, score);
         r.payload
-            .insert("content".into(), serde_json::json!(content));
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!(content));
         r
     }
 
@@ -3062,13 +3073,13 @@ mod tests {
     async fn reranker_reorders_results() {
         let mut r0 = make_search_result(0.9);
         r0.payload
-            .insert("content".into(), serde_json::json!("doc A"));
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc A"));
         let mut r1 = make_search_result(0.8);
         r1.payload
-            .insert("content".into(), serde_json::json!("doc B"));
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc B"));
         let mut r2 = make_search_result(0.7);
         r2.payload
-            .insert("content".into(), serde_json::json!("doc C"));
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc C"));
 
         let store = MockRetrievalStore::with_results(vec![r0, r1, r2]);
         let embed = MockEmbedder::ok(vec![0.1]);
@@ -3099,7 +3110,10 @@ mod tests {
         assert_eq!(results.len(), 3);
         // The last original result (index 2, doc C) should now be first
         assert_eq!(
-            results[0].payload.get("content").and_then(|v| v.as_str()),
+            results[0]
+                .payload
+                .get(CHUNK_TEXT_KEY)
+                .and_then(|v| v.as_str()),
             Some("doc C"),
             "reranked order should put last doc first"
         );
@@ -3109,10 +3123,10 @@ mod tests {
     async fn reranker_failure_returns_fused_order() {
         let mut r0 = make_search_result(0.9);
         r0.payload
-            .insert("content".into(), serde_json::json!("doc A"));
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc A"));
         let mut r1 = make_search_result(0.8);
         r1.payload
-            .insert("content".into(), serde_json::json!("doc B"));
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc B"));
 
         let store = MockRetrievalStore::with_results(vec![r0, r1]);
         let embed = MockEmbedder::ok(vec![0.1]);
@@ -3142,7 +3156,10 @@ mod tests {
         // Should still return results (fail-soft), in original fused order
         assert_eq!(results.len(), 2);
         assert_eq!(
-            results[0].payload.get("content").and_then(|v| v.as_str()),
+            results[0]
+                .payload
+                .get(CHUNK_TEXT_KEY)
+                .and_then(|v| v.as_str()),
             Some("doc A"),
             "on reranker failure, should return fused order"
         );
@@ -3162,13 +3179,14 @@ mod tests {
         let mut b1 = make_search_result(0.5);
         b1.payload
             .insert("file_path".into(), serde_json::json!("b.md"));
-        b1.payload.insert("content".into(), serde_json::json!("b1"));
+        b1.payload
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("b1"));
         let make_a = |content: &str| {
             let mut r = make_search_result(0.4);
             r.payload
                 .insert("file_path".into(), serde_json::json!("a.md"));
             r.payload
-                .insert("content".into(), serde_json::json!(content));
+                .insert(CHUNK_TEXT_KEY.into(), serde_json::json!(content));
             r
         };
         let store = MockRetrievalStore::with_results(vec![
@@ -3209,6 +3227,198 @@ mod tests {
             "post-rerank cap must trim a.md to 2 and backfill with b.md instead \
              of the page shrinking to 2 results"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #61 regression: writer (ingest) / reader (reranker input builder) key
+    // agreement. The bug was that `ingest.rs` wrote chunk text under `"text"`
+    // while `retrieval.rs` read it back under `"content"`, so the reranker's
+    // input list was always empty and reranking silently no-op'd — every
+    // result kept its pre-rerank fused order and `pre_rerank_score` stayed
+    // `None`, with no error anywhere. These tests pin the fix directly rather
+    // than through fixtures that could drift back to mirroring a future bug.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn docs_for_rerank_finds_text_written_under_the_shared_key() {
+        // Insert the payload exactly the way `ingest::index_paths` does — chunk
+        // text as a `serde_json::Value::String` under `CHUNK_TEXT_KEY` — and
+        // assert the reranker input builder (the reader) finds it under that
+        // same key. This is the assertion that should have existed since #61:
+        // it fails the instant writer and reader disagree on the key, without
+        // needing a full `search()` call (and its silent fail-soft path) to
+        // notice.
+        let mut r = make_search_result(0.42);
+        r.payload.insert(
+            CHUNK_TEXT_KEY.to_string(),
+            serde_json::Value::String("chunk body text".to_string()),
+        );
+
+        let docs = docs_for_rerank(std::slice::from_ref(&r));
+
+        assert_eq!(
+            docs,
+            vec![(0, "chunk body text")],
+            "reranker input builder must find chunk text under CHUNK_TEXT_KEY, \
+             the exact key ingest::index_paths writes it under"
+        );
+    }
+
+    #[test]
+    fn docs_for_rerank_skips_results_missing_the_shared_key() {
+        // The flip side: a result with no CHUNK_TEXT_KEY entry (or an
+        // unrelated key, like the old buggy "content") contributes nothing to
+        // the reranker's input list. This is the exact mechanism that made
+        // #61 silent — production payloads never had the reader's old key, so
+        // every result was filtered out and reranking quietly no-op'd via the
+        // `docs.is_empty()` fail-soft path instead of erroring.
+        let mut wrong_key = make_search_result(0.5);
+        wrong_key.payload.insert(
+            "content".to_string(),
+            serde_json::json!("should be ignored"),
+        );
+        let no_key = make_search_result(0.5);
+
+        let results = [wrong_key, no_key];
+        let docs = docs_for_rerank(&results);
+
+        assert!(
+            docs.is_empty(),
+            "results without CHUNK_TEXT_KEY must not reach the reranker"
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_is_invoked_when_results_carry_chunk_text() {
+        // Proves the reranker is actually called end-to-end when results carry
+        // real chunk text under the production key — not just that the input
+        // builder finds text in isolation (see `docs_for_rerank_finds_text_...`
+        // above). Payloads are built with `CHUNK_TEXT_KEY`, mirroring exactly
+        // what `ingest::index_paths` writes, and the mock reranker's known
+        // reversal is used as a witness: if the reranker were skipped (the
+        // #61 bug), results would keep their original fused order instead.
+        let mut r0 = make_search_result(0.9);
+        r0.payload.insert(
+            CHUNK_TEXT_KEY.to_string(),
+            serde_json::Value::String("doc A".to_string()),
+        );
+        let mut r1 = make_search_result(0.8);
+        r1.payload.insert(
+            CHUNK_TEXT_KEY.to_string(),
+            serde_json::Value::String("doc B".to_string()),
+        );
+        let mut r2 = make_search_result(0.7);
+        r2.payload.insert(
+            CHUNK_TEXT_KEY.to_string(),
+            serde_json::Value::String("doc C".to_string()),
+        );
+
+        let store = MockRetrievalStore::with_results(vec![r0, r1, r2]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 3,
+            rerank_candidate_limit: None,
+            ..default_opts()
+        };
+
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
+
+        // MockReranker fully reverses whatever order it's handed. If the
+        // reranker had been skipped (docs.is_empty()), the fused order (A, B,
+        // C by descending score) would survive untouched instead.
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r
+                    .payload
+                    .get(CHUNK_TEXT_KEY)
+                    .and_then(|v| v.as_str())
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            vec!["doc C", "doc B", "doc A"],
+            "reranker must have actually run and reordered results, proving \
+             `docs` was non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_explain_populates_nonnull_pre_rerank_score_when_reranker_runs() {
+        // This is exactly how the #61 bug surfaced in production: every result
+        // came back with `pre_rerank_score: null` even with `explain: true`
+        // and reranking enabled, because the reranker's input list was always
+        // empty and the early-return path never touches `pre_rerank_score`.
+        // Here the payload carries chunk text under the real key, so the
+        // reranker runs and must stamp each result's original (pre-rerank)
+        // score onto `pre_rerank_score`.
+        let mut r0 = make_search_result(0.9);
+        r0.payload.insert(
+            CHUNK_TEXT_KEY.to_string(),
+            serde_json::Value::String("doc A".to_string()),
+        );
+        let mut r1 = make_search_result(0.8);
+        r1.payload.insert(
+            CHUNK_TEXT_KEY.to_string(),
+            serde_json::Value::String("doc B".to_string()),
+        );
+
+        let store = MockRetrievalStore::with_results(vec![r0, r1]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            explain: true,
+            rerank_candidate_limit: Some(10),
+            ..default_opts()
+        };
+
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
+
+        assert_eq!(results.len(), 2, "reranker must have run on both results");
+        for r in &results {
+            assert!(
+                r.pre_rerank_score.is_some(),
+                "explain=true + an active reranker that actually receives chunk \
+                 text must set pre_rerank_score on every result — a null here \
+                 is exactly the production symptom of #61"
+            );
+        }
+        // The two original fused scores (0.9 for "doc A", 0.8 for "doc B")
+        // must both still be present as pre_rerank_score, just possibly
+        // reassigned to a different result after reordering.
+        let mut pre_scores: Vec<f32> = results
+            .iter()
+            .map(|r| r.pre_rerank_score.unwrap())
+            .collect();
+        pre_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(pre_scores, vec![0.8, 0.9]);
     }
 
     // ------------------------------------------------------------------
@@ -3279,10 +3489,10 @@ mod tests {
     async fn search_explain_populates_pre_rerank_score() {
         let mut r0 = make_search_result(0.9);
         r0.payload
-            .insert("content".into(), serde_json::json!("doc A"));
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc A"));
         let mut r1 = make_search_result(0.8);
         r1.payload
-            .insert("content".into(), serde_json::json!("doc B"));
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc B"));
 
         let store = MockRetrievalStore::with_results(vec![r0, r1]);
         let embed = MockEmbedder::ok(vec![0.1]);

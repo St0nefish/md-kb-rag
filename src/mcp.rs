@@ -18,7 +18,7 @@ use crate::{
     document_fields,
     embed::EmbedClient,
     git,
-    qdrant::{IndexKind, QdrantStore},
+    qdrant::{CHUNK_TEXT_KEY, IndexKind, QdrantStore},
     rerank::RerankClient,
     retrieval::{
         self, DocumentIndexDeps, GetDocumentError, RetrievalDeps, SearchFilters, SearchOptions,
@@ -3531,7 +3531,7 @@ fn build_chunk_search_payload(
         let (text_snippet, needs_ellipsis) = {
             let full_text = result
                 .payload
-                .get("text")
+                .get(CHUNK_TEXT_KEY)
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let chars: Vec<char> = full_text.chars().take(801).collect();
