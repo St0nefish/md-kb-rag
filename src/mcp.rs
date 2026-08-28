@@ -2295,161 +2295,23 @@ impl KbSearchServer {
             path_prefix_truncated, "search returned results"
         );
 
-        if results.is_empty() {
-            let mut text = "No results found.".to_string();
-            if path_prefix_truncated {
-                text.push_str(
-                    "\n\nNote: path_prefix matched more candidates than could be over-fetched, \
-                     so this may not be exhaustive — narrow the prefix or lower limit to be sure.",
-                );
-            }
-            let mut call_result = CallToolResult::success(vec![Content::text(text)]);
-            call_result.structured_content = Some(serde_json::json!({
-                "path_prefix_truncated": path_prefix_truncated,
-            }));
-            return Ok(call_result);
-        }
+        let mode = match (config.search.hybrid, phrase_arm_ran) {
+            (true, true) => "hybrid RRF + phrase",
+            (true, false) => "hybrid RRF",
+            (false, true) => "dense + phrase RRF",
+            (false, false) => "dense cosine",
+        };
 
-        // Format results as text content
-        let mut output = String::new();
-        for (i, result) in results.iter().enumerate() {
-            let title = result
-                .payload
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(untitled)");
+        let (text, structured) = build_chunk_search_payload(
+            &results,
+            &self.canonical_data_path,
+            explain,
+            mode,
+            path_prefix_truncated,
+        );
 
-            let (text_snippet, needs_ellipsis) = {
-                let full_text = result
-                    .payload
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let chars: Vec<char> = full_text.chars().take(801).collect();
-                if chars.len() > 800 {
-                    (chars[..800].iter().collect::<String>(), true)
-                } else {
-                    (chars.into_iter().collect::<String>(), false)
-                }
-            };
-
-            let file_path_raw = result
-                .payload
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let file_path = retrieval::relative_to_data(file_path_raw, &self.canonical_data_path);
-
-            let domain = result
-                .payload
-                .get("domain")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let doc_type = result
-                .payload
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let tags = result
-                .payload
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|t| t.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-
-            let lines = match (
-                result.payload.get("line_start").and_then(|v| v.as_i64()),
-                result.payload.get("line_end").and_then(|v| v.as_i64()),
-            ) {
-                (Some(s), Some(e)) => format!(" (lines {s}–{e})"),
-                _ => String::new(),
-            };
-
-            output.push_str(&format!(
-                "## Result {rank}\n\
-                **Title**: {title}\n\
-                **Score**: {score:.4}\n\
-                **File**: {file_path}{lines}\n",
-                rank = i + 1,
-                title = title,
-                score = result.score,
-                file_path = file_path,
-                lines = lines,
-            ));
-
-            if explain {
-                let mode = match (config.search.hybrid, phrase_arm_ran) {
-                    (true, true) => "hybrid RRF + phrase",
-                    (true, false) => "hybrid RRF",
-                    (false, true) => "dense + phrase RRF",
-                    (false, false) => "dense cosine",
-                };
-                let mut breakdown = if let Some(pre) = result.pre_rerank_score {
-                    format!(
-                        "**Score breakdown**: mode={mode}, rerank={:.4}, pre-rerank={:.4}",
-                        result.score, pre,
-                    )
-                } else {
-                    format!(
-                        "**Score breakdown**: mode={mode}, score={:.4}",
-                        result.score,
-                    )
-                };
-                if let Some(d) = result.dense_score {
-                    breakdown.push_str(&format!(", dense={d:.4}"));
-                }
-                if let Some(s) = result.sparse_score {
-                    breakdown.push_str(&format!(", sparse={s:.4}"));
-                }
-                // Presence, not magnitude, is the signal: the phrase arm's "score" is
-                // just the dense-ranked query re-run under a phrase filter, so its
-                // value carries no information beyond dense=. What a caller actually
-                // wants to know is whether this result matched every requested
-                // phrase at all.
-                if result.phrase_score.is_some() {
-                    breakdown.push_str(", phrase=matched");
-                }
-                breakdown.push('\n');
-                output.push_str(&breakdown);
-            }
-
-            if !domain.is_empty() {
-                output.push_str(&format!("**Domain**: {domain}\n"));
-            }
-            if !doc_type.is_empty() {
-                output.push_str(&format!("**Type**: {doc_type}\n"));
-            }
-            if !tags.is_empty() {
-                output.push_str(&format!("**Tags**: {tags}\n"));
-            }
-
-            if !text_snippet.is_empty() {
-                let ellipsis = if needs_ellipsis { "..." } else { "" };
-                output.push_str(&format!("\n{text_snippet}{ellipsis}\n"));
-            }
-
-            output.push('\n');
-        }
-
-        if path_prefix_truncated {
-            output.push_str(
-                "\nNote: path_prefix matched more candidates than could be over-fetched, so \
-                 fewer results than `limit` were returned and more may exist — narrow the \
-                 prefix or lower limit to be sure this is exhaustive.\n",
-            );
-        }
-
-        let mut call_result = CallToolResult::success(vec![Content::text(output.trim())]);
-        call_result.structured_content = Some(serde_json::json!({
-            "path_prefix_truncated": path_prefix_truncated,
-        }));
+        let mut call_result = CallToolResult::success(vec![Content::text(text)]);
+        call_result.structured_content = Some(structured);
         Ok(call_result)
     }
 
@@ -2543,53 +2405,9 @@ impl KbSearchServer {
         let path_prefix_truncated = outcome.path_prefix_truncated;
         let documents = outcome.documents;
 
-        let returned = documents.len();
+        let (text, structured) = build_grouped_search_payload(&documents, path_prefix_truncated);
 
-        let structured = serde_json::json!({
-            "returned": returned,
-            "path_prefix_truncated": path_prefix_truncated,
-            "documents": documents
-                .iter()
-                .map(|d| serde_json::json!({
-                    "file_path": d.summary.file_path,
-                    "title": d.summary.title,
-                    "description": d.summary.description,
-                    "mtime": d.summary.mtime,
-                    "frontmatter": d.summary.frontmatter,
-                    "score": d.score,
-                }))
-                .collect::<Vec<_>>(),
-        });
-
-        let mut text = if returned == 0 {
-            "No documents matched.".to_string()
-        } else {
-            format!("{returned} document(s) matched, ranked by relevance.\n\n")
-        };
-
-        for doc in &documents {
-            text.push_str(&format!(
-                "- {} (score {:.4})",
-                doc.summary.file_path, doc.score
-            ));
-            if let Some(title) = &doc.summary.title {
-                text.push_str(&format!(" — {}", title));
-            }
-            text.push('\n');
-            if let Some(description) = &doc.summary.description {
-                text.push_str(&format!("  {}\n", description.trim()));
-            }
-        }
-
-        if path_prefix_truncated {
-            text.push_str(
-                "\nNote: path_prefix matched more candidates than could be over-fetched, so \
-                 fewer results than `limit` were returned and more may exist — narrow the \
-                 prefix or lower limit to be sure this is exhaustive.\n",
-            );
-        }
-
-        let mut call_result = CallToolResult::success(vec![Content::text(text.trim_end())]);
+        let mut call_result = CallToolResult::success(vec![Content::text(text)]);
         call_result.structured_content = Some(structured);
         Ok(call_result)
     }
@@ -3657,6 +3475,264 @@ impl KbSearchServer {
             Err(err) => Err(delete_error_to_mcp_error(err, &rel_path)),
         }
     }
+}
+
+/// Builds `search_chunks`' text and structured payload from already-fetched
+/// results. Pulled out of the tool handler as its own pure function so the
+/// "results -> CallToolResult content" seam — the exact spot where
+/// `structured_content` once regressed to a bare `{"path_prefix_truncated": ...}"`
+/// while the text content still carried full results — is reachable by a plain
+/// unit test: no network, no mocked `KbSearchServer`, none of `EmbedClient`'s
+/// retry/backoff to defeat.
+///
+/// `mode` is the caller-computed `explain` label (see `search_chunks`'s
+/// `phrase_arm_ran` derivation) — constant across the whole result set, never
+/// per-result. The empty-results branch lives here too, so one seam covers both.
+fn build_chunk_search_payload(
+    results: &[crate::qdrant::SearchResult],
+    data_root: &Path,
+    explain: bool,
+    mode: &str,
+    path_prefix_truncated: bool,
+) -> (String, serde_json::Value) {
+    if results.is_empty() {
+        let mut text = "No results found.".to_string();
+        if path_prefix_truncated {
+            text.push_str(
+                "\n\nNote: path_prefix matched more candidates than could be over-fetched, \
+                 so this may not be exhaustive — narrow the prefix or lower limit to be sure.",
+            );
+        }
+        let structured = serde_json::json!({
+            "returned": 0,
+            "results": [],
+            "path_prefix_truncated": path_prefix_truncated,
+        });
+        return (text, structured);
+    }
+
+    // Format results as text content, and mirror them into `structured_content`.
+    //
+    // Both, not either: `search` historically returned text only, so a client
+    // that prefers structured content had nothing to render but the truncation
+    // flag — which reads as "no results" even when the text body is full. The
+    // other two granularities (`search_enumerate`, `search_grouped`) already
+    // return a full structured payload, so chunk mode returning a bare flag was
+    // the odd one out.
+    let mut output = String::new();
+    let mut structured_results: Vec<serde_json::Value> = Vec::with_capacity(results.len());
+    for (i, result) in results.iter().enumerate() {
+        let title = result
+            .payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(untitled)");
+
+        let (text_snippet, needs_ellipsis) = {
+            let full_text = result
+                .payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let chars: Vec<char> = full_text.chars().take(801).collect();
+            if chars.len() > 800 {
+                (chars[..800].iter().collect::<String>(), true)
+            } else {
+                (chars.into_iter().collect::<String>(), false)
+            }
+        };
+
+        let file_path_raw = result
+            .payload
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let file_path = retrieval::relative_to_data(file_path_raw, data_root);
+
+        let domain = result
+            .payload
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let doc_type = result
+            .payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let tags = result
+            .payload
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+
+        let lines = match (
+            result.payload.get("line_start").and_then(|v| v.as_i64()),
+            result.payload.get("line_end").and_then(|v| v.as_i64()),
+        ) {
+            (Some(s), Some(e)) => format!(" (lines {s}–{e})"),
+            _ => String::new(),
+        };
+
+        output.push_str(&format!(
+            "## Result {rank}\n\
+            **Title**: {title}\n\
+            **Score**: {score:.4}\n\
+            **File**: {file_path}{lines}\n",
+            rank = i + 1,
+            title = title,
+            score = result.score,
+            file_path = file_path,
+            lines = lines,
+        ));
+
+        if explain {
+            let mut breakdown = if let Some(pre) = result.pre_rerank_score {
+                format!(
+                    "**Score breakdown**: mode={mode}, rerank={:.4}, pre-rerank={:.4}",
+                    result.score, pre,
+                )
+            } else {
+                format!(
+                    "**Score breakdown**: mode={mode}, score={:.4}",
+                    result.score,
+                )
+            };
+            if let Some(d) = result.dense_score {
+                breakdown.push_str(&format!(", dense={d:.4}"));
+            }
+            if let Some(s) = result.sparse_score {
+                breakdown.push_str(&format!(", sparse={s:.4}"));
+            }
+            // Presence, not magnitude, is the signal: the phrase arm's "score" is
+            // just the dense-ranked query re-run under a phrase filter, so its
+            // value carries no information beyond dense=. What a caller actually
+            // wants to know is whether this result matched every requested
+            // phrase at all.
+            if result.phrase_score.is_some() {
+                breakdown.push_str(", phrase=matched");
+            }
+            breakdown.push('\n');
+            output.push_str(&breakdown);
+        }
+
+        if !domain.is_empty() {
+            output.push_str(&format!("**Domain**: {domain}\n"));
+        }
+        if !doc_type.is_empty() {
+            output.push_str(&format!("**Type**: {doc_type}\n"));
+        }
+        if !tags.is_empty() {
+            output.push_str(&format!("**Tags**: {tags}\n"));
+        }
+
+        if !text_snippet.is_empty() {
+            let ellipsis = if needs_ellipsis { "..." } else { "" };
+            output.push_str(&format!("\n{text_snippet}{ellipsis}\n"));
+        }
+
+        let null = serde_json::Value::Null;
+        structured_results.push(serde_json::json!({
+            "file_path": file_path,
+            "title": title,
+            "score": result.score,
+            "text": text_snippet,
+            "text_truncated": needs_ellipsis,
+            "domain": domain,
+            "type": doc_type,
+            "tags": result.payload.get("tags").cloned().unwrap_or(null.clone()),
+            "line_start": result.payload.get("line_start").cloned().unwrap_or(null.clone()),
+            "line_end": result.payload.get("line_end").cloned().unwrap_or(null),
+            "dense_score": result.dense_score,
+            "sparse_score": result.sparse_score,
+            "pre_rerank_score": result.pre_rerank_score,
+            "phrase_matched": result.phrase_score.is_some(),
+        }));
+
+        output.push('\n');
+    }
+
+    if path_prefix_truncated {
+        output.push_str(
+            "\nNote: path_prefix matched more candidates than could be over-fetched, so \
+             fewer results than `limit` were returned and more may exist — narrow the \
+             prefix or lower limit to be sure this is exhaustive.\n",
+        );
+    }
+
+    let structured = serde_json::json!({
+        "returned": structured_results.len(),
+        "results": structured_results,
+        "path_prefix_truncated": path_prefix_truncated,
+    });
+
+    (output.trim().to_string(), structured)
+}
+
+/// Builds `search_grouped`'s text and structured payload from already-fetched
+/// grouped documents. Same untested-adapter shape and risk as
+/// `build_chunk_search_payload` (wrong JSON key, an accidentally-included
+/// `total`/`has_more` — grouped must claim neither — or a dropped `score`) —
+/// pulled out so a hand-built `Vec<GroupedDocument>` can drive it directly, with
+/// no network involved.
+fn build_grouped_search_payload(
+    documents: &[retrieval::GroupedDocument],
+    path_prefix_truncated: bool,
+) -> (String, serde_json::Value) {
+    let returned = documents.len();
+
+    let structured = serde_json::json!({
+        "returned": returned,
+        "path_prefix_truncated": path_prefix_truncated,
+        "documents": documents
+            .iter()
+            .map(|d| serde_json::json!({
+                "file_path": d.summary.file_path,
+                "title": d.summary.title,
+                "description": d.summary.description,
+                "mtime": d.summary.mtime,
+                "frontmatter": d.summary.frontmatter,
+                "score": d.score,
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    let mut text = if returned == 0 {
+        "No documents matched.".to_string()
+    } else {
+        format!("{returned} document(s) matched, ranked by relevance.\n\n")
+    };
+
+    for doc in documents {
+        text.push_str(&format!(
+            "- {} (score {:.4})",
+            doc.summary.file_path, doc.score
+        ));
+        if let Some(title) = &doc.summary.title {
+            text.push_str(&format!(" — {}", title));
+        }
+        text.push('\n');
+        if let Some(description) = &doc.summary.description {
+            text.push_str(&format!("  {}\n", description.trim()));
+        }
+    }
+
+    if path_prefix_truncated {
+        text.push_str(
+            "\nNote: path_prefix matched more candidates than could be over-fetched, so \
+             fewer results than `limit` were returned and more may exist — narrow the \
+             prefix or lower limit to be sure this is exhaustive.\n",
+        );
+    }
+
+    (text.trim_end().to_string(), structured)
 }
 
 #[tool_handler]
@@ -9045,6 +9121,254 @@ mod tests {
             !err.message.contains("re-parent"),
             "no schema file moved, so there is nothing to explain re-parenting for: {}",
             err.message
+        );
+    }
+
+    // --- build_chunk_search_payload / build_grouped_search_payload ---
+    //
+    // These drive the response-assembly seam directly with hand-built
+    // `SearchResult`/`GroupedDocument` values — no network, no mocked
+    // `KbSearchServer`, none of `EmbedClient`'s retry/backoff to defeat. This is
+    // exactly the gap that let `search_chunks` ship with `structured_content`
+    // carrying only `{"path_prefix_truncated": ...}` while the text content had
+    // full results: nothing between "retrieval returned results" and
+    // "CallToolResult handed to the client" was reachable by any test.
+
+    fn payload_search_result(
+        file_path: &str,
+        title: &str,
+        score: f32,
+    ) -> crate::qdrant::SearchResult {
+        let mut payload = HashMap::new();
+        payload.insert("file_path".to_string(), serde_json::json!(file_path));
+        payload.insert("title".to_string(), serde_json::json!(title));
+        payload.insert("text".to_string(), serde_json::json!("some body text"));
+        crate::qdrant::SearchResult {
+            score,
+            pre_rerank_score: None,
+            dense_score: None,
+            sparse_score: None,
+            phrase_score: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn build_chunk_search_payload_structured_results_present_and_populated() {
+        // The regression itself: a non-empty result set must produce a
+        // `structured_content.results` array of the same length as the input,
+        // with each entry carrying `file_path`/`title`/`score`/`text`. Against
+        // the old `{"path_prefix_truncated": ...}`-only payload, `structured
+        // ["results"]` would be `Value::Null` and every index below would fail.
+        let results = vec![
+            payload_search_result("/data/notes/a.md", "A", 0.9),
+            payload_search_result("/data/notes/b.md", "B", 0.5),
+        ];
+
+        let (_text, structured) =
+            build_chunk_search_payload(&results, Path::new("/data"), false, "dense cosine", false);
+
+        let arr = structured["results"]
+            .as_array()
+            .expect("results must be an array, not missing/null");
+        assert_eq!(arr.len(), results.len());
+        for entry in arr {
+            assert!(entry["file_path"].is_string());
+            assert!(entry["title"].is_string());
+            assert!(entry["score"].is_number());
+            assert!(entry["text"].is_string());
+        }
+        assert_eq!(structured["returned"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn build_chunk_search_payload_empty_results_report_zero_not_missing_key() {
+        let (text, structured) =
+            build_chunk_search_payload(&[], Path::new("/data"), false, "dense cosine", false);
+
+        assert_eq!(text, "No results found.");
+        assert_eq!(structured["returned"], serde_json::json!(0));
+        assert_eq!(
+            structured["results"]
+                .as_array()
+                .expect("must be an array, not missing"),
+            &Vec::<serde_json::Value>::new()
+        );
+    }
+
+    #[test]
+    fn build_chunk_search_payload_text_and_structured_agree() {
+        let results = vec![
+            payload_search_result("/data/notes/a.md", "A", 0.9),
+            payload_search_result("/data/notes/b.md", "B", 0.5),
+            payload_search_result("/data/notes/c.md", "C", 0.1),
+        ];
+
+        let (text, structured) =
+            build_chunk_search_payload(&results, Path::new("/data"), false, "dense cosine", false);
+
+        let arr = structured["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        let structured_paths: Vec<&str> = arr
+            .iter()
+            .map(|e| e["file_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            structured_paths,
+            vec!["notes/a.md", "notes/b.md", "notes/c.md"]
+        );
+
+        // Text content lists the same files, in the same order.
+        let text_result_1_pos = text.find("notes/a.md").unwrap();
+        let text_result_2_pos = text.find("notes/b.md").unwrap();
+        let text_result_3_pos = text.find("notes/c.md").unwrap();
+        assert!(text_result_1_pos < text_result_2_pos);
+        assert!(text_result_2_pos < text_result_3_pos);
+    }
+
+    #[test]
+    fn build_chunk_search_payload_path_prefix_truncated_note_and_flag() {
+        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
+
+        let (text, structured) =
+            build_chunk_search_payload(&results, Path::new("/data"), false, "dense cosine", true);
+
+        assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
+        assert!(
+            text.contains("path_prefix matched more candidates"),
+            "text must render the truncation note; got: {text}"
+        );
+
+        // Same for the empty-results branch.
+        let (empty_text, empty_structured) =
+            build_chunk_search_payload(&[], Path::new("/data"), false, "dense cosine", true);
+        assert_eq!(
+            empty_structured["path_prefix_truncated"],
+            serde_json::json!(true)
+        );
+        assert!(
+            empty_text.contains("path_prefix matched more candidates"),
+            "empty-results text must also render the truncation note; got: {empty_text}"
+        );
+    }
+
+    #[test]
+    fn build_chunk_search_payload_explain_toggles_score_breakdown_line() {
+        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
+
+        let (text_off, _) =
+            build_chunk_search_payload(&results, Path::new("/data"), false, "dense cosine", false);
+        assert!(!text_off.contains("Score breakdown"));
+
+        let (text_on, _) =
+            build_chunk_search_payload(&results, Path::new("/data"), true, "dense cosine", false);
+        assert!(text_on.contains("Score breakdown"));
+    }
+
+    #[test]
+    fn build_chunk_search_payload_mode_label_appears_verbatim() {
+        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
+
+        for mode in [
+            "hybrid RRF + phrase",
+            "hybrid RRF",
+            "dense + phrase RRF",
+            "dense cosine",
+        ] {
+            let (text, _) =
+                build_chunk_search_payload(&results, Path::new("/data"), true, mode, false);
+            assert!(
+                text.contains(&format!("mode={mode}")),
+                "expected mode label {mode:?} verbatim in: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_chunk_search_payload_phrase_matched_tracks_phrase_score_presence() {
+        let mut matched = payload_search_result("/data/notes/a.md", "A", 0.9);
+        matched.phrase_score = Some(0.7);
+        let mut unmatched = payload_search_result("/data/notes/b.md", "B", 0.5);
+        unmatched.phrase_score = None;
+
+        let (_text, structured) = build_chunk_search_payload(
+            &[matched, unmatched],
+            Path::new("/data"),
+            false,
+            "dense + phrase RRF",
+            false,
+        );
+
+        let arr = structured["results"].as_array().unwrap();
+        assert_eq!(arr[0]["phrase_matched"], serde_json::json!(true));
+        assert_eq!(arr[1]["phrase_matched"], serde_json::json!(false));
+    }
+
+    fn payload_grouped_document(
+        file_path: &str,
+        title: &str,
+        score: f32,
+    ) -> retrieval::GroupedDocument {
+        retrieval::GroupedDocument {
+            score,
+            summary: crate::state::DocumentSummary {
+                file_path: file_path.to_string(),
+                title: Some(title.to_string()),
+                description: None,
+                mtime: 0,
+                indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                frontmatter: serde_json::json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn build_grouped_search_payload_omits_total_and_has_more_but_keeps_score() {
+        let documents = vec![
+            payload_grouped_document("notes/a.md", "A", 0.9),
+            payload_grouped_document("notes/b.md", "B", 0.5),
+        ];
+
+        let (_text, structured) = build_grouped_search_payload(&documents, false);
+
+        let obj = structured.as_object().unwrap();
+        assert!(
+            !obj.contains_key("total"),
+            "grouped search cannot back `total` and must not claim one: {structured}"
+        );
+        assert!(
+            !obj.contains_key("has_more"),
+            "grouped search cannot back `has_more` and must not claim one: {structured}"
+        );
+
+        let docs = structured["documents"].as_array().unwrap();
+        assert_eq!(docs.len(), 2);
+        for doc in docs {
+            assert!(
+                doc["score"].is_number(),
+                "each document must carry a score: {doc}"
+            );
+        }
+        assert_eq!(structured["returned"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn build_grouped_search_payload_empty_reports_zero() {
+        let (text, structured) = build_grouped_search_payload(&[], false);
+        assert_eq!(text, "No documents matched.");
+        assert_eq!(structured["returned"], serde_json::json!(0));
+        assert_eq!(structured["documents"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn build_grouped_search_payload_path_prefix_truncated_note_and_flag() {
+        let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
+        let (text, structured) = build_grouped_search_payload(&documents, true);
+
+        assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
+        assert!(
+            text.contains("path_prefix matched more candidates"),
+            "text must render the truncation note; got: {text}"
         );
     }
 }
