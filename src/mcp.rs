@@ -4494,6 +4494,70 @@ mod tests {
     }
 
     #[test]
+    fn update_schema_definition_keeps_all_named_properties_after_slimming_descriptions() {
+        // Regression test for the `#[schemars(description = "...")]` overrides added to
+        // `RawFieldDef` (see that struct in schema.rs): they replace the huge doc-comment
+        // text schemars would otherwise copy into every field's `description`, but must
+        // not touch the shape of the schema itself. This asserts the full set of named,
+        // typed properties the delegation exists to guarantee — including the recursive
+        // `fields` map, which is what would silently degrade to an empty object if the
+        // override attributes were misapplied (e.g. put on the wrong item, or swallowing
+        // the field itself via a typo) rather than just shortening a description.
+        let schema = schemars::schema_for!(UpdateSchemaParams);
+        let root = schema.as_value();
+
+        let definition_schema = &root["properties"]["definition"];
+        let object_schema = definition_schema["anyOf"]
+            .as_array()
+            .expect("definition must offer a typed alternative, not a bare {}")
+            .iter()
+            .find(|branch| branch["type"] != serde_json::json!("null"))
+            .expect("definition must have a non-null branch");
+        let resolved = match object_schema["$ref"].as_str() {
+            Some(reference) => &root["$defs"][reference.rsplit('/').next().unwrap()],
+            None => object_schema,
+        };
+
+        assert_eq!(resolved["type"], serde_json::json!("object"));
+        for key in [
+            "type", "required", "indexed", "values", "default", "open", "fields",
+        ] {
+            let prop = &resolved["properties"][key];
+            assert!(
+                !prop.is_null(),
+                "definition schema is missing documented key '{key}': {resolved}"
+            );
+            let desc = prop["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("property '{key}' lost its description: {prop}"));
+            assert!(
+                desc.len() <= 80,
+                "property '{key}' description should be a short override, not the full \
+                 doc comment ({} chars): {desc:?}",
+                desc.len()
+            );
+        }
+
+        // `fields` is a map keyed by field name, whose values recurse back into the same
+        // definition — confirm that recursion still resolves to the real object schema
+        // (via `$ref`) rather than being erased or inlined without bound.
+        let fields_prop = &resolved["properties"]["fields"];
+        let nested_ref = fields_prop["additionalProperties"]["$ref"]
+            .as_str()
+            .expect("recursive 'fields' map must $ref back into the definition schema");
+        let nested = &root["$defs"][nested_ref.rsplit('/').next().unwrap()];
+        assert_eq!(
+            nested["type"],
+            serde_json::json!("object"),
+            "recursive fields entry must resolve to the real object schema: {nested}"
+        );
+        assert!(
+            !nested["properties"]["values"].is_null(),
+            "recursive fields entry must keep its own named properties: {nested}"
+        );
+    }
+
+    #[test]
     fn set_field_parses_a_definition() {
         let mut params = update_params("set_field", "planning.prep_minutes");
         params.definition = Some(definition(
