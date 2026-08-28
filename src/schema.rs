@@ -101,8 +101,10 @@ pub const VALUES_SENTINEL: &str = "$values";
 /// validation — not just our runtime error — can catch a typo'd key.
 #[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "Frontmatter field definition, as in .kb-schema.yaml.")]
 pub struct RawFieldDef {
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Data type for this field (e.g. text, enum, list).")]
     pub ty: Option<FieldType>,
     /// `None` means "not declared here" and inherits the parent scope's `required`
     /// (`false` if there is no parent definition either) — see
@@ -111,9 +113,11 @@ pub struct RawFieldDef {
     /// author wrote `required: false`" from "the author said nothing," and per-attribute
     /// inheritance needs that distinction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Whether this field must be present.")]
     pub required: Option<bool>,
     /// Same absent-means-inherit rule as `required`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Whether this field is indexed for filtering.")]
     pub indexed: Option<bool>,
     /// Closed set of permitted values, for `enum` and `list`.
     ///
@@ -134,6 +138,7 @@ pub struct RawFieldDef {
     /// contains the [`VALUES_SENTINEL`] placeholder (`$values`), which splices the
     /// inherited set in at that position — see [`ResolvedSchema::merged_with`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Closed set of permitted values (enum/list).")]
     pub values: Option<Vec<String>>,
     /// **Deprecated** alias for a leading [`VALUES_SENTINEL`]: `extend: true` behaves
     /// exactly like writing `values: [$values, ...]` (see [`ResolvedSchema::merged_with`]
@@ -143,16 +148,20 @@ pub struct RawFieldDef {
     /// `validate_raw` rejects declaring both on the same field — the two ways of saying
     /// "inherit" must not be able to disagree about where the inherited values land.
     #[serde(default, skip_serializing_if = "is_false")]
+    #[schemars(description = "Deprecated; use '$values' in `values` instead.")]
     pub extend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Default value when the field is absent.")]
     pub default: Option<Value>,
     /// For `object`: whether undeclared child keys are permitted. `None` inherits the
     /// parent's `open` (`true`, the same default a fresh top-level declaration gets,
     /// when there is no parent definition either).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "For type object: whether extra child keys are allowed.")]
     pub open: Option<bool>,
     /// Nested authoring sugar, flattened into dot-paths at parse time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Nested field definitions (dot-path shorthand).")]
     pub fields: Option<HashMap<String, RawFieldDef>>,
 }
 
