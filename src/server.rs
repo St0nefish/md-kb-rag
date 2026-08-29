@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tower_governor::{
     GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{self, FrontmatterConfig, ResolvedConfig, SharedConfig};
 use crate::descriptions;
@@ -219,6 +219,17 @@ const SHUTDOWN_INDEX_WAIT: Duration = Duration::from_secs(75);
 /// so this bound exists only to keep the shutdown path itself from hanging forever —
 /// it does not hand git any headroom it didn't already have.
 const SHUTDOWN_GIT_QUIESCE_WAIT: Duration = Duration::from_secs(30);
+
+/// How long [`supervise_reindex_worker`] (#163) waits before respawning
+/// `reindex::run_worker` after it exits (panic, or — unreachably in production, since
+/// its own loop has no break — a plain return). A short, fixed delay rather than the
+/// exponential backoff `reindex.rs`'s per-unit retry logic uses for transient
+/// failures: a panic in the worker's own event loop is a programming bug, not a
+/// condition that clears with time, so backing off aggressively would only delay
+/// noticing (and indexing resuming) without improving the next attempt's odds. The
+/// delay exists purely so a worker that panics immediately on every restart doesn't
+/// spin the CPU and flood the logs.
+const REINDEX_WORKER_RESTART_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct StatusState {
@@ -1380,6 +1391,85 @@ fn compose_tool_overlay(config: &ResolvedConfig, data_path: &Path) -> HashMap<St
     descriptions::compose_tool_descriptions(extensions_dir.as_deref(), phrase_effective)
 }
 
+/// Supervises `reindex::run_worker` — the single task that drains `reindex_queue` and
+/// is the only thing that ever calls `ingest::index_paths` (see the doc comment on
+/// the call site below). A bare `tokio::spawn(run_worker(...))` with the `JoinHandle`
+/// discarded, which is what this replaces, has two problems (#163): a panic inside
+/// `ingest_runner`/`index_paths` kills the task silently — `tokio::spawn` swallows
+/// the panic, there is no join point to notice it, and indexing stops forever with
+/// nothing but `kb_reindex_queue_pending_paths` climbing to show for it — and the
+/// worker is never told about shutdown, unlike every sibling background loop in
+/// `run_server` (`reconcile_loop`, the metadata-refresh loop, the MCP transport),
+/// each of which takes a `ct.child_token()`.
+///
+/// `run_worker` itself never returns under normal operation (it loops on
+/// `queue.notify` forever, see its doc comment) and takes no `CancellationToken`
+/// parameter — `reindex.rs` is owned by another concurrent change right now, so that
+/// signature cannot be touched here. Cancellation is therefore achieved from this
+/// side instead: each attempt is its own `tokio::spawn` (so a panic surfaces as an
+/// `Err(JoinError)` from the handle rather than silently ending the task), raced via
+/// `tokio::select!` against `ct.cancelled()`. On cancellation this loop simply stops
+/// respawning — it does NOT abort the in-flight attempt's `JoinHandle`, so an
+/// index run already in progress keeps running and finishing exactly as before,
+/// which is what `run_server`'s shutdown sequence actually depends on
+/// (`wait_for_indexing_to_settle` polls `INDEX_STATUS`, unaffected by this change).
+///
+/// On a genuine exit (panic, or an unreachable plain return), this restarts the
+/// worker after `REINDEX_WORKER_RESTART_DELAY` rather than giving up — "skip this
+/// crash, keep indexing" instead of "one bad file permanently stops the pipeline."
+///
+/// `spawn_attempt` is injected rather than this function calling
+/// `crate::reindex::run_worker` directly — the same reasoning as `reconcile_loop`'s
+/// `on_fire` and `wait_for_indexing_to_settle`'s `is_indexing` just below: it lets
+/// `mod tests` drive the panic-restart and cancel-stops-respawning behavior against a
+/// fake task it fully controls (when it panics, how many times), instead of needing
+/// the real worker to panic on demand against live infrastructure. Production passes
+/// a closure that calls `crate::reindex::run_worker` with the process's real queue/
+/// config/schema-cache handles.
+async fn supervise_reindex_worker<F, Fut>(mut spawn_attempt: F, ct: CancellationToken)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        let attempt = tokio::spawn(spawn_attempt());
+
+        tokio::select! {
+            result = attempt => {
+                match result {
+                    // `run_worker`'s own loop has no break, so a plain return is
+                    // unreachable in production today — but treat it exactly like a
+                    // panic (log + restart) rather than letting the supervisor exit
+                    // quietly, so a future change that adds a return path to
+                    // `run_worker` can't silently reintroduce "indexing stops
+                    // forever with nothing to show for it."
+                    Ok(()) => error!(
+                        "reindex worker exited unexpectedly (returned rather than \
+                         looping forever); restarting in {:?}",
+                        REINDEX_WORKER_RESTART_DELAY
+                    ),
+                    Err(e) => error!(
+                        "reindex worker panicked: {e}; restarting in {:?}",
+                        REINDEX_WORKER_RESTART_DELAY
+                    ),
+                }
+            }
+            () = ct.cancelled() => {
+                // Shutdown requested. Deliberately not `.abort()`ed — see this
+                // function's doc comment for why the in-flight attempt is left to
+                // finish (or keep panicking) on its own rather than being killed
+                // here.
+                break;
+            }
+        }
+
+        tokio::select! {
+            () = tokio::time::sleep(REINDEX_WORKER_RESTART_DELAY) => {}
+            () = ct.cancelled() => break,
+        }
+    }
+}
+
 /// Periodic safety-net sweep loop: sleep for `indexing.reconcile_interval_secs`
 /// (read fresh from `shared_config` every iteration, not captured once outside the
 /// loop, so a `POST /admin/reload` that changes the interval governs the very next
@@ -1726,10 +1816,26 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // snapshot before every drain, so `indexing.include`/`exclude`/`exclude_files`,
     // `frontmatter.*`, `validation.*`, and `chunking.*` all observe a reload on the
     // worker's next wake rather than needing a restart.
-    tokio::spawn(crate::reindex::run_worker(
-        Arc::clone(&reindex_queue),
-        Arc::clone(&shared_config),
-        Arc::clone(&shared_schema_cache),
+    //
+    // Wrapped in `supervise_reindex_worker` (#163) rather than spawned bare: gives it
+    // panic-restart supervision and a `ct.child_token()`, matching every other
+    // background loop below (`reconcile_loop`, the metadata-refresh loop, the MCP
+    // transport) instead of being the one task with neither. See that function's doc
+    // comment for the full rationale, including why cancellation doesn't abort an
+    // in-flight run.
+    let worker_ct = ct.child_token();
+    let worker_queue = Arc::clone(&reindex_queue);
+    let worker_shared_config = Arc::clone(&shared_config);
+    let worker_schema_cache = Arc::clone(&shared_schema_cache);
+    tokio::spawn(supervise_reindex_worker(
+        move || {
+            crate::reindex::run_worker(
+                Arc::clone(&worker_queue),
+                Arc::clone(&worker_shared_config),
+                Arc::clone(&worker_schema_cache),
+            )
+        },
+        worker_ct,
     ));
 
     // Catch up on anything missed while this process was down (crash, deploy, a
@@ -2908,6 +3014,137 @@ mod tests {
         );
 
         crate::config::test_support::clear_required_env();
+    }
+
+    // --- supervise_reindex_worker (#163) ---
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_reindex_worker_restarts_after_a_panic() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_for_closure = Arc::clone(&attempts);
+        let ct = CancellationToken::new();
+
+        let handle = tokio::spawn(supervise_reindex_worker(
+            move || {
+                let n = attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        panic!("simulated worker panic");
+                    }
+                    // Second and later attempts behave like the real
+                    // `run_worker` (loops forever on `queue.notify`) — the test
+                    // controls termination entirely via `ct`.
+                    std::future::pending::<()>().await;
+                }
+            },
+            ct.child_token(),
+        ));
+
+        // Let the first attempt spawn and panic, and the supervisor observe the
+        // resulting `JoinError`, before advancing time.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "exactly one attempt before the restart delay elapses"
+        );
+
+        tokio::time::advance(REINDEX_WORKER_RESTART_DELAY).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "must restart once the backoff delay elapses — a bare tokio::spawn \
+             with the JoinHandle discarded (the pre-#163 shape) would have left \
+             indexing stopped forever here instead"
+        );
+
+        ct.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled supervisor must return promptly, not hang")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_reindex_worker_stops_respawning_once_cancelled() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_for_closure = Arc::clone(&attempts);
+        let ct = CancellationToken::new();
+
+        let handle = tokio::spawn(supervise_reindex_worker(
+            move || {
+                attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+                async { panic!("simulated worker panic") }
+            },
+            ct.child_token(),
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        ct.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled supervisor must return promptly, not hang")
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a cancelled supervisor must never respawn, no matter how long time \
+             advances afterward"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_reindex_worker_does_not_abort_an_in_flight_attempt_on_cancel() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_for_closure = Arc::clone(&finished);
+        let ct = CancellationToken::new();
+
+        let handle = tokio::spawn(supervise_reindex_worker(
+            move || {
+                let finished = Arc::clone(&finished_for_closure);
+                async move {
+                    // Simulates an index run still in flight when shutdown
+                    // arrives — long enough that it is still running when
+                    // `ct.cancel()` below fires. Graceful shutdown's contract
+                    // (`wait_for_indexing_to_settle`, which polls `INDEX_STATUS`)
+                    // depends on this run being left alone to finish rather than
+                    // being killed here.
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    finished.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+            },
+            ct.child_token(),
+        ));
+
+        tokio::task::yield_now().await;
+        ct.cancel();
+        // The supervisor itself must stop (no more respawning) promptly...
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled supervisor must return promptly, not hang")
+            .unwrap();
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the in-flight attempt must not have finished yet at cancellation time \
+             — otherwise the assertion below proves nothing"
+        );
+
+        // ...but the in-flight attempt, now detached from the supervisor, must
+        // still be allowed to run to completion rather than being aborted.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "cancelling the supervisor must not abort an attempt already in flight"
+        );
     }
 
     // --- reconcile_loop ---
