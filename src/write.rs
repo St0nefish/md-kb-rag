@@ -774,6 +774,22 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     //    index purge that follows a successful commit would never run.
     validate_commit_message(message)?;
 
+    // 4.5. Acquire GIT_LOCK now and hold ONE guard across every remaining step —
+    // the final on-disk write, the commit, and any rollback — rather than
+    // acquiring it only just before the commit as this used to. That gap is
+    // exactly what let #142 reopen the `expected_hash` stale-read guard: step 1
+    // above checks `expected_hash` once, against the caller-supplied
+    // `old_content`, but schema validation and (for a create) the dedup gate's
+    // embedding+Qdrant round trip both run AFTER that check and can take a
+    // while — long enough for a webhook merge, which independently needs this
+    // same lock for its own fetch + `git merge --ff-only`, to change the file's
+    // on-disk content in between with nothing to detect it. Acquiring the lock
+    // here and re-verifying against LIVE content immediately before the write
+    // below (rather than only re-checking the now-stale `old_content` again)
+    // closes the window instead of just narrowing it: nothing else can touch
+    // the working tree for the rest of this call.
+    let git_lock = git::lock_git().await;
+
     // Resolve fresh before creating directories too. The caller's resolution (if
     // any) happened before schema validation and a Qdrant dedup query — a wide
     // window in which a concurrent git sync could swap a component for a symlink,
@@ -829,6 +845,35 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         if !abs_path.exists() {
             return Err(WriteError::NotFound);
         }
+
+        // Re-verify the stale-read guard against the file's ACTUAL current
+        // content, immediately before the overwrite — this is the re-check
+        // #142 was filed over. Step 1's check ran against the caller-supplied
+        // `old_content`, which can go stale in the window between then and
+        // here (see the GIT_LOCK comment above); this one reads what is
+        // really on disk right now, under the lock, right before it gets
+        // clobbered. Skipped when the caller passed no `expected_hash`,
+        // matching that earlier check's own opt-in contract.
+        if let Some(expected) = expected_hash {
+            let live_content = tokio::fs::read(&abs_path).await.map_err(|e| {
+                error!(
+                    "Failed to re-read '{}' for stale-hash re-check: {}",
+                    abs_path.display(),
+                    e
+                );
+                WriteError::Io {
+                    msg: format!("Failed to read file for stale-hash re-check: {}", e),
+                }
+            })?;
+            let actual = crate::ingest::compute_hash_from_bytes(&live_content);
+            if !expected.trim().eq_ignore_ascii_case(&actual) {
+                return Err(WriteError::StaleHash {
+                    expected: expected.trim().to_string(),
+                    actual,
+                });
+            }
+        }
+
         tokio::fs::write(&abs_path, new_content.as_bytes())
             .await
             .map_err(|e| {
@@ -854,11 +899,13 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
     // failure means the commit is a real, durable part of local history — rolling
     // it back here would silently undo work that genuinely happened, so it is
     // left alone and reported as "committed, sync pending" instead.
-    // Held across the commit AND any rollback below. Releasing between the two
-    // would let another writer see — and, since it stages its own path into the
-    // same index, commit — the half-staged entry this call is about to undo.
-    let git_lock = git::lock_git().await;
-
+    // `git_lock` was acquired back at step 4.5, before the stale-hash re-check
+    // and the write itself, and is held continuously through here and any
+    // rollback below — NOT re-acquired at this point as it used to be.
+    // Releasing and re-acquiring in between would let another writer see — and,
+    // since it stages its own path into the same index, commit — the
+    // half-staged entry this call is about to undo (and would reopen exactly
+    // the #142 race step 4.5 exists to close).
     let commit_outcome = match git::commit_and_sync(
         &git_lock,
         deps.git_url,
@@ -1168,6 +1215,38 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
     //      this same guard by reference instead, which is what keeps this
     //      non-reentrant mutex from deadlocking against itself.
     let git_lock = git::lock_git().await;
+
+    // 9.6. Re-verify the stale-read guard against the SOURCE's live on-disk
+    //    content, now that GIT_LOCK is held and nothing else can touch the
+    //    clone for the rest of this call. Step 3's check ran before
+    //    `validate::validate_content` above — which can exec an arbitrarily
+    //    slow `validation.lint_command` — and before this lock acquisition,
+    //    so a webhook merge (which independently needs this same lock for its
+    //    own fetch + `git merge --ff-only`) could have changed the source's
+    //    content in that window with nothing to detect it; re-checking the
+    //    already-stale `old_content` a second time could never catch that.
+    //    Reads `abs_source` resolved back at step 4 — nothing between there
+    //    and here can have made it unsafe, since no filesystem mutation of
+    //    the clone has happened yet. Skipped when the caller passed no
+    //    `expected_hash`, matching step 3's own opt-in contract.
+    if let Some(expected) = expected_hash {
+        let live_source = tokio::fs::read(&abs_source).await.map_err(|e| {
+            error!(
+                "Failed to re-read source '{}' for stale-hash re-check while moving to '{}': {}",
+                source_rel, dest_rel, e
+            );
+            WriteError::Io {
+                msg: format!("Failed to read source file for stale-hash re-check: {}", e),
+            }
+        })?;
+        let actual = crate::ingest::compute_hash_from_bytes(&live_source);
+        if !expected.trim().eq_ignore_ascii_case(&actual) {
+            return Err(WriteError::StaleHash {
+                expected: expected.trim().to_string(),
+                actual,
+            });
+        }
+    }
 
     // 10. Filesystem: write the DESTINATION first (`create_new`, so this can never
     //    silently clobber a file that appeared between the check above and now),
@@ -3694,6 +3773,131 @@ mod tests {
             original
         );
         assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status(&work), "");
+    }
+
+    /// #142 regression: `expected_hash` must be re-verified against the file's
+    /// LIVE on-disk content immediately before the overwrite, not just once,
+    /// early, against the caller-supplied `old_content`. Simulates the failure
+    /// scenario from the issue: a caller reads `original`, and by the time its
+    /// write finally reaches the filesystem, something else (a webhook merge, in
+    /// production) has already changed the working-tree content — here modeled
+    /// directly as a second on-disk write between request construction and the
+    /// call, with `expected_hash` still computed from the ORIGINAL content the
+    /// caller actually read. Before the fix there is only the early check
+    /// (which the caller's own stale `old_content` trivially satisfies), so the
+    /// write silently clobbers the concurrent change; after the fix the
+    /// re-check catches the live mismatch and the file is left untouched.
+    #[tokio::test]
+    async fn stale_hash_re_check_catches_a_change_made_after_the_first_check() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+        let head_before = head_sha(&work);
+
+        let harness = git_backed_harness(&work);
+
+        // The hash the caller computed when it read `original` — still valid
+        // against `old_content` below, which is why the FIRST check (step 1)
+        // lets this through.
+        let expected_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
+
+        // Something else changes the file on disk after the caller read
+        // `original` but before this write reaches the filesystem — a webhook
+        // merge landing mid-flight, in production.
+        let concurrent = "---\ntitle: Concurrent\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Concurrent body\n";
+        std::fs::write(work.path().join("edit-me.md"), concurrent).unwrap();
+
+        let mut req = make_req(
+            "edit-me.md",
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n",
+            false,
+        );
+        req.old_content = original;
+        req.expected_hash = Some(&expected_hash);
+
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::StaleHash { expected, actual } => {
+                assert_eq!(expected, expected_hash);
+                assert_eq!(
+                    actual,
+                    crate::ingest::compute_hash_from_bytes(concurrent.as_bytes()),
+                    "the re-check must hash the LIVE on-disk content, not `old_content` again"
+                );
+            }
+            other => panic!("expected StaleHash, got {other:?}"),
+        }
+
+        // The concurrent write must survive untouched — that's the whole point:
+        // it must not be silently clobbered by the stale caller's edit.
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
+            concurrent
+        );
+        assert_eq!(head_before, head_sha(&work), "no commit must be made");
+    }
+
+    /// Same #142 regression, for `write_document_move`'s SOURCE: the stale-read
+    /// guard at step 3 runs before `validate::validate_content` (which can exec
+    /// an arbitrarily slow `lint_command`) and before GIT_LOCK is acquired, so a
+    /// concurrent change to the source's on-disk content in that window must
+    /// still be caught before the move writes the destination or removes the
+    /// source — not silently carried through as if the stale read were current.
+    #[tokio::test]
+    async fn move_stale_hash_re_check_catches_a_change_made_after_the_first_check() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let harness = git_backed_harness(&work);
+
+        let expected_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
+
+        // Concurrent change to the SOURCE after the caller's read but before the
+        // move's filesystem work runs — committed, same as a real webhook merge
+        // would (see `webhook.rs`), so the working tree is clean afterward and
+        // `git_status` below actually exercises the move's own rollback rather
+        // than an artifact of this test's own setup.
+        let concurrent =
+            "---\ntitle: Concurrent\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Concurrent\n";
+        std::fs::write(work.path().join("old/loc.md"), concurrent).unwrap();
+        git_commit_all(&work, "old/loc.md", "concurrent change to old/loc.md");
+        let head_before = head_sha(&work);
+
+        let mut req = make_move_req("old/loc.md", "new/loc.md", original, original);
+        req.expected_hash = Some(&expected_hash);
+
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::StaleHash { expected, actual } => {
+                assert_eq!(expected, expected_hash);
+                assert_eq!(
+                    actual,
+                    crate::ingest::compute_hash_from_bytes(concurrent.as_bytes()),
+                    "the re-check must hash the LIVE on-disk source, not `old_content` again"
+                );
+            }
+            other => panic!("expected StaleHash, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("old/loc.md")).unwrap(),
+            concurrent,
+            "source must be left exactly as the concurrent writer left it"
+        );
+        assert!(
+            !work.path().join("new/loc.md").exists(),
+            "destination must never be created when the re-check catches a stale source"
+        );
+        assert_eq!(head_before, head_sha(&work), "no commit must be made");
         assert_eq!(git_status(&work), "");
     }
 
