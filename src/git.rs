@@ -210,21 +210,30 @@ pub(crate) async fn rev_parse_head(_lock: &GitLock, data_path: &str) -> anyhow::
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Parse `git diff --name-status` output into the set of paths it touched.
+/// Parse `git diff --name-status -z` output into the set of paths it touched.
+///
+/// With `-z`, git NUL-delimits every field of the output — the status token AND
+/// each path — instead of separating status from path with a tab and one record
+/// from the next with a newline. That is what this function relies on: `-z` is
+/// also the one invocation shape where git does NOT C-quote/octal-escape a path
+/// containing non-ASCII bytes, tabs, backslashes, or quotes (`core.quotepath`'s
+/// effect and the newline-terminated `\t`-field format go together). Without
+/// `-z`, a file named `café.md` comes back as the literal 15-character string
+/// `"caf\303\251.md"` — quotes, backslashes, and all — which matches no real
+/// path on disk; `ReindexQueue::mark_paths` would then dirty a path that does
+/// not exist while the real file silently never gets reindexed (#143). Splitting
+/// the flat `-z`-delimited token stream below is what receives the raw bytes
+/// git actually wrote to the path, unmangled.
 ///
 /// Handles A(dded)/M(odified)/D(eleted) as a single path, and R(enamed)/C(opied) — which
-/// carry a similarity score suffix like `R100` and two tab-separated paths — as BOTH the
+/// carry a similarity score suffix like `R100` and two NUL-separated paths — as BOTH the
 /// old and new path, since both need reindexing (old: purge; new: index).
 fn parse_diff_name_status(output: &str) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let Some(status) = fields.next() else {
-            continue;
-        };
+    // Trailing (and any stray consecutive) NULs produce empty tokens; skip them
+    // rather than trying to parse a status out of "".
+    let mut fields = output.split('\0').filter(|s| !s.is_empty());
+    while let Some(status) = fields.next() {
         match status.chars().next() {
             Some('A') | Some('M') | Some('D') => {
                 if let Some(path) = fields.next() {
@@ -239,8 +248,8 @@ fn parse_diff_name_status(output: &str) -> Vec<std::path::PathBuf> {
             }
             _ => {
                 warn!(
-                    "Unrecognized 'git diff --name-status' line, ignoring: {}",
-                    line
+                    "Unrecognized 'git diff --name-status -z' status token, ignoring: {}",
+                    status
                 );
             }
         }
@@ -248,13 +257,17 @@ fn parse_diff_name_status(output: &str) -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// `git diff --name-status -M old..new` in `data_path`, parsed into touched paths.
+/// `git diff --name-status -M -z old..new` in `data_path`, parsed into touched paths.
 /// Local git only — no network. `-M` forces rename detection so a pure rename is
 /// reported as `R`, not as a delete+add pair (which would still work — both paths end
 /// up in the result — but would cost the new path an unnecessary re-embed instead of
 /// letting `index_paths` see it as unchanged content under a new name... which it
 /// cannot, since content hashing does not know about the old path. Either way both
 /// paths are enqueued; `-M` is for a cleaner log line, not correctness here).
+///
+/// `-z` NUL-delimits the output instead of git's default newline/tab-delimited,
+/// C-quoted format — see [`parse_diff_name_status`]'s doc comment for why that
+/// matters for any path containing non-ASCII bytes or other special characters.
 pub(crate) async fn git_diff_name_status(
     _lock: &GitLock,
     data_path: &str,
@@ -271,6 +284,7 @@ pub(crate) async fn git_diff_name_status(
                 "diff",
                 "--name-status",
                 "-M",
+                "-z",
                 &range,
             ])
             .current_dir(data_path)
@@ -570,21 +584,35 @@ pub async fn commit_and_sync(
             });
         }
 
+        // The rebase just succeeded, which means it may have REPLAYED our commit
+        // onto a brand-new sha (whenever FETCH_HEAD actually had something to
+        // rebase onto — the normal case, since writers and the webhook overlap
+        // routinely per this module's doc comment). Capture that post-rebase HEAD
+        // now and use it — not the pre-rebase `local_sha` — in every failure
+        // branch from here through the end of this function (#140): `local_sha`
+        // can already be a dangling, unreachable object by this point, so
+        // reporting it in a push-failure error would point the caller at a commit
+        // `git show`/`git log` can no longer find, with no way to locate the one
+        // that is actually sitting at HEAD pending sync. `git push` never rewrites
+        // local history, so this same value is also exactly the final answer on
+        // the success path below — no second re-read needed there anymore.
+        let post_rebase_sha =
+            rev_parse_head(lock, data_path)
+                .await
+                .map_err(|e| CommitSyncError::PostCommit {
+                    sha: "<unknown: rev-parse HEAD failed immediately after a successful rebase>"
+                        .to_string(),
+                    source: e,
+                })?;
+
         // Diff the rebase range now, before pushing — this is local-only (no network)
         // and a push failure below should not prevent the caller from at least
         // learning what changed locally, though in practice a push failure aborts the
         // whole call anyway.
-        let new_head =
-            rev_parse_head(lock, data_path)
-                .await
-                .map_err(|e| CommitSyncError::PostCommit {
-                    sha: local_sha.clone(),
-                    source: e,
-                })?;
-        rebased_paths = git_diff_name_status(lock, data_path, &old_head, &new_head)
+        rebased_paths = git_diff_name_status(lock, data_path, &old_head, &post_rebase_sha)
             .await
             .map_err(|e| CommitSyncError::PostCommit {
-                sha: local_sha.clone(),
+                sha: post_rebase_sha.clone(),
                 source: e.context("Failed to diff the rebase range"),
             })?;
 
@@ -597,31 +625,27 @@ pub async fn commit_and_sync(
         )
         .await
         .map_err(|_| CommitSyncError::PostCommit {
-            sha: local_sha.clone(),
+            sha: post_rebase_sha.clone(),
             source: anyhow::anyhow!("git push timed out after {:?}", GIT_TIMEOUT),
         })?
         .map_err(|e| CommitSyncError::PostCommit {
-            sha: local_sha.clone(),
+            sha: post_rebase_sha.clone(),
             source: anyhow::Error::new(e).context("Failed to spawn git push"),
         })?;
         if !push_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&push_out.stderr));
             return Err(CommitSyncError::PostCommit {
-                sha: local_sha.clone(),
+                sha: post_rebase_sha.clone(),
                 source: anyhow::anyhow!("git push failed: {}", stderr),
             });
         }
 
-        // The rebase may have replayed our commit onto a new sha — read HEAD fresh
-        // for the success return rather than reusing `local_sha`.
-        let sha =
-            rev_parse_head(lock, data_path)
-                .await
-                .map_err(|e| CommitSyncError::PostCommit {
-                    sha: local_sha.clone(),
-                    source: e,
-                })?;
-        return Ok(CommitOutcome { sha, rebased_paths });
+        // `git push` does not move local HEAD, so `post_rebase_sha` is still
+        // exactly right here — no need to re-read it a second time.
+        return Ok(CommitOutcome {
+            sha: post_rebase_sha,
+            rebased_paths,
+        });
     }
 
     // No remote configured: `local_sha` is already the final answer.
@@ -1465,6 +1489,51 @@ pub(crate) mod tests {
         );
     }
 
+    /// #143 regression, exercised against a real `git diff` invocation rather
+    /// than a hand-built string: git's default `core.quotepath=true` C-quotes
+    /// and octal-escapes any path with non-ASCII bytes in `--name-status`
+    /// output, so without `-z` this returned `"caf\303\251.md"` verbatim — a
+    /// string matching no real file on disk — instead of `café.md`.
+    #[tokio::test]
+    async fn git_diff_name_status_handles_a_non_ascii_filename() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        let old_head = rev_parse_head(&lock, work_path).await.unwrap();
+
+        std::fs::write(work.path().join("café.md"), "content").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "café.md"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add café.md",
+            ])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let new_head = rev_parse_head(&lock, work_path).await.unwrap();
+
+        let paths = git_diff_name_status(&lock, work_path, &old_head, &new_head)
+            .await
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![std::path::PathBuf::from("café.md")],
+            "the real, unmangled filename must come back — not git's quoted/escaped form"
+        );
+    }
+
     /// Two independent new files, committed together via a two-element `paths`
     /// slice, must land as a single commit that contains both — not two commits,
     /// and not one commit missing either file.
@@ -2031,6 +2100,168 @@ pub(crate) mod tests {
         assert!(!full.contains("super_secret_token"));
     }
 
+    /// #140 regression: when the rebase replays our commit onto a NEW sha (the
+    /// normal case whenever another writer already pushed — exactly the
+    /// scenario `commit_and_sync_reports_paths_pulled_in_by_the_rebase` above
+    /// sets up) and the subsequent push then fails, the `PostCommit` error must
+    /// report that new, post-rebase sha — not the pre-rebase sha, which the
+    /// replay has already made unreachable.
+    ///
+    /// Making the bare remote's directory tree read-only after A's push (but
+    /// before B's call) is what makes the push fail deterministically while
+    /// leaving `fetch` (upload-pack, read-only, writes nothing under the repo)
+    /// unaffected — `git receive-pack` needs to create objects/lock refs and
+    /// fails outright without write permission, so the rebase genuinely
+    /// completes locally before the push failure hits.
+    #[tokio::test]
+    async fn commit_and_sync_postcommit_push_failure_after_rebase_reports_post_rebase_sha() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+
+        let lock = lock_git().await;
+
+        // Clone A pushes first, so clone B's own commit below must fetch + rebase
+        // onto A's commit before it can (attempt to) push.
+        let work_a = clone_bare_repo(bare.path(), "main");
+        std::fs::write(work_a.path().join("other.md"), "from A").unwrap();
+        commit_and_sync(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_a.path().to_str().unwrap(),
+            None,
+            &["other.md"],
+            "add other.md from A",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        // Clone B, rewound to before A's push, so its own `commit_and_sync` call
+        // below must fetch + rebase onto A's commit before attempting to push.
+        let work_b = clone_bare_repo(bare.path(), "main");
+        let log_out = std::process::Command::new("git")
+            .args(["log", "--format=%H", "-2"])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+        let commits: Vec<&str> = std::str::from_utf8(&log_out.stdout)
+            .unwrap()
+            .lines()
+            .collect();
+        let parent_sha = commits[1].trim();
+        std::process::Command::new("git")
+            .args(["reset", "--hard", parent_sha])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+
+        std::fs::write(work_b.path().join("mine.md"), "from B").unwrap();
+
+        // Make the bare remote reject pushes now, AFTER A's push — `git push`
+        // (receive-pack) runs the `pre-receive` hook and fails on its non-zero
+        // exit, while `git fetch` (upload-pack) never runs that hook and is
+        // unaffected. That asymmetry is the point: `commit_and_sync` must get
+        // far enough to fetch and rebase before the push fails.
+        reject_pushes(bare.path());
+
+        let result = commit_and_sync(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_b.path().to_str().unwrap(),
+            None,
+            &["mine.md"],
+            "add mine.md from B",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+
+        let sha = match result {
+            Err(CommitSyncError::PostCommit { sha, source }) => {
+                let msg = format!("{:#}", source);
+                assert!(
+                    msg.contains("git push failed"),
+                    "expected a push failure, got: {}",
+                    msg
+                );
+                sha
+            }
+            other => panic!("expected CommitSyncError::PostCommit, got: {:?}", other),
+        };
+
+        // The rebase really did replay B's commit onto a new sha — HEAD in B's
+        // clone must be the reported sha, and that sha must actually exist as a
+        // commit (proving it is real, not a placeholder).
+        let head = rev_parse_head(&lock, work_b.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            sha, head,
+            "the reported sha must be the CURRENT local HEAD (the post-rebase \
+             replay), not the pre-rebase sha the replay orphaned"
+        );
+        let cat_file = std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+        assert!(
+            cat_file.status.success(),
+            "the reported sha must resolve to a real, findable commit"
+        );
+    }
+
+    /// Install a `pre-receive` hook on a bare repo that rejects every push.
+    ///
+    /// Failure injection for the push-failure test above. This deliberately does
+    /// NOT work by making the remote's tree read-only: `receive-pack` writing to
+    /// a `chmod -w` directory is only blocked for an unprivileged user, and CI
+    /// here runs on a self-hosted runner privileged enough to write anyway
+    /// (root, or anything holding `CAP_DAC_OVERRIDE`, ignores the permission
+    /// bits outright). That made the read-only version pass locally and fail in
+    /// CI, where the push simply succeeded and no `PostCommit` error was ever
+    /// produced.
+    ///
+    /// A `pre-receive` hook is privilege-independent: git runs it and honours a
+    /// non-zero exit no matter who the pushing process is. It also targets
+    /// exactly the operation under test — `fetch` (upload-pack) never runs
+    /// `pre-receive`, so the fetch-then-rebase half of `commit_and_sync` still
+    /// succeeds, which is precisely the sequence this test needs.
+    ///
+    /// Unix-only, same as the rest of this test module's assumptions
+    /// (`create_bare_repo` et al. already shell out to a real `git`, which this
+    /// project only targets on Linux).
+    #[cfg(unix)]
+    fn reject_pushes(bare: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let hooks_dir = bare.join("hooks");
+        let hook = hooks_dir.join("pre-receive");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'pushes rejected by test' >&2\nexit 1\n",
+        )
+        .unwrap();
+
+        // Pin the repo's hooks directory explicitly. A `core.hooksPath` in the
+        // developer's or runner's GLOBAL git config silently replaces a repo's
+        // own `hooks/` for every repo on the machine, which would leave this
+        // hook dead and let the test pass a push it exists to reject. This
+        // project's own `scripts/setup-dev.sh` sets `core.hooksPath`
+        // (repo-locally), and setting it globally is a common enough habit that
+        // the test must not depend on its absence. Repo-local config wins over
+        // global, so writing it here makes the hook fire either way.
+        std::process::Command::new("git")
+            .args(["config", "core.hooksPath", hooks_dir.to_str().unwrap()])
+            .current_dir(bare)
+            .output()
+            .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     // --- restore_from_head / unstage tests ---
 
     /// `restore_from_head` is the rollback primitive for a PreCommit failure on an
@@ -2188,7 +2419,9 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_diff_name_status_handles_add_modify_delete() {
-        let out = "A\tnew.md\nM\tchanged.md\nD\tgone.md\n";
+        // `-z` NUL-delimits every field — status AND path — rather than
+        // tab-separating fields and newline-separating records.
+        let out = "A\0new.md\0M\0changed.md\0D\0gone.md\0";
         let paths = parse_diff_name_status(out);
         assert_eq!(
             paths,
@@ -2202,8 +2435,9 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_diff_name_status_enqueues_both_sides_of_a_rename() {
-        // Git reports renames with a similarity-score suffix on the status ("R100").
-        let out = "R100\told-name.md\tnew-name.md\n";
+        // Git reports renames with a similarity-score suffix on the status
+        // ("R100"), still NUL-separated from the two paths under `-z`.
+        let out = "R100\0old-name.md\0new-name.md\0";
         let paths = parse_diff_name_status(out);
         assert_eq!(
             paths,
@@ -2216,11 +2450,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn parse_diff_name_status_ignores_blank_lines() {
-        let out = "A\tnew.md\n\n";
+    fn parse_diff_name_status_ignores_trailing_and_stray_empty_tokens() {
+        // A trailing NUL (git always terminates the last record with one, same
+        // as every other) must not be mistaken for an empty status token.
+        let out = "A\0new.md\0\0";
         assert_eq!(
             parse_diff_name_status(out),
             vec![std::path::PathBuf::from("new.md")]
+        );
+    }
+
+    /// #143 regression: without `-z`, git C-quotes/octal-escapes any path
+    /// containing non-ASCII bytes (also tabs/backslashes/quotes) by default
+    /// (`core.quotepath=true`), and the old tab/newline-based parser returned
+    /// that quoted string verbatim — a value matching no real file on disk.
+    /// `-z` output is never quoted, so the raw bytes git wrote to the path
+    /// come through unmangled.
+    #[test]
+    fn parse_diff_name_status_handles_non_ascii_and_special_paths() {
+        let out = "M\0caf\u{e9}.md\0D\0gone.md\0R100\0old.md\0new\u{201c}quoted\u{201d}.md\0";
+        let paths = parse_diff_name_status(out);
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("caf\u{e9}.md"),
+                std::path::PathBuf::from("gone.md"),
+                std::path::PathBuf::from("old.md"),
+                std::path::PathBuf::from("new\u{201c}quoted\u{201d}.md"),
+            ]
         );
     }
 
