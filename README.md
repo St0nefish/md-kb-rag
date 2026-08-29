@@ -84,10 +84,14 @@ Three Docker services:
 ## CLI Commands
 
 ```bash
-md-kb-rag serve              # Start server (MCP + webhook endpoints)
+md-kb-rag serve              # Start server (MCP + webhook endpoints + web UI)
 md-kb-rag index              # Incremental index (only changed files)
 md-kb-rag index --full       # Full re-index (clear state, re-embed everything)
 md-kb-rag validate           # Validate all markdown files without indexing
+md-kb-rag search "query"     # Search the knowledge base from the CLI (same pipeline as MCP search)
+md-kb-rag search "query" --limit 10 --explain      # Score-breakdown per result
+md-kb-rag search "query" --domain infra --type guide --tags docker,node:ares
+md-kb-rag search "query" --modified-after 2026-01-01 --json
 md-kb-rag get PATH           # Print one document (path resolves like the MCP tool)
 md-kb-rag get PATH --start-line 40 --end-line 60   # ...or just those lines, 1-based inclusive
 md-kb-rag status             # Aggregate counts + metadata breakdown
@@ -140,12 +144,13 @@ See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 - **frontmatter** *(deprecated)* — Required fields, indexed fields, defaults, and `allowed` closed-set enums (enforced by `validate` and the write tools); prefer a root `.kb-schema.yaml` instead — see [`.kb-schema.yaml` Directory Schemas](#kb-schemayaml-directory-schemas)
 - **chunking** — Markdown-aware splitting with configurable chunk size
 - **embedding** — OpenAI-compatible endpoint (works with llama.cpp, vLLM, etc.)
-- **qdrant** — Connection URL and collection name
 - **validation** — Strict/lenient mode, optional lint command
 - **webhook** — HMAC verification for Gitea/GitHub/GitLab (disabled if `WEBHOOK_SECRET` is unset)
 - **mcp** — Server port, bearer token authentication, and `extensions_path` (where per-KB tool/server description policy lives in the served knowledge base; `instructions` is a deprecated narrative override — see [MCP Tools](#mcp-tools) below)
 - **write** — Behaviour of the write tools: near-duplicate detection (`dedup_enabled`, `dedup_threshold`) and the git commit identity
 - **search** — Retrieval behaviour: hybrid sparse+dense search with RRF fusion (`hybrid`, default `true`) and per-arm candidate count (`rrf_candidates`). Set `hybrid: false` for legacy dense-only search. See the migration note below. Also `phrase` (default `true`) — exact-phrase matching for double-quoted spans in a `search` query, fused as a third RRF arm.
+- **reranking** — Optional cross-encoder reranking pass over the top hybrid candidates (`enabled`, default `false`; `candidate_limit`, default `50`). Requires `RERANKING_BASE_URL`/`RERANKING_MODEL` when enabled — see [Configuration](#configuration) above and `deploy/config.example.yaml`
+- **ui** — Web UI graph-view tuning: `semantic_edges` adds precomputed kNN neighbor edges alongside markdown-link edges (off by default — each enabled run costs one Qdrant `recommend` query per indexed document). See [Web UI](#web-ui) below.
 
 > **Hybrid search migration:** collections now use named `dense` + `sparse` vectors. Upgrading a knowledge base that was indexed by a pre-hybrid version requires a one-time full reindex (`md-kb-rag index --full`) — the old single-unnamed-vector schema is incompatible. After that, toggling `search.hybrid` needs no reindex (both vectors are always stored).
 
@@ -366,6 +371,18 @@ When validation fails, write tools return a structured error whose `data.field_e
 
 Server and tool descriptions are assembled from three layers, in order: mechanics true of every deployment (compiled into the binary), mechanics that depend on this deployment's config (e.g. whether `search.hybrid`/`search.phrase` are on, plus the distinct filter values and write-authoring rules discovered in the live index), and this knowledge base's own policy — what belongs here, tagging conventions, writing style — loaded at runtime from `<mcp.extensions_path>/` in the served repo (default `meta/mcp`) and refreshed on `mcp.metadata_refresh_secs`. The per-KB layer is append-only: editing it is a normal `write_document` call, no restart required. `mcp.instructions` is a deprecated narrative override that still works but is superseded by `<extensions_path>/server.md` when both are set. See the [`mcp` section of the config reference](deploy/config.example.yaml) and [deploy/USAGE.md](deploy/USAGE.md#agent-write-tools) for details.
 
+## Web UI
+
+The server also ships a browser UI, served at `/` on the same port as MCP (8001) — no separate service, no separate port. Point a browser at `http://your-host:8001/` (or wherever it sits behind your reverse proxy).
+
+It's docs-first: a sidebar document tree and a semantic-search results panel (backed by the same `search` retrieval core as the MCP tool) are the primary views. A Cytoscape.js graph view is available alongside them — either a whole-knowledge-base view or, from any open document, its link neighborhood — and a full document editor lets you create, edit, move, and delete documents directly from the browser.
+
+The editor's writes are not a separate, lesser code path: `POST`/`DELETE /api/doc/{*path}` run through the exact same `write_document`/`delete_document` pipeline the MCP write tools use — the same frontmatter validation against the `.kb-schema.yaml` cascade, the same near-duplicate check on create, the same commit-and-push to the knowledge base's git remote, and the same incremental reindex trigger. Editing a document in the browser and editing it through an MCP client produce indistinguishable commits.
+
+**The web UI has no authentication of its own, on any of its routes, including the write and delete ones.** This is deliberate, not an oversight: `MCP_BEARER_TOKEN` (and `mcp.allow_unauthenticated`) gate `/mcp`, `/status`, `/metrics`, and `POST /admin/reload` — they do **not** gate `/`, `/api/graph`, `/api/search`, `/api/schema/{*path}`, or `/api/doc/{*path}` (GET, POST, *or* DELETE). Setting a bearer token does not add a credential requirement to the web UI in any way; it remains exactly as open as `/health`. The intended deployment shape puts an identity-aware reverse proxy — Authentik via Traefik, in the reference deployment this project targets — in front of the whole port, and relies on that proxy for the web UI's access control entirely.
+
+**Practical consequence:** if you publish port 8001 directly (a bare `docker run -p 8001:8001`, a cloud load balancer with no auth in front, a home-lab port-forward) without a reverse-proxy auth layer ahead of it, anyone who can reach that port can read, create, edit, and delete every document in the knowledge base through the web UI — regardless of whether `MCP_BEARER_TOKEN` is set. Put an authenticating reverse proxy in front of port 8001 for any deployment reachable beyond a fully trusted network; the MCP bearer token alone does not cover this surface.
+
 ## `.kb-schema.yaml` Directory Schemas
 
 A file named `.kb-schema.yaml` governs its directory and everything beneath it, cascading like `CLAUDE.md` — including at the knowledge-base root. `frontmatter` in `config.yaml` used to be the *only* way to declare root-level rules; it's now a deprecated fallback (see [Backward compatibility](#backward-compatibility) below), and a root `.kb-schema.yaml` — authored with the exact same syntax as any other directory — is the preferred way to declare them, since it's part of the knowledge base's own git repo rather than deployment config on the container host.
@@ -492,7 +509,7 @@ POST to `/hooks/reindex` triggers:
 1. HMAC signature verification (Gitea/GitHub/GitLab)
 2. Branch matching against `source.branch`
 3. `git fetch` + `git merge --ff-only` (if `source.git_url` is configured)
-4. Incremental reindex of changed files
+4. The changed paths from that pull are marked dirty and the handler returns immediately — it does not reindex inline. A single background worker drains that queue and does the actual indexing asynchronously, off the request path (see [Architecture](docs/ARCHITECTURE.md#webhook-flow) for the full design). If `source.git_url` isn't configured, there's nothing to fetch or diff, so the webhook instead marks the whole corpus for a full reconcile.
 
 The webhook endpoint is only available if `WEBHOOK_SECRET` is set to a non-empty value.
 

@@ -4,24 +4,27 @@ Current-state reference for md-kb-rag. For setup instructions see [`deploy/USAGE
 
 ## Overview
 
-`md-kb-rag` is a single Rust binary that combines three concerns:
+`md-kb-rag` is a single Rust binary that combines four concerns:
 
 - **Indexing pipeline** — walks a markdown knowledge base, chunks and embeds files, and stores vectors + state
 - **MCP server** — exposes exactly six tools over Streamable HTTP (port 8001): `search`, `get_document`, `write_document`, `delete_document`, `get_schema`, and `update_schema`
-- **Webhook handler** — receives push events from a Git forge, pulls changes, and triggers incremental reindex
+- **Webhook handler** — receives push events from a Git forge, pulls changes, and marks the changed paths dirty for the reindex worker (see [Webhook Flow](#webhook-flow))
+- **Web UI** — a docs-first browser and semantic-search UI, served at `/` on the same port, with a Cytoscape graph view and a full create/edit/move/delete document editor; deliberately unauthenticated by design (see [Web UI](#web-ui))
 
-All three share the same binary and config. The `serve` subcommand runs the server (MCP + webhook); the remaining subcommands are standalone CLI operations.
+All four share the same binary and config. The `serve` subcommand runs the server (MCP + webhook + web UI); the remaining subcommands are standalone CLI operations.
 
 ### Subcommands
 
 | Subcommand | Purpose |
 |---|---|
-| `serve` | Start the MCP server and webhook handler |
+| `serve` | Start the MCP server, webhook handler, and web UI |
 | `index` | Incremental reindex (changed files only) |
 | `index --full` | Full reindex — drops Qdrant collection and re-embeds everything |
 | `validate` | Check frontmatter on all files without indexing |
 | `status` | Print collection stats and state DB info, including the document-metadata count (warns if it lags behind indexed files) |
 | `health` | Query the running server's `/health` endpoint |
+| `search` | Search the knowledge base from the CLI, through the same `retrieval::search` core the MCP `search` tool (query mode) uses — ranked results only, no enumeration mode |
+| `get` | Retrieve one document (or a line range of it) by path from the CLI, resolved the same way as the MCP `get_document` tool |
 | `reproject-fields` | Rebuild `document_fields` from stored frontmatter JSON (state DB only, no re-embed) |
 
 ## Docker Topology
@@ -75,16 +78,23 @@ The MCP port (8001) is the only externally exposed port. This service is designe
 | `chunk.rs` | Section-aware markdown chunker |
 | `embed.rs` | Embedding API client (async-openai, batched, exponential backoff) |
 | `qdrant.rs` | Qdrant gRPC operations: upsert, delete, search, facet fetch |
-| `state.rs` | SQLite state DB (sqlx): tracks relative path → content hash + chunk count + schema fingerprint, plus the `documents` and `document_fields` metadata index |
+| `state.rs` | SQLite state DB (sqlx): tracks relative path → content hash + chunk count + schema fingerprint, plus the `documents`/`document_fields` metadata index and the `document_links` graph-edge table (see [State Model](#state-model)) |
 | `document_fields.rs` | Projects frontmatter JSON into filterable `document_fields` rows (dot-path flattening, array expansion, numeric coercion) |
 | `schema.rs` | `.kb-schema.yaml` cascade: parsing, cascade merge, `SchemaCache` tree walk + resolution, type/value checking, schema fingerprinting |
-| `retrieval.rs` | Shared retrieval core: `search` and `get_document` logic used by `mcp.rs` |
+| `retrieval.rs` | Shared retrieval core: `search`, `get_document`, and `list_documents`, consumed by `mcp.rs`, `web.rs`, and the `search`/`get` CLI subcommands alike |
+| `sparse.rs` | Pure-Rust BM25-style sparse-vector tokenizer (FNV-1a term hashing) feeding the `sparse` named vector for hybrid retrieval — no model, no network |
+| `rerank.rs` | Cross-encoder reranking client; truncates each candidate to a byte budget derived from `chunking.max_chunk_size` before sending, with exponential-backoff retry |
 | `mcp.rs` | The six MCP tool handlers (`search` — covering both ranked query results and, with no `query`, the exhaustive enumeration formerly served by `list_documents` — `get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`): input validation, result formatting; delegates to `retrieval.rs` / `write.rs` / `state.rs` / `schema.rs` |
 | `descriptions.rs` | Assembles each tool's and the server's MCP description from compiled-in `assets/mcp/*.md` (mechanics true of every deployment), config-derived sentences (e.g. the hybrid/phrase retrieval-mode sentence), and a per-KB policy extension loaded at runtime from `mcp.extensions_path` in the served knowledge base (append-only, editable via `write_document`) |
-| `server.rs` | Axum server: MCP route, webhook route, bearer-token middleware, rate limiter, metadata refresh |
-| `webhook.rs` | Webhook handler: provider signature verification, branch filter, git subprocess, reindex dispatch |
+| `write.rs` | Transport-agnostic write pipeline (`write_document`/`delete_document`) shared by the MCP write tools and `web.rs`'s `POST`/`DELETE /api/doc/{*path}`: schema-frozen check, frontmatter validation, dedup gate, pre-commit rollback, `git::commit_and_sync`, and marking the written path dirty on the `ReindexQueue` |
+| `reindex.rs` | `ReindexQueue` and its single background worker (`run_worker`): every producer (write tools, webhook handler, startup, the periodic reconcile sweep) marks paths — or a full reconcile — dirty and returns immediately; the worker drains the queue into `ingest::index_paths` with coalesce-don't-drop semantics and transient-vs-permanent retry/backoff (see [Webhook Flow](#webhook-flow)) |
+| `web.rs` | The knowledge-base web UI — docs browser, semantic search, Cytoscape graph view, and a create/edit/move/delete editor — served straight from the binary and deliberately unauthenticated (see [Web UI](#web-ui)) |
+| `server.rs` | Axum server: MCP route, webhook route, `/health`/`/status`/`/metrics`/`POST /admin/reload`, and the unauthenticated web UI routes from `web.rs`, all merged in before the rate-limit `GovernorLayer` wrap; spawns the reindex worker and the periodic reconcile-sweep timer (`indexing.reconcile_interval_secs`) |
+| `webhook.rs` | Webhook handler: provider signature verification, branch filter, `git fetch` + `git merge --ff-only`, then diffs the pulled range and marks exactly those paths dirty on the `ReindexQueue` — it never indexes inline (see [Webhook Flow](#webhook-flow)) |
+| `reload.rs` | `POST /admin/reload`: re-reads and re-validates `config.yaml`, swaps it into the live `SharedConfig`, and classifies each changed setting as `applied` (read fresh on next use), `restart_required` (baked into a startup-built value), or `reindex_required` (`chunking.*`) |
+| `status.rs` | Process-global indexing run state (`INDEX_STATUS`) backing `/status` and `/metrics`: in-flight phase/progress, last-run outcome and counters, payload-index health |
 | `validate.rs` | Frontmatter validation against the resolved `.kb-schema.yaml` cascade for each file's path (falls back to the `frontmatter` config as the implicit root schema) |
-| `git.rs` | Git subprocess helpers: token injection, URL redaction, fetch/merge with timeout |
+| `git.rs` | Git subprocess helpers: token injection, URL redaction, fetch/merge with timeout, serialized by `GIT_LOCK` |
 
 ## Indexing Pipeline
 
@@ -187,6 +197,21 @@ Arrays produce one row per element. This table is projected by `document_fields.
 
 A full reindex (`index --full`) also clears the `documents`/`document_fields` metadata index via `StateDb::clear`, alongside `indexed_files` — so a file removed from disk since the last full run cannot leave a phantom `list_documents` entry behind.
 
+### Link graph
+
+A third table, `document_links`, holds the edges behind the web UI's graph view and the move-time link rewriter — one row per (`source_path`, `target_path`, `kind`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `source_path` | TEXT | Document the link is written in |
+| `target_path` | TEXT | Document the link points at |
+| `kind` | TEXT | `markdown` (an inline link extracted from the source's body at ingest time) or `semantic` (a precomputed kNN neighbor, carrying a similarity `score`; opt-in via `ui.semantic_edges.enabled`, off by default) |
+| `score` | REAL, nullable | Cosine similarity for `semantic` edges; unset for `markdown` ones |
+
+Unlike `document_fields`, this table carries no foreign key to `documents` and no `ON DELETE CASCADE`: a link's target need not exist as an indexed document at all — it may point at a file that hasn't been indexed yet, or one that was since renamed or deleted out from under it. `GET /api/graph` (`web.rs`) drops dangling edges at read time instead of relying on the schema to keep them consistent. Rows for one `(source_path, kind)` are replaced wholesale (delete-then-insert in one transaction) whenever that file's outgoing links are recomputed, so a reader never observes a partially-replaced edge set, and a file's rows are removed outright on `delete_document`.
+
+The reverse lookup — "what points at this target" — is what `write_document`'s directory/document move uses to rewrite links: when a path moves, `StateDb::links_targeting` (scoped to `kind = "markdown"`, so precomputed semantic neighbors are never treated as literal link text to rewrite) names every source document whose body needs its link text updated to the new path, and the move updates each of them in the same commit.
+
 ### Qdrant payload schema
 
 Each indexed chunk is stored as a Qdrant point with this payload:
@@ -270,41 +295,58 @@ POST /hooks/reindex
   mismatch? ──► 200 (ignored, no reindex)
         │ match
         ▼
- acquire reindex try-lock (single-flight)
+ git_url configured?
         │
-  busy? ──► coalesce/skip (logged) + 200
-        │ acquired
-        ▼
- git fetch + git merge --ff-only
- (with source.git_url; git_token injected transiently, never written to disk)
- (120-second timeout on each subprocess)
-        │
-        ▼
- incremental reindex (same pipeline as `index` subcommand)
-        │
-        ▼
- release lock
+   no ──┴──────────────────────────────► mark_full() on the ReindexQueue
+        │ yes                                          │
+        ▼                                               │
+ capture HEAD, then git fetch + git merge --ff-only     │
+ (git_token injected transiently, never written to disk) │
+ (120-second timeout on each subprocess)                 │
+        │                                                │
+        ▼                                                │
+ diff old HEAD..new HEAD, mark_paths(changed)             │
+        │                                                │
+        └──────────────────────────────┬─────────────────┘
+                                        ▼
+                    200 "Changes queued for indexing" — handler returns
+                                        │
+                     (asynchronously, off the request path)
+                                        ▼
+                     reindex::run_worker drains the queue
+                     and calls ingest::index_paths / scan_and_index
 ```
 
-The single-flight lock (`REINDEX_LOCK`) is an `Arc<tokio::Mutex<()>>`. The handler attempts `try_lock_owned()`: if it succeeds, the reindex runs in a spawned task holding the owned guard; if the lock is already held, the webhook is **skipped** (coalesced) — it is not queued or replayed — and the handler logs the coalesce and returns 200. Rationale: reindexing is incremental over the repo's current state, so a single in-flight run subsumes concurrent triggers. The one caveat is that a push landing *after* the in-flight run's `git fetch` is not seen by that run; it is picked up by the next webhook-triggered reindex.
+There is no lock, no single-flight, and no coalesce-or-skip in the handler itself. `handle_webhook` (`src/webhook.rs`) never indexes anything — it fetches, merges, diffs the pulled range with `git::git_diff_name_status`, and marks exactly those paths dirty via `ReindexQueue::mark_paths` (or, when `source.git_url` is unset and there is nothing to fetch or diff, falls back to `ReindexQueue::mark_full`). `mark_paths`/`mark_full` never block and never fail, so the handler returns `200 "Changes queued for indexing"` as soon as the git operations finish — it does not wait for the paths it just marked to actually be reindexed.
+
+The queue itself is what used to be a single-flight `REINDEX_LOCK` (`Arc<tokio::Mutex<()>>`, `try_lock_owned()`), and that design had a real bug: a webhook arriving while a previous one's inline reindex was still running lost its race for the lock and was **dropped** — skipped, not queued or replayed. `reindex::ReindexQueue` replaces that with coalesce-don't-drop semantics instead: every delivery's `mark_paths` call lands in the same dirty-path set (a `HashSet`, so marking an already-pending path is a no-op, not data loss), and the single background worker (`reindex::run_worker`) drains that set, indexes it, and immediately drains again — if new work landed while it was running, it loops and runs again before going back to sleep, rather than a losing webhook being dropped outright. A path is lost only if it is never marked at all, never because of *when* it was marked. The worker retries a transient failure (embeddings/Qdrant unreachable, git I/O) with exponential backoff up to a bounded attempt count before deferring to the next periodic reconcile sweep, and drops a permanent one (a strict-mode validation rejection) immediately, since the writer that caused it already saw the rejection. See `reindex.rs`'s module doc for the full design rationale, and [Webhook](../README.md#webhook) in the README for the operator-facing summary.
+
+## Web UI
+
+`web.rs` serves a docs-first web UI on the *same port* as MCP (8001) — it is a second router merged into the one Axum app `server::run_server` builds, not a separate service. Its shell (`assets/ui/`) and every script it loads — Cytoscape.js plus its `layout-base`/`cose-base`/`fcose` layout plugins, `marked`/`dompurify` for rendering markdown safely, `edit.js` for the editor — are embedded into the binary via `include_str!` and served from `/assets/*`, so there are no filesystem reads or external fetches at request time.
+
+**Routes:** `/` (the shell), `/assets/*`, `/api/graph` (nodes from `StateDb::all_document_summaries`, edges from `StateDb::all_links` — see [Link graph](#link-graph) above — filtered to the current node set), `/api/search` (a thin wrapper over `retrieval::search`), `/api/schema/{*path}`, and `/api/doc/{*path}`, which carries all three HTTP methods on one route: `GET` (via `retrieval::get_document`, with the same `?start_line=&end_line=` slicing contract as the MCP tool and the CLI's `get`), `POST` (create, full-replace edit, or move — `write::write_document`), and `DELETE` (`write::delete_document`).
+
+The UI itself is docs-first: a sidebar document tree and a semantic-search results panel are the primary views, hash-routed (home/browse/doc); the Cytoscape graph — full-KB or a per-document neighborhood, `fcose` layout, hover/zoom-gated labels — is reachable but secondary. A full create/edit/move/delete editor rides on top of the same `/api/doc/{*path}` route the read view uses.
+
+**`POST`/`DELETE /api/doc/{*path}` are thin adapters over the exact same `write::write_document`/`write::delete_document` pipeline the MCP `write_document`/`delete_document` tools use** — the same frontmatter validation, the same dedup gate on create, the same pre-commit rollback, the same `git::commit_and_sync` (commit and push to the knowledge base's real git remote), and the same marking of the written path dirty on the `ReindexQueue`. A web UI edit is indistinguishable, downstream, from an MCP write.
+
+**Deliberately unauthenticated, independent of `MCP_BEARER_TOKEN`.** Unlike `mcp_router`/`status_router`/`admin_router`, the web UI's router is merged into the app with no bearer-auth middleware layer at all (`server.rs`) — not "unauthenticated because `mcp.allow_unauthenticated` is set", but unauthenticated unconditionally, regardless of that setting. This applies equally to the read routes and to `POST`/`DELETE /api/doc/{*path}`: there is no separate, stricter gate on the write/delete routes. `web.rs`'s own module doc states the reasoning directly: the deployment this was built for sits behind an identity-aware reverse proxy (Authentik via Traefik), and the binary does not gate these routes itself — the same open-route posture `/health` already has. The startup log names the UI as unauthenticated, but does not currently spell out that this is independent of the bearer-token setting; see [README.md's Web UI section](../README.md#web-ui) for the operator-facing statement of what exposing this port directly, with no reverse-proxy auth in front, actually grants.
 
 ## Security Model
 
-This service is designed for intranet/tailnet deployment — the threat model assumes network-level access control at the perimeter.
+This service is designed for intranet/tailnet deployment — the threat model assumes network-level access control at the perimeter. That assumption carries the most weight for the web UI (see above), which has no authentication story of its own at all.
 
 | Control | Mechanism |
 |---|---|
 | MCP authentication | Bearer token (`mcp.bearer_token_env`); rejections logged at WARN |
 | Webhook authentication | HMAC-SHA256 (`webhook.secret_env`); failures logged at WARN with provider |
-| Path traversal | Every path-taking tool (`get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`) resolves and canonicalizes paths, then checks `starts_with(data_path)`; a leading `/` is treated as the KB root, not a filesystem escape hatch, and `..` components are rejected either way (see [Retrieval](#retrieval)) |
-| File-type restriction | `get_document` and the write tools check the resolved path against `indexing.include` glob patterns |
+| Web UI authentication | **None — by design, and independent of `mcp.bearer_token_env`/`mcp.allow_unauthenticated`.** Every route in `web.rs`, including `POST`/`DELETE /api/doc/{*path}`, is mounted with no bearer-auth layer; see [Web UI](#web-ui) above |
+| Path traversal | Every path-taking tool (`get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`) and the equivalent web UI routes resolve and canonicalize paths, then check `starts_with(data_path)`; a leading `/` is treated as the KB root, not a filesystem escape hatch, and `..` components are rejected either way (see [Retrieval](#retrieval)) |
+| File-type restriction | `get_document`, the write tools, and the web UI's write route check the resolved path against `indexing.include` glob patterns |
 | Facet value sanitization | MCP server instructions embed live facet values (available domains/types/tags) read from **indexed document frontmatter** in Qdrant; these are sanitized (control characters stripped, length-capped) before inclusion to mitigate prompt-injection against connected AI clients |
-| Rate limiting | Configurable token-bucket rate limiter on the MCP endpoint (`rate_limit.per_second`, `rate_limit.burst_size`) |
+| Rate limiting | Configurable token-bucket rate limiter (`rate_limit.per_second`, `rate_limit.burst_size`), applied to the whole app — MCP, webhook, and the unauthenticated web UI routes alike, since the `GovernorLayer` wraps the fully-merged router |
 
 ## Configuration and Environment Variables
 
 See [`deploy/config.example.yaml`](../deploy/config.example.yaml) for all options with defaults and [`README.md`](../README.md#configuration) for the env-var table.
-
-## Roadmap
-
-Hybrid sparse+dense retrieval with RRF fusion (#55) is implemented (see [Retrieval](#retrieval)). Remaining retrieval enhancements — cross-encoder reranking (#56) and power-ups such as score explanation, recency filters, and a local CLI search (#57) — are tracked in GitHub issues.
