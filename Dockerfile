@@ -34,6 +34,13 @@ WORKDIR /app
 
 RUN mkdir -p /app/data && chown nonroot:nonroot /app/data
 
+# The app's actual default data_path is /data (source.data_path, config.rs), which is
+# where every compose file and deploy template mounts the named volume. Pre-creating
+# and chowning it here means Docker propagates that ownership when it initializes a
+# fresh named volume, instead of the mountpoint coming up root-owned and unwritable
+# by the non-root user below.
+RUN mkdir -p /data && chown nonroot:nonroot /data
+
 USER nonroot
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=10s \
