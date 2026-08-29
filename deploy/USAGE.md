@@ -83,6 +83,7 @@ chunking:
 - **Smaller chunks** (500–800) → more precise search results, more vectors, higher storage/compute cost.
 - **Larger chunks** (1500–2000) → broader context per result, fewer vectors, may dilute relevance.
 - `target_chunk_size` should be ≤ `max_chunk_size`. The target controls when new chunks start; the max controls when oversized sections are force-split.
+- `max_chunk_size` also bounds **reranking**. Chunk text is what gets sent to the reranker, so each document in a rerank request is truncated to this many bytes — there is no separate knob, and the two cannot drift apart. Raising it means the reranker must be able to accept documents that large; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) under "Reranking returns 500 on every request".
 
 ## Frontmatter Validation
 

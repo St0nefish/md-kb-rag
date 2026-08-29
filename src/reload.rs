@@ -128,6 +128,13 @@ fn d<T: std::fmt::Debug>(v: &T) -> String {
 /// discarded. Both are restart-required regardless (`EmbedClient`/`RerankClient`
 /// bake the resolved key in at construction — `embed.rs`, `rerank.rs`), this just
 /// means a reload has nothing to diff for that specific setting changing.
+///
+/// `ResolvedRerankingConfig::max_document_bytes` is likewise absent, and is not a
+/// YAML setting at all: it is derived from `chunking.max_chunk_size` in
+/// `Config::resolve_inner` and baked into `RerankClient` at construction. It rides
+/// on the classification `chunking.max_chunk_size` already has (reindex-required),
+/// so a change to that number reaches the reranker only on restart — the same
+/// lifetime as every other `RerankClient` field.
 pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
     let mut r = ReloadReport::default();
 
@@ -775,6 +782,7 @@ mod tests {
                 model: "test".into(),
                 api_key: None,
                 candidate_limit: limit,
+                max_document_bytes: 1500,
             })
         };
         old.reranking = rr(50);

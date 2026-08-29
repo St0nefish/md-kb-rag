@@ -83,7 +83,6 @@ You're likely running the CPU image when a GPU is available.
 On AMD RDNA3/RDNA4, check `rocm-smi` at idle afterwards — offloading an encoder
 through ROCm can pin the card at 100% forever. See [GPU Backends](#gpu-backends).
 
-
 ## GPU Backends
 
 ### GPU pinned at 100% while completely idle (AMD ROCm)
@@ -158,8 +157,25 @@ the server rejects the whole request rather than that one document. llama.cpp
 defaults `--ubatch-size` to 512 tokens; chunks at the default `max_chunk_size` of
 1500 characters can exceed that.
 
-**Fix.** Raise the reranker's batch and context sizing so a single query-plus-document
-pair fits comfortably:
+**Fix.** md-kb-rag now truncates each document to `chunking.max_chunk_size` bytes
+before sending it, so an over-long chunk degrades *that document's* score instead of
+costing the whole query its reranking. When this happens you get one warning per
+request rather than a silent fallback:
+
+```text
+Truncated 1 of 50 rerank documents to the 1500-byte budget (longest was 2199 bytes).
+```
+
+The budget deliberately has no knob of its own — it follows `chunking.max_chunk_size`,
+so the reranker accepts exactly what the chunker is configured to emit. It is applied
+only to the reranker's view of the text; returned document content is unaffected.
+
+That bound is in **bytes**, not tokens, and the two are not the same thing. Roughly
+four bytes per token holds for English prose (1500 bytes ≈ 375 tokens, comfortably
+inside llama.cpp's 512 default), but CJK text, base64 blobs and long unbroken
+identifiers tokenize far worse per byte. So if you raise `max_chunk_size` much past
+~2000, or your corpus is not mostly English prose, also raise the reranker's batch and
+context sizing so a query-plus-document pair still fits:
 
 ```yaml
       --ctx-size 16384
@@ -171,6 +187,12 @@ Size `--ctx-size` for the number of parallel slots as well — llama.cpp divides
 across them, and it will cap per-slot context to the model's training context.
 Going too large fails at startup with `failed to fit params to free device memory`
 when the card is shared with another model.
+
+**Note on the "tens of seconds" symptom.** A rerank failure is now given a ~5s retry
+budget rather than 120s. A 500 like the one above is deterministic — it never succeeds
+on retry — so the old budget turned a sub-second failure into an MCP tool timeout that
+made search look broken. Reranking is an enhancement whose fallback (fused order) is
+serviceable, so it now gives up quickly and returns results.
 
 ### Reranking is enabled but never runs
 
@@ -186,6 +208,7 @@ which routes both through `qdrant::CHUNK_TEXT_KEY`).
 **Fix.** Confirm the reranker is reachable and returns scores when called directly.
 If it does, and `pre_rerank_score` is still null, the candidate list is empty before
 it is sent — check that chunks carry text in the payload field retrieval reads.
+
 ## Indexing
 
 ### Files skipped: "missing required frontmatter field"

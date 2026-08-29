@@ -173,6 +173,11 @@ chunking:
 
   # Hard upper limit. Sections larger than this are force-split by a
   # secondary markdown-aware splitter. Must be >= target_chunk_size.
+  #
+  # This value does double duty: it is also the per-document budget for
+  # rerank requests (see the reranking section below), since the reranker
+  # is sent chunk text. Raising it therefore has a reranker-side cost —
+  # the reranker must be able to accept documents this large.
   max_chunk_size: 1500
 
   # Prepend the document's `description` frontmatter field (if present) to
@@ -511,6 +516,15 @@ reranking:
   # Number of candidates fetched before reranking narrows them down.
   # Higher values improve rerank quality at the cost of latency.
   candidate_limit: 50
+
+  # NOTE — per-document size has no knob here. Each document sent to the
+  # reranker is truncated to chunking.max_chunk_size bytes, because the
+  # reranker is sent chunk text and so the largest document it can be asked
+  # to score is exactly what the chunker is configured to emit. Without this
+  # bound, one over-long chunk makes the server reject the WHOLE request and
+  # every candidate loses its reranking. Truncation is logged once per
+  # request and affects only the reranker's view — returned content is
+  # unchanged. See deploy/TROUBLESHOOTING.md for the bytes-vs-tokens caveat.
 
 
 # ============================================================================
