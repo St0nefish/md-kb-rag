@@ -169,20 +169,16 @@ pub struct IndexedFile {
     /// written before schema tracking existed, which forces one revalidation pass.
     pub schema_hash: String,
     /// File modification time (Unix seconds) as of the last successful index of this
-    /// file. The reconcile scan (`ingest::scan_for_dirty`) reads these two columns
-    /// directly via [`ScanRow`] rather than through this struct — nothing currently
-    /// constructs an `IndexedFile` and then inspects `mtime`/`size` on it, hence the
-    /// `allow`. They stay on `IndexedFile` anyway for symmetry with the table schema
-    /// and because `get`/`get_many`/`list_all` are the general-purpose row accessors;
-    /// a future caller (e.g. `status --files`) reaching for "when was this last
-    /// indexed" on a specific row-lookup path shouldn't need a second query type.
-    #[allow(dead_code)]
+    /// file, or the last stat-only refresh of an unchanged file (`process_file`'s skip
+    /// path via `StateDb::update_stat`, #139). The reconcile scan
+    /// (`ingest::scan_for_dirty`) reads these two columns directly via [`ScanRow`]
+    /// rather than through this struct; `index_paths`'s scoped scan reads them via
+    /// `get_many` to decide whether a skipped file's stat baseline needs refreshing.
     pub mtime: i64,
-    /// File size in bytes as of the last successful index, same purpose and caveat as
-    /// `mtime`. `-1` for rows written before this column existed, which never matches
-    /// a real size and so forces one stat-mismatch (and therefore a content-hash
-    /// check) per file on the first reconcile scan after upgrading.
-    #[allow(dead_code)]
+    /// File size in bytes as of the last successful index or stat-only refresh, same
+    /// purpose and caveat as `mtime`. `-1` for rows written before this column existed,
+    /// which never matches a real size and so forces one stat-mismatch (and therefore a
+    /// content-hash check) per file on the first reconcile scan after upgrading.
     pub size: i64,
 }
 
@@ -506,6 +502,27 @@ impl StateDb {
         .bind(size)
         .execute(&self.pool)
         .await?;
+
+        Ok(())
+    }
+
+    /// Refresh only the stat pre-filter baseline (`mtime`/`size`) for an already-indexed
+    /// row, leaving `content_hash`/`chunk_count`/`schema_hash`/`indexed_at` untouched.
+    ///
+    /// Exists for the "content unchanged, mtime moved" case (#139): `process_file`'s
+    /// skip path reads a fresh mtime/size but has no changed content to justify a full
+    /// [`Self::upsert`] (which would also bump `indexed_at`, misrepresenting the file as
+    /// just-reindexed). A no-op `UPDATE` still costs a write, so the caller is expected
+    /// to compare against the stored value first and only call this when it differs —
+    /// otherwise every skip on every scan would rewrite the row it exists to avoid
+    /// rewriting.
+    pub async fn update_stat(&self, file_path: &str, mtime: i64, size: i64) -> Result<()> {
+        sqlx::query("UPDATE indexed_files SET mtime = ?, size = ? WHERE file_path = ?")
+            .bind(mtime)
+            .bind(size)
+            .bind(file_path)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }

@@ -262,6 +262,15 @@ validation:
   # Example: ["markdownlint", "--config", ".markdownlint.json"]
   lint_command: null
 
+  # Wall-clock timeout, in seconds, for a single `lint_command` invocation.
+  # Validation runs inside the indexing pipeline, which is driven by a single
+  # background worker — so a lint script that hangs takes indexing down for the
+  # whole knowledge base, with no crash and no log line to say so. On timeout
+  # the child process is killed and that one file fails validation; the run
+  # continues. Lint commands are typically fast static checks, so this can sit
+  # well below embedding.request_timeout_secs. Must be >= 1.
+  lint_timeout_secs: 30
+
 
 # ----------------------------------------------------------------------------
 # webhook — push-to-reindex endpoint

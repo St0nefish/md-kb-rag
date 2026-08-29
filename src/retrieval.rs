@@ -881,10 +881,54 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
         }
         match reranker.rerank(query, &docs).await {
             Ok(ranked) => {
+                // The reranker's response is untrusted external input, deserialized
+                // straight off the wire (`rerank.rs`'s `RerankResult`, no validation
+                // there either) — a version mismatch between the configured
+                // `reranking.model`/API and this client's index-mapping assumption,
+                // an off-by-one in the backend's own truncation logic, or a
+                // misconfigured `reranking.base_url` pointed at a different service
+                // can all produce an `index` that is out of range or repeated.
+                // Indexing `docs_with_indices` with an out-of-range value used to
+                // panic this request outright (#136); a repeated index used to let
+                // one chunk occupy two result slots, double-charging its document's
+                // diversity allowance and handing the caller a literal duplicate
+                // (#138). Bounds-check and dedupe here, keeping the first
+                // (highest-ranked, since a reranker returns its results best-first)
+                // occurrence of each valid index, so a malformed response degrades
+                // the same way a reranker error already does (the `Err` arm below)
+                // instead of corrupting or crashing the request.
+                let mut seen_indices: std::collections::HashSet<usize> =
+                    std::collections::HashSet::with_capacity(ranked.len());
+                let mut out_of_range = 0usize;
+                let mut duplicate = 0usize;
                 let mut indexed: Vec<(usize, f32)> = ranked
                     .iter()
+                    .filter(|r| {
+                        if r.index >= docs_with_indices.len() {
+                            out_of_range += 1;
+                            false
+                        } else if !seen_indices.insert(r.index) {
+                            duplicate += 1;
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .map(|r| (docs_with_indices[r.index].0, r.relevance_score))
                     .collect();
+
+                if out_of_range > 0 || duplicate > 0 {
+                    warn!(
+                        "Reranker response had {out_of_range} out-of-range and \
+                         {duplicate} duplicate indices (of {} entries against {} \
+                         documents sent); dropping them and continuing with the \
+                         remaining {} entries",
+                        ranked.len(),
+                        docs_with_indices.len(),
+                        indexed.len(),
+                    );
+                }
+
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Diversity, pass 2 of 2 — the real, user-tunable cap, applied to
@@ -3163,6 +3207,169 @@ mod tests {
             Some("doc A"),
             "on reranker failure, should return fused order"
         );
+    }
+
+    // A reranker stub that hands back an exact, caller-specified response
+    // rather than computing one from the input — needed for the #136/#138
+    // tests below, which must control the returned `index` values precisely
+    // (out of range, or repeated) rather than derive them from `documents`.
+    struct MockRerankerFixed {
+        ranked: Vec<crate::rerank::RerankResult>,
+    }
+
+    impl crate::rerank::Reranker for MockRerankerFixed {
+        fn rerank<'a>(
+            &'a self,
+            _query: &'a str,
+            _documents: &'a [&'a str],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<Vec<crate::rerank::RerankResult>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let ranked = self.ranked.clone();
+            Box::pin(async move { Ok(ranked) })
+        }
+    }
+
+    #[tokio::test]
+    async fn reranker_out_of_range_index_is_dropped_not_panicking() {
+        // #136 regression: `docs_with_indices[r.index]` used to be indexed
+        // straight off the reranker's untrusted response with no bounds check,
+        // so an out-of-range `index` panicked the whole search request. Only
+        // 2 documents are sent to the reranker here (valid indices 0 and 1);
+        // index 5 is malformed and must be dropped, not indexed.
+        let mut r0 = make_search_result(0.9);
+        r0.payload
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc A"));
+        let mut r1 = make_search_result(0.8);
+        r1.payload
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc B"));
+
+        let store = MockRetrievalStore::with_results(vec![r0, r1]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockRerankerFixed {
+            ranked: vec![
+                crate::rerank::RerankResult {
+                    index: 0,
+                    relevance_score: 1.0,
+                },
+                crate::rerank::RerankResult {
+                    index: 5,
+                    relevance_score: 2.0,
+                },
+            ],
+        };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 2,
+            rerank_candidate_limit: None,
+            ..default_opts()
+        };
+
+        // The old code panicked inside this call; the assertion below is only
+        // reachable at all once the bounds check is in place.
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "the out-of-range entry must be dropped, leaving only the valid one"
+        );
+        assert_eq!(
+            results[0]
+                .payload
+                .get(CHUNK_TEXT_KEY)
+                .and_then(|v| v.as_str()),
+            Some("doc A"),
+            "the surviving result must be the one with the valid index"
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_duplicate_index_is_deduplicated() {
+        // #138 regression: a reranker response repeating the same `index`
+        // used to make that one chunk occupy two slots in `indexed`, so it
+        // came out twice in the final result set. The duplicate (lower-scored,
+        // second) occurrence must be dropped, keeping the result set free of
+        // literal duplicates.
+        let mut r0 = make_search_result(0.9);
+        r0.payload
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc A"));
+        let mut r1 = make_search_result(0.8);
+        r1.payload
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc B"));
+
+        let store = MockRetrievalStore::with_results(vec![r0, r1]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockRerankerFixed {
+            ranked: vec![
+                crate::rerank::RerankResult {
+                    index: 0,
+                    relevance_score: 0.9,
+                },
+                crate::rerank::RerankResult {
+                    index: 0,
+                    relevance_score: 0.5,
+                },
+                crate::rerank::RerankResult {
+                    index: 1,
+                    relevance_score: 0.7,
+                },
+            ],
+        };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        // `limit` must be large enough that the spurious duplicate would
+        // survive `take(top_k)` if it weren't deduplicated — at limit 2 the
+        // duplicate's lower score happens to fall outside the page regardless,
+        // which would make this test pass even without the fix.
+        let opts = SearchOptions {
+            limit: 3,
+            rerank_candidate_limit: None,
+            ..default_opts()
+        };
+
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
+
+        assert_eq!(
+            results.len(),
+            2,
+            "the duplicate index-0 entry must be dropped, not counted as a \
+             second result, even though the page has room for 3"
+        );
+        let doc_a_count = results
+            .iter()
+            .filter(|r| r.payload.get(CHUNK_TEXT_KEY).and_then(|v| v.as_str()) == Some("doc A"))
+            .count();
+        assert_eq!(doc_a_count, 1, "doc A must appear exactly once");
     }
 
     #[tokio::test]
