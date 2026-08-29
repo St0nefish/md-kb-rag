@@ -276,9 +276,16 @@ struct PendingFile {
 /// Result of processing a single discovered file.
 enum FileOutcome {
     /// Unchanged since the last run. Carries the content hash so `index_paths` can tell
-    /// whether the document metadata index is in sync without a per-file query.
+    /// whether the document metadata index is in sync without a per-file query, and the
+    /// freshly-read `mtime`/`size` so the caller can refresh the stat pre-filter
+    /// baseline even though there is no content change to justify a full `upsert`
+    /// (#139) — without this, a file whose bytes are unchanged but whose mtime moved
+    /// (git checkout, cherry-pick, restore, plain `touch`) is re-detected as dirty and
+    /// re-read/re-hashed by every subsequent reconcile sweep, forever.
     Skipped {
         hash: String,
+        mtime: i64,
+        size: i64,
     },
     Invalid,
     Empty,
@@ -322,7 +329,7 @@ async fn process_file(
         && entry.schema_hash == schema_hash
     {
         debug!("Unchanged, skipping: {}", file_path);
-        return Ok(FileOutcome::Skipped { hash });
+        return Ok(FileOutcome::Skipped { hash, mtime, size });
     }
 
     if config.validation.enabled {
@@ -2153,12 +2160,32 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         )
         .await?
         {
-            FileOutcome::Skipped { hash } => {
+            FileOutcome::Skipped { hash, mtime, size } => {
                 skipped += 1;
                 // Unchanged content, but the metadata index may still be missing or
                 // stale for this file — queue it for a cheap parse-only backfill.
                 if document_hashes.get(rel_key) != Some(&hash) {
                     backfill_queue.push((rel_key.clone(), abs_path.clone()));
+                }
+
+                // #139: refresh the stat pre-filter baseline even on this no-content-
+                // change path, so an external mtime touch (checkout, cherry-pick,
+                // restore, plain `touch`) doesn't get re-detected as dirty by every
+                // future reconcile sweep forever. Only write when the stored value
+                // actually differs — comparing costs nothing (the row is already
+                // loaded in `state_map`), while an unconditional `UPDATE` on every
+                // skip would turn the common case (nothing touched) into a full
+                // table rewrite on every sweep, defeating the very pre-filter this
+                // is meant to protect.
+                if let Some(entry) = state_map.get(rel_key)
+                    && (entry.mtime != mtime || entry.size != size)
+                    && let Err(e) = state.update_stat(rel_key, mtime, size).await
+                {
+                    warn!(
+                        file = %rel_key,
+                        "Failed to refresh stat baseline (non-fatal, will retry next scan): {:#}",
+                        e
+                    );
                 }
             }
             FileOutcome::Invalid => invalid += 1,
@@ -2528,6 +2555,73 @@ mod tests {
             state.document_count().await.unwrap(),
             2,
             "changed.md + unchanged.md remain; missing.md's metadata is gone"
+        );
+    }
+
+    /// #139: a file whose content is unchanged but whose on-disk mtime moved (e.g. a
+    /// git checkout rewriting an unchanged blob, or a plain `touch`) must still get its
+    /// stored `indexed_files.mtime`/`size` baseline refreshed, even though it takes the
+    /// `Skipped` path and never reaches `upsert_pending`. Without this, the reconcile
+    /// scan's stat pre-filter (`scan_for_dirty`) would re-detect the file as dirty and
+    /// re-read/re-hash it on every subsequent sweep, forever, since a stale baseline
+    /// never converges with a real, unmoving mtime.
+    #[tokio::test]
+    async fn index_paths_generic_refreshes_stat_baseline_for_unchanged_file() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let content = "# Unchanged\n\nSame as last run.";
+        let path = dir.path().join("unchanged.md");
+        std::fs::write(&path, content).unwrap();
+        let (real_mtime, real_size) = stat(&path);
+
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+        let hash = compute_hash_from_bytes(content.as_bytes());
+
+        let state = open_scan_test_db(&config).await;
+        // Seed a stale baseline (mtime/size 0) that does not match the file's real,
+        // current stat — simulating an external touch since the last index run. The
+        // content hash and schema hash match, so `process_file` must take the
+        // `Skipped` path, not the `Ready` one.
+        state
+            .upsert("unchanged.md", &hash, 1, &schema_hash, 0, 0)
+            .await
+            .unwrap();
+
+        let paths = vec![PathBuf::from("unchanged.md")];
+        let embedder = MockEmbedClient::ok(vec![]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        assert_eq!(
+            store.upserted_points.lock().unwrap().len(),
+            0,
+            "an unchanged file must not be re-embedded just to refresh its stat baseline"
+        );
+
+        let entry = state.get("unchanged.md").await.unwrap().unwrap();
+        assert_eq!(
+            entry.content_hash, hash,
+            "content hash must be untouched by a stat-only refresh"
+        );
+        assert_eq!(
+            entry.mtime, real_mtime,
+            "mtime baseline must be refreshed even on the skip path"
+        );
+        assert_eq!(
+            entry.size, real_size,
+            "size baseline must be refreshed even on the skip path"
         );
     }
 
