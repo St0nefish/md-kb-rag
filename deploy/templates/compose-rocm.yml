@@ -1,6 +1,12 @@
 # md-kb-rag — AMD ROCm embedding backend
 # Requires ROCm userspace drivers on the host.
 # Usage: cp compose-rocm.yml docker-compose.yml && docker compose up -d
+#
+# RDNA3/RDNA4 (gfx11xx/gfx12xx) WARNING: an AMD MES firmware bug pins the GPU at
+# 100% and ~90W while completely idle whenever an encoder model is offloaded here
+# (ROCm/ROCm#5706). Check `rocm-smi` at idle after starting this stack. If you see
+# it, either update GPU firmware to MES 0x8b (amdgpu 31.20.0+) or use
+# compose-vulkan.yml instead. See deploy/TROUBLESHOOTING.md -> GPU Backends.
 
 services:
   qdrant:
