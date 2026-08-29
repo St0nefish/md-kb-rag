@@ -1316,6 +1316,16 @@ impl Config {
                 missing.push("RERANKING_MODEL");
             }
         }
+        // Only meaningful while reranking is on — `ResolvedRerankingConfig` (and
+        // therefore this value) is only ever constructed inside the
+        // `self.reranking.enabled` branch below, same guard as the env-var checks
+        // above. Unlike `search.rrf_candidates`, this had no lower bound at all: a
+        // `candidate_limit: 0` loaded successfully and only surfaced at query time
+        // as `retrieval.rs`'s `rerank_candidate_limit` silently degrading every
+        // reranked search to zero candidates instead of failing loudly at startup.
+        if self.reranking.enabled && self.reranking.candidate_limit == 0 {
+            anyhow::bail!("reranking.candidate_limit must be >= 1");
+        }
         if !missing.is_empty() {
             anyhow::bail!(
                 "Missing required environment variable(s):\n  - {}",
@@ -1746,6 +1756,39 @@ mcp:
         assert!(err.contains("RERANKING_BASE_URL"), "{err}");
         assert!(err.contains("RERANKING_MODEL"), "{err}");
 
+        clear_required_env();
+    }
+
+    #[test]
+    fn reranking_zero_candidate_limit_is_rejected_when_enabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("RERANKING_BASE_URL", "http://reranker:8081/v1");
+            std::env::set_var("RERANKING_MODEL", "reranker");
+        }
+
+        // Enabled with candidate_limit: 0 must fail loudly at load, the same way
+        // its sibling search.rrf_candidates already does, rather than silently
+        // asking the reranker to score zero candidates at query time (#149).
+        let yaml = format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: true\n  candidate_limit: 0\n");
+        let err = Config::from_str(&yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reranking.candidate_limit must be >= 1"),
+            "expected the candidate_limit validation message, got: {err}"
+        );
+
+        // Disabled with the same zero value must NOT fail — the check only
+        // applies while reranking is actually in use.
+        let yaml =
+            format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: false\n  candidate_limit: 0\n");
+        Config::from_str(&yaml).expect("disabled reranking must ignore candidate_limit");
+
+        unsafe {
+            std::env::remove_var("RERANKING_BASE_URL");
+            std::env::remove_var("RERANKING_MODEL");
+        }
         clear_required_env();
     }
 
