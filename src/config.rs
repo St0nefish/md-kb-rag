@@ -349,6 +349,18 @@ pub struct ResolvedRerankingConfig {
     pub model: String,
     pub api_key: Option<String>,
     pub candidate_limit: usize,
+    /// Per-document byte budget for the rerank request, **derived** from
+    /// `chunking.max_chunk_size` — deliberately not a knob of its own. The
+    /// reranker is sent chunk text, so the largest document it can be asked to
+    /// score is exactly what the chunker is configured to emit; one number
+    /// governs both ends and they cannot drift apart.
+    ///
+    /// This exists because the reranker rejects the *whole request* when any
+    /// single document exceeds its physical batch size (llama.cpp's
+    /// `--ubatch-size`, 512 tokens by default), which cost every candidate its
+    /// reranking over one long chunk (#128). Note this is a byte budget, not a
+    /// token count — see `truncate_for_rerank` in `rerank.rs`.
+    pub max_document_bytes: usize,
 }
 
 fn default_collection() -> String {
@@ -1304,6 +1316,11 @@ impl Config {
             anyhow::anyhow!("QDRANT_URL must be set (internal error: missing after validation)")
         })?;
 
+        // Read before the struct literal below moves `self.chunking` into it.
+        // The reranker's per-document budget is derived from this, not configured
+        // separately — see `ResolvedRerankingConfig::max_document_bytes`.
+        let max_chunk_size = self.chunking.max_chunk_size;
+
         Ok(ResolvedConfig {
             source: ResolvedSourceConfig {
                 git_url: source_git_url,
@@ -1347,6 +1364,7 @@ impl Config {
                     model: reranking_model.unwrap(),
                     api_key: reranking_api_key,
                     candidate_limit: self.reranking.candidate_limit,
+                    max_document_bytes: max_chunk_size,
                 })
             } else {
                 None
