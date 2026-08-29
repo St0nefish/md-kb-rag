@@ -19,11 +19,19 @@ jobs:
       - name: Check if build needed
         id: check
         run: |
-          # Get the sha of the current latest amd64 image
-          LATEST_DIGEST=$(docker manifest inspect ${{ steps.image.outputs.name }}:latest-arm64 2>/dev/null | \
-            grep -o '"org.opencontainers.image.revision":"[^"]*"' | cut -d'"' -f4 || echo "none")
+          # `docker manifest inspect` only ever prints the manifest object itself
+          # (schemaVersion/mediaType/manifests/digest/platform) — the
+          # org.opencontainers.image.revision label baked in below lives in the
+          # image *config* blob, which that command never surfaces, so the old
+          # grep could never match and this check always rebuilt (fix #194).
+          # `docker buildx imagetools inspect --format` fetches the config blob
+          # instead (verified empirically: :latest-arm64 is single-platform, so
+          # `.Image.Config.Labels` resolves directly with no platform index needed).
+          LABELS=$(docker buildx imagetools inspect ${{ steps.image.outputs.name }}:latest-arm64 \
+            --format '{{json .Image.Config.Labels}}' 2>/dev/null || echo '{}')
+          LAST_BUILT_SHA=$(printf '%s' "$LABELS" | jq -r '."org.opencontainers.image.revision" // "none"')
           CURRENT_SHA=$(git rev-parse --short HEAD)
-          if [ "$LATEST_DIGEST" = "$CURRENT_SHA" ]; then
+          if [ "$LAST_BUILT_SHA" = "$CURRENT_SHA" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "No changes since last arm64 build ($CURRENT_SHA)"
           else
