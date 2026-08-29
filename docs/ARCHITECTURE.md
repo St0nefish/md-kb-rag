@@ -82,7 +82,7 @@ The MCP port (8001) is the only externally exposed port. This service is designe
 | `mcp.rs` | The six MCP tool handlers (`search` — covering both ranked query results and, with no `query`, the exhaustive enumeration formerly served by `list_documents` — `get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`): input validation, result formatting; delegates to `retrieval.rs` / `write.rs` / `state.rs` / `schema.rs` |
 | `descriptions.rs` | Assembles each tool's and the server's MCP description from compiled-in `assets/mcp/*.md` (mechanics true of every deployment), config-derived sentences (e.g. the hybrid/phrase retrieval-mode sentence), and a per-KB policy extension loaded at runtime from `mcp.extensions_path` in the served knowledge base (append-only, editable via `write_document`) |
 | `server.rs` | Axum server: MCP route, webhook route, bearer-token middleware, rate limiter, metadata refresh |
-| `webhook.rs` | Webhook handler: provider signature verification, branch filter, git subprocess, reindex dispatch |
+| `webhook.rs` | Webhook handler: provider signature verification, branch filter, `git fetch` + `git merge --ff-only`, then diffs the pulled range and marks exactly those paths dirty on the `ReindexQueue` — it never indexes inline (see [Webhook Flow](#webhook-flow)) |
 | `validate.rs` | Frontmatter validation against the resolved `.kb-schema.yaml` cascade for each file's path (falls back to the `frontmatter` config as the implicit root schema) |
 | `git.rs` | Git subprocess helpers: token injection, URL redaction, fetch/merge with timeout |
 
@@ -270,23 +270,31 @@ POST /hooks/reindex
   mismatch? ──► 200 (ignored, no reindex)
         │ match
         ▼
- acquire reindex try-lock (single-flight)
+ git_url configured?
         │
-  busy? ──► coalesce/skip (logged) + 200
-        │ acquired
-        ▼
- git fetch + git merge --ff-only
- (with source.git_url; git_token injected transiently, never written to disk)
- (120-second timeout on each subprocess)
-        │
-        ▼
- incremental reindex (same pipeline as `index` subcommand)
-        │
-        ▼
- release lock
+   no ──┴──────────────────────────────► mark_full() on the ReindexQueue
+        │ yes                                          │
+        ▼                                               │
+ capture HEAD, then git fetch + git merge --ff-only     │
+ (git_token injected transiently, never written to disk) │
+ (120-second timeout on each subprocess)                 │
+        │                                                │
+        ▼                                                │
+ diff old HEAD..new HEAD, mark_paths(changed)             │
+        │                                                │
+        └──────────────────────────────┬─────────────────┘
+                                        ▼
+                    200 "Changes queued for indexing" — handler returns
+                                        │
+                     (asynchronously, off the request path)
+                                        ▼
+                     reindex::run_worker drains the queue
+                     and calls ingest::index_paths / scan_and_index
 ```
 
-The single-flight lock (`REINDEX_LOCK`) is an `Arc<tokio::Mutex<()>>`. The handler attempts `try_lock_owned()`: if it succeeds, the reindex runs in a spawned task holding the owned guard; if the lock is already held, the webhook is **skipped** (coalesced) — it is not queued or replayed — and the handler logs the coalesce and returns 200. Rationale: reindexing is incremental over the repo's current state, so a single in-flight run subsumes concurrent triggers. The one caveat is that a push landing *after* the in-flight run's `git fetch` is not seen by that run; it is picked up by the next webhook-triggered reindex.
+There is no lock, no single-flight, and no coalesce-or-skip in the handler itself. `handle_webhook` (`src/webhook.rs`) never indexes anything — it fetches, merges, diffs the pulled range with `git::git_diff_name_status`, and marks exactly those paths dirty via `ReindexQueue::mark_paths` (or, when `source.git_url` is unset and there is nothing to fetch or diff, falls back to `ReindexQueue::mark_full`). `mark_paths`/`mark_full` never block and never fail, so the handler returns `200 "Changes queued for indexing"` as soon as the git operations finish — it does not wait for the paths it just marked to actually be reindexed.
+
+The queue itself is what used to be a single-flight `REINDEX_LOCK` (`Arc<tokio::Mutex<()>>`, `try_lock_owned()`), and that design had a real bug: a webhook arriving while a previous one's inline reindex was still running lost its race for the lock and was **dropped** — skipped, not queued or replayed. `reindex::ReindexQueue` replaces that with coalesce-don't-drop semantics instead: every delivery's `mark_paths` call lands in the same dirty-path set (a `HashSet`, so marking an already-pending path is a no-op, not data loss), and the single background worker (`reindex::run_worker`) drains that set, indexes it, and immediately drains again — if new work landed while it was running, it loops and runs again before going back to sleep, rather than a losing webhook being dropped outright. A path is lost only if it is never marked at all, never because of *when* it was marked. The worker retries a transient failure (embeddings/Qdrant unreachable, git I/O) with exponential backoff up to a bounded attempt count before deferring to the next periodic reconcile sweep, and drops a permanent one (a strict-mode validation rejection) immediately, since the writer that caused it already saw the rejection. See `reindex.rs`'s module doc for the full design rationale, and [Webhook](../README.md#webhook) in the README for the operator-facing summary.
 
 ## Security Model
 
