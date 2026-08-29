@@ -584,21 +584,35 @@ pub async fn commit_and_sync(
             });
         }
 
+        // The rebase just succeeded, which means it may have REPLAYED our commit
+        // onto a brand-new sha (whenever FETCH_HEAD actually had something to
+        // rebase onto — the normal case, since writers and the webhook overlap
+        // routinely per this module's doc comment). Capture that post-rebase HEAD
+        // now and use it — not the pre-rebase `local_sha` — in every failure
+        // branch from here through the end of this function (#140): `local_sha`
+        // can already be a dangling, unreachable object by this point, so
+        // reporting it in a push-failure error would point the caller at a commit
+        // `git show`/`git log` can no longer find, with no way to locate the one
+        // that is actually sitting at HEAD pending sync. `git push` never rewrites
+        // local history, so this same value is also exactly the final answer on
+        // the success path below — no second re-read needed there anymore.
+        let post_rebase_sha =
+            rev_parse_head(lock, data_path)
+                .await
+                .map_err(|e| CommitSyncError::PostCommit {
+                    sha: "<unknown: rev-parse HEAD failed immediately after a successful rebase>"
+                        .to_string(),
+                    source: e,
+                })?;
+
         // Diff the rebase range now, before pushing — this is local-only (no network)
         // and a push failure below should not prevent the caller from at least
         // learning what changed locally, though in practice a push failure aborts the
         // whole call anyway.
-        let new_head =
-            rev_parse_head(lock, data_path)
-                .await
-                .map_err(|e| CommitSyncError::PostCommit {
-                    sha: local_sha.clone(),
-                    source: e,
-                })?;
-        rebased_paths = git_diff_name_status(lock, data_path, &old_head, &new_head)
+        rebased_paths = git_diff_name_status(lock, data_path, &old_head, &post_rebase_sha)
             .await
             .map_err(|e| CommitSyncError::PostCommit {
-                sha: local_sha.clone(),
+                sha: post_rebase_sha.clone(),
                 source: e.context("Failed to diff the rebase range"),
             })?;
 
@@ -611,31 +625,27 @@ pub async fn commit_and_sync(
         )
         .await
         .map_err(|_| CommitSyncError::PostCommit {
-            sha: local_sha.clone(),
+            sha: post_rebase_sha.clone(),
             source: anyhow::anyhow!("git push timed out after {:?}", GIT_TIMEOUT),
         })?
         .map_err(|e| CommitSyncError::PostCommit {
-            sha: local_sha.clone(),
+            sha: post_rebase_sha.clone(),
             source: anyhow::Error::new(e).context("Failed to spawn git push"),
         })?;
         if !push_out.status.success() {
             let stderr = redact_url(&String::from_utf8_lossy(&push_out.stderr));
             return Err(CommitSyncError::PostCommit {
-                sha: local_sha.clone(),
+                sha: post_rebase_sha.clone(),
                 source: anyhow::anyhow!("git push failed: {}", stderr),
             });
         }
 
-        // The rebase may have replayed our commit onto a new sha — read HEAD fresh
-        // for the success return rather than reusing `local_sha`.
-        let sha =
-            rev_parse_head(lock, data_path)
-                .await
-                .map_err(|e| CommitSyncError::PostCommit {
-                    sha: local_sha.clone(),
-                    source: e,
-                })?;
-        return Ok(CommitOutcome { sha, rebased_paths });
+        // `git push` does not move local HEAD, so `post_rebase_sha` is still
+        // exactly right here — no need to re-read it a second time.
+        return Ok(CommitOutcome {
+            sha: post_rebase_sha,
+            rebased_paths,
+        });
     }
 
     // No remote configured: `local_sha` is already the final answer.
@@ -2088,6 +2098,144 @@ pub(crate) mod tests {
         }
         .to_string();
         assert!(!full.contains("super_secret_token"));
+    }
+
+    /// #140 regression: when the rebase replays our commit onto a NEW sha (the
+    /// normal case whenever another writer already pushed — exactly the
+    /// scenario `commit_and_sync_reports_paths_pulled_in_by_the_rebase` above
+    /// sets up) and the subsequent push then fails, the `PostCommit` error must
+    /// report that new, post-rebase sha — not the pre-rebase sha, which the
+    /// replay has already made unreachable.
+    ///
+    /// Making the bare remote's directory tree read-only after A's push (but
+    /// before B's call) is what makes the push fail deterministically while
+    /// leaving `fetch` (upload-pack, read-only, writes nothing under the repo)
+    /// unaffected — `git receive-pack` needs to create objects/lock refs and
+    /// fails outright without write permission, so the rebase genuinely
+    /// completes locally before the push failure hits.
+    #[tokio::test]
+    async fn commit_and_sync_postcommit_push_failure_after_rebase_reports_post_rebase_sha() {
+        let bare = create_bare_repo("main");
+        let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+
+        let lock = lock_git().await;
+
+        // Clone A pushes first, so clone B's own commit below must fetch + rebase
+        // onto A's commit before it can (attempt to) push.
+        let work_a = clone_bare_repo(bare.path(), "main");
+        std::fs::write(work_a.path().join("other.md"), "from A").unwrap();
+        commit_and_sync(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_a.path().to_str().unwrap(),
+            None,
+            &["other.md"],
+            "add other.md from A",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await
+        .unwrap();
+
+        // Clone B, rewound to before A's push, so its own `commit_and_sync` call
+        // below must fetch + rebase onto A's commit before attempting to push.
+        let work_b = clone_bare_repo(bare.path(), "main");
+        let log_out = std::process::Command::new("git")
+            .args(["log", "--format=%H", "-2"])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+        let commits: Vec<&str> = std::str::from_utf8(&log_out.stdout)
+            .unwrap()
+            .lines()
+            .collect();
+        let parent_sha = commits[1].trim();
+        std::process::Command::new("git")
+            .args(["reset", "--hard", parent_sha])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+
+        std::fs::write(work_b.path().join("mine.md"), "from B").unwrap();
+
+        // Make the bare remote's whole tree read-only now, AFTER A's push — a
+        // subsequent `git push` (receive-pack) needs to write new objects and
+        // update refs and fails outright without write permission, while `git
+        // fetch` (upload-pack) reads only and is unaffected.
+        set_tree_readonly(bare.path(), true);
+
+        let result = commit_and_sync(
+            &lock,
+            Some(&bare_url),
+            "main",
+            work_b.path().to_str().unwrap(),
+            None,
+            &["mine.md"],
+            "add mine.md from B",
+            "test-bot",
+            "test-bot@localhost",
+        )
+        .await;
+
+        // Restore write permission immediately so this TempDir (and work_b's,
+        // below) can still be cleaned up on drop regardless of how the
+        // assertions below turn out.
+        set_tree_readonly(bare.path(), false);
+
+        let sha = match result {
+            Err(CommitSyncError::PostCommit { sha, source }) => {
+                let msg = format!("{:#}", source);
+                assert!(
+                    msg.contains("git push failed"),
+                    "expected a push failure, got: {}",
+                    msg
+                );
+                sha
+            }
+            other => panic!("expected CommitSyncError::PostCommit, got: {:?}", other),
+        };
+
+        // The rebase really did replay B's commit onto a new sha — HEAD in B's
+        // clone must be the reported sha, and that sha must actually exist as a
+        // commit (proving it is real, not a placeholder).
+        let head = rev_parse_head(&lock, work_b.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            sha, head,
+            "the reported sha must be the CURRENT local HEAD (the post-rebase \
+             replay), not the pre-rebase sha the replay orphaned"
+        );
+        let cat_file = std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+            .current_dir(work_b.path())
+            .output()
+            .unwrap();
+        assert!(
+            cat_file.status.success(),
+            "the reported sha must resolve to a real, findable commit"
+        );
+    }
+
+    /// Recursively set (or clear) read-only permissions on every entry under
+    /// `path`, inclusive. Helper for the push-failure test above — Unix-only,
+    /// same as the rest of this test module's assumptions (`create_bare_repo`
+    /// et al. already shell out to a real `git`, which this project only
+    /// targets on Linux).
+    #[cfg(unix)]
+    fn set_tree_readonly(path: &std::path::Path, readonly: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if readonly { 0o555 } else { 0o755 };
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    set_tree_readonly(&p, readonly);
+                }
+            }
+        }
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
     }
 
     // --- restore_from_head / unstage tests ---
