@@ -659,6 +659,24 @@ impl StateDb {
         Ok(row.0)
     }
 
+    /// Sum of `indexed_files.chunk_count` across every tracked file — the number of
+    /// Qdrant points state.db believes are live. `index_paths` writes exactly
+    /// `chunks.len()` points per file and records that same count in the same
+    /// bookkeeping step (see `ingest::upsert_pending`), so in a healthy steady state
+    /// this equals Qdrant's own point count exactly. `/status` (`collect_status` in
+    /// `server.rs`) compares the two as a passive check for a Qdrant data wipe that
+    /// left state.db intact (#155) — a deficit (Qdrant points < this sum) is the
+    /// signal; a surplus is not, since a couple of documented conditions leave stale
+    /// Qdrant points behind on purpose. See the comment at the comparison site for why
+    /// the check is one-sided.
+    pub async fn total_chunk_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as("SELECT COALESCE(SUM(chunk_count), 0) FROM indexed_files")
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(row.0)
+    }
+
     /// Replace a document's metadata row and its full field projection.
     ///
     /// Runs as a single transaction: the projection is deleted and rebuilt rather than
@@ -1465,6 +1483,24 @@ mod tests {
         let all = db.list_all().await.unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].file_path, "a.md"); // sorted
+    }
+
+    #[tokio::test]
+    async fn total_chunk_count_sums_across_files() {
+        let (db, _dir) = test_db().await;
+        // Empty table: COALESCE must turn SQL NULL into 0, not surface as an error or
+        // as a bare NULL that panics the row-mapping — this is the case that motivates
+        // the COALESCE in the query at all.
+        assert_eq!(db.total_chunk_count().await.unwrap(), 0);
+
+        db.upsert("a.md", "h1", 3, "", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 5, "", 0, 0).await.unwrap();
+        assert_eq!(db.total_chunk_count().await.unwrap(), 8);
+
+        // A re-upsert (simulating a shrinking file) replaces, not adds to, the prior
+        // chunk_count — the sum must track the replacement, not accumulate it.
+        db.upsert("a.md", "h1v2", 1, "", 0, 0).await.unwrap();
+        assert_eq!(db.total_chunk_count().await.unwrap(), 6);
     }
 
     #[tokio::test]

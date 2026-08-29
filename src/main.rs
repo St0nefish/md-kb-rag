@@ -702,6 +702,10 @@ mod tests {
                 documents_with_metadata: Some(330),
                 documents_missing_metadata: Some(0),
                 qdrant_points: Some(2481),
+                // #155 (passive Qdrant-wipe detection, server.rs): in sync, so no
+                // deficit — matches the `qdrant_points` value above.
+                chunk_count_total: Some(2481),
+                qdrant_points_deficit: Some(0),
                 errors: vec![],
             },
             breakdown: vec![],

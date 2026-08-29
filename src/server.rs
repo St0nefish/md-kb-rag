@@ -183,6 +183,18 @@ const STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 /// response" beats making the endpoint that answers "is anything wrong?" the one thing
 /// that hangs when something is.
 const STATUS_QDRANT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Slack for the `qdrant_points` vs. `chunk_count_total` deficit check in
+/// `collect_status` (#155, passive half). A deficit inside this slack is not
+/// reported as an error even outside an in-flight run — it covers the sub-second
+/// windows `ingest.rs` itself documents as producing a transient deficit: between
+/// `delete_by_files` and its matching state-row deletes in `remove_orphans`, or
+/// between a tail-trim delete and its state upsert, for a small number of files.
+/// Deliberately not zero — a zero slack would treat that ordinary, self-correcting
+/// window as an incident. Deliberately small — the scenario this check exists to
+/// catch (Qdrant's data wiped while state.db survived) produces a deficit equal to
+/// the *entire* corpus's chunk count, orders of magnitude larger than any legitimate
+/// transient gap, so a generous slack is not needed to keep the signal clean.
+const QDRANT_DEFICIT_SLACK: i64 = 50;
 /// How long graceful shutdown waits for an in-flight indexing run to finish before
 /// giving up and letting the process exit anyway. A run this long is already an
 /// anomaly the reconcile sweep will retry after restart; shutdown should not hang
@@ -293,6 +305,20 @@ pub struct StoreCounts {
     pub documents_missing_metadata: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qdrant_points: Option<u64>,
+    /// Sum of `indexed_files.chunk_count` — the number of Qdrant points state.db
+    /// believes are live (see [`crate::state::StateDb::total_chunk_count`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_count_total: Option<i64>,
+    /// `chunk_count_total - qdrant_points`. Zero in a healthy steady state.
+    /// Populated whenever both inputs are available, independent of whether a
+    /// deficit is currently large enough to be reported as an error below — so
+    /// `/metrics` stays alertable off this number directly rather than depending on
+    /// `errors`' in-flight suppression. See the one-sided comparison in
+    /// `collect_status` for why only a positive (deficit) value, past a small slack
+    /// and outside an in-flight run, is treated as a problem; a negative value
+    /// (surplus) is expected to persist and is not itself a fault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qdrant_points_deficit: Option<i64>,
     /// Populated when a backing store could not be read. The rest of the response is
     /// still served: "is it indexing" must stay answerable while Qdrant is down.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -326,6 +352,33 @@ fn store_error(prefix: &str, e: &anyhow::Error) -> String {
     crate::status::redact_error(&format!("{prefix}: {e:#}"))
 }
 
+/// The one-sided deficit check behind #155's passive Qdrant-wipe detection — see the
+/// call site in `collect_status` for the full rationale (steady-state equality, why
+/// only a deficit and not a surplus is a fault, why in-flight runs are suppressed).
+/// Pulled out as a pure function, rather than left inline, specifically so `mod
+/// tests` can drive the slack/one-sidedness/in-flight logic directly with arbitrary
+/// `chunk_sum`/`points`/`indexing` combinations — exercising it through
+/// `collect_status` itself would mean getting a real Qdrant connection to report a
+/// specific, wrong point count, which is exactly the failure mode this check exists
+/// to catch without one.
+///
+/// Returns the error message to push onto `store.errors`, or `None` if nothing is
+/// wrong (no deficit, a deficit within slack, or a deficit while indexing).
+fn qdrant_deficit_error(chunk_sum: i64, points: u64, indexing: bool) -> Option<String> {
+    let deficit = chunk_sum - points as i64;
+    if deficit > QDRANT_DEFICIT_SLACK && !indexing {
+        Some(format!(
+            "qdrant has {deficit} fewer point(s) than state.db's chunk_count sum \
+             ({points} vs {chunk_sum}); this can mean Qdrant's data was wiped while \
+             state.db survived, and search may be silently returning incomplete or \
+             empty results for the whole knowledge base. Run `md-kb-rag index --full` \
+             to force a reconcile."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Gather everything the status views need. Never fails: unreachable stores are
 /// reported as errors inside the response rather than as a failed request.
 pub async fn collect_status(state: &StatusState) -> StatusResponse {
@@ -345,6 +398,10 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
             match db.document_count().await {
                 Ok(n) => store.documents_with_metadata = Some(n),
                 Err(e) => store.errors.push(store_error("documents", &e)),
+            }
+            match db.total_chunk_count().await {
+                Ok(n) => store.chunk_count_total = Some(n),
+                Err(e) => store.errors.push(store_error("chunk count", &e)),
             }
             if let (Some(files), Some(docs)) = (store.indexed_files, store.documents_with_metadata)
             {
@@ -448,11 +505,51 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
         )),
     }
 
+    // Fetched once and reused below (for the deficit check's in-flight suppression
+    // and for the response's own `indexing` field) rather than snapshotting
+    // `INDEX_STATUS` twice — both reads must agree on whether a run is in flight,
+    // and a second, later snapshot could observe a run that started or finished
+    // between the two calls.
+    let indexing_snapshot = crate::status::INDEX_STATUS.snapshot();
+
+    // Passive detection of a Qdrant data wipe (#155 — passive `/status` half only;
+    // the active self-heal belongs to ingest.rs/qdrant.rs as a follow-up). In a
+    // healthy steady state `qdrant_points == chunk_count_total` exactly:
+    // `index_paths` writes exactly `chunks.len()` points per file and records that
+    // same count in the same bookkeeping step (`ingest.rs`'s `upsert_pending`). If
+    // Qdrant's data is wiped while state.db survives, `ensure_collection` silently
+    // recreates an empty collection, the reconcile scan finds nothing changed
+    // (state.db still matches the files on disk), and `qdrant_points` stays at/near
+    // zero forever while `chunk_count_total` stays at its old value — this is the
+    // signal that catches that.
+    //
+    // Deliberately one-sided: only a DEFICIT (points < chunk_sum) is flagged. A
+    // surplus (points > chunk_sum) is not a fault and can persist indefinitely —
+    // `ingest.rs` documents at least two conditions that produce one on purpose: a
+    // failed tail-trim leaves stale high-index points until the next `--full`, and a
+    // bookkeeping failure after a successful upsert leaves points with no matching
+    // state row. A symmetric "large gap either direction" check would false-alarm on
+    // exactly the states the code already tolerates.
+    //
+    // A small deficit is also legitimate mid-run — the sub-second window between
+    // `delete_by_files` and its state-row deletes in `remove_orphans`, or between a
+    // tail-trim delete and its state upsert — hence `QDRANT_DEFICIT_SLACK` plus
+    // suppressing the alarm (though `qdrant_points_deficit` itself is still
+    // populated either way — see its doc comment) while `indexing_snapshot.indexing`
+    // is true.
+    if let (Some(chunk_sum), Some(points)) = (store.chunk_count_total, store.qdrant_points) {
+        let deficit = chunk_sum - points as i64;
+        store.qdrant_points_deficit = Some(deficit);
+        if let Some(msg) = qdrant_deficit_error(chunk_sum, points, indexing_snapshot.indexing) {
+            store.errors.push(msg);
+        }
+    }
+
     StatusResponse {
         uptime_secs: crate::status::uptime_secs(),
         collection: config.qdrant.collection.clone(),
         data_path: config.data_path().to_string(),
-        indexing: crate::status::INDEX_STATUS.snapshot(),
+        indexing: indexing_snapshot,
         queue: state.reindex_queue.snapshot(),
         store,
         breakdown,
@@ -782,6 +879,18 @@ pub fn render_prometheus(status: &StatusResponse) -> String {
         metric(
             "kb_qdrant_points",
             "Points (chunks) stored in the Qdrant collection.",
+            "gauge",
+            &plain(n as f64),
+        );
+    }
+    if let Some(n) = status.store.qdrant_points_deficit {
+        metric(
+            "kb_qdrant_points_deficit",
+            "chunk_count_total minus qdrant_points. Persistently positive and well \
+             above a small slack usually means Qdrant lost data while state.db did \
+             not (#155) — e.g. the collection was wiped and silently recreated \
+             empty. A negative value (surplus) is benign and can persist \
+             indefinitely; alert on sustained positive values, not on nonzero.",
             "gauge",
             &plain(n as f64),
         );
@@ -1981,6 +2090,8 @@ mod tests {
                 documents_with_metadata: Some(300),
                 documents_missing_metadata: Some(29),
                 qdrant_points: Some(2481),
+                chunk_count_total: Some(2481),
+                qdrant_points_deficit: Some(0),
                 errors: vec![],
             },
             breakdown: vec![FieldBreakdown {
@@ -2252,6 +2363,110 @@ mod tests {
         assert_eq!(status.store.documents_with_metadata, Some(0));
         assert_eq!(status.store.documents_missing_metadata, Some(3));
         assert!(render_prometheus(&status).contains("kb_documents_missing_metadata 3"));
+    }
+
+    // --- #155 (passive half): qdrant_points vs. chunk_count_total ---
+
+    #[tokio::test]
+    async fn status_reports_total_chunk_count_from_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+
+        let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        db.upsert("a.md", "h1", 3, "sh", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 5, "sh", 0, 0).await.unwrap();
+
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config: config::shared_config(config),
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+        };
+
+        let status = collect_status(&state).await;
+        assert_eq!(
+            status.store.chunk_count_total,
+            Some(8),
+            "must be the SUM of chunk_count across indexed_files, not e.g. the row count"
+        );
+        // Qdrant is unreachable in this test config (see `status_config`'s doc
+        // comment on the refusing port), so `qdrant_points` is `None` and the
+        // deficit — which needs both sides — must stay unpopulated rather than
+        // comparing against a bogus default.
+        assert!(status.store.qdrant_points.is_none());
+        assert!(status.store.qdrant_points_deficit.is_none());
+    }
+
+    /// Pure unit tests for `qdrant_deficit_error`, the one-sided check behind #155's
+    /// passive Qdrant-wipe detection — see its doc comment and the call site in
+    /// `collect_status` for the full rationale. Exercised directly (not through
+    /// `collect_status`) because getting a real `QdrantStore::collection_info` to
+    /// report an arbitrary, wrong point count would need live infrastructure this
+    /// check is specifically meant to work without.
+    mod qdrant_deficit_error_tests {
+        use super::*;
+
+        #[test]
+        fn flags_a_deficit_past_slack_when_idle() {
+            // Simulates the #155 failure scenario at a small scale: state.db
+            // believes 1000 chunks are indexed, Qdrant reports far fewer.
+            let msg = qdrant_deficit_error(1000, 10, false);
+            assert!(msg.is_some(), "a large deficit while idle must be flagged");
+            let msg = msg.unwrap();
+            assert!(msg.contains("990"), "message must state the deficit: {msg}");
+            assert!(
+                msg.contains("index --full"),
+                "message must tell the operator how to recover: {msg}"
+            );
+        }
+
+        #[test]
+        fn ignores_a_deficit_within_slack() {
+            assert_eq!(
+                qdrant_deficit_error(1000, (1000 - QDRANT_DEFICIT_SLACK) as u64, false),
+                None,
+                "exactly at the slack boundary must not alarm"
+            );
+            assert_eq!(
+                qdrant_deficit_error(1000, (1000 - QDRANT_DEFICIT_SLACK + 1) as u64, false),
+                None,
+                "one point of slack still available: must not alarm"
+            );
+        }
+
+        #[test]
+        fn flags_a_deficit_one_past_slack() {
+            assert!(
+                qdrant_deficit_error(1000, (1000 - QDRANT_DEFICIT_SLACK - 1) as u64, false)
+                    .is_some(),
+                "one point beyond the slack boundary must alarm"
+            );
+        }
+
+        #[test]
+        fn ignores_a_surplus_no_matter_how_large() {
+            // Stale tail-trim points and orphaned bookkeeping-failure points both
+            // leave Qdrant with MORE points than state.db's chunk_count sum — see
+            // this function's doc comment for why that is documented as benign,
+            // not the fault this check exists to catch.
+            assert_eq!(qdrant_deficit_error(10, 1_000_000, false), None);
+        }
+
+        #[test]
+        fn suppresses_a_large_deficit_while_indexing() {
+            // The same gap that would alarm at rest must not alarm mid-run — see
+            // the sub-second deficit windows documented on `collect_status`'s
+            // call site (between `delete_by_files` and its state-row deletes, or
+            // between a tail-trim delete and its state upsert).
+            assert_eq!(
+                qdrant_deficit_error(1000, 10, true),
+                None,
+                "must be suppressed while a run is in flight, however large the gap"
+            );
+        }
     }
 
     #[tokio::test]
