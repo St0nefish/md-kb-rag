@@ -655,6 +655,13 @@ impl ResolvedSchema {
             hasher.update([0u8]);
             hasher.update(format!("{:?}", def.ty).as_bytes());
             hasher.update([def.required as u8, def.indexed as u8, def.open as u8]);
+            // Presence discriminant: `Some(vec![])` ("nothing is permitted", per
+            // `check_values`/`check_values_lenient`) and `None` ("unconstrained")
+            // enforce opposite rules but would otherwise hash identically — the
+            // loop below contributes zero bytes either way when the list is empty
+            // or absent. Emitted unconditionally, before the loop, so the two
+            // states always diverge regardless of list contents (#152).
+            hasher.update([def.values.is_some() as u8]);
             if let Some(values) = &def.values {
                 let mut sorted = values.clone();
                 sorted.sort();
@@ -2333,6 +2340,39 @@ mod tests {
         assert_ne!(
             base.merged_with(&loose, "s").fingerprint(),
             base.merged_with(&tight, "s").fingerprint()
+        );
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_absent_values_from_empty_values() {
+        // `values` absent entirely (None: unconstrained) vs. `values: []`
+        // (Some(vec![]): nothing permitted) enforce opposite rules but, before
+        // #152's fix, hashed identically because the values loop contributes
+        // zero bytes when the list is empty OR absent.
+        let unconstrained: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  status:\n    type: text\n").unwrap();
+        let closed: SchemaFile =
+            serde_yaml_ng::from_str("fields:\n  status:\n    type: text\n    values: []\n")
+                .unwrap();
+
+        let base = ResolvedSchema::default();
+        let unconstrained_resolved = base.merged_with(&unconstrained, "s");
+        let closed_resolved = base.merged_with(&closed, "s");
+
+        // Sanity check that the YAML actually produced the two states under test.
+        assert_eq!(
+            unconstrained_resolved.fields.get("status").unwrap().values,
+            None
+        );
+        assert_eq!(
+            closed_resolved.fields.get("status").unwrap().values,
+            Some(Vec::new())
+        );
+
+        assert_ne!(
+            unconstrained_resolved.fingerprint(),
+            closed_resolved.fingerprint(),
+            "None and Some(vec![]) values must produce different fingerprints"
         );
     }
 
