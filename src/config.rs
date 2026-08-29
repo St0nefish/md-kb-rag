@@ -654,7 +654,19 @@ pub struct SearchConfig {
     pub phrase: bool,
     /// Global minimum relevance score floor. Results below this threshold are
     /// dropped before returning. `None` (the default) disables the floor.
-    /// Note: RRF scores are ~0.01–0.03 — set accordingly when hybrid is true.
+    ///
+    /// Note: RRF scores are ~0.01–0.03 — set accordingly whenever a fused arm
+    /// can run, which is NOT gated by `hybrid` alone. `retrieval::search`
+    /// dispatches to the fused `hybrid_search` path (RRF score) whenever sparse
+    /// is present (`hybrid: true`) OR a query contains a quoted phrase and
+    /// `phrase` is enabled — see [`SearchOptions::rrf_candidates`]'s doc comment
+    /// for the same "any fused arm" framing. `phrase` defaults to `true`, so a
+    /// deployment with `hybrid: false` still fuses (and lands on the RRF scale)
+    /// for any query with a `"quoted span"`; only a query with no quoted phrase
+    /// at all takes the plain dense-cosine path in that configuration. Setting a
+    /// dense-cosine-scale `min_score` (e.g. 0.5) under `hybrid: false` silently
+    /// zeroes out results for every phrase query rather than erroring, since the
+    /// fused score can never clear a cosine-appropriate floor.
     #[serde(default)]
     pub min_score: Option<f32>,
     /// Per-document result diversity: the maximum number of chunks from a single
