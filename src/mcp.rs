@@ -396,6 +396,28 @@ fn render_casualties(casualties: &[serde_json::Value]) -> String {
     out
 }
 
+/// Cap a casualty list for `structured_content`, mirroring the cap
+/// [`render_casualties`] already applies to the text half.
+///
+/// `documents_broken_by` deliberately returns the *complete* casualty list — the
+/// force/refuse decision needs completeness, so that query stays unbounded — but
+/// embedding the full `Vec` verbatim into `structured_content` let a schema
+/// tightening that broke thousands of documents emit a multi-megabyte tool result
+/// while the text channel silently stayed capped at [`MAX_REPORTED_CASUALTIES`].
+/// Returns the capped list alongside the true total and whether it was truncated,
+/// the same `total`/`has_more` shape `search` uses elsewhere in this file, so a
+/// client that only reads `structured_content` can still tell "empty" from
+/// "truncated" rather than only ever seeing the first page.
+fn capped_casualties(casualties: &[serde_json::Value]) -> (Vec<serde_json::Value>, usize, bool) {
+    let total = casualties.len();
+    let capped = casualties
+        .iter()
+        .take(MAX_REPORTED_CASUALTIES)
+        .cloned()
+        .collect();
+    (capped, total, total > MAX_REPORTED_CASUALTIES)
+}
+
 /// Default page size for `list_documents` — well above `search`'s cap, since
 /// enumeration is the point.
 const DEFAULT_LIST_LIMIT: u64 = 100;
@@ -2710,6 +2732,8 @@ impl KbSearchServer {
         let force = params.force.unwrap_or(false);
 
         if !casualties.is_empty() && !force && !dry_run {
+            let (would_invalidate, casualties_total, casualties_truncated) =
+                capped_casualties(&casualties);
             return Err(McpError::invalid_params(
                 format!(
                     "Refusing to apply: {} existing document(s) would fail the new rules. \
@@ -2717,7 +2741,11 @@ impl KbSearchServer {
                     casualties.len(),
                     render_casualties(&casualties)
                 ),
-                Some(serde_json::json!({ "would_invalidate": casualties })),
+                Some(serde_json::json!({
+                    "would_invalidate": would_invalidate,
+                    "casualties_total": casualties_total,
+                    "casualties_truncated": casualties_truncated,
+                })),
             ));
         }
 
@@ -2734,11 +2762,15 @@ impl KbSearchServer {
                 crate::schema::SCHEMA_FILE_NAME,
                 yaml
             );
+            let (would_invalidate, casualties_total, casualties_truncated) =
+                capped_casualties(&casualties);
             let mut result = CallToolResult::success(vec![Content::text(text)]);
             result.structured_content = Some(serde_json::json!({
                 "dry_run": true,
                 "summary": summary,
-                "would_invalidate": casualties,
+                "would_invalidate": would_invalidate,
+                "casualties_total": casualties_total,
+                "casualties_truncated": casualties_truncated,
                 "yaml": yaml,
             }));
             return Ok(result);
@@ -2827,13 +2859,16 @@ impl KbSearchServer {
             ));
         }
 
+        let (invalidated, casualties_total, casualties_truncated) = capped_casualties(&casualties);
         let mut result = CallToolResult::success(vec![Content::text(text)]);
         result.structured_content = Some(serde_json::json!({
             "outcome": outcome.as_str(),
             "dry_run": false,
             "summary": summary,
             "path": rel_file_str,
-            "invalidated": casualties,
+            "invalidated": invalidated,
+            "casualties_total": casualties_total,
+            "casualties_truncated": casualties_truncated,
         }));
         Ok(result)
     }
@@ -5067,6 +5102,90 @@ mod tests {
                 .exists(),
             "a dry run must not touch the filesystem"
         );
+    }
+
+    #[tokio::test]
+    async fn update_schema_caps_structured_casualties_like_it_caps_the_text() {
+        // #148: `documents_broken_by` deliberately returns every casualty — the
+        // force/refuse decision needs completeness — but before this fix that full
+        // list went straight into `structured_content` while the text half was
+        // already capped at MAX_REPORTED_CASUALTIES via `render_casualties`. Seed
+        // enough documents to blow past the cap and assert the structured half is
+        // bounded too, with a total/truncated flag so a client reading only
+        // `structured_content` can still tell it was cut off.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        let seeded = MAX_REPORTED_CASUALTIES + 5;
+        for i in 0..seeded {
+            seed_document(
+                &server,
+                &format!("notes/doc{i}.md"),
+                serde_json::json!({ "title": format!("Doc {i}") }),
+            )
+            .await;
+        }
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: None,
+                definition: Some(definition(serde_json::json!({ "required": true }))),
+                dry_run: Some(true),
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(
+            structured["would_invalidate"].as_array().unwrap().len(),
+            MAX_REPORTED_CASUALTIES,
+            "structured_content must cap the casualty list the same way the text \
+             rendering does, not embed all {seeded} verbatim"
+        );
+        assert_eq!(
+            structured["casualties_total"],
+            serde_json::json!(seeded),
+            "the true count must still be reported even though the list is capped"
+        );
+        assert_eq!(
+            structured["casualties_truncated"],
+            serde_json::json!(true),
+            "truncation must never be silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_reports_untruncated_casualties_below_the_cap() {
+        // Companion to the truncation test above: when the casualty count is at or
+        // under the cap, `casualties_truncated` must read false and
+        // `casualties_total` must match the (uncapped) list length exactly, so a
+        // client cannot mistake "small" for "truncated."
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(&server, "notes/a.md", serde_json::json!({ "title": "A" })).await;
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: None,
+                definition: Some(definition(serde_json::json!({ "required": true }))),
+                dry_run: Some(true),
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["would_invalidate"].as_array().unwrap().len(), 1);
+        assert_eq!(structured["casualties_total"], serde_json::json!(1));
+        assert_eq!(structured["casualties_truncated"], serde_json::json!(false));
     }
 
     #[tokio::test]
