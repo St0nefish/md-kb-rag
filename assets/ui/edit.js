@@ -731,6 +731,12 @@
       window.alert("Commit message is required.");
       return;
     }
+    // Guard against a second concurrent DELETE for the same path: the
+    // confirm modal's own OK button is already safe (hideConfirm() hides
+    // it synchronously before this runs), but nothing stops the user from
+    // re-opening the confirm dialog via delete-btn and confirming again
+    // while this fetch is still in flight.
+    els.deleteBtn.disabled = true;
     try {
       const res = await fetch(`api/doc/${window.KBViz.encodePathForApi(path)}`, {
         method: "DELETE",
@@ -751,6 +757,8 @@
       }
     } catch (err) {
       window.alert(`Delete failed: ${err.message}`);
+    } finally {
+      els.deleteBtn.disabled = false;
     }
   }
 
