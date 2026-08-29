@@ -23,6 +23,8 @@ All four share the same binary and config. The `serve` subcommand runs the serve
 | `validate` | Check frontmatter on all files without indexing |
 | `status` | Print collection stats and state DB info, including the document-metadata count (warns if it lags behind indexed files) |
 | `health` | Query the running server's `/health` endpoint |
+| `search` | Search the knowledge base from the CLI, through the same `retrieval::search` core the MCP `search` tool (query mode) uses — ranked results only, no enumeration mode |
+| `get` | Retrieve one document (or a line range of it) by path from the CLI, resolved the same way as the MCP `get_document` tool |
 | `reproject-fields` | Rebuild `document_fields` from stored frontmatter JSON (state DB only, no re-embed) |
 
 ## Docker Topology
@@ -348,7 +350,3 @@ This service is designed for intranet/tailnet deployment — the threat model as
 ## Configuration and Environment Variables
 
 See [`deploy/config.example.yaml`](../deploy/config.example.yaml) for all options with defaults and [`README.md`](../README.md#configuration) for the env-var table.
-
-## Roadmap
-
-Hybrid sparse+dense retrieval with RRF fusion (#55) is implemented (see [Retrieval](#retrieval)). Remaining retrieval enhancements — cross-encoder reranking (#56) and power-ups such as score explanation, recency filters, and a local CLI search (#57) — are tracked in GitHub issues.

@@ -84,10 +84,14 @@ Three Docker services:
 ## CLI Commands
 
 ```bash
-md-kb-rag serve              # Start server (MCP + webhook endpoints)
+md-kb-rag serve              # Start server (MCP + webhook endpoints + web UI)
 md-kb-rag index              # Incremental index (only changed files)
 md-kb-rag index --full       # Full re-index (clear state, re-embed everything)
 md-kb-rag validate           # Validate all markdown files without indexing
+md-kb-rag search "query"     # Search the knowledge base from the CLI (same pipeline as MCP search)
+md-kb-rag search "query" --limit 10 --explain      # Score-breakdown per result
+md-kb-rag search "query" --domain infra --type guide --tags docker,node:ares
+md-kb-rag search "query" --modified-after 2026-01-01 --json
 md-kb-rag get PATH           # Print one document (path resolves like the MCP tool)
 md-kb-rag get PATH --start-line 40 --end-line 60   # ...or just those lines, 1-based inclusive
 md-kb-rag status             # Aggregate counts + metadata breakdown
@@ -140,12 +144,13 @@ See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 - **frontmatter** *(deprecated)* — Required fields, indexed fields, defaults, and `allowed` closed-set enums (enforced by `validate` and the write tools); prefer a root `.kb-schema.yaml` instead — see [`.kb-schema.yaml` Directory Schemas](#kb-schemayaml-directory-schemas)
 - **chunking** — Markdown-aware splitting with configurable chunk size
 - **embedding** — OpenAI-compatible endpoint (works with llama.cpp, vLLM, etc.)
-- **qdrant** — Connection URL and collection name
 - **validation** — Strict/lenient mode, optional lint command
 - **webhook** — HMAC verification for Gitea/GitHub/GitLab (disabled if `WEBHOOK_SECRET` is unset)
 - **mcp** — Server port, bearer token authentication, and `extensions_path` (where per-KB tool/server description policy lives in the served knowledge base; `instructions` is a deprecated narrative override — see [MCP Tools](#mcp-tools) below)
 - **write** — Behaviour of the write tools: near-duplicate detection (`dedup_enabled`, `dedup_threshold`) and the git commit identity
 - **search** — Retrieval behaviour: hybrid sparse+dense search with RRF fusion (`hybrid`, default `true`) and per-arm candidate count (`rrf_candidates`). Set `hybrid: false` for legacy dense-only search. See the migration note below. Also `phrase` (default `true`) — exact-phrase matching for double-quoted spans in a `search` query, fused as a third RRF arm.
+- **reranking** — Optional cross-encoder reranking pass over the top hybrid candidates (`enabled`, default `false`; `candidate_limit`, default `50`). Requires `RERANKING_BASE_URL`/`RERANKING_MODEL` when enabled — see [Configuration](#configuration) above and `deploy/config.example.yaml`
+- **ui** — Web UI graph-view tuning: `semantic_edges` adds precomputed kNN neighbor edges alongside markdown-link edges (off by default — each enabled run costs one Qdrant `recommend` query per indexed document). See [Web UI](#web-ui) below.
 
 > **Hybrid search migration:** collections now use named `dense` + `sparse` vectors. Upgrading a knowledge base that was indexed by a pre-hybrid version requires a one-time full reindex (`md-kb-rag index --full`) — the old single-unnamed-vector schema is incompatible. After that, toggling `search.hybrid` needs no reindex (both vectors are always stored).
 
