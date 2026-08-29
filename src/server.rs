@@ -1319,6 +1319,124 @@ async fn wait_for_indexing_to_settle(is_indexing: impl Fn() -> bool) {
     }
 }
 
+// Path constants for every route `assemble_router` nests under the bearer-auth
+// `route_layer` (plus `/health`, which is deliberately open). These exist so a path
+// is written ONCE in this file: the `.route()`/`.nest_service()` call that registers
+// it below names the constant, and so does
+// `router_assembly_rejects_unauthenticated_requests_on_every_protected_route` in
+// `mod tests`. That is what makes the test something other than the
+// hand-maintained, driftable second list #177 flagged — the old per-concern tests
+// (`status_and_metrics_require_the_bearer_token`, `admin_test_app`, etc.) built
+// their own throwaway `Router`s with the path strings retyped from scratch, so a
+// route added to production here without also being retyped into one of those
+// tests sailed through every one of them. Moving a route in or out of the
+// protected group, or adding a new one, now only requires touching the constant
+// list below and the one `.route()` call that uses it — the test picks it up for
+// free instead of needing a matching edit of its own.
+const STATUS_PATH: &str = "/status";
+const METRICS_PATH: &str = "/metrics";
+const ADMIN_RELOAD_PATH: &str = "/admin/reload";
+const MCP_PATH: &str = "/mcp";
+/// Open by design, unlike the four paths above — see `web.rs`'s module doc for why
+/// `/health` and the UI routes carry no `bearer_auth` layer.
+const HEALTH_PATH: &str = "/health";
+
+/// Everything `assemble_router` needs to build the exact `Router` `run_server`
+/// serves. Bundled into one struct — rather than a long parameter list — so
+/// `mod tests` can construct the same deps against fake/in-memory backends and
+/// call the identical assembly function `run_server` calls, instead of a
+/// hand-rolled stand-in router that drifts from production the moment a route is
+/// added or moved (see #177).
+struct RouterAssemblyDeps {
+    mcp_service: StreamableHttpService<KbSearchServer, LocalSessionManager>,
+    auth_state: AuthState,
+    health_state: HealthState,
+    status_state: StatusState,
+    admin_state: AdminState,
+    ui_state: crate::web::UiState,
+    /// `Some` exactly when `run_server`'s `webhook_secret` lookup succeeded — mirrors
+    /// the `if let Some(secret) = webhook_secret` this replaces: `/hooks/reindex` only
+    /// exists at all when a secret is configured.
+    webhook_state: Option<WebhookState>,
+}
+
+/// Assembles the full router `run_server` serves: `/health`, the bearer-protected
+/// `/mcp` + `/status`/`/metrics` + `/admin/reload` group, the open web UI, and the
+/// optional webhook endpoint. Deliberately does NOT apply the outermost
+/// `GovernorLayer` rate-limit wrap — `run_server` layers that onto this function's
+/// return value itself (see the comment at that call site for why rate limiting has
+/// to stay outermost and therefore outside this function).
+///
+/// Extracted out of `run_server` so tests exercise this exact assembly — the real
+/// merge order, the real `route_layer` placement per sub-router, the real body
+/// limits — rather than a hand-rolled Router built fresh in the test module. See
+/// #177: a test that never calls this function cannot notice a new route left
+/// outside the `bearer_auth` layer, no matter how many assertions it makes about
+/// routes it already knows the names of.
+fn assemble_router(deps: RouterAssemblyDeps) -> Router {
+    let mcp_router = Router::new()
+        .nest_service(MCP_PATH, deps.mcp_service)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        .route_layer(middleware::from_fn_with_state(
+            deps.auth_state.clone(),
+            bearer_auth,
+        ));
+
+    // `/status` and `/metrics` sit behind the same bearer token as `/mcp`, not open like
+    // `/health`. `/health` answers "is it up" and reveals nothing; these enumerate tag
+    // vocabularies, area names and document counts, which is a readable sketch of the
+    // knowledge base's contents. Prometheus scrapes them with an `authorization` stanza.
+    let status_router = Router::new()
+        .route(STATUS_PATH, axum::routing::get(status_handler))
+        .route(METRICS_PATH, axum::routing::get(metrics_handler))
+        .with_state(deps.status_state)
+        .route_layer(middleware::from_fn_with_state(
+            deps.auth_state.clone(),
+            bearer_auth,
+        ));
+
+    // `/admin/reload` sits behind the same bearer token as `/status`/`/metrics` —
+    // triggering it can change how the write tools authenticate content or which
+    // webhook provider is trusted, so it gets no weaker a gate than those, and it is
+    // an explicit, single-purpose action (not exposed on `/status`'s GET) so it can
+    // never be triggered by an unauthenticated crawler or a misconfigured health
+    // check hitting it with the wrong verb.
+    let admin_router = Router::new()
+        .route(ADMIN_RELOAD_PATH, axum::routing::post(reload_handler))
+        .with_state(deps.admin_state)
+        .route_layer(middleware::from_fn_with_state(
+            deps.auth_state.clone(),
+            bearer_auth,
+        ));
+
+    let mut app = Router::new()
+        .route(
+            HEALTH_PATH,
+            axum::routing::get(health_handler).with_state(deps.health_state),
+        )
+        .merge(status_router)
+        .merge(admin_router)
+        .merge(mcp_router)
+        // Merged BEFORE the `GovernorLayer` wrap (applied by `run_server`, outside
+        // this function), same as every other route, so rate limiting applies to
+        // the UI/API routes too. No bearer-auth layer — see `web.rs`'s module doc
+        // for why these routes are deliberately open.
+        .merge(crate::web::ui_router(deps.ui_state));
+
+    if let Some(webhook_state) = deps.webhook_state {
+        let webhook_router = Router::new()
+            .route(
+                "/hooks/reindex",
+                axum::routing::post(webhook::handle_webhook),
+            )
+            .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+            .with_state(webhook_state);
+        app = app.merge(webhook_router);
+    }
+
+    app
+}
+
 pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf) -> Result<()> {
     let config = Arc::new(config);
     // The live handle `POST /admin/reload` swaps into. Every consumer built from
@@ -1700,87 +1818,38 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         }
     });
 
-    // Build router
-    let mcp_router = Router::new()
-        .nest_service("/mcp", mcp_service)
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
-        .route_layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            bearer_auth,
-        ));
-
-    let health_state = HealthState {
-        qdrant: Arc::clone(&qdrant),
-        embed: Arc::clone(&embed_client),
-    };
-
-    // `/status` and `/metrics` sit behind the same bearer token as `/mcp`, not open like
-    // `/health`. `/health` answers "is it up" and reveals nothing; these enumerate tag
-    // vocabularies, area names and document counts, which is a readable sketch of the
-    // knowledge base's contents. Prometheus scrapes them with an `authorization` stanza.
-    let status_state = StatusState {
-        config: Arc::clone(&shared_config),
-        qdrant: Arc::clone(&qdrant),
-        state_db: Arc::clone(&shared_state_db),
-        cache: Arc::new(tokio::sync::Mutex::new(None)),
-        reindex_queue: Arc::clone(&reindex_queue),
-    };
-    let status_router = Router::new()
-        .route("/status", axum::routing::get(status_handler))
-        .route("/metrics", axum::routing::get(metrics_handler))
-        .with_state(status_state)
-        .route_layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            bearer_auth,
-        ));
-
-    // `/admin/reload` sits behind the same bearer token as `/status`/`/metrics` —
-    // triggering it can change how the write tools authenticate content or which
-    // webhook provider is trusted, so it gets no weaker a gate than those, and it is
-    // an explicit, single-purpose action (not exposed on `/status`'s GET) so it can
-    // never be triggered by an unauthenticated crawler or a misconfigured health
-    // check hitting it with the wrong verb.
-    let admin_state = AdminState {
-        shared_config: Arc::clone(&shared_config),
-        config_path: Arc::new(config_path),
-        reindex_queue: Arc::clone(&reindex_queue),
-    };
-    let admin_router = Router::new()
-        .route("/admin/reload", axum::routing::post(reload_handler))
-        .with_state(admin_state)
-        .route_layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            bearer_auth,
-        ));
-
-    let mut app = Router::new()
-        .route(
-            "/health",
-            axum::routing::get(health_handler).with_state(health_state),
-        )
-        .merge(status_router)
-        .merge(admin_router)
-        .merge(mcp_router)
-        // Merged BEFORE the `GovernorLayer` wrap below, same as every other route,
-        // so rate limiting applies to the UI/API routes too. No bearer-auth layer —
-        // see `web.rs`'s module doc for why these routes are deliberately open.
-        .merge(crate::web::ui_router(ui_state));
-
-    if let Some(secret) = webhook_secret {
-        let webhook_state = WebhookState {
+    // Build router. See `assemble_router`'s doc comment (above `run_server`) for why
+    // the assembly itself lives in its own function rather than inline here.
+    let webhook_enabled = webhook_secret.is_some();
+    let app = assemble_router(RouterAssemblyDeps {
+        mcp_service,
+        auth_state: auth_state.clone(),
+        health_state: HealthState {
+            qdrant: Arc::clone(&qdrant),
+            embed: Arc::clone(&embed_client),
+        },
+        status_state: StatusState {
+            config: Arc::clone(&shared_config),
+            qdrant: Arc::clone(&qdrant),
+            state_db: Arc::clone(&shared_state_db),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::clone(&reindex_queue),
+        },
+        admin_state: AdminState {
+            shared_config: Arc::clone(&shared_config),
+            config_path: Arc::new(config_path),
+            reindex_queue: Arc::clone(&reindex_queue),
+        },
+        ui_state,
+        webhook_state: webhook_secret.map(|secret| WebhookState {
             config: Arc::clone(&shared_config),
             secret,
             git_token: git_pull_token.clone(),
             reindex_queue: Arc::clone(&reindex_queue),
-        };
-        let webhook_router = Router::new()
-            .route(
-                "/hooks/reindex",
-                axum::routing::post(webhook::handle_webhook),
-            )
-            .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
-            .with_state(webhook_state);
-        app = app.merge(webhook_router);
+        }),
+    });
+
+    if webhook_enabled {
         info!("  Webhook endpoint: /hooks/reindex");
     } else {
         warn!(
@@ -3229,11 +3298,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    /// `/` must exist once the UI router is part of the assembled app — the plain
-    /// existence check `run_server`'s real router assembly doesn't otherwise get a
-    /// dedicated test for at this layer (the full server-assembly test lives in
-    /// `web.rs`'s own router-level tests, which exercise `web::ui_router` directly
-    /// against a real `UiState`).
+    /// `/` must exist once the UI router is part of the assembled app — a plain
+    /// existence check against a stand-in Router, independent of the full real-router
+    /// assembly test (`router_assembly_rejects_unauthenticated_requests_on_every_protected_route`,
+    /// below) which additionally covers this same path.
     #[tokio::test]
     async fn ui_root_route_exists_alongside_the_other_top_level_routers() {
         let health = Router::new().route("/health", get(|| async { "ok" }));
@@ -3281,6 +3349,208 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- router assembly: the real `run_server` router, not a hand-rolled stand-in ---
+    //
+    // #177: every auth/rate-limit/body-limit test above this point (and
+    // `ui_root_route_exists_alongside_the_other_top_level_routers` just above) builds
+    // its own purpose-built `Router` literal, so each only proves that hand-rolled
+    // shape behaves correctly — not that `assemble_router` (what `run_server` actually
+    // serves) wires the same routes the same way. A new protected route added to
+    // `assemble_router` and left outside its `bearer_auth` `route_layer` sails through
+    // every test above unnoticed. The test below calls `assemble_router` itself
+    // against fake-but-real dependencies, and walks the same `STATUS_PATH`/
+    // `METRICS_PATH`/`ADMIN_RELOAD_PATH`/`MCP_PATH` constants `assemble_router` used to
+    // register those routes — so a route moved into or out of the protected group is
+    // covered without any matching edit here.
+
+    /// Builds a `RouterAssemblyDeps` wired to closed/unreachable backends (port 1
+    /// refuses instantly, same trick `status_config`/`health_handler_reports_component_errors`
+    /// use above) so the test can exercise real routing and real `bearer_auth`
+    /// without a live Qdrant/embeddings/git remote. `bearer_token` controls what
+    /// `auth_state` inside the assembled router will accept.
+    fn test_router_assembly_deps(
+        data_path: &std::path::Path,
+        bearer_token: Option<String>,
+    ) -> RouterAssemblyDeps {
+        let config = status_config(data_path);
+        let shared_config = config::shared_config(Arc::clone(&config));
+        let qdrant = Arc::new(QdrantStore::new(&config.qdrant).unwrap());
+        let embed = Arc::new(EmbedClient::new(&config.embedding));
+        let schema_cache = crate::mcp::empty_test_schema_cache();
+        let reindex_queue = Arc::new(crate::reindex::ReindexQueue::new());
+        let state_db = Arc::new(tokio::sync::OnceCell::new());
+        let instructions = Arc::new(RwLock::new("test instructions".to_string()));
+
+        let mcp_handler = KbSearchServer::new(
+            Arc::clone(&embed),
+            Arc::clone(&qdrant),
+            config.qdrant.collection.clone(),
+            data_path.to_path_buf(),
+            &["**/*.md".to_string()],
+            instructions,
+            Arc::clone(&shared_config),
+            Arc::clone(&schema_cache),
+            None,
+            Arc::clone(&reindex_queue),
+            Arc::new(RwLock::new(descriptions::compose_tool_descriptions(
+                None, false,
+            ))),
+        )
+        .unwrap();
+
+        // Same transport config production uses, minus a real `allowed_hosts` list —
+        // orthogonal to what this test checks (auth/routing), same carve-out
+        // `test_mcp_router_with_hosts` documents below.
+        let mcp_service = StreamableHttpService::new(
+            move || Ok(mcp_handler.clone()),
+            LocalSessionManager::default().into(),
+            mcp_transport_config(CancellationToken::new(), &[]),
+        );
+
+        let ui_state = crate::web::UiState::new(
+            Arc::clone(&shared_config),
+            Arc::clone(&qdrant),
+            Arc::clone(&embed),
+            config.qdrant.collection.clone(),
+            data_path.to_path_buf(),
+            &["**/*.md".to_string()],
+            None,
+            Arc::clone(&schema_cache),
+            Arc::clone(&state_db),
+            Arc::clone(&reindex_queue),
+        );
+
+        RouterAssemblyDeps {
+            mcp_service,
+            auth_state: AuthState { bearer_token },
+            health_state: HealthState {
+                qdrant: Arc::clone(&qdrant),
+                embed: Arc::clone(&embed),
+            },
+            status_state: StatusState {
+                config: Arc::clone(&shared_config),
+                qdrant: Arc::clone(&qdrant),
+                state_db: Arc::clone(&state_db),
+                cache: Arc::new(tokio::sync::Mutex::new(None)),
+                reindex_queue: Arc::clone(&reindex_queue),
+            },
+            admin_state: AdminState {
+                shared_config: Arc::clone(&shared_config),
+                config_path: Arc::new(data_path.join("config.yaml")),
+                reindex_queue: Arc::clone(&reindex_queue),
+            },
+            ui_state,
+            webhook_state: Some(WebhookState {
+                config: Arc::clone(&shared_config),
+                secret: "webhook-secret".into(),
+                git_token: None,
+                reindex_queue: Arc::clone(&reindex_queue),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn router_assembly_rejects_unauthenticated_requests_on_every_protected_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = assemble_router(test_router_assembly_deps(dir.path(), Some("secret".into())));
+
+        // Every path `assemble_router` nests under `bearer_auth`. See the constants'
+        // doc comment above `run_server` — this is the exact list `assemble_router`
+        // used to register these routes, not a retyped copy of it.
+        for (method, path) in [
+            ("GET", STATUS_PATH),
+            ("GET", METRICS_PATH),
+            ("POST", ADMIN_RELOAD_PATH),
+            ("POST", MCP_PATH),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "kb.example.com")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} must reject a request with no bearer token on the \
+                 router run_server actually serves — a route reachable here without \
+                 auth is exactly the regression #177 exists to catch"
+            );
+
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "kb.example.com")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} with a valid bearer token must be let past \
+                 bearer_auth (whatever the handler itself then does with an empty \
+                 body is not this test's concern)"
+            );
+        }
+
+        // `/health` and the web UI's `/` stay open by design — no `bearer_auth` layer
+        // covers either (see `web.rs`'s module doc). A request with no token at all
+        // must still be served.
+        for path in [HEALTH_PATH, "/"] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must stay reachable without a token"
+            );
+        }
+    }
+
+    // #187: `webhook_router`'s 1 MB `DefaultBodyLimit` had no test coverage. Built on
+    // the same `assemble_router` as the auth test above, so this exercises the real
+    // `webhook_router` construction (including its position relative to
+    // `handle_webhook`'s signature check, which the oversized body below never
+    // reaches — `Bytes::from_request` rejects it before the handler runs).
+    //
+    // `mcp_router`'s 10 MB limit is deliberately NOT covered here: `nest_service`
+    // hands the request straight to rmcp's `StreamableHttpService`, which reads the
+    // body via `Body::collect()` rather than an axum extractor — and
+    // `DefaultBodyLimit` only take effect through `Bytes`/`String`/`Json`-style
+    // extractors reading the `DefaultBodyLimitKind` request extension it sets. A
+    // local check against rmcp 1.8.0 confirmed a body well over 10 MB reaches
+    // `/mcp` and is processed normally (200 OK), so the `// 10 MB` comment on
+    // `mcp_router`'s layer does not actually bound anything today. Writing a test
+    // that asserts today's (non-enforcing) behavior would just codify the bug;
+    // writing one that asserts the intended 413 would fail. Either needs a real fix
+    // to `mcp_router`'s body-limit mechanism, which is out of scope here — left for
+    // a separate issue.
+    #[tokio::test]
+    async fn webhook_router_enforces_the_1mb_body_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = assemble_router(test_router_assembly_deps(dir.path(), None));
+
+        let oversized = vec![b'x'; 1024 * 1024 + 1];
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/reindex")
+            .body(Body::from(oversized))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a webhook body over 1 MB must be rejected before signature \
+             verification even runs"
+        );
     }
 
     // --- stateless MCP transport tests ---

@@ -286,16 +286,25 @@
 
   /** Re-fetch `api/graph` and fold it into every live surface: the data
    * layer, the sidebar, the current view, and (if built) the Cytoscape
-   * instance. Returns the raw bundle, or `null` if the fetch failed. */
+   * instance. Returns the raw bundle, or `null` if the fetch failed —
+   * on failure, also surfaces the error via #graph-error so a refresh
+   * triggered from the graph view (or that later lands on it) doesn't
+   * fail silently. */
   async function refreshGraph() {
+    const errorEl = document.getElementById("graph-error");
     let bundle;
     try {
       const res = await fetch("api/graph");
-      if (!res.ok) return null;
+      if (!res.ok) throw new Error(`api/graph returned ${res.status}`);
       bundle = await res.json();
     } catch (err) {
+      if (errorEl) {
+        errorEl.textContent = `Failed to refresh the knowledge base: ${err.message}`;
+        errorEl.hidden = false;
+      }
       return null;
     }
+    if (errorEl) errorEl.hidden = true;
 
     const prevIds = Object.keys(nodeIndex);
     setBundle(bundle);
@@ -512,10 +521,10 @@
     for (const d of docs) {
       const a = document.createElement("a");
       a.className = "tree-doc";
+      a.href = `#/doc/${encodeHashPath(d.id)}`;
       a.dataset.id = d.id;
       a.title = d.id;
       a.textContent = d.label || d.id;
-      a.addEventListener("click", () => showDetail(d.id));
       parentEl.appendChild(a);
     }
   }
@@ -571,6 +580,7 @@
     for (const domain of Object.keys(counts).sort()) {
       const card = document.createElement("a");
       card.className = "domain-card";
+      card.href = `#/browse/${encodeHashPath(domain)}`;
       const name = document.createElement("div");
       name.className = "name";
       name.textContent = domain;
@@ -579,7 +589,6 @@
       count.textContent = `${counts[domain]} document${counts[domain] === 1 ? "" : "s"}`;
       card.appendChild(name);
       card.appendChild(count);
-      card.addEventListener("click", () => navigate(`#/browse/${encodeHashPath(domain)}`));
       domainsEl.appendChild(card);
     }
   }
@@ -606,6 +615,7 @@
   function makeDocRow(d, opts) {
     const row = document.createElement("a");
     row.className = "doc-row";
+    row.href = `#/doc/${encodeHashPath(d.id)}`;
 
     const head = document.createElement("div");
     head.className = "doc-row-head";
@@ -636,7 +646,6 @@
       row.appendChild(desc);
     }
 
-    row.addEventListener("click", () => showDetail(d.id));
     return row;
   }
 
@@ -694,7 +703,7 @@
         const a = document.createElement("a");
         a.textContent = nodeIndex[src]?.label || src;
         a.dataset.target = src;
-        a.addEventListener("click", () => showDetail(src));
+        a.href = `#/doc/${encodeHashPath(src)}`;
         li.appendChild(a);
         const muted = document.createElement("span");
         muted.className = "muted";

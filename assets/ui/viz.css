@@ -285,12 +285,13 @@ a.tree-doc {
   padding: 2px 6px;
   border-radius: 4px;
   color: var(--text);
+  text-decoration: none;
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-a.tree-doc:hover { background: var(--bg-inset); }
+a.tree-doc:hover, a.tree-doc:focus { background: var(--bg-inset); outline: none; }
 a.tree-doc.active { background: var(--accent); color: var(--on-accent); }
 
 /* Home + browse views */
@@ -314,9 +315,11 @@ a.tree-doc.active { background: var(--accent); color: var(--on-accent); }
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-panel);
+  color: inherit;
+  text-decoration: none;
   cursor: pointer;
 }
-.domain-card:hover { border-color: var(--accent); }
+.domain-card:hover, .domain-card:focus { border-color: var(--accent); outline: none; }
 .domain-card .name { font-weight: 600; }
 .domain-card .count { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
 #browse-list { margin-top: 14px; max-width: 860px; }
@@ -328,9 +331,11 @@ a.tree-doc.active { background: var(--accent); color: var(--on-accent); }
   border-radius: 6px;
   margin-bottom: 6px;
   background: var(--bg-panel);
+  color: inherit;
+  text-decoration: none;
   cursor: pointer;
 }
-.doc-row:hover { border-color: var(--accent); }
+.doc-row:hover, .doc-row:focus { border-color: var(--accent); outline: none; }
 .doc-row-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .type-dot {
   width: 10px;
@@ -511,6 +516,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 #detail-backlinks h2 { font-size: 13px; color: var(--text-muted); margin-bottom: 6px; }
 #detail-backlinks ul { padding-left: 18px; }
 #detail-backlinks a { color: var(--accent); cursor: pointer; }
+#detail-backlinks a:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ---------------------------------------------------------------------
  * Editing UI (assets/edit.js) — not part of the original OKF viewer.

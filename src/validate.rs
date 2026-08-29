@@ -300,9 +300,25 @@ pub async fn validate_content(
     if let Some(lint_cmd) = &validation.lint_command
         && let Some((program, args)) = lint_cmd.split_first()
     {
-        let output = Command::new(program).args(args).arg(path).output().await;
+        let mut command = Command::new(program);
+        command.args(args).arg(path);
+        // `kill_on_drop` is what makes the timeout below safe rather than merely
+        // impatient: `tokio::time::timeout` dropping the `command.output()` future
+        // on expiry only stops *waiting* on the child, it does not by itself send
+        // it a signal. Without this, a hung lint command (waiting on stdin, a
+        // network call with no timeout of its own) would be orphaned and keep
+        // running indefinitely instead of being reaped — a slow process leak on
+        // every timeout rather than a fixed one-time hang, but still a leak (#146).
+        command.kill_on_drop(true);
+
+        let timeout_secs = validation.lint_timeout_secs;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            command.output(),
+        )
+        .await;
         match output {
-            Ok(out) if !out.status.success() => {
+            Ok(Ok(out)) if !out.status.success() => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let raw = if !stderr.is_empty() {
@@ -321,7 +337,7 @@ pub async fn validate_content(
                     schema_origin: None,
                 });
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 field_errors.push(FieldError {
                     field: "<lint>".into(),
                     rule: "lint".into(),
@@ -331,7 +347,23 @@ pub async fn validate_content(
                     schema_origin: None,
                 });
             }
-            _ => {}
+            // The lint command itself is never allowed to take the reindex worker
+            // down with it (#146): a timeout fails validation for this one file,
+            // with a message that names the knob an operator would tune, instead
+            // of propagating an error that would abort the whole indexing run.
+            Err(_elapsed) => {
+                field_errors.push(FieldError {
+                    field: "<lint>".into(),
+                    rule: "lint".into(),
+                    message: format!(
+                        "Lint command timed out after {timeout_secs}s (validation.lint_timeout_secs)"
+                    ),
+                    got: None,
+                    expected: None,
+                    schema_origin: None,
+                });
+            }
+            Ok(Ok(_)) => {}
         }
     }
 
@@ -438,6 +470,7 @@ mod tests {
             enabled: true,
             strict: false,
             lint_command: None,
+            ..Default::default()
         }
     }
 
@@ -753,9 +786,8 @@ mod tests {
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
         let val_config = ValidationConfig {
-            enabled: true,
-            strict: false,
             lint_command: Some(vec!["true".into()]),
+            ..default_val_config()
         };
         let (result, _) = validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
             .await
@@ -769,9 +801,8 @@ mod tests {
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
         let val_config = ValidationConfig {
-            enabled: true,
-            strict: false,
             lint_command: Some(vec!["false".into()]),
+            ..default_val_config()
         };
         let (result, validated) =
             validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
@@ -788,20 +819,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lint_command_timeout_adds_error_and_does_not_hang() {
+        // A lint command that hangs past `lint_timeout_secs` must fail validation
+        // for this one file with a clear message, not stall the caller forever —
+        // ingest::index_paths runs this one file at a time on the single
+        // background reindex worker (#146), so a bare `.output().await` with no
+        // timeout would take the whole KB's indexing down silently.
+        let content = "---\ntitle: Test\ntype: guide\n---\nBody";
+        let f = write_temp(content);
+        // `sh -c 'sleep 2'` rather than a bare `sleep 2`: `validate_content` appends
+        // the file path as a trailing argument, and a bare `sleep 2 <path>` would
+        // fail immediately with "invalid time interval" instead of actually
+        // hanging — routing through a shell absorbs the extra positional arg.
+        let val_config = ValidationConfig {
+            lint_command: Some(vec!["sh".into(), "-c".into(), "sleep 2".into()]),
+            lint_timeout_secs: 1,
+            ..default_val_config()
+        };
+        // Bound the whole call well above the configured 1s timeout but well
+        // below the 2s the lint command sleeps for. If the timeout wrapper is
+        // missing (or the child isn't actually killed), this outer timeout trips
+        // instead of the test hanging indefinitely.
+        let (result, validated) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            validate_file(f.path(), &as_schema(&default_fm_config()), &val_config),
+        )
+        .await
+        .expect("validate_file must return well within 5s even if the lint command hangs")
+        .unwrap();
+        assert!(!result.valid);
+        assert!(validated.is_none());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_lowercase().contains("timed out")),
+            "errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
     async fn lint_command_receives_path_as_argument() {
         // Use `sh -c 'test -f "$1"' -- ` to verify the path was passed as a
         // distinct argument and actually points to an existing file.
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
         let val_config = ValidationConfig {
-            enabled: true,
-            strict: false,
             lint_command: Some(vec![
                 "sh".into(),
                 "-c".into(),
                 "test -f \"$1\"".into(),
                 "--".into(),
             ]),
+            ..default_val_config()
         };
         let (result, _) = validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
             .await
@@ -814,9 +885,8 @@ mod tests {
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
         let val_config = ValidationConfig {
-            enabled: true,
-            strict: false,
             lint_command: Some(vec![]),
+            ..default_val_config()
         };
         let (result, _) = validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
             .await
@@ -1060,9 +1130,8 @@ mod tests {
         let content = "---\ntitle: Test\ntype: guide\n---\nBody";
         let f = write_temp(content);
         let val_config = ValidationConfig {
-            enabled: true,
-            strict: false,
             lint_command: Some(vec!["false".into()]),
+            ..default_val_config()
         };
         let (result, _) = validate_file(f.path(), &as_schema(&default_fm_config()), &val_config)
             .await
