@@ -2159,11 +2159,12 @@ pub(crate) mod tests {
 
         std::fs::write(work_b.path().join("mine.md"), "from B").unwrap();
 
-        // Make the bare remote's whole tree read-only now, AFTER A's push — a
-        // subsequent `git push` (receive-pack) needs to write new objects and
-        // update refs and fails outright without write permission, while `git
-        // fetch` (upload-pack) reads only and is unaffected.
-        set_tree_readonly(bare.path(), true);
+        // Make the bare remote reject pushes now, AFTER A's push — `git push`
+        // (receive-pack) runs the `pre-receive` hook and fails on its non-zero
+        // exit, while `git fetch` (upload-pack) never runs that hook and is
+        // unaffected. That asymmetry is the point: `commit_and_sync` must get
+        // far enough to fetch and rebase before the push fails.
+        reject_pushes(bare.path());
 
         let result = commit_and_sync(
             &lock,
@@ -2177,11 +2178,6 @@ pub(crate) mod tests {
             "test-bot@localhost",
         )
         .await;
-
-        // Restore write permission immediately so this TempDir (and work_b's,
-        // below) can still be cleaned up on drop regardless of how the
-        // assertions below turn out.
-        set_tree_readonly(bare.path(), false);
 
         let sha = match result {
             Err(CommitSyncError::PostCommit { sha, source }) => {
@@ -2218,24 +2214,52 @@ pub(crate) mod tests {
         );
     }
 
-    /// Recursively set (or clear) read-only permissions on every entry under
-    /// `path`, inclusive. Helper for the push-failure test above — Unix-only,
-    /// same as the rest of this test module's assumptions (`create_bare_repo`
-    /// et al. already shell out to a real `git`, which this project only
-    /// targets on Linux).
+    /// Install a `pre-receive` hook on a bare repo that rejects every push.
+    ///
+    /// Failure injection for the push-failure test above. This deliberately does
+    /// NOT work by making the remote's tree read-only: `receive-pack` writing to
+    /// a `chmod -w` directory is only blocked for an unprivileged user, and CI
+    /// here runs on a self-hosted runner privileged enough to write anyway
+    /// (root, or anything holding `CAP_DAC_OVERRIDE`, ignores the permission
+    /// bits outright). That made the read-only version pass locally and fail in
+    /// CI, where the push simply succeeded and no `PostCommit` error was ever
+    /// produced.
+    ///
+    /// A `pre-receive` hook is privilege-independent: git runs it and honours a
+    /// non-zero exit no matter who the pushing process is. It also targets
+    /// exactly the operation under test — `fetch` (upload-pack) never runs
+    /// `pre-receive`, so the fetch-then-rebase half of `commit_and_sync` still
+    /// succeeds, which is precisely the sequence this test needs.
+    ///
+    /// Unix-only, same as the rest of this test module's assumptions
+    /// (`create_bare_repo` et al. already shell out to a real `git`, which this
+    /// project only targets on Linux).
     #[cfg(unix)]
-    fn set_tree_readonly(path: &std::path::Path, readonly: bool) {
+    fn reject_pushes(bare: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
-        let mode = if readonly { 0o555 } else { 0o755 };
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    set_tree_readonly(&p, readonly);
-                }
-            }
-        }
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+        let hooks_dir = bare.join("hooks");
+        let hook = hooks_dir.join("pre-receive");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'pushes rejected by test' >&2\nexit 1\n",
+        )
+        .unwrap();
+
+        // Pin the repo's hooks directory explicitly. A `core.hooksPath` in the
+        // developer's or runner's GLOBAL git config silently replaces a repo's
+        // own `hooks/` for every repo on the machine, which would leave this
+        // hook dead and let the test pass a push it exists to reject. This
+        // project's own `scripts/setup-dev.sh` sets `core.hooksPath`
+        // (repo-locally), and setting it globally is a common enough habit that
+        // the test must not depend on its absence. Repo-local config wins over
+        // global, so writing it here makes the hook fire either way.
+        std::process::Command::new("git")
+            .args(["config", "core.hooksPath", hooks_dir.to_str().unwrap()])
+            .current_dir(bare)
+            .output()
+            .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     // --- restore_from_head / unstage tests ---
