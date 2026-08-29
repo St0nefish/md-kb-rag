@@ -225,6 +225,131 @@ fn json_value_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// `search`'s `filters` parameter as delivered by an MCP client.
+///
+/// Same fix as [`FieldDefinitionInput`], applied to the same shape of bug: the old
+/// type here, `Option<serde_json::Map<String, serde_json::Value>>`, advertises no
+/// schema constraint at all (schemars emits `{}` for a bare `serde_json::Map`), so a
+/// calling model has no way to learn from the tool schema that a scalar means
+/// equality, an array means any-of, or that an object accepts
+/// `any_of`/`all_of`/`gte`/`lte`/`gt`/`lt`. It has to learn that from prose alone —
+/// and, per the same failure mode `FieldDefinitionInput` exists to cover, at least
+/// one client class responds to an under-specified object parameter by sending it
+/// JSON-encoded as a string instead, which the old `Option<Map<...>>` field rejected
+/// with a raw deserialize error rather than a caller-actionable one.
+///
+/// Unlike `FieldDefinitionInput`, there is no existing typed Rust struct to delegate
+/// to for the advertised schema — `filters` is a map keyed by arbitrary caller-chosen
+/// field names, each valued by one of several shapes — so [`json_schema`] below
+/// builds that schema by hand instead of deriving it. Actual per-condition parsing
+/// still happens in `parse_field_filter`, unchanged: this type only fixes what the
+/// tool schema advertises and adds the same string-tolerance fallback, it does not
+/// duplicate that function's shape checking or its field-named error messages.
+///
+/// [`json_schema`]: schemars::JsonSchema::json_schema
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchFiltersInput(pub serde_json::Map<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for SearchFiltersInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_search_filters_input(value)
+            .map(SearchFiltersInput)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parse `search`'s `filters` argument from JSON: an object directly, or (see
+/// [`SearchFiltersInput`]) a string containing one. Mirrors
+/// [`parse_field_definition`]'s two-shape acceptance and error style.
+fn parse_search_filters_input(
+    value: serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    use serde_json::Value;
+
+    match value {
+        Value::Object(map) => Ok(map),
+        Value::String(s) => match serde_json::from_str::<Value>(&s) {
+            Ok(Value::Object(map)) => Ok(map),
+            Ok(other) => Err(filters_shape_error(&other)),
+            Err(e) => Err(format!(
+                "filters must be a JSON object mapping frontmatter field names to \
+                 conditions. A JSON string containing that object is also accepted, \
+                 but this string is not valid JSON: {e}"
+            )),
+        },
+        other => Err(filters_shape_error(&other)),
+    }
+}
+
+/// Build the "wrong shape entirely" error for [`parse_search_filters_input`], naming
+/// what was actually received without echoing its (possibly large) content.
+fn filters_shape_error(value: &serde_json::Value) -> String {
+    format!(
+        "filters must be a JSON object mapping frontmatter field names to conditions, \
+         got {}",
+        json_value_kind(value)
+    )
+}
+
+impl schemars::JsonSchema for SearchFiltersInput {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SearchFilters".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(concat!(module_path!(), "::SearchFiltersInput"))
+    }
+
+    // Hand-built rather than derived (see this type's doc comment): describes an
+    // object whose values ("filter conditions") are, per field, a scalar
+    // (equality), an array of scalars (any-of), or an object carrying
+    // `any_of`/`all_of`/`gte`/`lte`/`gt`/`lt` — exactly the shapes
+    // `parse_field_filter` accepts. Kept tight and caller-facing (see #126): no
+    // implementation rationale leaks into the emitted schema, only the shape a
+    // caller needs to construct a valid `filters` value.
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "description": "Frontmatter criteria by field (dot-path keys). Each \
+                value is either a scalar (equality), an array of scalars (any-of), \
+                or an object with any_of/all_of (explicit set match) or \
+                gte/lte/gt/lt (numeric range).",
+            "additionalProperties": {
+                "description": "One field's filter condition.",
+                "anyOf": [
+                    { "type": ["string", "number", "boolean"] },
+                    {
+                        "type": "array",
+                        "items": { "type": ["string", "number", "boolean"] }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "any_of": {
+                                "type": "array",
+                                "items": { "type": ["string", "number", "boolean"] }
+                            },
+                            "all_of": {
+                                "type": "array",
+                                "items": { "type": ["string", "number", "boolean"] }
+                            },
+                            "gte": { "type": "number" },
+                            "lte": { "type": "number" },
+                            "gt": { "type": "number" },
+                            "lt": { "type": "number" }
+                        }
+                    }
+                ]
+            }
+        })
+    }
+}
+
 /// Turn tool parameters into a typed schema edit.
 fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::SchemaEdit, McpError> {
     use crate::schema::SchemaEdit;
@@ -562,12 +687,13 @@ fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilte
 /// both backends: SQLite (`state::StateDb::push_where`, enumeration mode) and Qdrant
 /// (`qdrant::lower_field_filters`, query mode).
 fn parse_filters(
-    raw_filters: &Option<serde_json::Map<String, serde_json::Value>>,
+    raw_filters: &Option<SearchFiltersInput>,
 ) -> Result<Vec<(String, FieldFilter)>, McpError> {
     let invalid = |msg: String| McpError::invalid_params(msg, None);
 
     let mut filters = Vec::new();
     if let Some(raw_filters) = raw_filters {
+        let raw_filters = &raw_filters.0;
         if raw_filters.len() > MAX_LIST_FILTERS {
             return Err(invalid(format!(
                 "too many filters: {} (max {})",
@@ -837,7 +963,7 @@ pub struct SearchParams {
 
     /// Frontmatter criteria by field (dot-paths).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filters: Option<serde_json::Map<String, serde_json::Value>>,
+    pub filters: Option<SearchFiltersInput>,
 
     /// Restrict to paths starting with this prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3919,7 +4045,7 @@ mod tests {
 
     fn filters_from(json: serde_json::Value) -> SearchParams {
         SearchParams {
-            filters: Some(json.as_object().unwrap().clone()),
+            filters: Some(SearchFiltersInput(json.as_object().unwrap().clone())),
             ..Default::default()
         }
     }
@@ -4095,11 +4221,140 @@ mod tests {
             map.insert(format!("field{i}"), serde_json::json!("x"));
         }
         let err = build_document_query(&SearchParams {
-            filters: Some(map),
+            filters: Some(SearchFiltersInput(map)),
             ..Default::default()
         })
         .unwrap_err();
         assert!(format!("{:?}", err).contains("too many filters"));
+    }
+
+    #[test]
+    fn search_filters_advertises_as_a_typed_object() {
+        // Regression test for #151: `filters` used to be typed
+        // `Option<serde_json::Map<String, serde_json::Value>>`, which schemars turns
+        // into an unconstrained `{"type": "object"}` with no `additionalProperties`
+        // constraint at all — no signal to a calling client about what a field's
+        // condition may look like, and (per `SearchFiltersInput`'s doc comment) the
+        // same under-specification that drove at least one real client to send a
+        // nested-object parameter JSON-encoded as a string instead of an object.
+        let schema = schemars::schema_for!(SearchParams);
+        let root = schema.as_value();
+
+        let filters_schema = &root["properties"]["filters"];
+        // `Option<SearchFiltersInput>` becomes `anyOf: [<real schema>, {"type":
+        // "null"}]`; find the non-null branch.
+        let object_schema = filters_schema["anyOf"]
+            .as_array()
+            .expect("filters must offer a typed alternative, not a bare {}")
+            .iter()
+            .find(|branch| branch["type"] != serde_json::json!("null"))
+            .expect("filters must have a non-null branch");
+
+        // schemars refs a named type's schema into `$defs` rather than inlining it;
+        // resolve it so the assertions below see the real shape (mirrors
+        // `update_schema_definition_advertises_as_a_typed_object`'s resolution).
+        let resolved = match object_schema["$ref"].as_str() {
+            Some(reference) => &root["$defs"][reference.rsplit('/').next().unwrap()],
+            None => object_schema,
+        };
+
+        assert_eq!(
+            resolved["type"],
+            serde_json::json!("object"),
+            "filters must advertise as an object, got: {resolved}"
+        );
+        let condition_schema = &resolved["additionalProperties"];
+        assert_ne!(
+            *condition_schema,
+            serde_json::json!(true),
+            "a bare `additionalProperties: true` (schemars' rendering of an \
+             unconstrained serde_json::Map) tells a client nothing about a \
+             condition's shape — this is the exact bug being fixed, got: {resolved}"
+        );
+
+        let branches = condition_schema["anyOf"]
+            .as_array()
+            .expect("a filter condition must advertise its scalar/array/object forms");
+
+        // Scalar branch: equality against a string, number, or boolean.
+        assert!(
+            branches
+                .iter()
+                .any(|b| b["type"].as_array().is_some_and(|types| {
+                    let types: Vec<&str> = types.iter().filter_map(|t| t.as_str()).collect();
+                    types.contains(&"string")
+                        && types.contains(&"number")
+                        && types.contains(&"boolean")
+                })),
+            "missing the scalar-equality branch, got: {condition_schema}"
+        );
+
+        // Array branch: any-of against a list of scalars.
+        assert!(
+            branches
+                .iter()
+                .any(|b| b["type"] == serde_json::json!("array") && !b["items"].is_null()),
+            "missing the any-of-array branch, got: {condition_schema}"
+        );
+
+        // Object branch: named any_of/all_of/gte/lte/gt/lt properties.
+        let object_branch = branches
+            .iter()
+            .find(|b| b["type"] == serde_json::json!("object"))
+            .expect("missing the any_of/all_of/range object branch");
+        for key in ["any_of", "all_of", "gte", "lte", "gt", "lt"] {
+            assert!(
+                !object_branch["properties"][key].is_null(),
+                "condition object schema is missing documented key '{key}': \
+                 {object_branch}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_filters_accepts_a_json_encoded_string_as_a_fallback() {
+        // At least one real MCP client sends nested-object tool arguments as a
+        // JSON-encoded string rather than an object, regardless of what the tool
+        // schema advertises (same failure mode `FieldDefinitionInput` exists to
+        // cover — see #151). `SearchFiltersInput` must tolerate that as a fallback,
+        // and the parsed result must behave identically to the equivalent object.
+        let params: SearchParams = serde_json::from_value(serde_json::json!({
+            "filters": r#"{"type":"guide"}"#,
+        }))
+        .expect("a JSON-encoded filters string must deserialize");
+        let query = build_document_query(&params).unwrap();
+        assert_eq!(
+            query.filters,
+            vec![("type".to_string(), FieldFilter::AnyOf(vec!["guide".into()]))]
+        );
+    }
+
+    #[test]
+    fn search_filters_rejects_a_string_that_is_not_valid_json() {
+        let err = serde_json::from_value::<SearchFiltersInput>(serde_json::Value::String(
+            "not json at all".to_string(),
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not valid JSON"),
+            "expected a message explaining the string wasn't parseable JSON, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn search_filters_rejects_a_json_array_naming_the_expected_shape() {
+        let err = serde_json::from_value::<SearchFiltersInput>(serde_json::json!(["type", "x"]))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("JSON object"),
+            "expected the error to name the expected shape, got: {msg}"
+        );
+        assert!(
+            !msg.contains("SearchFiltersInput"),
+            "a Rust type name is meaningless to an MCP client, got: {msg}"
+        );
     }
 
     #[test]
@@ -4203,7 +4458,7 @@ mod tests {
         // attributable to routing, not to the filter being universally invalid.
         let enumerate_result = server
             .search(Parameters(SearchParams {
-                filters: Some(filters.clone()),
+                filters: Some(SearchFiltersInput(filters.clone())),
                 ..Default::default()
             }))
             .await
@@ -4221,7 +4476,7 @@ mod tests {
             .search(Parameters(SearchParams {
                 query: Some("test".to_string()),
                 granularity: Some("document".to_string()),
-                filters: Some(filters),
+                filters: Some(SearchFiltersInput(filters)),
                 ..Default::default()
             }))
             .await
@@ -4302,7 +4557,7 @@ mod tests {
 
     fn filters_param(json: serde_json::Value) -> SearchParams {
         SearchParams {
-            filters: Some(json.as_object().unwrap().clone()),
+            filters: Some(SearchFiltersInput(json.as_object().unwrap().clone())),
             ..Default::default()
         }
     }
@@ -5648,7 +5903,7 @@ mod tests {
         filters.insert("prep".into(), serde_json::json!({ "lt": 30 }));
         let result = server
             .search(Parameters(SearchParams {
-                filters: Some(filters),
+                filters: Some(SearchFiltersInput(filters)),
                 ..Default::default()
             }))
             .await
