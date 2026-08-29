@@ -3338,6 +3338,24 @@ impl KbSearchServer {
                 None,
             ));
         }
+        // Mirrors `get_document`'s length guard (see its comment): rejecting an
+        // oversized path here avoids paying for `resolve_safe_write_path`, an
+        // include-pattern check, and git staging on an input that was never going
+        // to resolve to anything.
+        if raw.len() > MAX_PATH_LEN {
+            return Err(McpError::invalid_params(
+                format!("path exceeds maximum length of {MAX_PATH_LEN} characters"),
+                None,
+            ));
+        }
+        if let Some(new_path) = params.new_path.as_deref()
+            && new_path.len() > MAX_PATH_LEN
+        {
+            return Err(McpError::invalid_params(
+                format!("new_path exceeds maximum length of {MAX_PATH_LEN} characters"),
+                None,
+            ));
+        }
 
         // Branch 1: a directory move. Detected via the literal (non-fuzzy)
         // resolver — a directory can never satisfy `resolve_within_data`'s
@@ -3400,6 +3418,15 @@ impl KbSearchServer {
         if raw.is_empty() {
             return Err(McpError::invalid_params(
                 "path parameter is empty".to_string(),
+                None,
+            ));
+        }
+        // Mirrors `get_document`'s length guard (see its comment) and
+        // `write_document`'s identical check: reject before the fuzzy resolver, the
+        // metadata index, or git ever see an input that was never going to resolve.
+        if raw.len() > MAX_PATH_LEN {
+            return Err(McpError::invalid_params(
+                format!("path exceeds maximum length of {MAX_PATH_LEN} characters"),
                 None,
             ));
         }
@@ -7309,6 +7336,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_document_overlong_path_rejected() {
+        // Mirrors `get_document`'s overlong-path test (see that test's comment on
+        // MAX_PATH_LEN): `delete_document` must reject the same class of input
+        // before the fuzzy resolver ever runs, not fall through to a resolver-level
+        // "not found" error.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let params = DeleteDocumentParams {
+            path: "a".repeat(MAX_PATH_LEN + 1),
+            message: None,
+        };
+        let err = server
+            .delete_document(Parameters(params))
+            .await
+            .expect_err("overlong path should return Err");
+        assert!(
+            err.message.contains("exceeds maximum length"),
+            "error should name the length problem, got: {}",
+            err.message
+        );
+    }
+
     // `delete_document_existing_file_proceeds_to_git_step` used to live here: create
     // a file in a plain tempdir with no git repo, delete it, and check the failure
     // wasn't a path-resolution error. `delete_document_with_no_git_repo_reports_
@@ -8762,6 +8814,68 @@ mod tests {
             err.message
                 .contains("cannot surgically edit a document that does not exist"),
             "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_overlong_path_rejected() {
+        // Mirrors `get_document`'s overlong-path test: `write_document` must reject
+        // the same class of input before `resolve_safe_write_path`, the
+        // include-pattern check, or git staging ever see it — see #153.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let err = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "a".repeat(MAX_PATH_LEN + 1),
+                content: Some("---\ntitle: Test\n---\n# Body".to_string()),
+                old_string: None,
+                new_string: None,
+                new_path: None,
+                message: None,
+                expected_hash: None,
+                force_new: Some(true),
+            }))
+            .await
+            .expect_err("overlong path should return Err");
+        assert!(
+            err.message.contains("exceeds maximum length"),
+            "error should name the length problem, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_overlong_new_path_rejected() {
+        // Same guard, applied to `new_path` (used for moves) rather than `path` —
+        // see #153.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+        std::fs::write(
+            tmp.path().join("existing.md"),
+            "---\ntitle: Old\n---\n# Old\n",
+        )
+        .unwrap();
+
+        let err = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "existing.md".to_string(),
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: Some("a".repeat(MAX_PATH_LEN + 1)),
+                message: None,
+                expected_hash: None,
+                force_new: None,
+            }))
+            .await
+            .expect_err("overlong new_path should return Err");
+        assert!(
+            err.message.contains("exceeds maximum length"),
+            "error should name the length problem, got: {}",
             err.message
         );
     }
