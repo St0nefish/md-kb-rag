@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tower_governor::{
     GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{self, FrontmatterConfig, ResolvedConfig, SharedConfig};
@@ -1601,7 +1602,15 @@ struct RouterAssemblyDeps {
 fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     let mcp_router = Router::new()
         .nest_service(MCP_PATH, deps.mcp_service)
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        // NOT `DefaultBodyLimit`: that works only by inserting a marker into request
+        // extensions for axum's `Bytes`/`String`/`Json` extractors to consult, and
+        // rmcp's `StreamableHttpService` reads the body itself via a raw
+        // `Body::collect()` that never looks at that marker — so a `DefaultBodyLimit`
+        // layer here would be silently inert (#205; confirmed empirically, an
+        // 11.5 MB body reached `/mcp` and returned 200 OK). `RequestBodyLimitLayer`
+        // instead wraps the body type itself, so the cap applies no matter how the
+        // inner service reads it.
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10 MB
         .route_layer(middleware::from_fn_with_state(
             deps.auth_state.clone(),
             bearer_auth,
@@ -4024,19 +4033,6 @@ mod tests {
     // `webhook_router` construction (including its position relative to
     // `handle_webhook`'s signature check, which the oversized body below never
     // reaches — `Bytes::from_request` rejects it before the handler runs).
-    //
-    // `mcp_router`'s 10 MB limit is deliberately NOT covered here: `nest_service`
-    // hands the request straight to rmcp's `StreamableHttpService`, which reads the
-    // body via `Body::collect()` rather than an axum extractor — and
-    // `DefaultBodyLimit` only take effect through `Bytes`/`String`/`Json`-style
-    // extractors reading the `DefaultBodyLimitKind` request extension it sets. A
-    // local check against rmcp 1.8.0 confirmed a body well over 10 MB reaches
-    // `/mcp` and is processed normally (200 OK), so the `// 10 MB` comment on
-    // `mcp_router`'s layer does not actually bound anything today. Writing a test
-    // that asserts today's (non-enforcing) behavior would just codify the bug;
-    // writing one that asserts the intended 413 would fail. Either needs a real fix
-    // to `mcp_router`'s body-limit mechanism, which is out of scope here — left for
-    // a separate issue.
     #[tokio::test]
     async fn webhook_router_enforces_the_1mb_body_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -4054,6 +4050,62 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "a webhook body over 1 MB must be rejected before signature \
              verification even runs"
+        );
+    }
+
+    // #205: `mcp_router`'s 10 MB limit used to be `DefaultBodyLimit`, which is a
+    // no-op here — `nest_service` hands the request straight to rmcp's
+    // `StreamableHttpService`, which reads the body itself via `Body::collect()`
+    // rather than an axum `Bytes`/`String`/`Json` extractor, and `DefaultBodyLimit`
+    // only takes effect through those extractors consulting the request-extension
+    // marker it sets. A local check against rmcp 1.8.0 confirmed a body well over
+    // 10 MB reached `/mcp` and was processed normally (200 OK) under the old layer
+    // — this test fails with `left: 200, right: 400` against that code.
+    //
+    // Asserting 400 rather than 413 (unlike the webhook test above) is deliberate,
+    // not an oversight: `RequestBodyLimitLayer` wraps the body type itself, so
+    // rmcp's `Body::collect()` gets an `Err` partway through reading rather than
+    // ever completing — which is what stops it from buffering the full oversized
+    // body in memory, the actual vulnerability. But because rmcp (out of scope to
+    // modify here — this fix has to sit somewhere it cannot bypass, not inside it)
+    // treats that as a generic body-read failure rather than recognizing the
+    // specific `LengthLimitError` axum's own extractors special-case into 413, it
+    // maps to a plain 400. The security property this test protects — the request
+    // is rejected rather than accepted, and the body is never fully buffered — holds
+    // either way; the status code is a secondary, rmcp-internal detail.
+    //
+    // `bearer_token: None` (unauthenticated) is deliberate, same as the webhook
+    // test above: this test is about the body-limit layer specifically, and auth
+    // has its own coverage elsewhere — see
+    // `router_assembly_rejects_unauthenticated_requests_on_every_protected_route`.
+    #[tokio::test]
+    async fn mcp_router_enforces_the_10mb_body_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = assemble_router(test_router_assembly_deps(dir.path(), None));
+
+        let oversized = vec![b'x'; 10 * 1024 * 1024 + 1];
+        let req = Request::builder()
+            .method("POST")
+            .uri(MCP_PATH)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(oversized))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "a /mcp body over 10 MB must not be accepted — it used to return 200 OK \
+             because DefaultBodyLimit is inert against rmcp's raw Body::collect()"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "RequestBodyLimitLayer stops rmcp's Body::collect() mid-read with an \
+             error, which rmcp surfaces as a generic 400 rather than the 413 axum's \
+             own extractors would produce for the same LengthLimitError — see the \
+             comment above for why that distinction doesn't matter for the bug \
+             this test guards against"
         );
     }
 
