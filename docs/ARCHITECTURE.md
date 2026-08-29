@@ -76,17 +76,23 @@ The MCP port (8001) is the only externally exposed port. This service is designe
 | `chunk.rs` | Section-aware markdown chunker |
 | `embed.rs` | Embedding API client (async-openai, batched, exponential backoff) |
 | `qdrant.rs` | Qdrant gRPC operations: upsert, delete, search, facet fetch |
-| `state.rs` | SQLite state DB (sqlx): tracks relative path → content hash + chunk count + schema fingerprint, plus the `documents` and `document_fields` metadata index |
+| `state.rs` | SQLite state DB (sqlx): tracks relative path → content hash + chunk count + schema fingerprint, plus the `documents`/`document_fields` metadata index and the `document_links` graph-edge table (see [State Model](#state-model)) |
 | `document_fields.rs` | Projects frontmatter JSON into filterable `document_fields` rows (dot-path flattening, array expansion, numeric coercion) |
 | `schema.rs` | `.kb-schema.yaml` cascade: parsing, cascade merge, `SchemaCache` tree walk + resolution, type/value checking, schema fingerprinting |
-| `retrieval.rs` | Shared retrieval core: `search` and `get_document` logic used by `mcp.rs` |
+| `retrieval.rs` | Shared retrieval core: `search`, `get_document`, and `list_documents`, consumed by `mcp.rs`, `web.rs`, and the `search`/`get` CLI subcommands alike |
+| `sparse.rs` | Pure-Rust BM25-style sparse-vector tokenizer (FNV-1a term hashing) feeding the `sparse` named vector for hybrid retrieval — no model, no network |
+| `rerank.rs` | Cross-encoder reranking client; truncates each candidate to a byte budget derived from `chunking.max_chunk_size` before sending, with exponential-backoff retry |
 | `mcp.rs` | The six MCP tool handlers (`search` — covering both ranked query results and, with no `query`, the exhaustive enumeration formerly served by `list_documents` — `get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`): input validation, result formatting; delegates to `retrieval.rs` / `write.rs` / `state.rs` / `schema.rs` |
 | `descriptions.rs` | Assembles each tool's and the server's MCP description from compiled-in `assets/mcp/*.md` (mechanics true of every deployment), config-derived sentences (e.g. the hybrid/phrase retrieval-mode sentence), and a per-KB policy extension loaded at runtime from `mcp.extensions_path` in the served knowledge base (append-only, editable via `write_document`) |
+| `write.rs` | Transport-agnostic write pipeline (`write_document`/`delete_document`) shared by the MCP write tools and `web.rs`'s `POST`/`DELETE /api/doc/{*path}`: schema-frozen check, frontmatter validation, dedup gate, pre-commit rollback, `git::commit_and_sync`, and marking the written path dirty on the `ReindexQueue` |
+| `reindex.rs` | `ReindexQueue` and its single background worker (`run_worker`): every producer (write tools, webhook handler, startup, the periodic reconcile sweep) marks paths — or a full reconcile — dirty and returns immediately; the worker drains the queue into `ingest::index_paths` with coalesce-don't-drop semantics and transient-vs-permanent retry/backoff (see [Webhook Flow](#webhook-flow)) |
 | `web.rs` | The knowledge-base web UI — docs browser, semantic search, Cytoscape graph view, and a create/edit/move/delete editor — served straight from the binary and deliberately unauthenticated (see [Web UI](#web-ui)) |
 | `server.rs` | Axum server: MCP route, webhook route, `/health`/`/status`/`/metrics`/`POST /admin/reload`, and the unauthenticated web UI routes from `web.rs`, all merged in before the rate-limit `GovernorLayer` wrap; spawns the reindex worker and the periodic reconcile-sweep timer (`indexing.reconcile_interval_secs`) |
 | `webhook.rs` | Webhook handler: provider signature verification, branch filter, `git fetch` + `git merge --ff-only`, then diffs the pulled range and marks exactly those paths dirty on the `ReindexQueue` — it never indexes inline (see [Webhook Flow](#webhook-flow)) |
+| `reload.rs` | `POST /admin/reload`: re-reads and re-validates `config.yaml`, swaps it into the live `SharedConfig`, and classifies each changed setting as `applied` (read fresh on next use), `restart_required` (baked into a startup-built value), or `reindex_required` (`chunking.*`) |
+| `status.rs` | Process-global indexing run state (`INDEX_STATUS`) backing `/status` and `/metrics`: in-flight phase/progress, last-run outcome and counters, payload-index health |
 | `validate.rs` | Frontmatter validation against the resolved `.kb-schema.yaml` cascade for each file's path (falls back to the `frontmatter` config as the implicit root schema) |
-| `git.rs` | Git subprocess helpers: token injection, URL redaction, fetch/merge with timeout |
+| `git.rs` | Git subprocess helpers: token injection, URL redaction, fetch/merge with timeout, serialized by `GIT_LOCK` |
 
 ## Indexing Pipeline
 
@@ -188,6 +194,21 @@ Arrays produce one row per element. This table is projected by `document_fields.
 `reproject-fields` is safe to run against a live server: `StateDb::reproject_all_fields` re-reads each document's stored frontmatter *inside* the same transaction that rewrites its projection (rather than snapshotting paths and frontmatter up front), and retries on `SQLITE_BUSY`/`SQLITE_LOCKED` — so a concurrent index run or write-tool commit can never be reverted by a reprojection that raced it. A document whose stored frontmatter JSON is unparseable is skipped (logged as a warning) rather than aborting the whole run, and the command prints the count of documents successfully reprojected.
 
 A full reindex (`index --full`) also clears the `documents`/`document_fields` metadata index via `StateDb::clear`, alongside `indexed_files` — so a file removed from disk since the last full run cannot leave a phantom `list_documents` entry behind.
+
+### Link graph
+
+A third table, `document_links`, holds the edges behind the web UI's graph view and the move-time link rewriter — one row per (`source_path`, `target_path`, `kind`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `source_path` | TEXT | Document the link is written in |
+| `target_path` | TEXT | Document the link points at |
+| `kind` | TEXT | `markdown` (an inline link extracted from the source's body at ingest time) or `semantic` (a precomputed kNN neighbor, carrying a similarity `score`; opt-in via `ui.semantic_edges.enabled`, off by default) |
+| `score` | REAL, nullable | Cosine similarity for `semantic` edges; unset for `markdown` ones |
+
+Unlike `document_fields`, this table carries no foreign key to `documents` and no `ON DELETE CASCADE`: a link's target need not exist as an indexed document at all — it may point at a file that hasn't been indexed yet, or one that was since renamed or deleted out from under it. `GET /api/graph` (`web.rs`) drops dangling edges at read time instead of relying on the schema to keep them consistent. Rows for one `(source_path, kind)` are replaced wholesale (delete-then-insert in one transaction) whenever that file's outgoing links are recomputed, so a reader never observes a partially-replaced edge set, and a file's rows are removed outright on `delete_document`.
+
+The reverse lookup — "what points at this target" — is what `write_document`'s directory/document move uses to rewrite links: when a path moves, `StateDb::links_targeting` (scoped to `kind = "markdown"`, so precomputed semantic neighbors are never treated as literal link text to rewrite) names every source document whose body needs its link text updated to the new path, and the move updates each of them in the same commit.
 
 ### Qdrant payload schema
 
@@ -302,7 +323,7 @@ The queue itself is what used to be a single-flight `REINDEX_LOCK` (`Arc<tokio::
 
 `web.rs` serves a docs-first web UI on the *same port* as MCP (8001) — it is a second router merged into the one Axum app `server::run_server` builds, not a separate service. Its shell (`assets/ui/`) and every script it loads — Cytoscape.js plus its `layout-base`/`cose-base`/`fcose` layout plugins, `marked`/`dompurify` for rendering markdown safely, `edit.js` for the editor — are embedded into the binary via `include_str!` and served from `/assets/*`, so there are no filesystem reads or external fetches at request time.
 
-**Routes:** `/` (the shell), `/assets/*`, `/api/graph` (nodes from `StateDb::all_document_summaries`, edges from `StateDb::all_links` filtered to the current node set), `/api/search` (a thin wrapper over `retrieval::search`), `/api/schema/{*path}`, and `/api/doc/{*path}`, which carries all three HTTP methods on one route: `GET` (via `retrieval::get_document`, with the same `?start_line=&end_line=` slicing contract as the MCP tool and the CLI's `get`), `POST` (create, full-replace edit, or move — `write::write_document`), and `DELETE` (`write::delete_document`).
+**Routes:** `/` (the shell), `/assets/*`, `/api/graph` (nodes from `StateDb::all_document_summaries`, edges from `StateDb::all_links` — see [Link graph](#link-graph) above — filtered to the current node set), `/api/search` (a thin wrapper over `retrieval::search`), `/api/schema/{*path}`, and `/api/doc/{*path}`, which carries all three HTTP methods on one route: `GET` (via `retrieval::get_document`, with the same `?start_line=&end_line=` slicing contract as the MCP tool and the CLI's `get`), `POST` (create, full-replace edit, or move — `write::write_document`), and `DELETE` (`write::delete_document`).
 
 The UI itself is docs-first: a sidebar document tree and a semantic-search results panel are the primary views, hash-routed (home/browse/doc); the Cytoscape graph — full-KB or a per-document neighborhood, `fcose` layout, hover/zoom-gated labels — is reachable but secondary. A full create/edit/move/delete editor rides on top of the same `/api/doc/{*path}` route the read view uses.
 
