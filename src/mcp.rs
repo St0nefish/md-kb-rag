@@ -6826,6 +6826,7 @@ mod tests {
                 enabled: true,
                 strict: false,
                 lint_command: None,
+                ..Default::default()
             },
             webhook: crate::config::WebhookConfig::default(),
             mcp: crate::config::ResolvedMcpConfig::default(),

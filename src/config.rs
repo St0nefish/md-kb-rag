@@ -375,6 +375,20 @@ pub struct ValidationConfig {
     #[serde(default)]
     pub strict: bool,
     pub lint_command: Option<Vec<String>>,
+    /// Wall-clock timeout for a single `lint_command` invocation. Validation runs
+    /// inside `ingest::index_paths`, which is driven one file at a time by the
+    /// single background reindex worker (`reindex::run_worker`) — an operator-
+    /// configured lint script that hangs (waiting on stdin, a network call with no
+    /// timeout of its own, a misconfigured binary) would otherwise stall that
+    /// worker forever with no crash and no log line, silently taking indexing down
+    /// for the whole KB (#146). Same rationale as `embedding.request_timeout_secs`,
+    /// but a much shorter default: lint commands are typically fast static checks
+    /// (markdownlint, a small custom script) with nothing like the embedding
+    /// service's legitimate multi-second batch latency, so 30s is already generous
+    /// for real work while still catching a hang promptly. YAML-only, no env
+    /// override — a pure tuning knob like its `validation.*` neighbours.
+    #[serde(default = "default_lint_timeout_secs")]
+    pub lint_timeout_secs: u64,
 }
 
 impl Default for ValidationConfig {
@@ -383,12 +397,17 @@ impl Default for ValidationConfig {
             enabled: default_true(),
             strict: false,
             lint_command: None,
+            lint_timeout_secs: default_lint_timeout_secs(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_lint_timeout_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -868,6 +887,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("validation.enabled", "validation"),
     ("validation.strict", "validation"),
     ("validation.lint_command", "validation"),
+    ("validation.lint_timeout_secs", "validation"),
     ("webhook.secret_env", "webhook"),
     ("webhook.provider", "webhook"),
     ("mcp.bearer_token_env", "mcp"),
@@ -1217,6 +1237,9 @@ impl Config {
         }
         if self.embedding.request_timeout_secs == 0 {
             anyhow::bail!("embedding.request_timeout_secs must be >= 1");
+        }
+        if self.validation.lint_timeout_secs == 0 {
+            anyhow::bail!("validation.lint_timeout_secs must be >= 1");
         }
         if self.embedding.batch_concurrency == 0 {
             anyhow::bail!("embedding.batch_concurrency must be >= 1");
@@ -2351,6 +2374,26 @@ embedding:
         assert!(
             err.contains("batch_size"),
             "error should mention batch_size: {err}"
+        );
+
+        clear_required_env();
+    }
+
+    #[test]
+    fn zero_lint_timeout_secs_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+
+        let yaml = r#"
+validation:
+  lint_timeout_secs: 0
+"#;
+        let result = Config::from_str_raw(yaml).unwrap().resolve();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lint_timeout_secs"),
+            "error should mention lint_timeout_secs: {err}"
         );
 
         clear_required_env();
