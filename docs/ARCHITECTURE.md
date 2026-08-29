@@ -4,19 +4,20 @@ Current-state reference for md-kb-rag. For setup instructions see [`deploy/USAGE
 
 ## Overview
 
-`md-kb-rag` is a single Rust binary that combines three concerns:
+`md-kb-rag` is a single Rust binary that combines four concerns:
 
 - **Indexing pipeline** — walks a markdown knowledge base, chunks and embeds files, and stores vectors + state
 - **MCP server** — exposes exactly six tools over Streamable HTTP (port 8001): `search`, `get_document`, `write_document`, `delete_document`, `get_schema`, and `update_schema`
-- **Webhook handler** — receives push events from a Git forge, pulls changes, and triggers incremental reindex
+- **Webhook handler** — receives push events from a Git forge, pulls changes, and marks the changed paths dirty for the reindex worker (see [Webhook Flow](#webhook-flow))
+- **Web UI** — a docs-first browser and semantic-search UI, served at `/` on the same port, with a Cytoscape graph view and a full create/edit/move/delete document editor; deliberately unauthenticated by design (see [Web UI](#web-ui))
 
-All three share the same binary and config. The `serve` subcommand runs the server (MCP + webhook); the remaining subcommands are standalone CLI operations.
+All four share the same binary and config. The `serve` subcommand runs the server (MCP + webhook + web UI); the remaining subcommands are standalone CLI operations.
 
 ### Subcommands
 
 | Subcommand | Purpose |
 |---|---|
-| `serve` | Start the MCP server and webhook handler |
+| `serve` | Start the MCP server, webhook handler, and web UI |
 | `index` | Incremental reindex (changed files only) |
 | `index --full` | Full reindex — drops Qdrant collection and re-embeds everything |
 | `validate` | Check frontmatter on all files without indexing |
@@ -81,7 +82,8 @@ The MCP port (8001) is the only externally exposed port. This service is designe
 | `retrieval.rs` | Shared retrieval core: `search` and `get_document` logic used by `mcp.rs` |
 | `mcp.rs` | The six MCP tool handlers (`search` — covering both ranked query results and, with no `query`, the exhaustive enumeration formerly served by `list_documents` — `get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`): input validation, result formatting; delegates to `retrieval.rs` / `write.rs` / `state.rs` / `schema.rs` |
 | `descriptions.rs` | Assembles each tool's and the server's MCP description from compiled-in `assets/mcp/*.md` (mechanics true of every deployment), config-derived sentences (e.g. the hybrid/phrase retrieval-mode sentence), and a per-KB policy extension loaded at runtime from `mcp.extensions_path` in the served knowledge base (append-only, editable via `write_document`) |
-| `server.rs` | Axum server: MCP route, webhook route, bearer-token middleware, rate limiter, metadata refresh |
+| `web.rs` | The knowledge-base web UI — docs browser, semantic search, Cytoscape graph view, and a create/edit/move/delete editor — served straight from the binary and deliberately unauthenticated (see [Web UI](#web-ui)) |
+| `server.rs` | Axum server: MCP route, webhook route, `/health`/`/status`/`/metrics`/`POST /admin/reload`, and the unauthenticated web UI routes from `web.rs`, all merged in before the rate-limit `GovernorLayer` wrap; spawns the reindex worker and the periodic reconcile-sweep timer (`indexing.reconcile_interval_secs`) |
 | `webhook.rs` | Webhook handler: provider signature verification, branch filter, `git fetch` + `git merge --ff-only`, then diffs the pulled range and marks exactly those paths dirty on the `ReindexQueue` — it never indexes inline (see [Webhook Flow](#webhook-flow)) |
 | `validate.rs` | Frontmatter validation against the resolved `.kb-schema.yaml` cascade for each file's path (falls back to the `frontmatter` config as the implicit root schema) |
 | `git.rs` | Git subprocess helpers: token injection, URL redaction, fetch/merge with timeout |
@@ -296,18 +298,31 @@ There is no lock, no single-flight, and no coalesce-or-skip in the handler itsel
 
 The queue itself is what used to be a single-flight `REINDEX_LOCK` (`Arc<tokio::Mutex<()>>`, `try_lock_owned()`), and that design had a real bug: a webhook arriving while a previous one's inline reindex was still running lost its race for the lock and was **dropped** — skipped, not queued or replayed. `reindex::ReindexQueue` replaces that with coalesce-don't-drop semantics instead: every delivery's `mark_paths` call lands in the same dirty-path set (a `HashSet`, so marking an already-pending path is a no-op, not data loss), and the single background worker (`reindex::run_worker`) drains that set, indexes it, and immediately drains again — if new work landed while it was running, it loops and runs again before going back to sleep, rather than a losing webhook being dropped outright. A path is lost only if it is never marked at all, never because of *when* it was marked. The worker retries a transient failure (embeddings/Qdrant unreachable, git I/O) with exponential backoff up to a bounded attempt count before deferring to the next periodic reconcile sweep, and drops a permanent one (a strict-mode validation rejection) immediately, since the writer that caused it already saw the rejection. See `reindex.rs`'s module doc for the full design rationale, and [Webhook](../README.md#webhook) in the README for the operator-facing summary.
 
+## Web UI
+
+`web.rs` serves a docs-first web UI on the *same port* as MCP (8001) — it is a second router merged into the one Axum app `server::run_server` builds, not a separate service. Its shell (`assets/ui/`) and every script it loads — Cytoscape.js plus its `layout-base`/`cose-base`/`fcose` layout plugins, `marked`/`dompurify` for rendering markdown safely, `edit.js` for the editor — are embedded into the binary via `include_str!` and served from `/assets/*`, so there are no filesystem reads or external fetches at request time.
+
+**Routes:** `/` (the shell), `/assets/*`, `/api/graph` (nodes from `StateDb::all_document_summaries`, edges from `StateDb::all_links` filtered to the current node set), `/api/search` (a thin wrapper over `retrieval::search`), `/api/schema/{*path}`, and `/api/doc/{*path}`, which carries all three HTTP methods on one route: `GET` (via `retrieval::get_document`, with the same `?start_line=&end_line=` slicing contract as the MCP tool and the CLI's `get`), `POST` (create, full-replace edit, or move — `write::write_document`), and `DELETE` (`write::delete_document`).
+
+The UI itself is docs-first: a sidebar document tree and a semantic-search results panel are the primary views, hash-routed (home/browse/doc); the Cytoscape graph — full-KB or a per-document neighborhood, `fcose` layout, hover/zoom-gated labels — is reachable but secondary. A full create/edit/move/delete editor rides on top of the same `/api/doc/{*path}` route the read view uses.
+
+**`POST`/`DELETE /api/doc/{*path}` are thin adapters over the exact same `write::write_document`/`write::delete_document` pipeline the MCP `write_document`/`delete_document` tools use** — the same frontmatter validation, the same dedup gate on create, the same pre-commit rollback, the same `git::commit_and_sync` (commit and push to the knowledge base's real git remote), and the same marking of the written path dirty on the `ReindexQueue`. A web UI edit is indistinguishable, downstream, from an MCP write.
+
+**Deliberately unauthenticated, independent of `MCP_BEARER_TOKEN`.** Unlike `mcp_router`/`status_router`/`admin_router`, the web UI's router is merged into the app with no bearer-auth middleware layer at all (`server.rs`) — not "unauthenticated because `mcp.allow_unauthenticated` is set", but unauthenticated unconditionally, regardless of that setting. This applies equally to the read routes and to `POST`/`DELETE /api/doc/{*path}`: there is no separate, stricter gate on the write/delete routes. `web.rs`'s own module doc states the reasoning directly: the deployment this was built for sits behind an identity-aware reverse proxy (Authentik via Traefik), and the binary does not gate these routes itself — the same open-route posture `/health` already has. The startup log names the UI as unauthenticated, but does not currently spell out that this is independent of the bearer-token setting; see [README.md's Web UI section](../README.md#web-ui) for the operator-facing statement of what exposing this port directly, with no reverse-proxy auth in front, actually grants.
+
 ## Security Model
 
-This service is designed for intranet/tailnet deployment — the threat model assumes network-level access control at the perimeter.
+This service is designed for intranet/tailnet deployment — the threat model assumes network-level access control at the perimeter. That assumption carries the most weight for the web UI (see above), which has no authentication story of its own at all.
 
 | Control | Mechanism |
 |---|---|
 | MCP authentication | Bearer token (`mcp.bearer_token_env`); rejections logged at WARN |
 | Webhook authentication | HMAC-SHA256 (`webhook.secret_env`); failures logged at WARN with provider |
-| Path traversal | Every path-taking tool (`get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`) resolves and canonicalizes paths, then checks `starts_with(data_path)`; a leading `/` is treated as the KB root, not a filesystem escape hatch, and `..` components are rejected either way (see [Retrieval](#retrieval)) |
-| File-type restriction | `get_document` and the write tools check the resolved path against `indexing.include` glob patterns |
+| Web UI authentication | **None — by design, and independent of `mcp.bearer_token_env`/`mcp.allow_unauthenticated`.** Every route in `web.rs`, including `POST`/`DELETE /api/doc/{*path}`, is mounted with no bearer-auth layer; see [Web UI](#web-ui) above |
+| Path traversal | Every path-taking tool (`get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`) and the equivalent web UI routes resolve and canonicalize paths, then check `starts_with(data_path)`; a leading `/` is treated as the KB root, not a filesystem escape hatch, and `..` components are rejected either way (see [Retrieval](#retrieval)) |
+| File-type restriction | `get_document`, the write tools, and the web UI's write route check the resolved path against `indexing.include` glob patterns |
 | Facet value sanitization | MCP server instructions embed live facet values (available domains/types/tags) read from **indexed document frontmatter** in Qdrant; these are sanitized (control characters stripped, length-capped) before inclusion to mitigate prompt-injection against connected AI clients |
-| Rate limiting | Configurable token-bucket rate limiter on the MCP endpoint (`rate_limit.per_second`, `rate_limit.burst_size`) |
+| Rate limiting | Configurable token-bucket rate limiter (`rate_limit.per_second`, `rate_limit.burst_size`), applied to the whole app — MCP, webhook, and the unauthenticated web UI routes alike, since the `GovernorLayer` wraps the fully-merged router |
 
 ## Configuration and Environment Variables
 
