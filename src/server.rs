@@ -1450,6 +1450,32 @@ const MCP_PATH: &str = "/mcp";
 /// `/health` and the UI routes carry no `bearer_auth` layer.
 const HEALTH_PATH: &str = "/health";
 
+/// The startup warning `run_server` logs when `mcp.allow_unauthenticated: true` and
+/// no bearer token is configured — i.e. every route in the `STATUS_PATH`/
+/// `METRICS_PATH`/`ADMIN_RELOAD_PATH`/`MCP_PATH` group above is reachable by anyone.
+///
+/// Pulled out as its own function, rather than left inline in the `warn!` call, for
+/// two reasons: it lets `mod tests` assert on the message's actual content instead of
+/// only on the fact that some `warn!` fired, and — the point of #154 — it forces the
+/// endpoint list to be built from the same path constants `assemble_router` uses to
+/// wire up `bearer_auth`, rather than retyped as string literals that can silently
+/// drift from the route group they describe. That drift is exactly what happened
+/// before this fix: the message named only `/mcp`, `/status` and `/metrics`, omitting
+/// `/admin/reload` even though `reload_handler`'s own doc comment says it "gets no
+/// weaker a gate than" those two — an operator reading only this warning had no way
+/// to know `/admin/reload` was equally exposed.
+fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
+    format!(
+        "SECURITY: bearer token env var '{bearer_token_env}' is not set — {MCP_PATH}, \
+         {STATUS_PATH}, {METRICS_PATH} and {ADMIN_RELOAD_PATH} are all reachable WITHOUT \
+         authentication. {MCP_PATH} will serve full document content to any caller; \
+         {STATUS_PATH} and {METRICS_PATH} expose tag vocabularies, area names and document \
+         counts; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
+         unconditional full reindex reconcile. Set the env var or restrict network access. \
+         (allow_unauthenticated is enabled in config)"
+    )
+}
+
 /// Everything `assemble_router` needs to build the exact `Router` `run_server`
 /// serves. Bundled into one struct — rather than a long parameter list — so
 /// `mod tests` can construct the same deps against fake/in-memory backends and
@@ -1890,12 +1916,8 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
                 );
             }
             warn!(
-                "SECURITY: bearer token env var '{}' is not set — /mcp, /status and /metrics are \
-                 all reachable WITHOUT authentication. /mcp will serve full document content to \
-                 any caller; /status and /metrics expose tag vocabularies, area names and \
-                 document counts. Set the env var or restrict network access. \
-                 (allow_unauthenticated is enabled in config)",
-                config.mcp.bearer_token_env
+                "{}",
+                unauthenticated_mcp_warning(&config.mcp.bearer_token_env)
             );
             None
         }
@@ -3664,6 +3686,36 @@ mod tests {
                 reindex_queue: Arc::clone(&reindex_queue),
             }),
         }
+    }
+
+    // --- #154 ---
+
+    /// Regression: this warning used to name only `/mcp`, `/status` and `/metrics`,
+    /// omitting `/admin/reload` even though it shares `AuthState` with the other
+    /// three and is documented (`reload_handler`'s own doc comment) as equally
+    /// sensitive. Assert on the actual message content, not just "a warning fires" —
+    /// a content-blind test would have kept passing against the old, incomplete
+    /// message.
+    #[test]
+    fn unauthenticated_warning_names_every_protected_path() {
+        let msg = unauthenticated_mcp_warning("MCP_BEARER_TOKEN");
+        for path in [MCP_PATH, STATUS_PATH, METRICS_PATH, ADMIN_RELOAD_PATH] {
+            assert!(
+                msg.contains(path),
+                "warning must name {path} as unauthenticated-reachable: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("MCP_BEARER_TOKEN"),
+            "warning must name the actual env var an operator needs to set: {msg}"
+        );
+        // `/health` is deliberately open regardless of auth config (see its own
+        // const doc comment) — it must not appear as if disabling auth were what
+        // exposed it, which would misdescribe the actual security boundary.
+        assert!(
+            !msg.contains(HEALTH_PATH),
+            "must not describe /health: {msg}"
+        );
     }
 
     #[tokio::test]
