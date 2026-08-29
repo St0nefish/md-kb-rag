@@ -88,7 +88,10 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        # --all-targets lints test code too, matching .githooks/pre-commit. Without
+        # it, lint failures confined to #[cfg(test)] code sail past both the
+        # (opt-in) hook and CI (fix #196).
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run tests
         run: cargo test
