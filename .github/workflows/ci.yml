@@ -128,8 +128,102 @@ jobs:
             --file ./Dockerfile \
             .
 
+  # The mocked VectorStore suite proves nothing about real Qdrant wire
+  # semantics — filters, phrase matching, RRF, recommend. The six tests that
+  # do exercise a live server (src/qdrant.rs) are #[ignore]d, and plain
+  # `cargo test` (above) never passes --ignored, so none of them have ever
+  # run in CI (#186, and its narrower instance #133). Bring up the project's
+  # own qdrant service and run just those.
+  qdrant-integration:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: self-hosted
+    # Deliberately non-blocking for now: running this suite for the first time
+    # (while wiring it up) found phrase_index_enables_exact_phrase_matching
+    # and recommend_by_point_id_finds_nearest_neighbor FAILING against a real
+    # server — an invalid literal point-ID UUID in the phrase test's fixture,
+    # and a genuine assertion mismatch in the recommend test. Both are
+    # pre-existing bugs in the tests themselves (#133 already tracks the
+    # phrase one), not something this CI-wiring change fixes. Making the job
+    # required today would immediately red-flag every PR, including the one
+    # that adds it, over failures nobody here introduced. continue-on-error
+    # keeps the job's own pass/fail visible without letting it block, and it
+    # is deliberately left out of ci-pass's `needs` below for the same
+    # reason. Flip both once the underlying test bugs are fixed.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Rebase onto master
+        run: |
+          git config user.email "ci@stonefish.tech"
+          git config user.name "CI"
+          # Same self-hosted-runner hygiene as the test job above — see its
+          # comment for the two failure modes this guards against.
+          git rebase --abort 2>/dev/null || true
+          rm -rf .git/rebase-merge .git/rebase-apply
+          git fetch --force origin master "refs/pull/${{ github.event.pull_request.number }}/head"
+          git checkout --force --detach "${{ github.event.pull_request.head.sha }}"
+          git rebase origin/master
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Start Qdrant
+        run: |
+          # -v first: a persistent self-hosted runner can carry a leftover
+          # ./data/qdrant volume from a prior run — start every run clean.
+          docker compose -f docker-compose.yml down -v 2>/dev/null || true
+          docker compose -f docker-compose.yml up -d qdrant
+
+      - name: Wait for Qdrant to be healthy
+        run: |
+          # docker-compose.yml already defines qdrant's healthcheck; poll it
+          # directly instead of a fixed sleep (see deploy.sh's own fix, #198,
+          # for why a flat sleep isn't good enough here either).
+          timeout=60
+          elapsed=0
+          while true; do
+            status=$(docker compose -f docker-compose.yml ps --format json qdrant |
+              jq -rs 'flatten | .[0].Health // empty')
+            [[ "$status" == "healthy" ]] && break
+            if [[ "$status" == "unhealthy" ]] || (( elapsed >= timeout )); then
+              echo "::error::qdrant did not become healthy within ${timeout}s (status: ${status:-none})"
+              docker compose -f docker-compose.yml logs qdrant
+              exit 1
+            fi
+            sleep 2
+            elapsed=$((elapsed + 2))
+          done
+
+      - name: Run live-Qdrant tests
+        run: cargo test -- --ignored
+
+      - name: Stop Qdrant
+        if: always()
+        run: docker compose -f docker-compose.yml down -v
+
   # Gate job for branch protection — set "ci-pass" as the required status check.
   # Passes when test succeeds or was skipped (doc-only changes).
+  # qdrant-integration is deliberately NOT in this list — see its own comment.
   ci-pass:
     if: always()
     needs: [test]
