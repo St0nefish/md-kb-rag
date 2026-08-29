@@ -49,16 +49,16 @@ docker compose up -d kb-rag
 
 ### `/data/.git: Permission denied` on startup
 
-The named volume was created as root but the container runs with a non-root `user:` directive. The container can't write to the volume.
+The image runs as `nonroot` (uid 65532) unconditionally — this is baked into the Dockerfile, not something you opt into with a compose `user:` directive. Docker initializes a fresh named volume mount point by copying ownership from the image's directory at that path, if one exists. Images built before this was fixed had no `/data` directory in the image, so Docker created the mount point `root:root`, and the non-root container couldn't write to it — hitting every fresh deployment, `user:` uncommented or not.
 
-**Fix:** Set the volume ownership to match your container user before starting:
+Images from this fix forward create and chown `/data` in the image, so a fresh named volume comes up already writable by `nonroot` and this shouldn't occur. If you hit it anyway (e.g. a volume created by an older image before upgrading), fix the existing volume's ownership once:
 
 ```bash
 docker run --rm -v <volume_name>:/data --user root --entrypoint chown \
-  ghcr.io/st0nefish/md-kb-rag:latest <uid>:<gid> /data
+  ghcr.io/st0nefish/md-kb-rag:latest 65532:65532 /data
 ```
 
-Replace `<uid>:<gid>` with the values from your compose `user:` setting (e.g. `1000:1000`). This only needs to be done once per volume.
+If you're running the container with a custom compose `user:` override instead of the image default, replace `65532:65532` with that uid:gid. This only needs to be done once per pre-existing volume.
 
 ## Embedding Service
 
