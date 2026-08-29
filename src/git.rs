@@ -210,21 +210,30 @@ pub(crate) async fn rev_parse_head(_lock: &GitLock, data_path: &str) -> anyhow::
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Parse `git diff --name-status` output into the set of paths it touched.
+/// Parse `git diff --name-status -z` output into the set of paths it touched.
+///
+/// With `-z`, git NUL-delimits every field of the output — the status token AND
+/// each path — instead of separating status from path with a tab and one record
+/// from the next with a newline. That is what this function relies on: `-z` is
+/// also the one invocation shape where git does NOT C-quote/octal-escape a path
+/// containing non-ASCII bytes, tabs, backslashes, or quotes (`core.quotepath`'s
+/// effect and the newline-terminated `\t`-field format go together). Without
+/// `-z`, a file named `café.md` comes back as the literal 15-character string
+/// `"caf\303\251.md"` — quotes, backslashes, and all — which matches no real
+/// path on disk; `ReindexQueue::mark_paths` would then dirty a path that does
+/// not exist while the real file silently never gets reindexed (#143). Splitting
+/// the flat `-z`-delimited token stream below is what receives the raw bytes
+/// git actually wrote to the path, unmangled.
 ///
 /// Handles A(dded)/M(odified)/D(eleted) as a single path, and R(enamed)/C(opied) — which
-/// carry a similarity score suffix like `R100` and two tab-separated paths — as BOTH the
+/// carry a similarity score suffix like `R100` and two NUL-separated paths — as BOTH the
 /// old and new path, since both need reindexing (old: purge; new: index).
 fn parse_diff_name_status(output: &str) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let Some(status) = fields.next() else {
-            continue;
-        };
+    // Trailing (and any stray consecutive) NULs produce empty tokens; skip them
+    // rather than trying to parse a status out of "".
+    let mut fields = output.split('\0').filter(|s| !s.is_empty());
+    while let Some(status) = fields.next() {
         match status.chars().next() {
             Some('A') | Some('M') | Some('D') => {
                 if let Some(path) = fields.next() {
@@ -239,8 +248,8 @@ fn parse_diff_name_status(output: &str) -> Vec<std::path::PathBuf> {
             }
             _ => {
                 warn!(
-                    "Unrecognized 'git diff --name-status' line, ignoring: {}",
-                    line
+                    "Unrecognized 'git diff --name-status -z' status token, ignoring: {}",
+                    status
                 );
             }
         }
@@ -248,13 +257,17 @@ fn parse_diff_name_status(output: &str) -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// `git diff --name-status -M old..new` in `data_path`, parsed into touched paths.
+/// `git diff --name-status -M -z old..new` in `data_path`, parsed into touched paths.
 /// Local git only — no network. `-M` forces rename detection so a pure rename is
 /// reported as `R`, not as a delete+add pair (which would still work — both paths end
 /// up in the result — but would cost the new path an unnecessary re-embed instead of
 /// letting `index_paths` see it as unchanged content under a new name... which it
 /// cannot, since content hashing does not know about the old path. Either way both
 /// paths are enqueued; `-M` is for a cleaner log line, not correctness here).
+///
+/// `-z` NUL-delimits the output instead of git's default newline/tab-delimited,
+/// C-quoted format — see [`parse_diff_name_status`]'s doc comment for why that
+/// matters for any path containing non-ASCII bytes or other special characters.
 pub(crate) async fn git_diff_name_status(
     _lock: &GitLock,
     data_path: &str,
@@ -271,6 +284,7 @@ pub(crate) async fn git_diff_name_status(
                 "diff",
                 "--name-status",
                 "-M",
+                "-z",
                 &range,
             ])
             .current_dir(data_path)
@@ -1465,6 +1479,51 @@ pub(crate) mod tests {
         );
     }
 
+    /// #143 regression, exercised against a real `git diff` invocation rather
+    /// than a hand-built string: git's default `core.quotepath=true` C-quotes
+    /// and octal-escapes any path with non-ASCII bytes in `--name-status`
+    /// output, so without `-z` this returned `"caf\303\251.md"` verbatim — a
+    /// string matching no real file on disk — instead of `café.md`.
+    #[tokio::test]
+    async fn git_diff_name_status_handles_a_non_ascii_filename() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        let old_head = rev_parse_head(&lock, work_path).await.unwrap();
+
+        std::fs::write(work.path().join("café.md"), "content").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "café.md"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add café.md",
+            ])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        let new_head = rev_parse_head(&lock, work_path).await.unwrap();
+
+        let paths = git_diff_name_status(&lock, work_path, &old_head, &new_head)
+            .await
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![std::path::PathBuf::from("café.md")],
+            "the real, unmangled filename must come back — not git's quoted/escaped form"
+        );
+    }
+
     /// Two independent new files, committed together via a two-element `paths`
     /// slice, must land as a single commit that contains both — not two commits,
     /// and not one commit missing either file.
@@ -2188,7 +2247,9 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_diff_name_status_handles_add_modify_delete() {
-        let out = "A\tnew.md\nM\tchanged.md\nD\tgone.md\n";
+        // `-z` NUL-delimits every field — status AND path — rather than
+        // tab-separating fields and newline-separating records.
+        let out = "A\0new.md\0M\0changed.md\0D\0gone.md\0";
         let paths = parse_diff_name_status(out);
         assert_eq!(
             paths,
@@ -2202,8 +2263,9 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_diff_name_status_enqueues_both_sides_of_a_rename() {
-        // Git reports renames with a similarity-score suffix on the status ("R100").
-        let out = "R100\told-name.md\tnew-name.md\n";
+        // Git reports renames with a similarity-score suffix on the status
+        // ("R100"), still NUL-separated from the two paths under `-z`.
+        let out = "R100\0old-name.md\0new-name.md\0";
         let paths = parse_diff_name_status(out);
         assert_eq!(
             paths,
@@ -2216,11 +2278,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn parse_diff_name_status_ignores_blank_lines() {
-        let out = "A\tnew.md\n\n";
+    fn parse_diff_name_status_ignores_trailing_and_stray_empty_tokens() {
+        // A trailing NUL (git always terminates the last record with one, same
+        // as every other) must not be mistaken for an empty status token.
+        let out = "A\0new.md\0\0";
         assert_eq!(
             parse_diff_name_status(out),
             vec![std::path::PathBuf::from("new.md")]
+        );
+    }
+
+    /// #143 regression: without `-z`, git C-quotes/octal-escapes any path
+    /// containing non-ASCII bytes (also tabs/backslashes/quotes) by default
+    /// (`core.quotepath=true`), and the old tab/newline-based parser returned
+    /// that quoted string verbatim — a value matching no real file on disk.
+    /// `-z` output is never quoted, so the raw bytes git wrote to the path
+    /// come through unmangled.
+    #[test]
+    fn parse_diff_name_status_handles_non_ascii_and_special_paths() {
+        let out = "M\0caf\u{e9}.md\0D\0gone.md\0R100\0old.md\0new\u{201c}quoted\u{201d}.md\0";
+        let paths = parse_diff_name_status(out);
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("caf\u{e9}.md"),
+                std::path::PathBuf::from("gone.md"),
+                std::path::PathBuf::from("old.md"),
+                std::path::PathBuf::from("new\u{201c}quoted\u{201d}.md"),
+            ]
         );
     }
 
