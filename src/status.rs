@@ -171,12 +171,18 @@ pub struct RunCounters {
     pub frozen_by_broken_schema: u64,
     pub broken_schemas: u64,
     pub orphans_removed: u64,
+    /// Files rejected this run by `validation.strict` — see `ingest::FileOutcome::Rejected`.
+    /// Unlike every other counter here, a non-zero value is not fully explained by this
+    /// one run: `INDEX_STATUS::strict_rejected_files` (populated alongside this counter)
+    /// is the durable, per-path view that survives past this run's summary, because a
+    /// rejected file's state row is never updated and so it resurfaces on every sweep.
+    pub strict_rejected: u64,
 }
 
 impl RunCounters {
     /// Name/value pairs for the Prometheus encoder, so adding a counter above cannot
     /// silently fail to appear in `/metrics`.
-    pub fn as_pairs(&self) -> [(&'static str, u64); 10] {
+    pub fn as_pairs(&self) -> [(&'static str, u64); 11] {
         [
             ("discovered", self.discovered),
             ("indexed", self.indexed),
@@ -188,6 +194,7 @@ impl RunCounters {
             ("frozen_by_broken_schema", self.frozen_by_broken_schema),
             ("broken_schemas", self.broken_schemas),
             ("orphans_removed", self.orphans_removed),
+            ("strict_rejected", self.strict_rejected),
         ]
     }
 }
@@ -240,6 +247,26 @@ pub enum PayloadIndexState {
     Failed { error: String },
 }
 
+/// A file currently rejected by `validation.strict`, and why.
+///
+/// Populated via [`IndexStatus::record_strict_rejection`] from `ingest::index_paths`
+/// when `process_file` returns `FileOutcome::Rejected` for a path, and cleared for
+/// that path when it later indexes cleanly (`FileOutcome::Ready`) or is purged as an
+/// orphan (removed from disk). See that method's doc comment for why a healed path is
+/// removed from the map entirely rather than flipped to some "ok" variant — unlike
+/// [`PayloadIndexState`], there is no healthy state worth recording here, only an
+/// absence of a defect.
+///
+/// This is deliberately per-run-instance state (reset on restart, like everything else
+/// in this module), not a substitute for durability: what makes it trustworthy anyway
+/// is that a rejected file's `indexed_files` row is never updated on rejection, so
+/// `scan_for_dirty` re-presents it on every reconcile sweep — the map repopulates
+/// within one sweep interval even after a restart wipes it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StrictRejection {
+    pub reason: String,
+}
+
 /// Everything the status endpoints read, captured under one lock acquisition.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusSnapshot {
@@ -259,6 +286,11 @@ pub struct StatusSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_at: Option<String>,
     pub payload_indexes: BTreeMap<String, PayloadIndexState>,
+    /// Files currently rejected by `validation.strict`, keyed by repo-relative path.
+    /// The map's cardinality is the `kb_strict_rejected_files` gauge — see
+    /// [`StrictRejection`] for why an entry is removed on healing rather than marked ok.
+    #[serde(default)]
+    pub strict_rejected_files: BTreeMap<String, StrictRejection>,
 }
 
 #[derive(Debug)]
@@ -288,6 +320,7 @@ struct Inner {
     runs_failed: u64,
     last_success_unix: Option<i64>,
     payload_indexes: BTreeMap<String, PayloadIndexState>,
+    strict_rejected_files: BTreeMap<String, StrictRejection>,
 }
 
 /// In-memory record of indexing activity for this process.
@@ -452,6 +485,31 @@ impl IndexStatus {
         });
     }
 
+    /// Record (or clear) a strict-mode validation rejection for `path`.
+    ///
+    /// `Some(reason)` marks the path rejected — call this from `ingest::index_paths`
+    /// exactly when `process_file` returns `FileOutcome::Rejected { reason }` for it.
+    /// `None` clears it — call this when the same path later reaches
+    /// `FileOutcome::Ready` (it validated cleanly this run) or is purged as an orphan
+    /// (deleted from disk, so it can never resurface as dirty again). Mirrors
+    /// [`Self::record_payload_index`]'s "record every outcome, including recovery" shape,
+    /// with one difference: a healed path is removed from the map entirely rather than
+    /// recorded as some `Ok` variant, because the map's cardinality IS the
+    /// `kb_strict_rejected_files` gauge — a path with no current defect must not linger
+    /// in it under any state, healthy or otherwise.
+    pub fn record_strict_rejection(&self, path: &str, reason: Option<String>) {
+        self.with(|inner| match reason {
+            Some(reason) => {
+                inner
+                    .strict_rejected_files
+                    .insert(path.to_string(), StrictRejection { reason });
+            }
+            None => {
+                inner.strict_rejected_files.remove(path);
+            }
+        });
+    }
+
     /// Whether the phrase-matching text index on the `text` payload field is known
     /// to be present and working, per the last `ensure_collection` outcome recorded
     /// via [`Self::record_payload_index`] for `"text"`.
@@ -495,6 +553,7 @@ impl IndexStatus {
             last_success_unix: inner.last_success_unix,
             last_success_at: inner.last_success_unix.map(format_unix),
             payload_indexes: inner.payload_indexes.clone(),
+            strict_rejected_files: inner.strict_rejected_files.clone(),
         })
     }
 }
@@ -907,13 +966,39 @@ mod tests {
             frozen_by_broken_schema: 8,
             broken_schemas: 9,
             orphans_removed: 10,
+            strict_rejected: 11,
         };
         let pairs = c.as_pairs();
         // Every field is distinct and non-zero above, so a missing or duplicated entry
         // in as_pairs() shows up as a sum mismatch.
-        assert_eq!(pairs.iter().map(|(_, v)| v).sum::<u64>(), 55);
+        assert_eq!(pairs.iter().map(|(_, v)| v).sum::<u64>(), 66);
         let names: std::collections::BTreeSet<_> = pairs.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
+    }
+
+    #[test]
+    fn strict_rejections_are_recorded_and_cleared_on_healing() {
+        let s = IndexStatus::new();
+        s.record_strict_rejection("bad.md", Some("missing 'description'".into()));
+        s.record_strict_rejection("also-bad.md", Some("missing 'title'".into()));
+
+        let snap = s.snapshot();
+        assert_eq!(snap.strict_rejected_files.len(), 2);
+        assert_eq!(
+            snap.strict_rejected_files.get("bad.md"),
+            Some(&StrictRejection {
+                reason: "missing 'description'".into()
+            })
+        );
+
+        // A later clean run (Ready) or an orphan purge clears the entry entirely —
+        // unlike `record_payload_index`, there is no "ok" variant to flip to; a
+        // healed path must not linger in the map under any state.
+        s.record_strict_rejection("bad.md", None);
+        let snap = s.snapshot();
+        assert_eq!(snap.strict_rejected_files.len(), 1);
+        assert!(!snap.strict_rejected_files.contains_key("bad.md"));
+        assert!(snap.strict_rejected_files.contains_key("also-bad.md"));
     }
 
     #[test]

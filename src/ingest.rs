@@ -290,6 +290,55 @@ enum FileOutcome {
     Invalid,
     Empty,
     Ready(PendingFile),
+    /// A `validation.strict` rejection: the content-level validation errors branch
+    /// (`Ok((result, None))`) or the validation-engine error branch (`Err(e)`), when
+    /// `config.validation.strict` is set, both land here instead of propagating an
+    /// `Err` out of `process_file`.
+    ///
+    /// This used to be `anyhow::bail!`/`Err`, propagated with `?` out of the whole
+    /// `index_paths_generic` per-path loop (#156). That meant one bad file — a
+    /// direct push bypassing the write-tool validation gate, say — aborted the
+    /// entire call: every other file already read and chunked into `pending` for
+    /// that run was discarded before ever reaching `upsert_pending`, and every path
+    /// later in the worklist was never even scanned. `reindex.rs`'s
+    /// `is_permanent_failure` then classified the propagated error as permanent (it
+    /// matched the `"(strict mode)"` substring) and dropped the whole coalesced
+    /// unit — so one bad file, once, permanently disabled indexing for every other
+    /// file coalesced alongside it in that run. Worse: because a rejected file's
+    /// `indexed_files` state row is never written (there is nothing valid to
+    /// record), `scan_for_dirty` re-flags it as dirty on every subsequent reconcile
+    /// sweep forever — so every FUTURE `FullReconcile` unit also contained the same
+    /// bad file, also bailed, and was also dropped as permanent. One bad file
+    /// permanently disabled all background reconciliation, not just its own batch.
+    ///
+    /// `Rejected` fixes this the same way `Invalid`/`Empty`/`Skipped` already work:
+    /// it is a per-file outcome the per-path loop in `index_paths_generic` accumulates
+    /// into a counter and continues past, so one rejection can never abort the batch.
+    /// Deliberately NOT the issue's own suggested fix of catching the `Err` inside the
+    /// loop instead — that would encode "file rejected" two different ways (a
+    /// substring-matched `Err` AND a typed outcome) and inherit the same
+    /// string-matching fragility `is_permanent_failure` already has, for no benefit.
+    ///
+    /// Two consequences worth stating plainly:
+    ///   - The rejected file's OLD points and metadata (if any — from before the
+    ///     rejected edit) stay in the index untouched, so search keeps serving the
+    ///     pre-push version indefinitely. That is the correct degrade, and strictly
+    ///     better than the pre-#156 behavior (where the other 49 valid files in the
+    ///     same batch ALSO served stale content, not just this one) — but it is a
+    ///     silent staleness unless surfaced, which is why every `Rejected` outcome
+    ///     is mirrored into `status::INDEX_STATUS`'s persistent rejection registry
+    ///     (`record_strict_rejection`) rather than only counted for this run.
+    ///   - A TRANSIENT validation failure (a flaky `lint_command` exec, say) is no
+    ///     longer retried within this run/unit the way an `Err` used to be
+    ///     (retried whole-unit by `reindex::run_with_retry`'s backoff loop). But
+    ///     because the file's state row is never updated on rejection, it stays
+    ///     dirty forever and the periodic reconcile sweep re-validates it every
+    ///     `indexing.reconcile_interval_secs` — so it self-heals on the very next
+    ///     sweep once the transient condition clears, just on that cadence instead
+    ///     of the tighter retry-with-backoff one.
+    Rejected {
+        reason: String,
+    },
 }
 
 /// Process a single file: hash, skip-if-unchanged, validate, chunk.
@@ -372,11 +421,16 @@ async fn process_file(
                 }
 
                 if config.validation.strict {
-                    anyhow::bail!(
-                        "Validation failed for '{}' (strict mode): {:?}",
-                        file_path,
-                        result.errors
+                    let reason = format!("Validation failed (strict mode): {:?}", result.errors);
+                    error!(
+                        file = %file_path,
+                        "Rejecting (strict mode): {}. This file's previously-indexed \
+                         content, if any, stays served unchanged until it is fixed — its \
+                         state row is never updated on rejection, so it resurfaces and is \
+                         re-validated on every reconcile sweep until it passes.",
+                        reason
                     );
+                    return Ok(FileOutcome::Rejected { reason });
                 }
 
                 Ok(FileOutcome::Invalid)
@@ -385,9 +439,15 @@ async fn process_file(
                 error!("Failed to validate {}: {:#}", file_path, e);
 
                 if config.validation.strict {
-                    return Err(e).with_context(|| {
-                        format!("Validation error in strict mode for '{}'", file_path)
-                    });
+                    let reason = format!("Validation error in strict mode: {:#}", e);
+                    error!(
+                        file = %file_path,
+                        "Rejecting (strict mode, validation engine error): {}. Same \
+                         self-healing behavior as a content rejection — re-validated on \
+                         every reconcile sweep until the validator stops erroring.",
+                        reason
+                    );
+                    return Ok(FileOutcome::Rejected { reason });
                 }
 
                 Ok(FileOutcome::Invalid)
@@ -780,6 +840,14 @@ async fn remove_orphans<Q: VectorStore>(
         }
 
         info!("Removed orphaned file: {}", file_path);
+
+        // A file can be deleted from disk while it is still standing rejected by
+        // strict-mode validation (the bad edit gets reverted via deletion rather than
+        // a fix). It can never resurface as dirty again once it is gone, so a
+        // rejection entry for it would otherwise linger in the registry forever with
+        // no future sweep able to clear it. `record_strict_rejection` is a no-op if
+        // this path was never rejected.
+        crate::status::INDEX_STATUS.record_strict_rejection(file_path, None);
     }
     Ok(())
 }
@@ -2099,6 +2167,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     let mut empty = 0usize;
     let mut read_errors = 0usize;
     let mut frozen = 0usize;
+    let mut rejected = 0usize;
 
     INDEX_STATUS.set_phase(Phase::Scanning);
     let mut scanned = 0usize;
@@ -2190,7 +2259,23 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             }
             FileOutcome::Invalid => invalid += 1,
             FileOutcome::Empty => empty += 1,
-            FileOutcome::Ready(pf) => pending.push(pf),
+            FileOutcome::Rejected { reason } => {
+                rejected += 1;
+                // Persistent, per-path — see `FileOutcome::Rejected`'s doc comment and
+                // `IndexStatus::record_strict_rejection`. This is what keeps the defect
+                // visible after this run's summary line scrolls away and after the next
+                // unrelated write resets `RunCounters` for a different path.
+                INDEX_STATUS.record_strict_rejection(rel_key, Some(reason));
+            }
+            FileOutcome::Ready(pf) => {
+                // Clears any stale rejection for this path: it validated cleanly this
+                // time, whatever the earlier defect was. Cleared here rather than only
+                // after `upsert_pending` succeeds below — a failure there is a batch-
+                // level infrastructure problem (Qdrant/embeddings unreachable), unrelated
+                // to this file's validity, and is retried at the run level regardless.
+                INDEX_STATUS.record_strict_rejection(rel_key, None);
+                pending.push(pf);
+            }
         }
     }
 
@@ -2247,6 +2332,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         frozen_by_broken_schema: frozen as u64,
         broken_schemas: schemas.broken_scopes().count() as u64,
         orphans_removed: missing.len() as u64,
+        strict_rejected: rejected as u64,
     };
     INDEX_STATUS.set_counters(counters.clone());
 
@@ -2261,6 +2347,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         frozen_by_broken_schema = counters.frozen_by_broken_schema,
         broken_schemas = counters.broken_schemas,
         orphans_removed = counters.orphans_removed,
+        strict_rejected = counters.strict_rejected,
         elapsed_secs = run_start.elapsed().as_secs_f64(),
         "Indexing run complete"
     );
@@ -2555,6 +2642,91 @@ mod tests {
             state.document_count().await.unwrap(),
             2,
             "changed.md + unchanged.md remain; missing.md's metadata is gone"
+        );
+    }
+
+    /// #156: before the fix, `process_file` returned `Err` for a `validation.strict`
+    /// rejection, and this function's per-path loop let that `Err` propagate straight
+    /// out of the whole call via `?` — aborting the entire batch. A valid file
+    /// coalesced alongside a rejected one in the same run would never be embedded or
+    /// upserted, and the whole run would report as failed.
+    ///
+    /// This test indexes one valid file and one strict-mode-rejected file together.
+    /// Before the fix, `result.is_ok()` is false (the call returns `Err` and nothing is
+    /// upserted) — this assertion is what pins the regression. After the fix, the run
+    /// succeeds and the valid file is still indexed; only the bad one is skipped.
+    #[tokio::test]
+    async fn index_paths_generic_one_strict_rejection_does_not_drop_the_rest_of_the_batch() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+        config.validation = crate::config::ValidationConfig {
+            enabled: true,
+            strict: true,
+            ..Default::default()
+        };
+        config.frontmatter = crate::config::FrontmatterConfig {
+            required: vec!["title".into()],
+            ..Default::default()
+        };
+
+        std::fs::write(
+            dir.path().join("good.md"),
+            "---\ntitle: Good\n---\n# Good\n\nValid body.",
+        )
+        .unwrap();
+        // Missing the required `title` — rejected under strict mode.
+        std::fs::write(
+            dir.path().join("bad.md"),
+            "---\n---\n# Bad\n\nMissing the required title.",
+        )
+        .unwrap();
+
+        let paths = vec![PathBuf::from("good.md"), PathBuf::from("bad.md")];
+        // Exactly 1 embedding expected: only "good.md" should ever reach
+        // `upsert_pending`. If the rejection ever let "bad.md" through too, the
+        // embedding-count mismatch check in `upsert_pending` would itself fail the run
+        // — a second, independent signal on top of the assertions below.
+        let embedder = MockEmbedClient::ok(vec![vec![1.0, 2.0, 3.0]]);
+        let store = TrackingMockVectorStore::all_ok();
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "one strict-mode rejection must not abort the whole batch: {:?}",
+            result.err()
+        );
+
+        {
+            let points = store.upserted_points.lock().unwrap();
+            assert_eq!(points.len(), 1, "the valid file must still be indexed");
+            assert_eq!(
+                points[0].payload.get("file_path").and_then(|v| v.as_str()),
+                Some("good.md")
+            );
+        }
+
+        // The rejected file's state row must never be written — this is what makes it
+        // resurface as dirty on every future reconcile sweep instead of being silently
+        // forgotten (see `FileOutcome::Rejected`'s doc comment).
+        let state = StateDb::new(Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        assert!(
+            state.get("bad.md").await.unwrap().is_none(),
+            "a rejected file must never get a state row"
+        );
+        assert!(
+            state.get("good.md").await.unwrap().is_some(),
+            "the valid file must be tracked"
         );
     }
 
@@ -3911,8 +4083,15 @@ mod tests {
         assert!(matches!(outcome, FileOutcome::Invalid));
     }
 
+    /// #156: a strict-mode validation failure used to propagate as `Err`, which
+    /// `index_paths_generic`'s per-path loop then let `?` straight out of the whole
+    /// call — aborting every other file in the same batch. It must instead come back
+    /// as a typed `FileOutcome::Rejected` outcome the loop can accumulate and continue
+    /// past, exactly like `Invalid`/`Empty`/`Skipped` already do. Before the fix this
+    /// test asserted `result.is_err()`; that assertion now fails (process_file returns
+    /// `Ok(FileOutcome::Rejected { .. })`), which is what pins the behavior change.
     #[tokio::test]
-    async fn process_file_strict_validation_failure_is_error() {
+    async fn process_file_strict_validation_failure_is_rejected_not_err() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("doc.md");
         let content = "---\ntitle: Test\n---\n# Hello\nBody.";
@@ -3932,7 +4111,7 @@ mod tests {
             c
         };
 
-        let result = process_file(
+        let outcome = process_file(
             &path,
             "doc.md",
             content,
@@ -3942,9 +4121,35 @@ mod tests {
             &ResolvedSchema::from_config(&config.frontmatter),
             "",
         )
-        .await;
-        assert!(result.is_err(), "Strict mode should propagate as Err");
+        .await
+        .expect("a strict-mode rejection must be Ok(Rejected), never Err");
+
+        match outcome {
+            FileOutcome::Rejected { reason } => {
+                assert!(
+                    reason.contains("description"),
+                    "reason should name the missing field: {reason}"
+                );
+            }
+            other => panic!(
+                "Expected Rejected for a strict-mode validation failure, got {}",
+                outcome_name(&other)
+            ),
+        }
     }
+
+    // NOTE: there is deliberately no test here for the `Err(e)` arm of process_file's
+    // `match validate::validate_content(...)` (the "validation engine error" branch,
+    // formatted as "Validation error in strict mode: {:#}") converting to `Rejected`.
+    // As of this change, `validate::validate_content` has no `?`/error-propagating path
+    // in its body at all — every outcome it can produce (including a lint command that
+    // fails to spawn, or times out) is folded into `field_errors` and returned as
+    // `Ok((result, None))`, which is the content-rejection branch already covered
+    // above. That `Err(e)` arm is therefore unreachable through the public API today,
+    // both before and after this change — it is converted for symmetry and as a
+    // defensive backstop (see `FileOutcome::Rejected`'s doc comment and #159's note on
+    // the "no parentheses" formatting discrepancy this also fixes), not because a live
+    // path exercises it.
 
     #[tokio::test]
     async fn unchanged_content_with_unchanged_schema_is_skipped() {
@@ -4128,6 +4333,7 @@ mod tests {
             FileOutcome::Invalid => "Invalid",
             FileOutcome::Empty => "Empty",
             FileOutcome::Ready(_) => "Ready",
+            FileOutcome::Rejected { .. } => "Rejected",
         }
     }
 
