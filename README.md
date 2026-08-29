@@ -211,7 +211,15 @@ Most common GPU backend. Requires [nvidia-container-toolkit](https://docs.nvidia
 
 ### AMD ROCm
 
-Best performance on AMD GPUs. Requires ROCm userspace drivers on the host. In `docker-compose.yml`, uncomment the `## --- AMD ROCm ---` block (which uses `server-rocm` with `/dev/kfd` and `/dev/dri` device access), or use the `deploy/templates/compose-rocm.yml` template.
+Best performance on AMD GPUs. Requires ROCm userspace drivers on the host.
+
+> **RDNA3/RDNA4 (gfx11xx/gfx12xx):** check `rocm-smi` at idle after starting the
+> stack. An AMD MES firmware bug ([ROCm/ROCm#5706](https://github.com/ROCm/ROCm/issues/5706))
+> pins the GPU at 100% and ~90W continuously whenever an encoder model is offloaded
+> through HIP — which is what the embedding and reranking servers do. Either update
+> GPU firmware to MES `0x8b` (amdgpu 31.20.0+), or use the Vulkan backend below.
+> See [GPU Backends](deploy/TROUBLESHOOTING.md#gpu-backends) for diagnosis and the
+> workarounds that do and do not work. In `docker-compose.yml`, uncomment the `## --- AMD ROCm ---` block (which uses `server-rocm` with `/dev/kfd` and `/dev/dri` device access), or use the `deploy/templates/compose-rocm.yml` template.
 
 For fine-grained control (e.g. targeting a specific GPU render node or setting `HSA_OVERRIDE_GFX_VERSION`), use a `docker-compose.override.yml`:
 

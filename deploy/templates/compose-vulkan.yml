@@ -1,6 +1,12 @@
 # md-kb-rag — AMD Vulkan embedding backend
 # Works with standard Mesa Vulkan drivers. Supports multi-GPU.
 # Usage: cp compose-vulkan.yml docker-compose.yml && docker compose up -d
+#
+# Preferred over compose-rocm.yml on RDNA3/RDNA4 unless your GPU firmware is
+# MES 0x8b or newer: the ROCm/HIP path pins the card at 100% and ~90W while idle
+# with encoder models (ROCm/ROCm#5706), and Vulkan does not. Costs roughly 40-50%
+# more time per batch. Same GGUF models and the same server flags — only the image
+# tag differs. See deploy/TROUBLESHOOTING.md -> GPU Backends.
 
 services:
   qdrant:

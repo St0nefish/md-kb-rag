@@ -80,6 +80,112 @@ You're likely running the CPU image when a GPU is available.
 
 **Fix:** Switch to the appropriate GPU image in `docker-compose.yml` (see commented blocks) and add `-ngl 999` to offload all layers to GPU.
 
+On AMD RDNA3/RDNA4, check `rocm-smi` at idle afterwards — offloading an encoder
+through ROCm can pin the card at 100% forever. See [GPU Backends](#gpu-backends).
+
+
+## GPU Backends
+
+### GPU pinned at 100% while completely idle (AMD ROCm)
+
+**Symptom.** An AMD GPU serving embeddings or reranking sits at 100% utilisation,
+core clock at maximum, and 80–100W draw — continuously, while the server handles
+no requests at all. Memory clock stays at idle, which is the tell: real inference
+saturates memory bandwidth, a busy-wait loop does not.
+
+Confirm it with `rocm-smi` while nothing is being indexed or searched:
+
+```text
+GPU  Temp    AvgPwr  SCLK     MCLK   VRAM%  GPU%
+0    68.0c   97.0W   3423Mhz  96Mhz  76%    100%    <- spinning
+1    38.0c   14.0W   41Mhz    96Mhz  78%    3%      <- healthy idle
+```
+
+Stop the container; if utilisation drops to ~3% and power to ~15W, that container
+is the cause.
+
+**Cause.** An AMD MES firmware bug affecting RDNA3/RDNA4 (gfx11xx/gfx12xx), tracked
+as [ROCm/ROCm#5706](https://github.com/ROCm/ROCm/issues/5706). It is a HIP runtime
+problem, not a llama.cpp one — it also reproduces under PyTorch-ROCm with no
+workload at all ([ROCm/ROCm#6298](https://github.com/ROCm/ROCm/issues/6298)).
+
+On this project's workload it appears specifically when an **encoder** model is
+offloaded to GPU (`-ngl` > 0): both embedding and reranking servers trigger it, in
+either `--embeddings` or `--reranking` mode. Decoder models on the same image and
+host do not.
+
+**Fix, in order of preference:**
+
+1. **Update the GPU firmware.** MES firmware `0x8b` (amdgpu 31.20.0+) resolves it at
+   the source. Check what you have:
+
+   ```bash
+   sudo grep -i "^MES feature" /sys/kernel/debug/dri/*/amdgpu_firmware_info
+   ```
+
+   `0x81` and similar are affected. Note that a distribution `linux-firmware`
+   package may be far older than your GPU — check its snapshot date before
+   assuming an upgrade will help.
+
+2. **Use the Vulkan backend for the encoders** (`compose-vulkan.yml`). Vulkan does
+   not go through HIP and does not exhibit the bug. It costs roughly 40–50% more
+   time per rerank batch than ROCm, which is usually a good trade against ~80W
+   burned continuously. GGUF models and all server flags carry over unchanged —
+   only the image tag differs.
+
+3. **Run the encoders on CPU.** Avoids the spin, but for reranking specifically
+   expect roughly 25–30× the latency; measured at 76s versus 2.8s for 150
+   candidates on one deployment. Viable for embeddings, which are cheap per query;
+   generally not viable for reranking.
+
+Things that do **not** fix it, all tested: `--parallel 1`, `--poll 0`,
+`HSA_ENABLE_INTERRUPT=1`, removing `HSA_OVERRIDE_GFX_VERSION`, and
+`GPU_MAX_HW_QUEUES=1` (which is reported to work for decoder models, but does not
+help encoders).
+
+### Reranking returns 500 on every request
+
+**Symptom.** `Reranker unavailable, falling back to fused order` in the logs, or
+searches that take tens of seconds and then return unranked results. Querying the
+reranker directly returns:
+
+```json
+{"error":{"code":500,"message":"input (518 tokens) is too large to process. increase the physical batch size (current batch size: 512)"}}
+```
+
+**Cause.** A single candidate chunk exceeds the reranker's physical batch size, and
+the server rejects the whole request rather than that one document. llama.cpp
+defaults `--ubatch-size` to 512 tokens; chunks at the default `max_chunk_size` of
+1500 characters can exceed that.
+
+**Fix.** Raise the reranker's batch and context sizing so a single query-plus-document
+pair fits comfortably:
+
+```yaml
+      --ctx-size 16384
+      --batch-size 2048
+      --ubatch-size 2048
+```
+
+Size `--ctx-size` for the number of parallel slots as well — llama.cpp divides it
+across them, and it will cap per-slot context to the model's training context.
+Going too large fails at startup with `failed to fit params to free device memory`
+when the card is shared with another model.
+
+### Reranking is enabled but never runs
+
+**Symptom.** `reranking.enabled: true`, the reranker container is healthy, but
+`search` with `explain: true` returns `pre_rerank_score: null` on every result and
+ranking looks like plain vector fusion.
+
+**Cause.** The reranker is being called with an empty document list, so it returns
+immediately and the fused order stands. Historically this was caused by a payload
+key mismatch between what indexing wrote and what retrieval read (fixed in #125,
+which routes both through `qdrant::CHUNK_TEXT_KEY`).
+
+**Fix.** Confirm the reranker is reachable and returns scores when called directly.
+If it does, and `pre_rerank_score` is still null, the candidate list is empty before
+it is sent — check that chunks carry text in the payload field retrieval reads.
 ## Indexing
 
 ### Files skipped: "missing required frontmatter field"
