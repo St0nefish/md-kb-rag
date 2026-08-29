@@ -3,12 +3,50 @@ name: Release
 on:
   push:
     branches: [master]
+  # Manual deploy, for shipping a batch of merges as one restart. With
+  # DEPLOY_HOLD set, merges accumulate on master without deploying; a single
+  # dispatch with force=true then promotes whatever master currently is.
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Deploy even if the DEPLOY_HOLD repo variable is set"
+        type: boolean
+        default: false
 
 jobs:
   release:
     runs-on: self-hosted
 
     steps:
+      # Deploy hold. Every merge to master otherwise retags :latest and pokes
+      # Watchtower, which restarts the running container — so a run of N merged
+      # PRs costs N restarts of a live service for no benefit, since only the
+      # last one's image is the one anybody keeps.
+      #
+      # Set the DEPLOY_HOLD repo variable to "true" to accumulate merges without
+      # deploying. Nothing is lost while held: CI still builds and pushes the
+      # per-PR sha image, and the steps below still run far enough to name the
+      # image this push would have shipped, so the log says exactly what is
+      # pending. Ship the batch with a workflow_dispatch run (force=true), which
+      # promotes master's current HEAD in a single restart.
+      #
+      # Deliberately a gate inside the job rather than disabling the workflow:
+      # a disabled workflow leaves no run history, so there is no record that a
+      # merge went out un-deployed. A held run shows up as a green run whose log
+      # says it was held.
+      - name: Resolve deploy hold
+        id: gate
+        env:
+          DEPLOY_HOLD: ${{ vars.DEPLOY_HOLD }}
+          FORCED: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          if [ "${DEPLOY_HOLD}" = "true" ] && [ "${FORCED}" != "true" ]; then
+            echo "::notice::DEPLOY_HOLD is set — this push will not be deployed. Run this workflow manually with force=true to ship the accumulated batch."
+            echo "held=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "held=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v5
         with:
           fetch-depth: 2
@@ -46,8 +84,28 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
+      - name: Report held deploy
+        if: steps.gate.outputs.held == 'true'
+        run: |
+          echo "Deploy held. This push would have shipped:"
+          echo "  ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}"
+          echo "  (as :latest and :${{ steps.version.outputs.merge_sha }})"
+          echo ""
+          echo "The sha-tagged image is already built and pushed by CI, so nothing"
+          echo "needs rebuilding when the batch ships — the release job only retags."
+          {
+            echo "### Deploy held :pause_button:"
+            echo ""
+            echo "\`DEPLOY_HOLD\` is set, so this merge did not restart the service."
+            echo ""
+            echo "Pending image: \`${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}\`"
+            echo ""
+            echo "Ship the accumulated batch by running this workflow manually with \`force=true\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Tag as latest
         id: retag
+        if: steps.gate.outputs.held != 'true'
         run: |
           IMAGE="${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}"
           # CI only builds/pushes the sha image when code changed (see ci.yml path filter).
@@ -68,7 +126,7 @@ jobs:
           echo "skipped=false" >> "$GITHUB_OUTPUT"
 
       - name: Trigger Watchtower
-        if: steps.retag.outputs.skipped != 'true'
+        if: steps.gate.outputs.held != 'true' && steps.retag.outputs.skipped != 'true'
         run: |
           # Pull the retagged image onto the host daemon first so Watchtower's
           # local digest comparison sees the new :latest immediately, rather
