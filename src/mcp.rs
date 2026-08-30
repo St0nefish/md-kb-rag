@@ -998,11 +998,16 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_score: Option<f32>,
 
-    /// Add a score-breakdown line per result (query only).
+    /// Add a score-breakdown line per result (query + chunk granularity only;
+    /// rejected at document granularity, since a grouped result collapses to
+    /// one row per document with no per-arm chunk score to report).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<bool>,
 
-    /// Frontmatter fields to include (dot-paths).
+    /// Frontmatter fields to include per result (dot-paths; document
+    /// granularity only, enumeration or query — rejected at chunk
+    /// granularity, since a chunk result never joins the document metadata
+    /// index this draws from).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
 
@@ -2372,6 +2377,23 @@ impl KbSearchServer {
         let query = params.query.as_deref().unwrap_or_default();
 
         validate_path_prefix(&params.path_prefix)?;
+        // #132 (audit follow-up): `fields` selects per-result frontmatter fields
+        // from the document metadata index — a chunk result is hydrated straight
+        // from the Qdrant chunk payload and never joins that index, so `fields`
+        // has nothing to draw from here. `search_grouped`/`build_document_query`
+        // (document granularity, query or enumeration) are its only real
+        // consumers; reject explicitly here rather than silently drop it the way
+        // it used to (this was the SAME silent-no-op bug `explain` at document
+        // granularity is, just for the mirror-image parameter/granularity pair).
+        if params.fields.is_some() {
+            return Err(McpError::invalid_params(
+                "fields is document-granularity only (fields draws from the document \
+                 metadata index, which a chunk result never joins) — omit it, or set \
+                 granularity to 'document'"
+                    .to_string(),
+                None,
+            ));
+        }
         let schemas = crate::schema::load_shared(&self.schema_cache);
         // Fetched once per call so every field below — including
         // reranking.candidate_limit — reflects the same live snapshot, rather than
@@ -2482,6 +2504,30 @@ impl KbSearchServer {
     async fn search_grouped(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
         let query = params.query.as_deref().unwrap_or_default();
 
+        // #132: `explain` produces a per-result score breakdown (dense/sparse/
+        // phrase/pre-rerank) from the per-arm scores `search_chunks` collects on
+        // each chunk `SearchResult`. This path collapses every document to its
+        // best-scoring chunk via Qdrant's server-side grouping (see this
+        // function's doc comment) with no explain-mode fusion query behind it —
+        // there is no per-arm breakdown to attach, so `GroupedDocument` carries
+        // none. Implementing the real thing would mean threading an `explain`
+        // flag through `RetrievalStore::search_grouped` and adding a
+        // client-side-fused, per-arm-scored grouped-query path in `qdrant.rs`
+        // mirroring `hybrid_search_explain` — real work, out of scope for this
+        // fix. Reject explicitly instead of the silent no-op this used to be:
+        // a caller that turned `explain` on to diagnose a confusing document
+        // ranking deserves an error telling them so, not a response that quietly
+        // drops the one thing they asked for.
+        if params.explain == Some(true) {
+            return Err(McpError::invalid_params(
+                "explain is chunk-granularity only; document-granularity results \
+                 collapse to one row per document with no per-arm score breakdown \
+                 available to report — omit it, or set granularity to 'chunk'"
+                    .to_string(),
+                None,
+            ));
+        }
+
         validate_path_prefix(&params.path_prefix)?;
         validate_fields_count(&params.fields)?;
         let schemas = crate::schema::load_shared(&self.schema_cache);
@@ -2522,7 +2568,14 @@ impl KbSearchServer {
             hybrid: config.search.hybrid,
             rrf_candidates: config.search.rrf_candidates as u64,
             phrase: config.search.phrase && crate::status::INDEX_STATUS.phrase_matching_available(),
-            explain: params.explain.unwrap_or(false),
+            // Always false: `explain: true` is rejected above (#132) before this
+            // point is reached, and `retrieval::search_grouped` never reads this
+            // field regardless — grouped results carry no per-arm score to
+            // explain in the first place. `false` here (rather than
+            // `params.explain.unwrap_or(false)`) says so plainly instead of
+            // leaving a dead-looking reference to a value that can only be
+            // `None`/`Some(false)` by now.
+            explain: false,
             modified_after,
             modified_before,
             path_prefix: params.path_prefix.clone(),
@@ -4615,6 +4668,58 @@ mod tests {
             format!("{:?}", err).contains("too many fields requested"),
             "the grouped adapter must validate fields itself, proving the param actually \
              reaches this branch rather than being silently dropped; got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_grouped_rejects_explain_true() {
+        // #132: `explain: true` used to be a silent no-op at document
+        // granularity — accepted, never producing a score breakdown, with no
+        // signal to the caller that it did nothing. Must now be rejected
+        // outright, and rejected before ever reaching Qdrant (no live Qdrant is
+        // configured in this test harness, so a Qdrant-side error here would
+        // prove the rejection did NOT happen early).
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("document".to_string()),
+                explain: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("chunk-granularity only"),
+            "explain: true at document granularity must be rejected with an \
+             explicit error, not silently ignored; got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_chunks_rejects_fields() {
+        // #132 audit follow-up: `fields` used to be a silent no-op at chunk
+        // granularity — accepted, never read by `search_chunks` or
+        // `build_chunk_search_payload`, the mirror image of `explain` silently
+        // no-opping at document granularity. Must now be rejected outright.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: Some("test".to_string()),
+                granularity: Some("chunk".to_string()),
+                fields: Some(vec!["status".to_string()]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("document-granularity only"),
+            "fields at chunk granularity must be rejected with an explicit error, \
+             not silently ignored; got: {err:?}"
         );
     }
 
