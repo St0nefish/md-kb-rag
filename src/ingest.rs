@@ -1382,12 +1382,12 @@ pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
 ///   the double-bracket wiki convention (Obsidian and similar tools) is
 ///   conventionally extension-less, and requiring the literal `.md` suffix would
 ///   make this syntax useless for the KBs that actually write it that way. The
-///   pipe-alias form `[[target|Display text]]` is NOT specially handled — no
-///   attempt is made to parse the alias apart from the target, and any target
-///   containing a literal `|` is rejected outright rather than fed through the
-///   default-extension step above (which would otherwise turn `guide.md|Alias`
-///   into a bogus resolved path like `guide.md|Alias.md`); write `[[target]]`
-///   without an alias if you want it indexed.
+///   pipe-alias form `[[target|Display text]]` IS specially handled (fix #131):
+///   the scanner splits at the first `|`, treating everything before it as the
+///   target (fed through the same default-extension/resolution rules as a bare
+///   `[[target]]`) and everything after it as opaque display text that is never
+///   part of the resolved path and is left completely alone — not even scanned
+///   for a nested link syntax of its own.
 /// - Autolinks `<target.md>`: the content between `<` and `>` must contain no
 ///   whitespace and (after fragment-stripping) end in `.md`, with no scheme
 ///   (`http://`, `https://`, `mailto:`, or any other `scheme://`) and no leading
@@ -1756,12 +1756,23 @@ fn scan_line_constructs(line: &str) -> LineConstructs {
             continue;
         }
 
-        // Wiki-style [[target]].
+        // Wiki-style [[target]], including the pipe-alias form [[target|Display
+        // text]] — fix #131. A pipe-alias link's target is only the text BEFORE
+        // the first `|`; the alias is display text, never part of the resolved
+        // path, so `target_end` (and therefore the recorded span/`raw`) stops at
+        // the first `|` when one is present, leaving the alias untouched by any
+        // rewrite that later replaces this span. A bare `[[target]]` with no `|`
+        // behaves exactly as before (`target_end == close`).
         if chars[i] == '['
             && chars.get(i + 1) == Some(&'[')
             && let Some(close) = find_double_bracket_close(&chars, i)
         {
-            let (target_start, target_end) = (i + 2, close);
+            let target_start = i + 2;
+            let target_end = chars[target_start..close]
+                .iter()
+                .position(|&c| c == '|')
+                .map(|rel| target_start + rel)
+                .unwrap_or(close);
             let raw: String = chars[target_start..target_end].iter().collect();
             occurrences.push((
                 byte_at[target_start]..byte_at[target_end],
@@ -1947,6 +1958,18 @@ fn find_link_parens(chars: &[char], bracket: usize) -> Option<(usize, usize, usi
 /// drop. `kind` controls the one syntax-specific rule: whether an extension-less
 /// target defaults to `.md` (wiki-style only — see [`extract_markdown_links`]'s doc
 /// comment for why).
+///
+/// `raw_target` is assumed to already be JUST the target portion — for a wiki
+/// pipe-alias link (`[[target|Display text]]`), `scan_line_constructs` splits the
+/// alias off before this function ever sees the target (fix #131), so there is no
+/// `|`-handling left to do here; a bare target containing `|` would just fail to
+/// resolve to any real file, same as any other nonexistent path. Splitting the
+/// alias off at the scanner — the one place both `extract_markdown_links` and
+/// `find_markdown_link_occurrences` already share — rather than here is what lets
+/// `write.rs`'s move-time rewriter get correct pipe-alias handling for free through
+/// the existing `pub(crate) find_markdown_link_occurrences`, with no need for this
+/// function (or `resolve_relative_md_path` below) to be exposed outside this
+/// module at all: see the removed `write.rs` duplicate this fix deleted.
 fn resolve_link_target(
     raw_target: &str,
     source_rel_path: &str,
@@ -1978,14 +2001,6 @@ fn resolve_link_target(
         || target.starts_with('/')
         || target.contains("://")
     {
-        return None;
-    }
-
-    // A wiki-style pipe-alias target (`[[target|Display text]]`) is not parsed
-    // apart from its target — see `extract_markdown_links`'s doc comment — so
-    // reject it outright rather than let the default-extension step below turn
-    // `guide.md|Alias` into a bogus resolved path like `guide.md|Alias.md`.
-    if kind == RawLinkKind::Wiki && target.contains('|') {
         return None;
     }
 
@@ -3809,10 +3824,24 @@ mod tests {
                 &["docs/top.md"],
             ),
             (
-                "wiki-style pipe-alias form is not specially handled and is dropped",
+                "wiki-style pipe-alias form resolves through its target, alias ignored \
+                 (fix #131)",
                 "[[guide.md|Display Text]]",
                 "docs/page.md",
-                &[],
+                &["docs/guide.md"],
+            ),
+            (
+                "wiki-style pipe-alias target still gets the default .md extension",
+                "[[guide|Display Text]]",
+                "docs/page.md",
+                &["docs/guide.md"],
+            ),
+            (
+                "wiki-style pipe-alias whose alias contains path-like characters still \
+                 resolves through only the target",
+                "[[guide.md|old/style/looking/alias]]",
+                "docs/page.md",
+                &["docs/guide.md"],
             ),
             (
                 "wiki-style links inside a fenced code block are not real links",
@@ -4005,6 +4034,31 @@ mod tests {
 
         let expected_start = body
             .find("guide]]")
+            .expect("target text must appear in body");
+        assert_eq!(occurrence.span.start, expected_start);
+        assert_eq!(occurrence.span.end, expected_start + "guide".len());
+        assert_eq!(&body[occurrence.span.clone()], "guide");
+    }
+
+    /// fix #131 — a pipe-alias wiki link's occurrence span must cover ONLY the
+    /// target portion, not the `|alias` suffix or the closing `]]`, so a rewrite
+    /// replacing that span leaves the alias byte-identical. Also proves the split
+    /// is byte-correct (not char-count-correct only) with multibyte text on both
+    /// sides of the `|`.
+    #[test]
+    fn find_markdown_link_occurrences_wiki_pipe_alias_span_excludes_alias() {
+        let body = "Café résumé — π ≈ 3.14: see [[guide|Résumé Café]] for the recipe.";
+        let source = "docs/page.md";
+
+        let occurrences = find_markdown_link_occurrences(body, source);
+        assert_eq!(occurrences.len(), 1, "got: {occurrences:?}");
+
+        let occurrence = &occurrences[0];
+        assert_eq!(occurrence.raw, "guide");
+        assert_eq!(occurrence.resolved, "docs/guide.md");
+
+        let expected_start = body
+            .find("guide|")
             .expect("target text must appear in body");
         assert_eq!(occurrence.span.start, expected_start);
         assert_eq!(occurrence.span.end, expected_start + "guide".len());

@@ -1753,10 +1753,11 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                             continue;
                         }
                     };
-                    let occurrences: Vec<_> = find_all_markdown_link_occurrences(&body, &ref_path)
-                        .into_iter()
-                        .filter(|o| o.resolved.as_str() == source_rel)
-                        .collect();
+                    let occurrences: Vec<_> =
+                        crate::ingest::find_markdown_link_occurrences(&body, &ref_path)
+                            .into_iter()
+                            .filter(|o| o.resolved.as_str() == source_rel)
+                            .collect();
                     if occurrences.is_empty() {
                         // Stale row again: `document_links` says this document links
                         // to the source, but nothing in its CURRENT body actually
@@ -2015,277 +2016,27 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
 // Wiki pipe-alias link support (`[[target|Display Text]]`) — fix #131
 // ---------------------------------------------------------------------------
 //
-// `ingest::resolve_link_target` deliberately REJECTS any wiki-style `[[...]]`
-// target containing a `|` (see that function's doc comment and its
-// `kind == RawLinkKind::Wiki && target.contains('|')` guard): the pipe-alias
-// form is not parsed apart from its target at all today, so
-// `ingest::extract_markdown_links`/`ingest::find_markdown_link_occurrences`
-// never produce an occurrence for `[[old/path|Display Text]]` — the KB's link
-// graph doesn't know the edge exists, and this module's move-time rewriter,
-// which is built entirely on top of `find_markdown_link_occurrences`, never
-// sees these links either. A move therefore leaves a pipe-alias link pointing
-// at the moved document's old path with no error.
+// This module used to carry a duplicate scanner/resolver here (find_pipe_alias_
+// link_occurrences / scan_pipe_alias_wiki_links / resolve_pipe_alias_wiki_target /
+// resolve_relative_md_path_for_pipe_alias) because `ingest::resolve_link_target`
+// rejected any wiki target containing a `|` outright, so `ingest::
+// find_markdown_link_occurrences` never produced an occurrence for
+// `[[old/path|Display Text]]` at all. Review of that duplicate surfaced a KNOWN
+// DIVERGENCE from the original it mirrored (the original cuts a target at its
+// first whitespace character; the duplicate did not) — a live risk of the
+// extractor and this rewriter resolving the same pipe-alias target to two
+// DIFFERENT paths, which is exactly the silent-broken-link failure mode #131
+// exists to fix.
 //
-// A full fix belongs in `ingest.rs` (out of scope for this change): teach
-// `resolve_link_target`/`scan_line_constructs` to split `[[target|alias]]`
-// into target and alias instead of rejecting it outright, so
-// `find_markdown_link_occurrences` returns an occurrence spanning just the
-// target portion (alias preserved), and `extract_markdown_links` records the
-// edge in `document_links` the same way it does for a bare `[[target]]`.
-// Until then, the functions below duplicate just enough of
-// `ingest::resolve_link_target`/`resolve_relative_md_path`'s judging rules
-// (trim, strip a trailing `#fragment`, reject external/absolute targets,
-// default a missing extension to `.md`, resolve `./`/`../` against the
-// containing document's directory) to find and correctly resolve pipe-alias
-// occurrences from THIS module, so at least everything the rewriter itself
-// controls — a moved document's own outbound links (self-reference included,
-// via `rewrite_outbound_links` below) and any referencing document that gets
-// visited because `StateDb::links_targeting` already returns it (e.g. it also
-// has a non-alias link to the same target) — gets a correctly rewritten
-// pipe-alias link with its alias preserved exactly. What this CANNOT fix: a
-// referencing document whose ONLY link to the moved target is a pipe-alias
-// link is never visited at all, because `document_links` (built from
-// `ingest::extract_markdown_links`) has no edge for it to be found by in the
-// first place. That case needs the `ingest.rs` change described above.
-
-/// Find every wiki pipe-alias link (`[[target|alias]]`) in `body` whose target
-/// resolves against `source_rel_path`, shaped exactly like an
-/// `ingest::LinkOccurrence` — `span` covers ONLY the target portion (not the
-/// `|alias` suffix or the surrounding `]]`), so replacing it in place leaves
-/// the alias untouched, and `resolved`/`raw` follow the same contract
-/// `ingest::find_markdown_link_occurrences` uses. See this section's doc
-/// comment for why this exists as a separate scan rather than a case
-/// `ingest::find_markdown_link_occurrences` already covers.
-///
-/// Line-oriented fence tracking mirrors `ingest`'s private `scan_link_occurrences`
-/// (`` ``` ``/`~~~` toggles a fence, and nothing inside one is scanned) so the two
-/// scanners never disagree about what counts as "inside a fence".
-fn find_pipe_alias_link_occurrences(
-    body: &str,
-    source_rel_path: &str,
-) -> Vec<crate::ingest::LinkOccurrence> {
-    let mut out = Vec::new();
-    let mut in_fence = false;
-    let mut offset = 0usize;
-
-    for line in body.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        let content = content.strip_suffix('\r').unwrap_or(content);
-
-        let trimmed = content.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            offset += line.len();
-            continue;
-        }
-
-        if !in_fence {
-            for (span, raw_target) in scan_pipe_alias_wiki_links(content) {
-                if let Some(resolved) = resolve_pipe_alias_wiki_target(&raw_target, source_rel_path)
-                {
-                    out.push(crate::ingest::LinkOccurrence {
-                        span: offset + span.start..offset + span.end,
-                        raw: raw_target,
-                        resolved,
-                    });
-                }
-            }
-        }
-
-        offset += line.len();
-    }
-
-    out
-}
-
-/// Find every `[[target|alias]]` construct on one already-fence-filtered line,
-/// honoring inline code spans and images the same way `ingest`'s private
-/// `scan_line_constructs` does for the syntaxes it recognizes (a
-/// backtick-quoted `` `[[foo|bar]]` `` is literal text, not a link;
-/// `![[foo|bar]]` is image-shaped and skipped). Returns the byte span of the
-/// TARGET portion only (not the alias) alongside the raw target text, for
-/// every bracketed pair whose content contains a `|` — a bare `[[target]]`
-/// with no alias is left for `ingest::find_markdown_link_occurrences` to find,
-/// since this function only exists to cover what that one cannot yet see.
-fn scan_pipe_alias_wiki_links(line: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let chars: Vec<char> = line.chars().collect();
-    let mut byte_at: Vec<usize> = line.char_indices().map(|(b, _)| b).collect();
-    byte_at.push(line.len());
-
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut in_code = false;
-    let mut code_run_len = 0usize;
-
-    while i < chars.len() {
-        if chars[i] == '`' {
-            let start = i;
-            while i < chars.len() && chars[i] == '`' {
-                i += 1;
-            }
-            let run_len = i - start;
-            if !in_code {
-                in_code = true;
-                code_run_len = run_len;
-            } else if run_len == code_run_len {
-                in_code = false;
-            }
-            continue;
-        }
-
-        if in_code {
-            i += 1;
-            continue;
-        }
-
-        // `![[...]]` is image-shaped, not a document link — skip past its own
-        // `[[` so the branch below never treats it as a wiki link.
-        if chars[i] == '!' && chars.get(i + 1) == Some(&'[') && chars.get(i + 2) == Some(&'[') {
-            i += 2;
-            continue;
-        }
-
-        if chars[i] == '['
-            && chars.get(i + 1) == Some(&'[')
-            && let Some(close) = find_double_bracket_close_for_pipe_alias(&chars, i)
-        {
-            let (content_start, content_end) = (i + 2, close);
-            let inner: String = chars[content_start..content_end].iter().collect();
-            if let Some(pipe_idx) = inner.find('|') {
-                let raw_target = inner[..pipe_idx].to_string();
-                // `pipe_idx` is a byte offset into `inner`, valid to slice on since
-                // `|` is single-byte ASCII — counting chars up to it gives the char
-                // offset needed to remap through `byte_at` for the line's real span.
-                let target_char_len = inner[..pipe_idx].chars().count();
-                let target_end_char = content_start + target_char_len;
-                out.push((byte_at[content_start]..byte_at[target_end_char], raw_target));
-            }
-            i = close + 2;
-            continue;
-        }
-
-        i += 1;
-    }
-
-    out
-}
-
-/// Find the index of the first `]` of a closing `]]` for a wiki link opened at
-/// `chars[open] == chars[open + 1] == '['`. Same no-nested-brackets
-/// simplification as `ingest`'s private `find_double_bracket_close`, which
-/// this mirrors (that one is not `pub(crate)`, so it cannot be called
-/// directly from here).
-fn find_double_bracket_close_for_pipe_alias(chars: &[char], open: usize) -> Option<usize> {
-    let mut j = open + 2;
-    while j + 1 < chars.len() {
-        if chars[j] == ']' && chars[j + 1] == ']' {
-            return Some(j);
-        }
-        j += 1;
-    }
-    None
-}
-
-/// Resolve a pipe-alias wiki link's target exactly the way
-/// `ingest::resolve_link_target` would for an ordinary `[[target]]` (wiki
-/// kind): trim, strip a trailing `#fragment`, reject external/absolute
-/// targets, default a missing extension to `.md`, then resolve `./`/`../`
-/// against `source_rel_path`'s directory. Duplicated here only because
-/// `ingest::resolve_link_target`/`resolve_relative_md_path` are private
-/// `fn`s, not `pub(crate)` — this mirrors their judging rules, not a
-/// divergent policy. See this section's doc comment for why this
-/// duplication exists and what would let it be deleted.
-///
-/// KNOWN DIVERGENCE, found in review: `ingest::resolve_link_target` also cuts
-/// the target at its first whitespace character (the CommonMark inline-link
-/// title convention — `[target "Title"](...)`), applied to every kind, not just
-/// inline links. This function does not. The gap is only reachable for a target
-/// containing a literal non-trailing space before the `|`, e.g.
-/// `[[my page|Alias]]`, which slug-style KB paths do not produce — but it is a
-/// real difference, not a restatement.
-///
-/// It matters specifically when #131's remaining half lands: if the `ingest.rs`
-/// fix teaches `resolve_link_target` to split `[[target|alias]]` and keeps its
-/// whitespace cut, the extractor and this rewriter would resolve such a target
-/// to DIFFERENT paths — the extractor recording an edge the rewriter then fails
-/// to match, which is exactly the silent-broken-link class #131 is about.
-/// Making the originals `pub(crate)` and deleting this function is the fix that
-/// closes the whole question; short of that, re-check this divergence then.
-fn resolve_pipe_alias_wiki_target(raw_target: &str, source_rel_path: &str) -> Option<String> {
-    let target = raw_target.trim();
-    let target = match target.find('#') {
-        Some(idx) => &target[..idx],
-        None => target,
-    };
-    if target.is_empty() {
-        return None;
-    }
-
-    let lower = target.to_ascii_lowercase();
-    if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("mailto:")
-        || target.starts_with('/')
-        || target.contains("://")
-    {
-        return None;
-    }
-
-    let with_ext: String;
-    let target = if target.ends_with(".md") {
-        target
-    } else {
-        with_ext = format!("{target}.md");
-        with_ext.as_str()
-    };
-
-    resolve_relative_md_path_for_pipe_alias(target, source_rel_path)
-}
-
-/// Join `target` onto `source_rel_path`'s directory and normalize
-/// component-by-component. Mirrors `ingest`'s private
-/// `resolve_relative_md_path` byte-for-byte (see
-/// `resolve_pipe_alias_wiki_target`'s doc comment for why it is duplicated
-/// rather than called directly) — a `..` climbing above the knowledge-base
-/// root rejects the whole target, same as there.
-fn resolve_relative_md_path_for_pipe_alias(target: &str, source_rel_path: &str) -> Option<String> {
-    let mut stack: Vec<&str> = source_rel_path
-        .rsplit_once('/')
-        .map(|(dir, _)| dir.split('/').filter(|c| !c.is_empty()).collect())
-        .unwrap_or_default();
-
-    for comp in target.split('/') {
-        match comp {
-            "" | "." => {}
-            ".." => {
-                stack.pop()?;
-            }
-            other => stack.push(other),
-        }
-    }
-
-    if stack.is_empty() {
-        None
-    } else {
-        Some(stack.join("/"))
-    }
-}
-
-/// Every recognized outbound Markdown link occurrence in `body`, resolved
-/// against `source_rel_path` — `ingest::find_markdown_link_occurrences` (every
-/// syntax it recognizes) UNIONED with [`find_pipe_alias_link_occurrences`]
-/// (the one syntax it doesn't yet: `[[target|alias]]` — fix #131). Both scans
-/// produce the same `ingest::LinkOccurrence` shape, so every existing
-/// consumer (`apply_link_replacements`/`apply_link_replacements_each`) handles
-/// the merged list with no changes of its own.
-fn find_all_markdown_link_occurrences(
-    body: &str,
-    source_rel_path: &str,
-) -> Vec<crate::ingest::LinkOccurrence> {
-    let mut occurrences = crate::ingest::find_markdown_link_occurrences(body, source_rel_path);
-    occurrences.extend(find_pipe_alias_link_occurrences(body, source_rel_path));
-    occurrences
-}
+// Fixed at the root instead: `ingest::scan_line_constructs` (the one scanner
+// `extract_markdown_links` and `find_markdown_link_occurrences` both share) now
+// splits `[[target|alias]]` into target and alias itself, so
+// `ingest::find_markdown_link_occurrences` — already `pub(crate)` and already the
+// function every rewrite site below calls — returns a correctly target-only-
+// spanned occurrence for a pipe-alias link with no extra code here at all. There
+// is exactly one implementation of "what counts as a link and where it resolves"
+// now, shared by `document_links` extraction and this module's rewriter, so the
+// two can never diverge again by construction rather than by discipline.
 
 /// Rewrite every outbound Markdown link occurrence in `content` — a document being
 /// relocated from `old_rel` to `new_rel` — so each one keeps resolving to its
@@ -2314,7 +2065,7 @@ fn rewrite_outbound_links(
     new_rel: &str,
     translate: impl Fn(&str) -> Option<String>,
 ) -> String {
-    let occurrences = find_all_markdown_link_occurrences(content, old_rel);
+    let occurrences = crate::ingest::find_markdown_link_occurrences(content, old_rel);
     if occurrences.is_empty() {
         return content.to_string();
     }
@@ -3352,7 +3103,7 @@ pub async fn move_directory<E: QueryEmbedder, Q: RetrievalStore>(
         let mut replacements: Vec<(crate::ingest::LinkOccurrence, String)> = Vec::new();
         for (old_rel, new_rel) in targets {
             let replacement = crate::ingest::relativize_md_path(ref_path, new_rel);
-            for occurrence in find_all_markdown_link_occurrences(&body, ref_path)
+            for occurrence in crate::ingest::find_markdown_link_occurrences(&body, ref_path)
                 .into_iter()
                 .filter(|o| &o.resolved == old_rel)
             {
@@ -6279,12 +6030,14 @@ mod tests {
 
         let harness = git_backed_harness_with_state_db(&work).await;
         // Seeded directly, matching every other incoming-link-rewrite test in this
-        // file — `document_links` is populated by `ingest::extract_markdown_links`
-        // in production, which does NOT yet recognize this syntax (fix #131 is
-        // scoped to the rewriter; the extractor change is a separate, out-of-scope
-        // fix). Seeding the edge here isolates what THIS module is responsible
-        // for: once a referencing document is known/visited, its pipe-alias
-        // occurrences must be found and correctly rewritten with the alias intact.
+        // file, to isolate what THIS module is responsible for: once a
+        // referencing document is known/visited (`document_links` has an edge to
+        // it, from wherever), its pipe-alias occurrences must be found and
+        // correctly rewritten with the alias intact. `document_links` itself is
+        // now populated for pipe-alias links too by `ingest::extract_markdown_links`
+        // (fix #131) — see `move_rewrites_a_referencing_documents_pipe_alias_link_\
+        // found_purely_through_the_real_extractor` below for the test that proves
+        // THAT half end-to-end, with no manual seeding.
         harness
             .state_db
             .as_ref()
@@ -6501,6 +6254,77 @@ mod tests {
              location with its alias preserved, got: {ref_after}"
         );
         assert!(!ref_after.contains("old6/a.md"));
+    }
+
+    #[tokio::test]
+    async fn move_rewrites_a_referencing_documents_pipe_alias_link_found_purely_through_the_real_extractor()
+     {
+        // The decisive test for fix #131's actual bug: a referencing document
+        // whose ONLY link to the moved target is a pipe-alias link. Unlike every
+        // other pipe-alias test above, `document_links` is NOT seeded with a
+        // hand-written literal here — it is populated by calling
+        // `ingest::extract_markdown_links` on the referencing body, exactly as
+        // production indexing does. Before fix #131, `extract_markdown_links`
+        // rejected any wiki target containing `|` and returned no edge at all for
+        // this document, so `links_targeting` (which this rewrite is built on)
+        // would never surface it, `rewritten_paths` would stay empty, and the
+        // file on disk would still contain "old/loc.md" after the move — the
+        // exact silent-broken-link failure #131 is about. After the fix,
+        // `extract_markdown_links` records the edge like any other wiki link, so
+        // this document is visited and rewritten like any other.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        // This document's ONLY outbound link is the pipe-alias one — no bare
+        // `[[old/loc.md]]` or `[text](old/loc.md)` alongside it that would let a
+        // stale/partial extractor find it by a different route.
+        let referencing_original = "---\ntitle: Referencer\ndescription: d\ntype: guide\n\
+             tags: [t]\n---\n\nSee [[old/loc.md|Display Text]] for more.\n";
+        std::fs::write(work.path().join("referencing.md"), referencing_original).unwrap();
+        git_commit_all(&work, "referencing.md", "add referencing.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        let extracted =
+            crate::ingest::extract_markdown_links(referencing_original, "referencing.md");
+        let link_targets: Vec<(String, Option<f64>)> =
+            extracted.into_iter().map(|t| (t, None)).collect();
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links("referencing.md", "markdown", &link_targets)
+            .await
+            .unwrap();
+
+        let req = make_move_req(
+            "old/loc.md",
+            "new/loc-real-extractor-test.md",
+            source_original,
+            source_original,
+        );
+        let success = write_document(&harness.deps(), req).await.unwrap();
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert_eq!(
+            success.rewritten_paths,
+            vec!["referencing.md".to_string()],
+            "the real extractor must have recorded the pipe-alias edge in \
+             document_links for links_targeting to find this document at all"
+        );
+
+        let referencing_after =
+            std::fs::read_to_string(work.path().join("referencing.md")).unwrap();
+        assert!(
+            referencing_after.contains("[[new/loc-real-extractor-test.md|Display Text]]"),
+            "the pipe-alias link's target must be rewritten to the new location while its \
+             alias survives byte-identical, got: {referencing_after}"
+        );
+        assert!(!referencing_after.contains("old/loc.md"));
     }
 
     #[tokio::test]
