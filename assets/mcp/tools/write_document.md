@@ -70,7 +70,7 @@ this call is rolled back — there is no partial-success result. Frontmatter
 validation (and the create-path dedup gate, for any entries that are creates)
 runs for every document before anything is written, so a batch that is going
 to fail does so having touched nothing; a failure lists every offending
-document at once; via `data.failures`, not just the first one found.
+document at once via `data.failures`, not just the first one found.
 
 `structured_content` for a successful batch write carries `outcome`, `sha`,
 `rebased_paths`, and `sync_failure_cause` exactly like a single-document write

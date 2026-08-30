@@ -14,6 +14,8 @@ In `serve` mode, indexing is asynchronous: MCP write tools and the webhook handl
 
 Every git invocation against the KB clone is serialized by `git::GIT_LOCK`. A working copy cannot take concurrent mutation — `add`/`commit`/`merge`/`rebase` all contend for `.git/index.lock` — and the write tools and the webhook handler reach the same clone routinely, because each write pushes and the push webhooks straight back. Functions in `git.rs` therefore take a `&GitLock` as their first argument, so the type checker, not review, answers "is the lock held". Acquire once per logical sequence and hold it across the whole thing: a failed write and its rollback must share one acquisition, or the rollback races the very writers it is protecting against. The guard is never re-acquired internally, which is what keeps the non-reentrant mutex from deadlocking a call chain against itself.
 
+That rule covers every git call that *mutates* the clone. Read-only history calls (`git::recent_commits`, `document_history`, `document_commit_diff`) deliberately take no `&GitLock`, and the deviation is argued in their doc comment: a read cannot corrupt an immutable object store, while taking the lock would queue history reads behind an in-flight write for up to `GIT_TIMEOUT` — the inverse of the contention #236 was filed for. Verified empirically against a repo held mid-rebase-conflict: `git log` exits 0 with a transiently reverted view (the in-flight commit hidden while HEAD is detached), never an error or invalid output, and a stray `.git/index.lock` does not affect reads at all. A new *mutating* git function still takes the guard.
+
 ## Key conventions
 
 - All async code uses tokio
