@@ -46,8 +46,6 @@ RUN addgroup -g 65532 -S nonroot && adduser -u 65532 -S nonroot -G nonroot
 
 WORKDIR /app
 
-RUN mkdir -p /app/data && chown nonroot:nonroot /app/data
-
 # The app's actual default data_path is /data (source.data_path, config.rs), which is
 # where every compose file and deploy template mounts the named volume. Pre-creating
 # and chowning it here means Docker propagates that ownership when it initializes a
