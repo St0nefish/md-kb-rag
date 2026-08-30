@@ -166,23 +166,13 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: self-hosted
-    # #133: this job shipped `continue-on-error: true` (and was left out of
-    # ci-pass's `needs`) specifically because running the suite for the first
-    # time, while wiring it up, found two pre-existing bugs in the tests
-    # themselves failing against a real server: an invalid literal point-ID
-    # UUID in phrase_index_enables_exact_phrase_matching's fixture (fixed by
-    # #212), and a genuine assertion mismatch in
-    # recommend_by_point_id_finds_nearest_neighbor (fixed by #231, which also
-    # made the whole suite safe to run with cargo's default multi-threaded
-    # test harness instead of forcing --test-threads=1). Both are closed, the
-    # phrase test has since been strengthened (same #133) to actually prove
-    # server-side exclusion rather than only a ranking effect, and this job's
-    # own health-wait step below was fixed alongside this change (see that
-    # step's comment) — a broken wait was the one thing that could still turn
-    # "the suite is green" into "the job times out for an unrelated reason."
-    # Twelve back-to-back local runs of the full ignored suite (multi-threaded,
-    # 16 threads) against a real Qdrant came back 7/7 green every time with no
-    # flakes observed — blocking now.
+    # TEMPORARY (this commit only): still non-blocking while the networking
+    # fix in `Start Qdrant` below is proven on the real runner. This job has
+    # never once succeeded — 0 successes in 52 attempts — so it does not get
+    # promoted to blocking on the strength of local runs alone. Flipped in the
+    # follow-up commit once a run is observed green.
+    continue-on-error: true
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -236,28 +226,37 @@ jobs:
 
       - name: Start Qdrant
         run: |
-          # -v first: a persistent self-hosted runner can carry a leftover
-          # ./data/qdrant volume from a prior run — start every run clean.
-          docker compose -f docker-compose.yml down -v 2>/dev/null || true
-          docker compose -f docker-compose.yml up -d qdrant
+          # The self-hosted runner is itself a container driving the host's
+          # Docker daemon through a mounted /var/run/docker.sock, so
+          # `docker compose up` creates a SIBLING container on the host and
+          # docker-compose.yml's `127.0.0.1:6334:6334` publishes onto the
+          # HOST's loopback -- which is not this container's loopback. Every
+          # run of this job since it was added failed for that reason, first
+          # in the wait step and then in `cargo test` itself, which hardcodes
+          # http://localhost:6334 (src/qdrant.rs).
+          #
+          # Put qdrant in THIS container's network namespace instead: then
+          # `localhost:6334` is literally correct, nothing is published on the
+          # host (so two PRs' jobs can't collide on 6333/6334), and the tests
+          # need no environment plumbing. `hostname` is NOT the container ID
+          # on this runner -- derive the real one from /proc/self/mountinfo,
+          # which is data-root/storage-driver agnostic because it keys off the
+          # second-to-last path component, not a fixed prefix.
+          docker rm -f ci-qdrant 2>/dev/null || true
+          cid=$(awk '$5=="/etc/hostname"{n=split($4,p,"/"); print p[n-1]}' /proc/self/mountinfo)
+          if [[ -z "$cid" ]]; then
+            echo "::error::could not determine this runner's own container id"
+            exit 1
+          fi
+          # Image stays single-sourced from docker-compose.yml so the pin
+          # can't drift from what the deployment runs.
+          image=$(docker compose -f docker-compose.yml config --images qdrant)
+          docker run -d --name ci-qdrant --network "container:${cid}" "$image"
 
-      - name: Wait for Qdrant to be healthy
+      - name: Wait for Qdrant to be ready
         run: |
-          # #133: this used to poll docker-compose.yml's own container
-          # healthcheck status via `docker compose ps ... Health`. Verified while
-          # making this job blocking that the healthcheck itself never reports
-          # `healthy` for the pinned qdrant/qdrant:v1.17.0 image: its `test`
-          # shells out to `curl`, which that image does not ship (`exec: "curl":
-          # executable file not found in $PATH`), and even a working `curl`
-          # would still hit a wall — that image dropped `/health` in favor of
-          # `/healthz`/`/readyz`/`/livez`, so the command it runs 404s regardless.
-          # The container itself comes up fine; only the healthcheck definition
-          # (out of scope here — docker-compose.yml is untouched by this change)
-          # is stale. Poll the real readiness endpoint directly from the runner
-          # instead of trusting that status — the REST port is already published
-          # to the host (`127.0.0.1:6333:6333` in docker-compose.yml), so this
-          # needs nothing from inside the container. Still poll-not-sleep (see
-          # deploy.sh's own fix, #198, for why a flat sleep isn't good enough).
+          # Now genuinely this container's loopback, so a direct probe is
+          # correct (poll, not sleep -- see deploy.sh's fix, #198).
           timeout=60
           elapsed=0
           while true; do
@@ -265,7 +264,7 @@ jobs:
             [[ "$code" == "200" ]] && break
             if (( elapsed >= timeout )); then
               echo "::error::qdrant did not become ready within ${timeout}s (last HTTP status: ${code})"
-              docker compose -f docker-compose.yml logs qdrant
+              docker logs ci-qdrant
               exit 1
             fi
             sleep 2
@@ -277,32 +276,22 @@ jobs:
 
       - name: Stop Qdrant
         if: always()
-        run: docker compose -f docker-compose.yml down -v
+        run: docker rm -f ci-qdrant 2>/dev/null || true
 
   # Gate job for branch protection — set "ci-pass" as the required status check.
-  # Passes when both test and qdrant-integration succeed or were skipped
-  # (doc-only changes skip both identically, via the same `changes` gate).
-  # #133: qdrant-integration used to be deliberately left out of this list —
-  # see its own job comment for why that's no longer the case.
+  # Passes when test succeeds or was skipped (doc-only changes).
+  # qdrant-integration is temporarily still out of this list — see its own
+  # comment; it is added back once its networking fix is observed green.
   ci-pass:
     if: always()
-    needs: [test, qdrant-integration]
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - name: Check result
         run: |
-          ok=true
-          if [[ ! "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
-            echo "test: ${{ needs.test.result }}"
-            ok=false
-          fi
-          if [[ ! "${{ needs.qdrant-integration.result }}" =~ ^(success|skipped)$ ]]; then
-            echo "qdrant-integration: ${{ needs.qdrant-integration.result }}"
-            ok=false
-          fi
-          if [[ "$ok" == "true" ]]; then
-            echo "CI passed (test: ${{ needs.test.result }}, qdrant-integration: ${{ needs.qdrant-integration.result }})"
+          if [[ "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "CI passed (test: ${{ needs.test.result }})"
           else
-            echo "CI failed"
+            echo "CI failed (test: ${{ needs.test.result }})"
             exit 1
           fi
