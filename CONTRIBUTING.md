@@ -60,6 +60,34 @@ pre-commit hook that:
 You can bypass the hook with `git commit --no-verify` when you genuinely need to, but
 anything it would have caught still has to pass in CI before the PR can merge.
 
+## Rust toolchain / MSRV
+
+The pinned toolchain — currently **1.89** — lives in one place, `rust-toolchain.toml`
+at the repo root, and everything else derives from it (#235):
+
+- **Local dev** needs nothing extra: rustup reads `rust-toolchain.toml` automatically
+  for every `cargo`/`rustc` invocation anywhere under this directory tree.
+- **CI** (`.github/workflows/ci.yml`) extracts the file's `channel` value in a "Read
+  pinned Rust toolchain version" step and feeds it explicitly to
+  `dtolnay/rust-toolchain@master` (that action doesn't read the file itself) — both the
+  `test` and `qdrant-integration` jobs do this, so neither can end up compiling against
+  a different toolchain than the other.
+- **The Docker build** takes the same value as a `--build-arg RUST_VERSION=...`, passed
+  by that same CI step, so the release image is built with the exact toolchain CI just
+  tested against — not `rust:X.Y-alpine` pinned by hand in the `Dockerfile` and left to
+  drift out of sync with whatever `stable` CI happened to resolve to that day.
+- **`rust-version` in `Cargo.toml`** carries the same number, so a plain `cargo build`
+  under a too-old local toolchain fails fast with a clear "package requires rustc X but
+  Y is installed" message instead of a confusing type error partway through a build.
+
+This exists because the split bit twice in one session before #235: CI resolving
+`dtolnay/rust-toolchain@stable` while the `Dockerfile` pinned an explicit, unrelated
+version meant a feature stabilized after the Dockerfile's pin (`std::fs::File::lock`,
+1.89.0) compiled clean through every `cargo` step CI ran and failed only in the Docker
+build, at the end of a long job. Bumping the MSRV means updating `channel` in
+`rust-toolchain.toml`, `rust-version` in `Cargo.toml`, and the `ARG RUST_VERSION`
+default in `Dockerfile` together — CI and the Docker build then just follow.
+
 ## Testing
 
 There is no `tests/` directory — every test lives inline in the module it tests,

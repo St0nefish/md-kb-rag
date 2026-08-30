@@ -1,0 +1,21 @@
+# Single source of truth for md-kb-rag's pinned Rust toolchain (#235).
+#
+# rustup honors this file automatically for every `cargo`/`rustc` invocation
+# anywhere under this directory tree, so local dev needs nothing extra once
+# rustup is installed. CI (.github/workflows/ci.yml) reads the `channel`
+# value out of this file and feeds it explicitly to `dtolnay/rust-toolchain`
+# (that action does not parse this file on its own) and to the Dockerfile's
+# `RUST_VERSION` build arg, so the toolchain CI compiles with and the
+# toolchain the release image is built with can no longer silently drift
+# apart the way they did before #235 (CI resolved `stable` while the
+# Dockerfile pinned an explicit, unrelated version).
+#
+# MSRV: `ingest::acquire_reindex_lock` uses `std::fs::File::lock` /
+# `lock_shared`, stabilized in 1.89.0 -- do not lower `channel` below that
+# without replacing that call. See also `rust-version` in Cargo.toml, which
+# makes a plain `cargo build` under a too-old toolchain fail fast with a
+# clear "package requires rustc X but Y is installed" instead of an obscure
+# type error deep in a build log.
+[toolchain]
+channel = "1.89"
+components = ["clippy", "rustfmt"]

@@ -29,6 +29,7 @@ jobs:
               - "Dockerfile"
               - "docker-compose.yml"
               - "migrations/**"
+              - "rust-toolchain.toml"
               - ".github/workflows/ci.yml"
 
   test:
@@ -69,9 +70,26 @@ jobs:
           sudo apt-get update && sudo apt-get install -y --no-install-recommends \
             pkg-config libssl-dev
 
+      - name: Read pinned Rust toolchain version
+        # Single source of truth is rust-toolchain.toml's `channel` (#235).
+        # dtolnay/rust-toolchain doesn't parse that file itself, so extract
+        # it here and feed the same value both to the toolchain action below
+        # and to the Docker build arg further down -- that's what keeps this
+        # job's own cargo steps and the image `docker buildx build` produces
+        # from ever being able to silently diverge again.
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          if [[ -z "$version" ]]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build
@@ -122,6 +140,7 @@ jobs:
           docker buildx build \
             --builder ci-builder \
             --push \
+            --build-arg RUST_VERSION=${{ steps.rust_version.outputs.version }} \
             --cache-from type=registry,ref=${{ steps.image.outputs.name }}:buildcache \
             --cache-to type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max \
             --tag ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }} \
@@ -174,8 +193,24 @@ jobs:
           sudo apt-get update && sudo apt-get install -y --no-install-recommends \
             pkg-config libssl-dev
 
+      - name: Read pinned Rust toolchain version
+        # Same reasoning as the `test` job's identically-named step: derive
+        # from rust-toolchain.toml's `channel` rather than resolving
+        # `stable`, so this job's `cargo test` can't end up on a different
+        # toolchain than the one `test` compiled and linted against (#235).
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          if [[ -z "$version" ]]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
 
       - name: Cache cargo registry and build
         uses: actions/cache@v5
