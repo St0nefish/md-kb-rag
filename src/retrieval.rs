@@ -712,7 +712,36 @@ pub(crate) fn resolve_within_data(
     };
 
     let canonical = resolved.canonicalize().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ResolveErr::NotFound,
+        std::io::ErrorKind::NotFound => {
+            // #225: a `..` component that fails to canonicalize is a traversal
+            // attempt whose escaped target just doesn't happen to exist — NOT
+            // a "no such document" the way a `..`-free path failing the same
+            // way genuinely is. Left unchecked, `../../etc/passwd` (relative)
+            // and `/../x` (leading-slash — falls into the `kb_root_relative`
+            // branch above, which is itself just `data_path.join("../x")`,
+            // equally escaping) report DIFFERENT error classes purely because
+            // one of them happens to resolve to a real file and the other
+            // doesn't: the real file's canonicalize succeeds and hits the
+            // `starts_with` check below (`Outside`), while the nonexistent
+            // one fails canonicalize first and would otherwise return
+            // `NotFound` here — before the traversal check ever runs. Neither
+            // shape leaks anything (both are hard-rejected either way), but
+            // `NotFound` reads as "no such document," hiding the real reason
+            // the path was refused from a caller or a developer debugging path
+            // handling. Route both shapes to the same `Outside` class instead,
+            // matching what the EXISTING-target case already reports a few
+            // lines below — a `..`-free path that fails to canonicalize is
+            // still a genuine `NotFound`, eligible for the fuzzy-basename
+            // fallback the way it always was.
+            if resolved
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                ResolveErr::Outside
+            } else {
+                ResolveErr::NotFound
+            }
+        }
         std::io::ErrorKind::PermissionDenied => {
             ResolveErr::Other(format!("Permission denied: {}", resolved.display()))
         }
@@ -1951,6 +1980,45 @@ mod tests {
                 Err(ResolveErr::NotPermitted)
             ),
             "non-.md file should return NotPermitted"
+        );
+    }
+
+    #[test]
+    fn resolve_within_data_leading_slash_traversal_reports_the_same_error_class_as_relative_traversal()
+     {
+        // #225: `../x` (relative) and `/../x` (leading-slash) are the same
+        // traversal attempt read two different ways, and neither `x` is
+        // expected to exist anywhere reachable — a sibling of the tempdir
+        // named `x`, or a top-level `/x` — so both exercise the
+        // failing-`canonicalize()` path this test guards, rather than the
+        // "target happens to exist" path `resolve_within_data_enforces_boundaries`
+        // above already covers via `/etc/hosts`.
+        //
+        // Before the fix, `/../x` fell into the absolute-path branch, failed
+        // the literal `canonicalize()` with `NotFound`, and returned that
+        // `NotFound` directly — the traversal check a few lines below never
+        // ran — while the relative shape already correctly returned `Outside`.
+        // Same rejection either way (no security impact), but a caller or a
+        // developer debugging path handling was told two different things for
+        // the same mistake.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().canonicalize().unwrap();
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/*.md").unwrap());
+        let include = builder.build().unwrap();
+
+        let relative = resolve_within_data("../x", &data_path, &include);
+        let leading_slash = resolve_within_data("/../x", &data_path, &include);
+
+        assert!(
+            matches!(relative, Err(ResolveErr::Outside)),
+            "relative traversal to a nonexistent target should report Outside, \
+             got a different variant"
+        );
+        assert!(
+            matches!(leading_slash, Err(ResolveErr::Outside)),
+            "leading-slash traversal to a nonexistent target should report \
+             Outside — the SAME class as the relative shape above, not NotFound"
         );
     }
 
