@@ -1,0 +1,80 @@
+# Eval cases for #166 — "chunks carry no title, path, or heading ancestry".
+#
+# STATUS: these are DEMONSTRATION cases, not results. This repository has no
+# local knowledge base to index and the maintainer's real corpus is
+# off-limits to this change (see the PR description), so nothing here has
+# actually been run — recall@k/MRR numbers exist nowhere in this PR. Every
+# `expect_paths` value below is a PLACEHOLDER path and must be swapped for a
+# real document in your own corpus before this file means anything. Run it
+# with:
+#
+#   md-kb-rag eval --queries docs/eval/heading-context-166.yaml
+#
+# What makes a case belong in this file specifically: pick a document with a
+# nested section whose heading (or an ancestor heading above it) names the
+# document's most identifying term — a hostname, a project name, a product
+# name — that the section's own body text never repeats verbatim. Before
+# #166, `chunk_markdown` embedded only `description + section_text`, so a
+# chunk from a section like that carried no signal at all that it concerned
+# the thing named only in its title/ancestry — exactly the case the sparse
+# (BM25) retrieval arm can never recover from on its own, since it can only
+# match terms literally present in the chunk. After #166
+# (`chunking.prepend_heading_path`, on by default), every chunk in that
+# section's ancestry carries the identifying term via its heading-breadcrumb
+# prefix (see `chunk.rs`'s module comment for exactly what gets prepended and
+# why).
+#
+# How to build a real case from your own corpus:
+#   1. Find a document + nested section where the section body genuinely
+#      never repeats the document's identifying term — the `## GPU Backends`
+#      section inside `sysadmin/ares.md` that never spells out "ares" in its
+#      own prose is the worked example the issue itself uses, and is exactly
+#      what case 1 below models.
+#   2. Write a query a real user would actually type — the identifying term
+#      plus the topic (e.g. "ares gpu backends"), NOT the heading text
+#      copy-pasted verbatim (that would pass even without this change, since
+#      MarkdownSplitter always keeps a section's own heading line attached to
+#      its first chunk — see `chunk.rs`'s `heading_stays_with_content` test).
+#   3. Set `expect_paths` to that document's real repo-relative path.
+#
+# How to actually measure the recall win this PR argues for but does not
+# claim to have measured (see the PR body for the full protocol):
+#   1. `md-kb-rag eval --queries docs/eval/heading-context-166.yaml` against
+#      the CURRENTLY DEPLOYED index (pre-#166 chunk text) — record recall@k
+#      and MRR. Every case will likely show partial or zero recall, since the
+#      indexed chunks carry no heading-ancestry signal yet.
+#   2. Deploy this change. `chunking.prepend_heading_path` defaults to true,
+#      so no config edit is required.
+#   3. `md-kb-rag index --full` — REQUIRED. `chunking.*` settings are
+#      reindex-required (see `ChunkingConfig::prepend_heading_path`'s doc
+#      comment and, once added, `reload.rs`'s diff entry for it): existing
+#      Qdrant chunks keep their pre-#166 text, prefix and all, until a full
+#      reindex re-chunks them.
+#   4. Re-run the same `eval` command against the now-reindexed corpus and
+#      compare recall@k/MRR to step 1. An improvement on cases like these
+#      specifically — and no regression on a broader, unrelated eval file —
+#      is the actual evidence this change needs before anyone treats the
+#      recall claim as more than argued-from-mechanism.
+
+cases:
+  # Case 1: the issue's own worked example, verbatim. `sysadmin/ares.md` is a
+  # real top-level domain in this project's own knowledge base (see the `kb`
+  # MCP server's domain list), but the exact path/section below is illustrative
+  # — confirm (or replace) it against your actual corpus before relying on it.
+  - query: "ares gpu backends"
+    expect_paths:
+      - sysadmin/ares.md # PLACEHOLDER — replace with the real document
+
+  # Case 2: same shape, a different domain — a document whose title names a
+  # specific piece of hardware, queried by name plus topic rather than by the
+  # heading text itself.
+  - query: "argos raid layout"
+    expect_paths:
+      - sysadmin/argos.md # PLACEHOLDER — replace with the real document
+
+  # Case 3: a third host, to confirm the win isn't an artifact of one
+  # particular document — a page whose name lives in the title/H1 and is
+  # queried alongside a topic that only appears in a nested section.
+  - query: "atlas backup schedule"
+    expect_paths:
+      - sysadmin/atlas.md # PLACEHOLDER — replace with the real document

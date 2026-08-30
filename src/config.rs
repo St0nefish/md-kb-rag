@@ -202,6 +202,37 @@ pub struct ChunkingConfig {
     pub target_chunk_size: Option<usize>,
     #[serde(default = "default_true")]
     pub prepend_description: bool,
+    /// Prepend each chunk's heading breadcrumb — the chain of ancestor headings
+    /// (e.g. `# ares > ## Hardware > ### GPU Backends` rendered as
+    /// `ares > Hardware > GPU Backends`) — to its indexed/embedded text (fix
+    /// #166). Without this, a chunk sourced from a deeply-nested section carries
+    /// no textual signal that it concerns the document/section named only in an
+    /// ancestor heading above it, which starves the sparse (BM25) retrieval arm
+    /// hardest: it can only match terms literally present in the chunk, so an
+    /// identifier-style query (a hostname, a project name) that lives in the
+    /// title/heading rather than the body section misses that chunk entirely.
+    ///
+    /// Deliberately heading-ancestry only, not a separate frontmatter `title` or
+    /// the file's repo-relative path: both would need `chunk::chunk_markdown`
+    /// to take a new parameter, which would ripple into every caller
+    /// (`ingest.rs`, the dedup-query alignment test in `mcp.rs`) outside this
+    /// module's own scope. Heading ancestry needs nothing beyond the section
+    /// text `chunk_markdown` already parses, and for the extremely common
+    /// single-root-H1 document shape it already carries the document's title as
+    /// the top of every subsection's breadcrumb — see `chunk.rs`'s module
+    /// comment for the full accounting of what is and is not prepended.
+    ///
+    /// Defaults ON: per #166 this is a recall win argued from the retrieval
+    /// mechanism (see above), not one this project has measured against a real
+    /// corpus — see `docs/eval/heading-context-166.yaml` for the case file that
+    /// would make it measurable.
+    ///
+    /// Like `prepend_description`, this changes the text every future chunk
+    /// embeds — it is reindex-required (see `YAML_ONLY_SETTINGS`/`reload.rs`):
+    /// existing Qdrant chunks keep their old text until `md-kb-rag index --full`
+    /// re-chunks them.
+    #[serde(default = "default_true")]
+    pub prepend_heading_path: bool,
 }
 
 impl Default for ChunkingConfig {
@@ -210,6 +241,7 @@ impl Default for ChunkingConfig {
             max_chunk_size: default_max_chunk_size(),
             target_chunk_size: default_target_chunk_size(),
             prepend_description: true,
+            prepend_heading_path: true,
         }
     }
 }
@@ -892,6 +924,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("chunking.max_chunk_size", "chunking"),
     ("chunking.target_chunk_size", "chunking"),
     ("chunking.prepend_description", "chunking"),
+    ("chunking.prepend_heading_path", "chunking"),
     ("embedding.api_key_env", "embedding"),
     ("embedding.batch_size", "embedding"),
     ("embedding.request_timeout_secs", "embedding"),
