@@ -20,7 +20,7 @@
 //! human-readable summary needs, which the fixed `WriteSuccess{outcome, sha,
 //! rebased_paths, diff}` shape had no room for otherwise.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use futures::stream::{self, StreamExt};
@@ -2137,6 +2137,677 @@ fn apply_link_replacements(
         .map(|o| (o, replacement.to_string()))
         .collect();
     apply_link_replacements_each(body, &paired)
+}
+
+// ---------------------------------------------------------------------------
+// write_documents_batch: multiple documents, one commit (#180)
+// ---------------------------------------------------------------------------
+
+/// Hard cap on how many documents a single [`write_documents_batch`] call may
+/// carry. An unbounded batch is a denial-of-service on the write path — one
+/// call would stage an arbitrary amount of validation, dedup-embedding, and
+/// git-add/commit work under a single [`GitLock`](git::GitLock) acquisition,
+/// starving every other writer and the webhook handler for however long that
+/// takes — and an unbounded MCP request payload besides. 25 is generous for
+/// the batch's actual motivating case (an agent restructuring a handful of
+/// related pages, or a bulk status change across a small set of documents,
+/// as one logical change) while keeping a single call's worst-case work
+/// bounded. The MCP adapter reports this value verbatim in its error so a
+/// caller that hits it learns the exact ceiling rather than guessing.
+pub const MAX_BATCH_DOCUMENTS: usize = 25;
+
+/// One document's request within [`write_documents_batch`]. A deliberately
+/// narrower cousin of [`WriteRequest`]: no `dest_path` — a batch entry can
+/// create or fully replace a document, but cannot MOVE one. Moves are
+/// excluded from v1 of batch writes for two reasons: a move's rollback and
+/// commit-path scope already span two paths (source + destination) plus
+/// every other document whose links get rewritten alongside it (see
+/// `write_document_move`), and a batch containing several moves could name
+/// the same document as both a plain entry's `rel_path` and another entry's
+/// rewrite target, with no well-defined ordering. A caller that needs to
+/// relocate documents still has the single-document `write_document` (move)
+/// and `move_directory` paths for that. There is also no per-document
+/// `message`/`default_verb`/`operation` here — the whole batch lands as ONE
+/// commit with one message and one `Operation:` trailer, not N of them (see
+/// [`write_documents_batch`]'s `message` parameter).
+pub struct BatchWriteRequest<'a> {
+    /// Repo-relative path, already resolved and validated by the caller —
+    /// same contract as `WriteRequest::rel_path`.
+    pub rel_path: &'a str,
+    /// Existing file bytes (empty string for a create) — same contract as
+    /// `WriteRequest::old_content`.
+    pub old_content: &'a str,
+    /// The content to write, already computed by the caller (e.g. after
+    /// applying a surgical old_string/new_string replacement, a frontmatter
+    /// patch, or an append) — same contract as `WriteRequest::new_content`.
+    pub new_content: &'a str,
+    pub is_create: bool,
+    /// When `Some(true)`, bypasses the dedup gate for THIS entry if it is a
+    /// create. Mirrors `WriteRequest::force_new` — dedup remains a
+    /// per-document decision even inside a batch, since two entries in the
+    /// same call can have entirely unrelated content.
+    pub force_new: Option<bool>,
+    /// Stale-read guard for this document specifically. Mirrors
+    /// `WriteRequest::expected_hash`.
+    pub expected_hash: Option<&'a str>,
+}
+
+/// One document's outcome within a successful [`write_documents_batch`] call.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BatchDocumentResult {
+    pub rel_path: String,
+    pub is_create: bool,
+    /// Unified diff of this document's own change — same rendering
+    /// (`render_unified_diff`) `WriteSuccess::diff` uses for a single write.
+    pub diff: String,
+}
+
+/// A successful batch write: every document landed in ONE commit (`Synced`),
+/// or landed locally in that one commit with its push still pending
+/// (`CommittedPendingSync`). There is no partial-success shape — a batch
+/// commits every document or none of them; see [`write_documents_batch`]'s
+/// doc comment for why that is a consequence of "one commit", not a
+/// separate design choice layered on top of it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BatchWriteSuccess {
+    pub outcome: WriteOutcome,
+    pub sha: String,
+    pub rebased_paths: Vec<PathBuf>,
+    /// Every document in the batch, in the order the caller supplied them.
+    pub documents: Vec<BatchDocumentResult>,
+    /// Present only when `outcome == CommittedPendingSync` — same contract as
+    /// `WriteSuccess::sync_failure_cause`.
+    pub sync_failure_cause: Option<String>,
+}
+
+/// Every structured failure mode of [`write_documents_batch`]. Distinct from
+/// [`WriteError`] because most of what can go wrong at this level is
+/// BATCH-shaped (size, a duplicate path, the one shared commit) rather than
+/// document-shaped — but a per-document problem (a path that fails
+/// path-safety, frontmatter that fails validation, a dedup hit, a stale
+/// hash, create-on-existing, edit-on-missing) is exactly a [`WriteError`]
+/// already, so [`Documents`](Self::Documents) reuses that vocabulary rather
+/// than reinventing a parallel one.
+#[derive(Debug)]
+pub enum BatchWriteError {
+    /// The batch was empty — nothing to write.
+    Empty,
+    /// More documents than [`MAX_BATCH_DOCUMENTS`] were supplied.
+    TooMany { count: usize, max: usize },
+    /// The same `rel_path` appeared more than once. A batch commit stages
+    /// every path exactly once; two entries targeting the same file has no
+    /// well-defined "which one wins" answer worth guessing at, so this is
+    /// rejected before anything is touched rather than silently letting
+    /// whichever entry is processed last clobber the other.
+    DuplicatePath { rel_path: String },
+    /// One or more documents failed a pre-write check: path safety,
+    /// schema-frozen, frontmatter validation, the dedup gate, a stale
+    /// `expected_hash`, or — discovered only under `GIT_LOCK`, at the same
+    /// point `write_document` itself discovers it — create-on-existing or
+    /// edit-on-missing. Carries EVERY failing document from this phase, not
+    /// just the first — mirrors `DirectoryMoveError::Validation`'s
+    /// all-failures-at-once reporting, so a caller fixes the whole batch in
+    /// one round trip instead of one entry at a time. Validation failures
+    /// (discovered before `GIT_LOCK` is acquired) always leave the batch
+    /// with literally nothing written; a create/edit-existence failure
+    /// (discovered while writing, under the lock) leaves it with every
+    /// EARLIER document in this batch rolled back — see
+    /// [`write_documents_batch`]'s phase-2 doc comment.
+    Documents { failures: Vec<(String, WriteError)> },
+    /// The caller-supplied commit message would confuse git or the log.
+    InvalidCommitMessage { reason: String },
+    /// `git add`/`git commit` failed for the one shared commit. Mirrors
+    /// `WriteError::PreCommitFailed`: `rolled_back` reports whether EVERY
+    /// document this batch had written to disk was successfully restored to
+    /// its pre-call state — `false` means at least one could not be, and the
+    /// batch needs operator attention rather than a blind retry.
+    PreCommitFailed { rolled_back: bool, msg: String },
+}
+
+/// Roll back every document in `written` to its pre-call state using plain
+/// filesystem operations — no git calls, because this is used only for a
+/// failure discovered BEFORE `git::commit_and_sync` (and therefore `git add`)
+/// has run for any of them: a create is undone by deleting the file, an edit
+/// is undone by writing its original content back. Returns the paths (if
+/// any) whose rollback itself failed, so the caller can decide how to report
+/// that (see the one call site's handling in [`write_documents_batch`]).
+///
+/// `written` and `originals` are parallel to each other in the sense that
+/// `originals` is queried by `rel_path`, not by position — a document's
+/// original content lives in the `BatchWriteRequest` the caller already has,
+/// looked up by path rather than threaded through as a second positional
+/// list, so this function cannot silently pair the wrong content with the
+/// wrong path if the two ever get out of step.
+async fn rollback_batch_filesystem_writes(
+    deps_data_path: &Path,
+    written: &[(String, bool)],
+    originals: &HashMap<&str, &str>,
+) -> Vec<String> {
+    let mut failed = Vec::new();
+    for (rel_path, is_create) in written {
+        let abs = deps_data_path.join(rel_path);
+        let result = if *is_create {
+            tokio::fs::remove_file(&abs).await
+        } else {
+            let original = originals.get(rel_path.as_str()).copied().unwrap_or("");
+            tokio::fs::write(&abs, original.as_bytes()).await
+        };
+        if let Err(e) = result {
+            error!(
+                "write_documents_batch: failed to roll back '{}' (pre-git-add phase): {}",
+                rel_path, e
+            );
+            failed.push(rel_path.clone());
+        }
+    }
+    failed
+}
+
+/// Write every document in `requests` and land them in ONE git commit, under
+/// ONE [`git::GitLock`] acquisition — the batched counterpart to
+/// [`write_document`] (`write_document` called once per document is what
+/// this replaces: see #180).
+///
+/// ## Phases
+///
+/// 1. **Pre-flight, no lock, no filesystem mutation.** Every document is
+///    checked — include-pattern eligibility, path safety, schema-frozen,
+///    frontmatter validation, the create-path dedup gate (its embedding call
+///    and Qdrant query, same as a single create's) — and EVERY failure
+///    across the whole batch is collected before this function returns
+///    anything. A batch that is going to fail validation does so having
+///    touched nothing: no file written, no lock taken, matching the ordering
+///    the issue calls for explicitly. `validate_commit_message` also runs
+///    here, before any of the slow per-document work, since a message this
+///    codebase's git tooling can't handle makes the whole call pointless
+///    regardless of whether every document would otherwise have been fine.
+/// 2. **Under `GIT_LOCK`, filesystem writes only — no git yet.** Each
+///    document is written to disk in order (re-resolving its path fresh,
+///    exactly as `write_document` does, to close the TOCTOU window between
+///    phase 1's checks and this write; a create uses `create_new` so a
+///    concurrent create of the same path is still caught here even though
+///    [`Self::DuplicatePath`]-class collisions within THIS call were already
+///    rejected up front). If document K's write fails — an `AlreadyExists`/
+///    `NotFound` this phase discovers for the first time, a stale
+///    `expected_hash` re-check against LIVE content, or a plain I/O error —
+///    every document 1..K-1 already written in this call is rolled back via
+///    [`rollback_batch_filesystem_writes`] (no git calls: nothing has been
+///    `git add`ed yet, so a plain filesystem revert is both correct and
+///    sufficient) and this returns `Err(Documents { failures: vec![(K, err)] })`.
+/// 3. **One `git::commit_and_sync` call, all paths at once.** Exactly the
+///    multi-path shape `move_directory` already established for a
+///    move-shaped change — see that function's own commit-path construction
+///    — applied here to a set of otherwise-unrelated documents instead of a
+///    move's paired old/new paths. A `PreCommit` failure here means `git
+///    add`/`git commit` failed for the whole batch: every document is rolled
+///    back, this time via the git-aware `restore_from_head`
+///    (edits)/`unstage`+`remove_file` (creates) pair `write_document` itself
+///    uses, since `git add` may have partially staged some of them by the
+///    time `git commit` failed. A `PostCommit` failure (fetch/rebase/push)
+///    means the commit is real and durable — nothing is rolled back, exactly
+///    like a single `write_document` call, and the whole batch is reported
+///    `CommittedPendingSync`.
+///
+/// `message` is the whole batch's own commit subject (`None` gets a generated
+/// default naming the document count) — there is no per-document message,
+/// since N documents in one commit only makes sense with one subject line.
+pub async fn write_documents_batch<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &WriteDeps<'_, E, Q>,
+    requests: &[BatchWriteRequest<'_>],
+    message: Option<&str>,
+) -> Result<BatchWriteSuccess, BatchWriteError> {
+    if requests.is_empty() {
+        return Err(BatchWriteError::Empty);
+    }
+    if requests.len() > MAX_BATCH_DOCUMENTS {
+        return Err(BatchWriteError::TooMany {
+            count: requests.len(),
+            max: MAX_BATCH_DOCUMENTS,
+        });
+    }
+
+    {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(requests.len());
+        for req in requests {
+            if !seen.insert(req.rel_path) {
+                return Err(BatchWriteError::DuplicatePath {
+                    rel_path: req.rel_path.to_string(),
+                });
+            }
+        }
+    }
+
+    // Validate the commit message before any of the slower per-document work
+    // below — same "cheap, structural checks first" ordering `write_document`
+    // itself uses for this exact check (see its own step 4).
+    validate_commit_message(message).map_err(|e| match e {
+        WriteError::InvalidCommitMessage { reason } => {
+            BatchWriteError::InvalidCommitMessage { reason }
+        }
+        other => unreachable!(
+            "validate_commit_message only ever returns InvalidCommitMessage, got {:?}",
+            other
+        ),
+    })?;
+
+    // --- Phase 1: pre-flight checks for every document, no lock, nothing
+    // written. Mirrors `write_document`'s own steps 0/0.5/1/2/3, run once per
+    // document, with every failure collected rather than returned on the
+    // first one — see this function's own doc comment.
+    let schemas = crate::schema::load_shared(deps.schema_cache);
+    let mut failures: Vec<(String, WriteError)> = Vec::new();
+
+    for req in requests {
+        if let Err(e) = check_include_pattern(deps, req.rel_path) {
+            failures.push((req.rel_path.to_string(), e));
+            continue;
+        }
+        if let Err(e) = safe_write_path(deps, req.rel_path) {
+            failures.push((req.rel_path.to_string(), e));
+            continue;
+        }
+        if let Some(expected) = req.expected_hash {
+            let actual = crate::ingest::compute_hash_from_bytes(req.old_content.as_bytes());
+            if !expected.trim().eq_ignore_ascii_case(&actual) {
+                failures.push((
+                    req.rel_path.to_string(),
+                    WriteError::StaleHash {
+                        expected: expected.trim().to_string(),
+                        actual,
+                    },
+                ));
+                continue;
+            }
+        }
+
+        if let Some(reason) = schemas.is_frozen(Path::new(req.rel_path)) {
+            failures.push((
+                req.rel_path.to_string(),
+                WriteError::Frozen {
+                    reason: reason.to_string(),
+                },
+            ));
+            continue;
+        }
+        let schema = schemas.resolve_for(Path::new(req.rel_path));
+
+        let (validation_result, validated) = match validate::validate_content(
+            Path::new(req.rel_path),
+            req.new_content,
+            schema,
+            deps.validation,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Validation error for '{}': {:#}", req.rel_path, e);
+                failures.push((
+                    req.rel_path.to_string(),
+                    WriteError::Io {
+                        msg: format!("Failed to validate content: {}", e),
+                    },
+                ));
+                continue;
+            }
+        };
+        if !validation_result.valid {
+            failures.push((
+                req.rel_path.to_string(),
+                WriteError::Validation {
+                    result: validation_result,
+                },
+            ));
+            continue;
+        }
+
+        if req.is_create && deps.dedup_enabled && !matches!(req.force_new, Some(true)) {
+            let query_text = validated
+                .as_ref()
+                .map(|v| {
+                    let description = v.frontmatter.get("description").and_then(|d| d.as_str());
+                    build_dedup_query(&v.body, description, deps.prepend_description)
+                })
+                .unwrap_or_default();
+
+            if query_text.trim().is_empty() {
+                warn!(
+                    "Dedup gate skipped for '{}' (batch): no body text to compare",
+                    req.rel_path
+                );
+            } else {
+                let empty_filters = SearchFilters::default();
+                let dedup_deps = RetrievalDeps {
+                    embed_client: deps.retrieval.embed_client,
+                    qdrant: deps.retrieval.qdrant,
+                    collection: deps.retrieval.collection,
+                    data_path: deps.retrieval.data_path,
+                    include_patterns: deps.retrieval.include_patterns,
+                    reranker: None,
+                };
+                match crate::retrieval::search(
+                    &dedup_deps,
+                    &query_text,
+                    &empty_filters,
+                    &dedup_search_opts(),
+                )
+                .await
+                {
+                    Ok(results) => {
+                        let top = results.into_iter().next().map(|r| {
+                            let path = r
+                                .payload
+                                .get("file_path")
+                                .and_then(|v| v.as_str())
+                                .map(|p| {
+                                    crate::retrieval::relative_to_data(p, deps.canonical_data_path)
+                                })
+                                .unwrap_or_default();
+                            (path, r.score)
+                        });
+                        if let Some(hit) = dedup_verdict(top, deps.dedup_threshold) {
+                            failures.push((
+                                req.rel_path.to_string(),
+                                WriteError::DedupHit {
+                                    duplicate_of: hit.file_path,
+                                    similarity: hit.score,
+                                    threshold: deps.dedup_threshold,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Dedup search failed for '{}' (batch, proceeding with write): {:#?}",
+                            req.rel_path, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(BatchWriteError::Documents { failures });
+    }
+
+    // --- Phase 2: acquire GIT_LOCK once for the rest of this call — the
+    // writes below, the single commit, and any rollback all share this one
+    // acquisition, for the identical #142 reason `write_document` itself
+    // holds its own lock across that same span (see its step 4.5 comment):
+    // releasing in between would let a concurrent webhook merge or another
+    // writer observe a half-written batch.
+    let git_lock = git::lock_git().await;
+    let data_path_str = deps.canonical_data_path.to_str().unwrap_or_default();
+
+    let originals: HashMap<&str, &str> = requests
+        .iter()
+        .map(|r| (r.rel_path, r.old_content))
+        .collect();
+    let mut written: Vec<(String, bool)> = Vec::with_capacity(requests.len());
+
+    for req in requests {
+        let abs_path = match safe_write_path(deps, req.rel_path) {
+            Ok(p) => p,
+            Err(e) => {
+                rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals)
+                    .await;
+                return Err(BatchWriteError::Documents {
+                    failures: vec![(req.rel_path.to_string(), e)],
+                });
+            }
+        };
+        if let Some(parent) = abs_path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            error!(
+                "Failed to create parent directories for '{}' (batch): {}",
+                abs_path.display(),
+                e
+            );
+            rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals).await;
+            return Err(BatchWriteError::Documents {
+                failures: vec![(
+                    req.rel_path.to_string(),
+                    WriteError::Io {
+                        msg: format!("Failed to create parent directories: {}", e),
+                    },
+                )],
+            });
+        }
+
+        if req.is_create {
+            use tokio::io::AsyncWriteExt as _;
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&abs_path)
+                .await;
+            let mut file = match file {
+                Ok(f) => f,
+                Err(e) => {
+                    let err = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        WriteError::AlreadyExists
+                    } else {
+                        error!(
+                            "Failed to create file '{}' (batch): {}",
+                            abs_path.display(),
+                            e
+                        );
+                        WriteError::Io {
+                            msg: format!("Failed to create file: {}", e),
+                        }
+                    };
+                    rollback_batch_filesystem_writes(
+                        deps.canonical_data_path,
+                        &written,
+                        &originals,
+                    )
+                    .await;
+                    return Err(BatchWriteError::Documents {
+                        failures: vec![(req.rel_path.to_string(), err)],
+                    });
+                }
+            };
+            if let Err(e) = file.write_all(req.new_content.as_bytes()).await {
+                error!(
+                    "Failed to write file '{}' (batch): {}",
+                    abs_path.display(),
+                    e
+                );
+                rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals)
+                    .await;
+                return Err(BatchWriteError::Documents {
+                    failures: vec![(
+                        req.rel_path.to_string(),
+                        WriteError::Io {
+                            msg: format!("Failed to write file: {}", e),
+                        },
+                    )],
+                });
+            }
+        } else {
+            if !abs_path.exists() {
+                rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals)
+                    .await;
+                return Err(BatchWriteError::Documents {
+                    failures: vec![(req.rel_path.to_string(), WriteError::NotFound)],
+                });
+            }
+            if let Some(expected) = req.expected_hash {
+                let live_content = match tokio::fs::read(&abs_path).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(
+                            "Failed to re-read '{}' for stale-hash re-check (batch): {}",
+                            abs_path.display(),
+                            e
+                        );
+                        rollback_batch_filesystem_writes(
+                            deps.canonical_data_path,
+                            &written,
+                            &originals,
+                        )
+                        .await;
+                        return Err(BatchWriteError::Documents {
+                            failures: vec![(
+                                req.rel_path.to_string(),
+                                WriteError::Io {
+                                    msg: format!(
+                                        "Failed to read file for stale-hash re-check: {}",
+                                        e
+                                    ),
+                                },
+                            )],
+                        });
+                    }
+                };
+                let actual = crate::ingest::compute_hash_from_bytes(&live_content);
+                if !expected.trim().eq_ignore_ascii_case(&actual) {
+                    rollback_batch_filesystem_writes(
+                        deps.canonical_data_path,
+                        &written,
+                        &originals,
+                    )
+                    .await;
+                    return Err(BatchWriteError::Documents {
+                        failures: vec![(
+                            req.rel_path.to_string(),
+                            WriteError::StaleHash {
+                                expected: expected.trim().to_string(),
+                                actual,
+                            },
+                        )],
+                    });
+                }
+            }
+            if let Err(e) = tokio::fs::write(&abs_path, req.new_content.as_bytes()).await {
+                error!(
+                    "Failed to write file '{}' (batch): {}",
+                    abs_path.display(),
+                    e
+                );
+                rollback_batch_filesystem_writes(deps.canonical_data_path, &written, &originals)
+                    .await;
+                return Err(BatchWriteError::Documents {
+                    failures: vec![(
+                        req.rel_path.to_string(),
+                        WriteError::Io {
+                            msg: format!("Failed to write file: {}", e),
+                        },
+                    )],
+                });
+            }
+        }
+
+        written.push((req.rel_path.to_string(), req.is_create));
+    }
+
+    // --- Phase 3: one commit for the whole batch.
+    let default_subject = format!("docs: batch update {} documents", requests.len());
+    let commit_message = build_commit_message(message, &default_subject, "write_document_batch");
+    let commit_paths: Vec<&str> = written.iter().map(|(p, _)| p.as_str()).collect();
+
+    let commit_outcome = match git::commit_and_sync(
+        &git_lock,
+        deps.git_url,
+        deps.branch,
+        data_path_str,
+        deps.token,
+        &commit_paths,
+        &commit_message,
+        deps.commit_author_name,
+        deps.commit_author_email,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+
+        Err(git::CommitSyncError::PreCommit(source)) => {
+            error!(
+                "write_documents_batch: commit_and_sync pre-commit failure, rolling back {} \
+                 document(s): {:#}",
+                written.len(),
+                source
+            );
+            let mut rolled_back = true;
+            for (rel_path, is_create) in &written {
+                let result = if *is_create {
+                    match tokio::fs::remove_file(deps.canonical_data_path.join(rel_path)).await {
+                        Ok(()) => git::unstage(&git_lock, data_path_str, rel_path).await,
+                        Err(e) => Err(anyhow::Error::new(e)
+                            .context("Failed to remove newly-written file during rollback")),
+                    }
+                } else {
+                    git::restore_from_head(&git_lock, data_path_str, rel_path).await
+                };
+                if let Err(e) = result {
+                    rolled_back = false;
+                    error!(
+                        "write_documents_batch rollback: failed to restore '{}': {:#}. \
+                         Filesystem and git state may now be inconsistent for this path.",
+                        rel_path, e
+                    );
+                }
+            }
+            return Err(BatchWriteError::PreCommitFailed {
+                rolled_back,
+                msg: format!("{:#}", source),
+            });
+        }
+
+        Err(git::CommitSyncError::PostCommit { sha, source }) => {
+            warn!(
+                "write_documents_batch: commit_and_sync post-commit (sync) failure, commit {} \
+                 stands uncorrected for {} document(s): {:#}",
+                sha,
+                written.len(),
+                source
+            );
+            deps.queue
+                .mark_paths(written.iter().map(|(p, _)| PathBuf::from(p)));
+            let documents = requests
+                .iter()
+                .map(|req| BatchDocumentResult {
+                    rel_path: req.rel_path.to_string(),
+                    is_create: req.is_create,
+                    diff: render_unified_diff(req.old_content, req.new_content, req.rel_path),
+                })
+                .collect();
+            return Ok(BatchWriteSuccess {
+                outcome: WriteOutcome::CommittedPendingSync,
+                sha,
+                rebased_paths: Vec::new(),
+                documents,
+                sync_failure_cause: Some(format!("{:#}", source)),
+            });
+        }
+    };
+
+    deps.queue.mark_paths(
+        written
+            .iter()
+            .map(|(p, _)| PathBuf::from(p))
+            .chain(commit_outcome.rebased_paths.iter().cloned()),
+    );
+
+    let documents = requests
+        .iter()
+        .map(|req| BatchDocumentResult {
+            rel_path: req.rel_path.to_string(),
+            is_create: req.is_create,
+            diff: render_unified_diff(req.old_content, req.new_content, req.rel_path),
+        })
+        .collect();
+
+    Ok(BatchWriteSuccess {
+        outcome: WriteOutcome::Synced,
+        sha: commit_outcome.sha,
+        rebased_paths: commit_outcome.rebased_paths,
+        documents,
+        sync_failure_cause: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -6977,6 +7648,290 @@ mod tests {
         assert_eq!(
             referencing_after, referencing_original,
             "with no state DB wired up, the referencing document must be left untouched"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // write_documents_batch: multiple documents, one commit (#180)
+    // -----------------------------------------------------------------------
+
+    fn make_batch_req<'a>(
+        rel_path: &'a str,
+        old_content: &'a str,
+        new_content: &'a str,
+        is_create: bool,
+    ) -> BatchWriteRequest<'a> {
+        BatchWriteRequest {
+            rel_path,
+            old_content,
+            new_content,
+            is_create,
+            force_new: Some(true),
+            expected_hash: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_documents_batch_lands_every_document_in_one_commit_and_marks_paths_dirty() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let head_before = head_sha(&work);
+        let harness = git_backed_harness(&work);
+
+        let requests = vec![
+            make_batch_req(
+                "docs/batch-one.md",
+                "",
+                "---\ntitle: One\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# One\n",
+                true,
+            ),
+            make_batch_req(
+                "docs/batch-two.md",
+                "",
+                "---\ntitle: Two\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Two\n",
+                true,
+            ),
+        ];
+
+        let success = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .expect("batch write should succeed");
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(!success.sha.is_empty());
+        assert_eq!(success.documents.len(), 2);
+        assert_eq!(success.documents[0].rel_path, "docs/batch-one.md");
+        assert!(success.documents[0].is_create);
+        assert!(success.documents[0].diff.contains("+title: One"));
+        assert_eq!(success.documents[1].rel_path, "docs/batch-two.md");
+        assert!(success.documents[1].diff.contains("+title: Two"));
+
+        assert!(work.path().join("docs/batch-one.md").exists());
+        assert!(work.path().join("docs/batch-two.md").exists());
+
+        // Exactly ONE commit landed for both documents — the whole point of
+        // batching (#180) — not two.
+        let head_after = head_sha(&work);
+        let count_out = std::process::Command::new("git")
+            .args([
+                "rev-list",
+                "--count",
+                &format!("{head_before}..{head_after}"),
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        let count = String::from_utf8_lossy(&count_out.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(count, "1", "both documents must land in exactly one commit");
+
+        let show_out = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=", "HEAD"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        let show_str = String::from_utf8_lossy(&show_out.stdout);
+        assert!(show_str.contains("docs/batch-one.md"));
+        assert!(show_str.contains("docs/batch-two.md"));
+
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["docs/batch-one.md", "docs/batch-two.md"],
+        );
+    }
+
+    #[tokio::test]
+    async fn write_documents_batch_rejects_more_than_the_size_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let owned: Vec<(String, String)> = (0..(MAX_BATCH_DOCUMENTS + 1))
+            .map(|i| (format!("docs/over-cap-{i}.md"), format!("# doc {i}")))
+            .collect();
+        let requests: Vec<BatchWriteRequest<'_>> = owned
+            .iter()
+            .map(|(path, content)| make_batch_req(path, "", content, true))
+            .collect();
+
+        let err = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .expect_err("over-cap batch must be rejected");
+        match err {
+            BatchWriteError::TooMany { count, max } => {
+                assert_eq!(count, MAX_BATCH_DOCUMENTS + 1);
+                assert_eq!(max, MAX_BATCH_DOCUMENTS);
+            }
+            other => panic!("expected TooMany, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_documents_batch_rejects_a_duplicate_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let requests = vec![
+            make_batch_req(
+                "docs/dup.md",
+                "",
+                "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n",
+                true,
+            ),
+            make_batch_req(
+                "docs/dup.md",
+                "",
+                "---\ntitle: B\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# B\n",
+                true,
+            ),
+        ];
+
+        let err = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .expect_err("a duplicate path within one batch must be rejected");
+        match err {
+            BatchWriteError::DuplicatePath { rel_path } => {
+                assert_eq!(rel_path, "docs/dup.md");
+            }
+            other => panic!("expected DuplicatePath, got {other:?}"),
+        }
+    }
+
+    /// Validation failure (bad frontmatter) on ONE document in an otherwise
+    /// valid batch must fail the WHOLE batch before anything is written —
+    /// mirrors `move_directory`'s own "validate every document before
+    /// touching any of them" contract, extended to a batch of otherwise
+    /// unrelated documents. Verified to fail before this feature existed
+    /// (there was no `write_documents_batch` to call at all) and to pass
+    /// after.
+    #[tokio::test]
+    async fn write_documents_batch_validation_failure_touches_nothing() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let head_before = head_sha(&work);
+
+        // `git_backed_harness`'s default test config has no required
+        // frontmatter fields configured — mirrors
+        // `validation_failure_carries_the_structured_result`'s own need to
+        // set this explicitly to get a real validation failure to test
+        // against.
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        {
+            let cfg = Arc::get_mut(&mut config).unwrap();
+            cfg.write.dedup_enabled = false;
+            cfg.frontmatter.required = vec!["title".into()];
+        }
+        let harness = Harness::new(&work, config);
+
+        let requests = vec![
+            make_batch_req(
+                "docs/valid.md",
+                "",
+                "---\ntitle: Valid\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Valid\n",
+                true,
+            ),
+            // Missing the required `title` field.
+            make_batch_req(
+                "docs/invalid.md",
+                "",
+                "---\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Invalid\n",
+                true,
+            ),
+        ];
+
+        let err = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .expect_err("a validation failure on one document must fail the whole batch");
+        match err {
+            BatchWriteError::Documents { failures } => {
+                assert_eq!(
+                    failures.len(),
+                    1,
+                    "only the invalid document should be reported"
+                );
+                assert_eq!(failures[0].0, "docs/invalid.md");
+                assert!(matches!(failures[0].1, WriteError::Validation { .. }));
+            }
+            other => panic!("expected Documents, got {other:?}"),
+        }
+
+        // Nothing written for EITHER document — not even the valid one.
+        assert!(!work.path().join("docs/valid.md").exists());
+        assert!(!work.path().join("docs/invalid.md").exists());
+        assert_eq!(
+            git_status(&work),
+            "",
+            "no filesystem change should be staged or untracked after a pre-flight failure"
+        );
+        assert_eq!(
+            head_sha(&work),
+            head_before,
+            "no commit should have been made"
+        );
+    }
+
+    /// A `git commit` failure for the batch's single shared commit must roll
+    /// back EVERY document this call had written to disk — mirrors
+    /// `move_directory_precommit_failure_rolls_back_every_document_and_referencing_document`'s
+    /// all-or-nothing rollback contract, for a batch of otherwise unrelated
+    /// documents instead of a move's paired source/destination. Verified to
+    /// fail before this feature existed and to pass after.
+    #[tokio::test]
+    async fn write_documents_batch_precommit_failure_rolls_back_every_document() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let harness = git_backed_harness(&work);
+
+        let requests = vec![
+            make_batch_req(
+                "docs/rollback-one.md",
+                "",
+                "---\ntitle: One\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# One\n",
+                true,
+            ),
+            make_batch_req(
+                "docs/rollback-two.md",
+                "",
+                "---\ntitle: Two\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Two\n",
+                true,
+            ),
+        ];
+
+        let err = write_documents_batch(&harness.deps(), &requests, None)
+            .await
+            .expect_err("a forced commit failure must be reported as an error");
+        match err {
+            BatchWriteError::PreCommitFailed { rolled_back, .. } => {
+                assert!(
+                    rolled_back,
+                    "rollback of every document should succeed cleanly"
+                );
+            }
+            other => panic!("expected PreCommitFailed, got {other:?}"),
+        }
+
+        assert!(
+            !work.path().join("docs/rollback-one.md").exists(),
+            "the first document's file must be removed by the rollback"
+        );
+        assert!(
+            !work.path().join("docs/rollback-two.md").exists(),
+            "the second document's file must be removed by the rollback"
+        );
+        assert_eq!(
+            git_status(&work),
+            "",
+            "the git index must be back to exactly its pre-call state"
+        );
+        assert_eq!(
+            head_sha(&work),
+            head_before,
+            "HEAD must be untouched — the commit never landed"
         );
     }
 
