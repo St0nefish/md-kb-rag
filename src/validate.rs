@@ -466,6 +466,17 @@ pub struct BrokenLinksBySource {
 /// exists so a badly-drifted KB cannot make the report itself unreadable.
 pub const MAX_BROKEN_LINKS_SHOWN: usize = 200;
 
+// NOTE (#238): `validate` creating `state.db` as a side effect is not fixable
+// from this module. `broken_links_report` below is a pure, read-only function
+// over pairs the caller already fetched — it has no filesystem or database
+// access of its own and creates nothing. The actual bug is upstream, in
+// `main.rs`'s `Commands::Validate` arm, which unconditionally calls
+// `StateDb::new` (a `mode=rwc` connect that creates and migrates `state.db`
+// if missing) before building this report — out of this fix's scope. See the
+// PR description for the exact `main.rs` change needed: check whether
+// `state.db` already exists on disk before opening it, and skip the report
+// (print "no index yet — run `index` first") rather than create the file.
+
 /// The full broken-link report `validate` renders (as text or JSON) after its
 /// frontmatter checks.
 ///
