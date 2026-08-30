@@ -217,13 +217,15 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// `UiState`) holds an `Arc<ReindexQueue>` field and lends a plain
     /// reference in for the duration of one write.
     pub queue: &'a crate::reindex::ReindexQueue,
-    /// The document metadata index, used ONLY by `write_document_move` to find
-    /// documents whose body links to the move's SOURCE path
-    /// (`StateDb::links_targeting`) so their link text can be rewritten in the
-    /// same commit as the move.
+    /// The document metadata index. Three consumers, all going through
+    /// `StateDb::links_targeting`'s reverse lookup ("what points at this
+    /// path"): `write_document_move` and `move_directory` find documents whose
+    /// body links to the move's SOURCE path so their link text can be
+    /// rewritten in the same commit as the move, and `delete_document` warns
+    /// about documents that link to the file being removed.
     ///
-    /// `None` disables link rewriting entirely — `write_document_move` still
-    /// performs the move itself, it just skips the reverse-link query and
+    /// `None` disables all three — the move/delete itself still happens, the
+    /// reverse-link query is just skipped. For a move that means it
     /// leaves every other document's links exactly as they were (they still
     /// self-heal on that document's own next reindex, since `document_links`
     /// is rebuilt from each document's current on-disk body, not trusted as an
@@ -5599,11 +5601,45 @@ mod tests {
         // Read-only: `read_to_string` (earlier in the same loop iteration)
         // still succeeds, so the code genuinely reaches — and fails at — the
         // write this test targets, rather than taking the earlier "stale
-        // row, skip" branch on a read failure.
+        // row, skip" branch on a read failure. That read-succeeds/write-fails
+        // asymmetry is why this uses a permission bit rather than, say,
+        // replacing the file with a directory: EISDIR would fail the *read*
+        // and route around the branch under test entirely.
+        //
+        // The catch is that DAC permission bits do not stop a privileged
+        // writer. Root — or anything holding CAP_DAC_OVERRIDE — writes through
+        // 0o444 unimpeded, the move then succeeds, and `unwrap_err()` below
+        // panics on an `Ok`. This repo has already been bitten by exactly that:
+        // see `git::tests::reject_pushes`, whose doc comment records a
+        // read-only-remote test that passed locally and failed on the
+        // self-hosted CI runner for this reason.
+        //
+        // There is no privilege-independent way to make one regular file
+        // readable but not writable, so rather than assume the injection
+        // worked, probe it: if the permission bit does not actually block a
+        // write here, skip loudly instead of reporting a failure that says
+        // nothing about the code under test.
         let ref_b_path = work.path().join("ref-b.md");
         let mut perms = std::fs::metadata(&ref_b_path).unwrap().permissions();
         perms.set_mode(0o444);
         std::fs::set_permissions(&ref_b_path, perms).unwrap();
+
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&ref_b_path)
+            .is_ok()
+        {
+            let mut perms = std::fs::metadata(&ref_b_path).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&ref_b_path, perms).unwrap();
+            eprintln!(
+                "SKIP move_link_rewrite_write_failure_rolls_back_the_move_and_every_already_rewritten_document: \
+                 this process can write through a 0o444 file (running as root or with \
+                 CAP_DAC_OVERRIDE), so the write failure this test injects cannot be produced. \
+                 Run as an unprivileged user to exercise the link-rewrite rollback."
+            );
+            return;
+        }
 
         let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
         let err = write_document(&harness.deps(), req).await.unwrap_err();
