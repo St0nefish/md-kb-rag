@@ -29,6 +29,7 @@ use tracing::error;
 
 use crate::config::{ResolvedConfig, SharedConfig};
 use crate::embed::{EmbedClient, QueryEmbedder};
+use crate::git;
 use crate::qdrant::{CHUNK_TEXT_KEY, QdrantStore, RetrievalStore, SearchResult};
 use crate::rerank::RerankClient;
 use crate::retrieval::{self, RetrievalDeps, SearchFilters, SearchOptions};
@@ -1031,6 +1032,216 @@ async fn get_schema_handler(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/history (#185)
+// ---------------------------------------------------------------------------
+//
+// The read-side counterpart of the `Tool:`/`Operation:` git commit provenance
+// trailers every write tool has written since long before this route existed
+// — see `git.rs`'s "Read-only history surface" section for the underlying
+// `git log`/`git show` calls and, importantly, why they run with NO
+// `GIT_LOCK` held (a deliberate, argued deviation from this codebase's
+// otherwise-uniform "every git.rs function takes a lock" rule — see that
+// section's doc comment).
+//
+// One route serves both of #185's questions rather than two: with no
+// `commit` query param, `path` (optional) scopes a commit LIST to one
+// document's history, or the whole KB's recent activity in general; with
+// `commit` (and, required alongside it, `path`), the same route returns that
+// one commit's diff for that one document instead — the smallest surface
+// that answers "what changed recently" and "what is this document's
+// history" without building a general git API (#185 explicitly asks for
+// restraint there).
+
+/// Default page size for a `/api/history` commit listing.
+const DEFAULT_HISTORY_LIMIT: usize = 20;
+/// Hard cap on a single `/api/history` commit listing — `git log -n` bounds
+/// the underlying walk to this directly, so this is also the actual bound on
+/// how much work one request can cause, independent of total repo history
+/// size (see `git::log_commits`'s doc comment).
+const MAX_HISTORY_LIMIT: usize = 100;
+/// Cap on a single commit's diff returned by `/api/history?commit=...`,
+/// mirroring `mcp::MAX_STRUCTURED_DIFF_BYTES` (private to that module) —
+/// same reasoning: bound one response's size regardless of how large a
+/// single commit's change to a document happened to be.
+const MAX_HISTORY_DIFF_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct HistoryQueryParams {
+    /// Scope to one document's history (repo-relative, same leading-`/`-means-KB-root
+    /// convention every other path-taking route uses). Required alongside `commit`;
+    /// optional otherwise (omitted = the whole KB's recent activity).
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// When set (with `path` also required), switch this request from a commit
+    /// LIST to that one commit's diff for `path`.
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+/// One commit as reported by `/api/history`'s list mode.
+#[derive(Debug, Serialize)]
+struct ApiCommitInfo {
+    sha: String,
+    author_name: String,
+    author_email: String,
+    /// Unix seconds (committer time) — same clock every other timestamp this
+    /// API surfaces uses, left as a number for the client to format rather
+    /// than pre-rendered server-side.
+    timestamp: i64,
+    subject: String,
+    tool: Option<String>,
+    operation: Option<String>,
+    /// Convenience flag mirroring `git::CommitInfo::is_tool_authored` — both
+    /// `tool` and `operation` present. A client could derive this itself, but
+    /// this is exactly the provenance distinction #185 is about, so it rides
+    /// along explicitly rather than asking every consumer to re-derive it.
+    tool_authored: bool,
+}
+
+impl From<git::CommitInfo> for ApiCommitInfo {
+    fn from(c: git::CommitInfo) -> Self {
+        let tool_authored = c.is_tool_authored();
+        ApiCommitInfo {
+            sha: c.sha,
+            author_name: c.author_name,
+            author_email: c.author_email,
+            timestamp: c.timestamp,
+            subject: c.subject,
+            tool: c.tool,
+            operation: c.operation,
+            tool_authored,
+        }
+    }
+}
+
+async fn history_handler(
+    State(state): State<UiState>,
+    Query(params): Query<HistoryQueryParams>,
+) -> Response {
+    let data_path = state.canonical_data_path.to_string_lossy().into_owned();
+
+    // Parameter-shape validation runs BEFORE the not-a-git-repo check below:
+    // a malformed request (`commit` with no `path`) is a client error
+    // regardless of what this deployment's data directory happens to be, so
+    // it must not silently succeed with `available: false` just because the
+    // repo check would have short-circuited first.
+    if let Some(commit) = params.commit.as_deref() {
+        let Some(raw_path) = params.path.as_deref() else {
+            return bad_request("commit requires path");
+        };
+        let rel_path = retrieval::kb_root_relative(raw_path.trim()).to_string();
+        if rel_path.is_empty() {
+            return bad_request("path parameter is empty");
+        }
+        if commit.trim().is_empty() {
+            return bad_request("commit parameter is empty");
+        }
+    }
+
+    if !git::is_git_repo(&data_path) {
+        // #185: a bind-mount deployment (`GIT_URL` unset) may not even be a
+        // git repository. Degrade gracefully — an empty, clearly-flagged
+        // result, not an error — rather than fail every request on a
+        // deployment shape this codebase otherwise supports fully.
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"available": false, "commits": []})),
+        )
+            .into_response();
+    }
+
+    // Diff mode: `commit` requires `path` — a commit's diff is always scoped
+    // to one document on this route (see this section's own doc comment on
+    // why a general two-revision diff API is deliberately out of scope).
+    if let Some(commit) = params.commit.as_deref() {
+        // Already validated above; `path` is guaranteed `Some` and non-empty.
+        let raw_path = params.path.as_deref().unwrap();
+        let rel_path = retrieval::kb_root_relative(raw_path.trim()).to_string();
+        return match git::document_commit_diff(&data_path, commit.trim(), &rel_path).await {
+            Ok(diff) => {
+                let (capped, diff_truncated, diff_total_bytes) =
+                    if diff.len() > MAX_HISTORY_DIFF_BYTES {
+                        let mut end = MAX_HISTORY_DIFF_BYTES;
+                        while end > 0 && !diff.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        (diff[..end].to_string(), true, diff.len())
+                    } else {
+                        let len = diff.len();
+                        (diff, false, len)
+                    };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "available": true,
+                        "path": rel_path,
+                        "commit": commit.trim(),
+                        "diff": capped,
+                        "diff_truncated": diff_truncated,
+                        "diff_total_bytes": diff_total_bytes,
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                error!("git::document_commit_diff failed for '{rel_path}' @ {commit}: {e:#}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "failed to read commit diff"})),
+                )
+                    .into_response()
+            }
+        };
+    }
+
+    // List mode.
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let rel_path = params
+        .path
+        .as_deref()
+        .map(|p| retrieval::kb_root_relative(p.trim()).to_string())
+        .filter(|p| !p.is_empty());
+
+    let result = match &rel_path {
+        Some(p) => git::document_history(&data_path, p, limit).await,
+        None => git::recent_commits(&data_path, limit).await,
+    };
+
+    match result {
+        Ok((commits, truncated)) => {
+            let returned = commits.len();
+            let commits_json: Vec<ApiCommitInfo> =
+                commits.into_iter().map(ApiCommitInfo::from).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "available": true,
+                    "path": rel_path,
+                    "commits": commits_json,
+                    "limit": limit,
+                    "returned": returned,
+                    "truncated": truncated,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!("git history lookup failed (path={rel_path:?}): {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to read git history"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST/DELETE /api/doc/{*path}
 // ---------------------------------------------------------------------------
 
@@ -1515,6 +1726,7 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/api/graph", get(graph_handler))
         .route("/api/search", get(search_handler))
         .route("/api/schema/{*path}", get(get_schema_handler))
+        .route("/api/history", get(history_handler))
         .merge(doc_router)
         .with_state(state)
 }
@@ -2070,6 +2282,145 @@ mod tests {
         );
         assert_eq!(normalize_ui_path("").unwrap(), PathBuf::new());
         assert_eq!(normalize_ui_path("/food/").unwrap(), PathBuf::from("food"));
+    }
+
+    // ------------------------------------------------------------------
+    // GET /api/history (#185)
+    // ------------------------------------------------------------------
+
+    /// Commit `rel_path` with `content`, using a message carrying the exact
+    /// provenance-trailer shape `write::build_commit_message` produces —
+    /// mirrors `git.rs`'s own `commit_tool_authored` test helper.
+    fn history_commit_tool_authored(work: &tempfile::TempDir, rel_path: &str, content: &str) {
+        let abs = work.path().join(rel_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&abs, content).unwrap();
+        let message =
+            format!("docs: update {rel_path}\n\nTool: md-kb-rag\nOperation: write_document");
+        std::process::Command::new("git")
+            .args(["add", rel_path])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=bot@localhost",
+                "-c",
+                "user.name=Bot",
+                "commit",
+                "-m",
+                &message,
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_handler_not_a_git_repo_returns_available_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = ui_router(test_state(&dir.path().canonicalize().unwrap()));
+        let req = Request::builder()
+            .uri("/api/history")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["available"], false);
+        assert_eq!(body["commits"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn history_handler_lists_recent_commits_with_provenance() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        history_commit_tool_authored(&work, "docs/a.md", "# A");
+
+        let app = ui_router(test_state(&work.path().canonicalize().unwrap()));
+        let req = Request::builder()
+            .uri("/api/history")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["available"], true);
+        let commits = body["commits"].as_array().unwrap();
+        // README.md's seed commit (hand-authored, from create_bare_repo) plus
+        // the tool-authored one just made above.
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["tool"], "md-kb-rag");
+        assert_eq!(commits[0]["operation"], "write_document");
+        assert_eq!(commits[0]["tool_authored"], true);
+        assert_eq!(commits[1]["tool_authored"], false);
+    }
+
+    #[tokio::test]
+    async fn history_handler_scopes_to_one_document() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        history_commit_tool_authored(&work, "docs/a.md", "# A");
+        history_commit_tool_authored(&work, "docs/b.md", "# B");
+
+        let app = ui_router(test_state(&work.path().canonicalize().unwrap()));
+        let req = Request::builder()
+            .uri("/api/history?path=docs/a.md")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["path"], "docs/a.md");
+        let commits = body["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 1, "only the commit touching docs/a.md");
+    }
+
+    #[tokio::test]
+    async fn history_handler_diff_mode_returns_the_commit_patch() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        history_commit_tool_authored(&work, "docs/a.md", "# A content\n");
+
+        let state = test_state(&work.path().canonicalize().unwrap());
+        let (commits, _) = git::document_history(
+            &work.path().canonicalize().unwrap().to_string_lossy(),
+            "docs/a.md",
+            10,
+        )
+        .await
+        .unwrap();
+        let sha = commits[0].sha.clone();
+
+        let app = ui_router(state);
+        let req = Request::builder()
+            .uri(format!("/api/history?path=docs/a.md&commit={sha}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["available"], true);
+        assert_eq!(body["path"], "docs/a.md");
+        assert!(
+            body["diff"].as_str().unwrap().contains("A content"),
+            "diff should show the added content: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_handler_diff_mode_requires_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = ui_router(test_state(&dir.path().canonicalize().unwrap()));
+        let req = Request::builder()
+            .uri("/api/history?commit=deadbeef")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ------------------------------------------------------------------

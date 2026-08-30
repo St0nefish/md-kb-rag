@@ -534,6 +534,310 @@ async fn git_log_mtimes_chunk(
     Ok(parse_git_log_mtimes(&out.stdout))
 }
 
+// ---------------------------------------------------------------------------
+// Read-only history surface (#185): "what changed recently" and "what is
+// this document's history" over the KB clone's own git log, plus parsing the
+// `Tool:`/`Operation:` provenance trailers `write::build_commit_message`
+// writes on every tool-authored commit — the read-side counterpart the
+// write side has had since #whatever-added-trailers but nothing has ever
+// consumed until now.
+//
+// ## Why these functions do NOT take `&GitLock`
+//
+// Deliberately breaking from this module's own "every function takes a
+// `&GitLock`" rule (see this module's top doc comment) — worth the
+// deviation being explicit and load-bearing rather than an oversight:
+//
+// - `git log`/`git show` are pure reads: they never touch `.git/index`,
+//   never move a ref, never write an object. Nothing here can race
+//   `add`/`commit`/`merge`/`rebase` in the way that made `GIT_LOCK` necessary
+//   in the first place (see this module's top doc comment) — there is no
+//   `index.lock` for a read to contend for.
+// - Git's object store is content-addressed and immutable: once a commit or
+//   blob exists, nothing after it can mutate that same object out from under
+//   a concurrent reader. The only thing a concurrent write can change while
+//   one of these functions runs is which ref (HEAD) a later step of that
+//   write points at — never the content of an object this function has
+//   already started reading.
+// - The worst case from skipping the lock is a slightly stale or
+//   momentarily unusual view — a history request that lands mid-rebase
+//   could observe a transient HEAD, or a request racing a fresh commit
+//   might not include it yet — never corruption, and never a hung or failed
+//   read. That is an acceptable trade for a read with no correctness
+//   requirement to observe one consistent snapshot across multiple git
+//   calls (contrast `commit_and_sync`'s own rebase-range diff, which DOES
+//   need that and holds the lock across it for exactly that reason).
+// - Taking the lock anyway would queue every history read behind whatever
+//   writer or webhook merge currently holds it — up to [`GIT_TIMEOUT`] in
+//   the worst case — for a feature whose entire point is a quick, read-only
+//   "what happened recently" glance. #236 was filed because a *different*
+//   read (the reconcile sweep's mtime walk) held this exact lock for an
+//   unbounded amount of work; queueing a bounded, cheap read behind live
+//   writers would trade that regression for a new one in the opposite
+//   direction — writers stalled behind reads instead of reads stalled
+//   behind an unbounded walk.
+// - Cost is bounded independently of lock discretion anyway: every call
+//   here is `git log -n <limit>` (git stops walking once it has emitted
+//   `limit` commits, regardless of how long the repository's full history
+//   is) or a single `git show` of one already-known commit — neither shape
+//   can reproduce #236's unbounded-per-file walk, so there is no "cheap
+//   enough to skip the lock only if bounded" caveat to weigh here the way
+//   there was for [`git_log_mtimes`].
+
+/// One commit's metadata, as reported by [`recent_commits`]/[`document_history`]
+/// — the read-side counterpart of the `Tool:`/`Operation:` provenance trailers
+/// [`crate::write::build_commit_message`] writes on every tool-authored commit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CommitInfo {
+    pub sha: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// Committer time (`%at`), Unix seconds — the same clock [`git_log_mtimes`]
+    /// already reports elsewhere in this module.
+    pub timestamp: i64,
+    /// The commit's subject line (first line of the message) only — the
+    /// trailer block is parsed out separately into `tool`/`operation` below,
+    /// not left duplicated in this field.
+    pub subject: String,
+    /// Parsed from a `Tool: <value>` trailer line in the commit body, if present.
+    pub tool: Option<String>,
+    /// Parsed from an `Operation: <value>` trailer line in the commit body, if present.
+    pub operation: Option<String>,
+}
+
+impl CommitInfo {
+    /// True when this commit carries BOTH provenance trailers
+    /// [`crate::write::build_commit_message`] always writes together — the
+    /// only shape a tool-authored commit produces. A commit with just one
+    /// trailer, or neither, is hand-authored (or predates the trailer
+    /// convention entirely).
+    pub fn is_tool_authored(&self) -> bool {
+        self.tool.is_some() && self.operation.is_some()
+    }
+}
+
+/// Whether `data_path` is a git working copy at all. A bind-mount deployment
+/// (`GIT_URL` unset — see `ResolvedSourceConfig::is_git_disabled`) may serve a
+/// plain directory of markdown with no `.git` at all, and every function below
+/// this point degrades to "nothing to report" rather than an error when this
+/// is `false` — see #185's "degrade gracefully" requirement.
+///
+/// A plain filesystem check, no git subprocess and (per this section's own
+/// doc comment above) no [`GitLock`] — this answers a question ABOUT the
+/// clone without touching it.
+pub fn is_git_repo(data_path: &str) -> bool {
+    Path::new(data_path).join(".git").exists()
+}
+
+/// Parse `Tool: <value>` / `Operation: <value>` trailer lines out of a raw
+/// commit message body (`%B`), matching exactly the shape
+/// [`crate::write::build_commit_message`] writes:
+/// ```text
+/// <subject line>
+///
+/// Tool: md-kb-rag
+/// Operation: <operation>
+/// ```
+/// The FIRST matching line of each wins (a well-formed trailer block has
+/// exactly one of each; a duplicate is not expected, but silently taking the
+/// first is safer than silently taking the last for a value this codebase
+/// treats as provenance). A hand-authored commit predating this convention,
+/// or written by anything else entirely, simply has neither and both come
+/// back `None` — that is the expected, common case, not a parse failure.
+fn parse_provenance_trailers(body: &str) -> (Option<String>, Option<String>) {
+    let mut tool = None;
+    let mut operation = None;
+    for line in body.lines() {
+        if tool.is_none()
+            && let Some(v) = line.strip_prefix("Tool: ")
+        {
+            tool = Some(v.trim().to_string());
+        } else if operation.is_none()
+            && let Some(v) = line.strip_prefix("Operation: ")
+        {
+            operation = Some(v.trim().to_string());
+        }
+    }
+    (tool, operation)
+}
+
+/// Parse `git log --format=%H%x1f%an%x1f%ae%x1f%at%x1f%B -z` output into
+/// [`CommitInfo`] records.
+///
+/// `-z` NUL-terminates every commit record (in place of the default
+/// blank-line separation) — the same delimiter [`parse_diff_name_status`]
+/// relies on for the identical reason: it is unambiguous regardless of what
+/// characters (including embedded newlines, since `%B` is the full,
+/// possibly-multi-line commit body) appear inside a record. `%x1f` (ASCII
+/// unit separator) delimits the four FIXED-width fields ahead of `%B`;
+/// `splitn(5, ...)` on that character is what keeps a `%B` body that
+/// happens to contain a literal `0x1f` byte (vanishingly unlikely in real
+/// commit text, but not impossible) from corrupting the fixed-field split —
+/// only the first four splits count, everything after the fourth separator
+/// is `%B` verbatim, is-a-part-of-body or not.
+fn parse_commit_log(raw: &[u8]) -> Vec<CommitInfo> {
+    let mut out = Vec::new();
+    for record in raw.split(|&b| b == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(record);
+        let mut parts = text.splitn(5, '\u{1f}');
+        let (Some(sha), Some(author_name), Some(author_email), Some(ts_str), Some(body)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            warn!("recent_commits: malformed git log record, skipping: {text:?}");
+            continue;
+        };
+        let Ok(timestamp) = ts_str.parse::<i64>() else {
+            warn!("recent_commits: unparseable timestamp '{ts_str}', skipping record");
+            continue;
+        };
+        let (tool, operation) = parse_provenance_trailers(body);
+        let subject = body.lines().next().unwrap_or("").to_string();
+        out.push(CommitInfo {
+            sha: sha.to_string(),
+            author_name: author_name.to_string(),
+            author_email: author_email.to_string(),
+            timestamp,
+            subject,
+            tool,
+            operation,
+        });
+    }
+    out
+}
+
+/// `git log -n <limit> --format=... -z [-- <path>]` in `data_path`, parsed
+/// into [`CommitInfo`] records, newest first (git's own default order).
+///
+/// `limit` bounds the walk directly — `git log -n N` stops once it has
+/// produced `N` commits, regardless of how much history precedes them — so
+/// this is cheap independent of total repository size; see this section's
+/// own doc comment for why that is also why no [`GitLock`] is required here.
+/// `path` narrows to commits touching that one repo-relative path (used by
+/// [`document_history`]); `None` reports the whole repository (used by
+/// [`recent_commits`]).
+///
+/// Requests `limit + 1` internally so it can report whether more history
+/// exists beyond what is returned — this codebase never truncates silently
+/// (see e.g. `search`'s `has_more`/`list_documents`'s `total`) — returning
+/// `(commits, truncated)` where `commits.len() <= limit` always.
+async fn log_commits(
+    data_path: &str,
+    limit: usize,
+    path: Option<&str>,
+) -> Result<(Vec<CommitInfo>, bool)> {
+    let safe_dir = format!("safe.directory={}", data_path);
+    // +1: see this function's doc comment on `truncated` detection.
+    let n = (limit + 1).to_string();
+    let mut args: Vec<&str> = vec![
+        "-c",
+        &safe_dir,
+        "log",
+        "-n",
+        &n,
+        "--format=%H%x1f%an%x1f%ae%x1f%at%x1f%B",
+        "-z",
+    ];
+    if let Some(p) = path {
+        args.push("--");
+        args.push(p);
+    }
+
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args(&args)
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git log timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git log")?;
+
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git log failed: {}", stderr);
+    }
+
+    let mut commits = parse_commit_log(&out.stdout);
+    let truncated = commits.len() > limit;
+    commits.truncate(limit);
+    Ok((commits, truncated))
+}
+
+/// The `limit` most recent commits across the whole KB clone, newest first —
+/// answers #185's "what changed in the KB recently". Returns `(commits,
+/// truncated)`; see [`log_commits`] for the truncation contract. Returns an
+/// empty, non-truncated result with no error when `data_path` is not a git
+/// repository at all (check [`is_git_repo`] first if the caller needs to
+/// distinguish "no repo" from "repo with no commits" — this function alone
+/// cannot, and callers exposing this over an API should surface that
+/// distinction rather than let both look like an empty KB).
+pub async fn recent_commits(data_path: &str, limit: usize) -> Result<(Vec<CommitInfo>, bool)> {
+    if !is_git_repo(data_path) {
+        return Ok((Vec::new(), false));
+    }
+    log_commits(data_path, limit, None).await
+}
+
+/// The `limit` most recent commits that touched `rel_path`, newest first —
+/// answers #185's "what is this document's history". Same
+/// not-a-git-repo/truncation contract as [`recent_commits`].
+pub async fn document_history(
+    data_path: &str,
+    rel_path: &str,
+    limit: usize,
+) -> Result<(Vec<CommitInfo>, bool)> {
+    if !is_git_repo(data_path) {
+        return Ok((Vec::new(), false));
+    }
+    log_commits(data_path, limit, Some(rel_path)).await
+}
+
+/// The patch `commit` made to `rel_path` — `git show --format= <commit> --
+/// <rel_path>`, i.e. exactly that one commit's diff for that one file, with
+/// no commit-metadata preamble (already available via
+/// [`recent_commits`]/[`document_history`]'s own `CommitInfo` for the same
+/// commit). This is deliberately narrower than a general "diff any two
+/// revisions" API (#185 explicitly calls for resisting that): a caller
+/// already has a specific commit sha from this document's own history and
+/// wants to see what THAT commit changed, not construct an arbitrary range.
+///
+/// Empty string if `commit` did not touch `rel_path` at all (a caller is
+/// expected to only ever pass a `commit` this document's own
+/// [`document_history`] reported, but this degrades to "no diff" rather than
+/// an error if it doesn't — same defensive posture [`is_git_repo`]'s callers
+/// get for a missing repo).
+pub async fn document_commit_diff(data_path: &str, commit: &str, rel_path: &str) -> Result<String> {
+    if !is_git_repo(data_path) {
+        return Ok(String::new());
+    }
+    let safe_dir = format!("safe.directory={}", data_path);
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args(["-c", &safe_dir, "show", "--format=", commit, "--", rel_path])
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git show timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git show")?;
+
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git show failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// The outcome of a failed [`commit_and_sync`] call, split by whether a commit landed.
 ///
 /// `commit_and_sync` runs five git operations in sequence — add, commit, fetch,
@@ -1533,6 +1837,302 @@ pub(crate) mod tests {
         assert!(!result.contains("tok2"));
         assert!(result.contains("https://***@host1/r.git"));
         assert!(result.contains("https://***@host2/r.git"));
+    }
+
+    // --- history (#185) tests ---
+
+    #[test]
+    fn parse_provenance_trailers_both_present() {
+        let body = "add docs/foo.md\n\nTool: md-kb-rag\nOperation: write_document";
+        let (tool, operation) = parse_provenance_trailers(body);
+        assert_eq!(tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(operation.as_deref(), Some("write_document"));
+    }
+
+    #[test]
+    fn parse_provenance_trailers_neither_present_for_a_hand_authored_message() {
+        let body = "Fix typo in the README\n\nCaught this while reviewing docs.";
+        let (tool, operation) = parse_provenance_trailers(body);
+        assert_eq!(tool, None);
+        assert_eq!(operation, None);
+    }
+
+    #[test]
+    fn parse_provenance_trailers_tolerates_only_one_present() {
+        let body = "some commit\n\nTool: md-kb-rag";
+        let (tool, operation) = parse_provenance_trailers(body);
+        assert_eq!(tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(operation, None);
+    }
+
+    #[test]
+    fn parse_provenance_trailers_first_occurrence_wins() {
+        let body = "msg\n\nTool: md-kb-rag\nOperation: write_document\nTool: something-else";
+        let (tool, _) = parse_provenance_trailers(body);
+        assert_eq!(tool.as_deref(), Some("md-kb-rag"));
+    }
+
+    #[test]
+    fn commit_info_is_tool_authored_requires_both_trailers() {
+        let base = CommitInfo {
+            sha: "abc".into(),
+            author_name: "a".into(),
+            author_email: "a@b.c".into(),
+            timestamp: 0,
+            subject: "s".into(),
+            tool: None,
+            operation: None,
+        };
+        assert!(!base.is_tool_authored());
+        assert!(
+            !CommitInfo {
+                tool: Some("md-kb-rag".into()),
+                ..base.clone()
+            }
+            .is_tool_authored()
+        );
+        assert!(
+            CommitInfo {
+                tool: Some("md-kb-rag".into()),
+                operation: Some("write_document".into()),
+                ..base
+            }
+            .is_tool_authored()
+        );
+    }
+
+    #[test]
+    fn parse_commit_log_empty_input_yields_no_commits() {
+        assert!(parse_commit_log(b"").is_empty());
+    }
+
+    #[test]
+    fn parse_commit_log_parses_one_tool_authored_record() {
+        let raw = b"deadbeef\x1fTest Bot\x1fbot@localhost\x1f1700000000\x1fadd foo.md\n\nTool: md-kb-rag\nOperation: write_document\0";
+        let commits = parse_commit_log(raw);
+        assert_eq!(commits.len(), 1);
+        let c = &commits[0];
+        assert_eq!(c.sha, "deadbeef");
+        assert_eq!(c.author_name, "Test Bot");
+        assert_eq!(c.author_email, "bot@localhost");
+        assert_eq!(c.timestamp, 1700000000);
+        assert_eq!(c.subject, "add foo.md");
+        assert_eq!(c.tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(c.operation.as_deref(), Some("write_document"));
+        assert!(c.is_tool_authored());
+    }
+
+    #[test]
+    fn parse_commit_log_parses_multiple_records_newest_first() {
+        let raw = b"sha2\x1fA\x1fa@x\x1f200\x1fsecond\0sha1\x1fA\x1fa@x\x1f100\x1ffirst\0";
+        let commits = parse_commit_log(raw);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "sha2");
+        assert_eq!(commits[1].sha, "sha1");
+    }
+
+    #[test]
+    fn parse_commit_log_skips_a_malformed_record_without_dropping_the_others() {
+        // First record has too few `\x1f`-delimited fields (missing body); the
+        // second is well-formed and must still come through.
+        let raw = b"badsha\x1fonly-two-fields\0goodsha\x1fA\x1fa@x\x1f100\x1fgood commit\0";
+        let commits = parse_commit_log(raw);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].sha, "goodsha");
+    }
+
+    #[test]
+    fn parse_commit_log_preserves_a_multiline_body_as_one_field() {
+        let raw = b"sha\x1fA\x1fa@x\x1f100\x1fsubject line\n\nbody line one\nbody line two\n\nTool: md-kb-rag\nOperation: delete_document\0";
+        let commits = parse_commit_log(raw);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "subject line");
+        assert_eq!(commits[0].operation.as_deref(), Some("delete_document"));
+    }
+
+    #[test]
+    fn is_git_repo_false_for_a_plain_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!is_git_repo(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_git_repo_true_for_a_real_clone() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        assert!(is_git_repo(work.path().to_str().unwrap()));
+    }
+
+    /// Helper: commit `rel_path` with `content` in `work_path`, using a
+    /// message that carries the exact provenance-trailer shape
+    /// `write::build_commit_message` produces — so history tests exercise the
+    /// real, shipped trailer format rather than a hand-rolled approximation.
+    fn commit_tool_authored(work_path: &str, rel_path: &str, content: &str, operation: &str) {
+        std::fs::write(std::path::Path::new(work_path).join(rel_path), content).unwrap();
+        let message = format!("docs: update {rel_path}\n\nTool: md-kb-rag\nOperation: {operation}");
+        git_test_cmd(work_path)
+            .args(["add", rel_path])
+            .output()
+            .unwrap();
+        git_test_cmd(work_path)
+            .args([
+                "-c",
+                "user.email=test-bot@localhost",
+                "-c",
+                "user.name=Test Bot",
+                "commit",
+                "-m",
+                &message,
+            ])
+            .output()
+            .unwrap();
+    }
+
+    /// Helper: commit `rel_path` with a plain, hand-authored-shaped message
+    /// (no trailers).
+    fn commit_hand_authored(work_path: &str, rel_path: &str, content: &str, message: &str) {
+        std::fs::write(std::path::Path::new(work_path).join(rel_path), content).unwrap();
+        git_test_cmd(work_path)
+            .args(["add", rel_path])
+            .output()
+            .unwrap();
+        git_test_cmd(work_path)
+            .args([
+                "-c",
+                "user.email=human@localhost",
+                "-c",
+                "user.name=A Human",
+                "commit",
+                "-m",
+                message,
+            ])
+            .output()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recent_commits_reports_tool_and_hand_authored_commits_newest_first() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        commit_tool_authored(work_path, "foo.md", "# Foo", "write_document");
+        commit_hand_authored(work_path, "bar.md", "# Bar", "manual edit of bar");
+
+        let (commits, truncated) = recent_commits(work_path, 10).await.unwrap();
+        // README.md's own seed commit (from create_bare_repo) plus these two.
+        assert!(commits.len() >= 2);
+        assert!(!truncated);
+
+        // Newest first: bar.md's hand-authored commit landed last.
+        assert_eq!(commits[0].subject, "manual edit of bar");
+        assert!(!commits[0].is_tool_authored());
+        assert_eq!(commits[1].tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(commits[1].operation.as_deref(), Some("write_document"));
+        assert!(commits[1].is_tool_authored());
+    }
+
+    #[tokio::test]
+    async fn recent_commits_reports_truncated_when_more_history_exists_than_limit() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        for i in 0..5 {
+            commit_hand_authored(
+                work_path,
+                &format!("f{i}.md"),
+                "content",
+                &format!("commit {i}"),
+            );
+        }
+
+        // README.md's seed commit + 5 more = 6 total; ask for 3.
+        let (commits, truncated) = recent_commits(work_path, 3).await.unwrap();
+        assert_eq!(commits.len(), 3);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn recent_commits_on_a_non_git_directory_returns_empty_without_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (commits, truncated) = recent_commits(dir.path().to_str().unwrap(), 10)
+            .await
+            .unwrap();
+        assert!(commits.is_empty());
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn document_history_scopes_to_commits_touching_that_path_only() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        commit_tool_authored(work_path, "a.md", "# A v1", "write_document");
+        commit_hand_authored(work_path, "b.md", "# B", "unrelated change to b");
+        commit_tool_authored(work_path, "a.md", "# A v2", "write_document");
+
+        let (commits, truncated) = document_history(work_path, "a.md", 10).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(commits.len(), 2, "only the two commits touching a.md");
+        for c in &commits {
+            assert!(c.is_tool_authored());
+        }
+    }
+
+    #[tokio::test]
+    async fn document_history_on_a_non_git_directory_returns_empty_without_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (commits, truncated) = document_history(dir.path().to_str().unwrap(), "a.md", 10)
+            .await
+            .unwrap();
+        assert!(commits.is_empty());
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn document_commit_diff_reports_the_content_change_for_that_commit() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        commit_tool_authored(work_path, "a.md", "# A v1\nline one\n", "write_document");
+        let (history, _) = document_history(work_path, "a.md", 10).await.unwrap();
+        let first_sha = history[0].sha.clone();
+
+        let diff = document_commit_diff(work_path, &first_sha, "a.md")
+            .await
+            .unwrap();
+        assert!(
+            diff.contains("A v1") || diff.contains("line one"),
+            "diff should show the content added by this commit, got: {diff}"
+        );
+    }
+
+    #[tokio::test]
+    async fn document_commit_diff_is_empty_for_a_commit_that_never_touched_the_path() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        commit_hand_authored(work_path, "other.md", "# Other", "touch other.md only");
+        let (history, _) = document_history(work_path, "other.md", 10).await.unwrap();
+        let sha = history[0].sha.clone();
+
+        // "a.md" was never touched by this commit — `git show ... -- a.md` has
+        // nothing to report, which must degrade to an empty diff, not an error.
+        let diff = document_commit_diff(work_path, &sha, "a.md").await.unwrap();
+        assert_eq!(diff, "");
+    }
+
+    #[tokio::test]
+    async fn document_commit_diff_on_a_non_git_directory_returns_empty_without_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let diff = document_commit_diff(dir.path().to_str().unwrap(), "deadbeef", "a.md")
+            .await
+            .unwrap();
+        assert_eq!(diff, "");
     }
 
     // --- commit_and_sync tests ---
