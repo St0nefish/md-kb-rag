@@ -21,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use tower_governor::{
     GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
-use tracing::{debug, info, warn};
+use tower_http::limit::RequestBodyLimitLayer;
+use tracing::{debug, error, info, warn};
 
 use crate::config::{self, FrontmatterConfig, ResolvedConfig, SharedConfig};
 use crate::descriptions;
@@ -183,6 +184,18 @@ const STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 /// response" beats making the endpoint that answers "is anything wrong?" the one thing
 /// that hangs when something is.
 const STATUS_QDRANT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Slack for the `qdrant_points` vs. `chunk_count_total` deficit check in
+/// `collect_status` (#155, passive half). A deficit inside this slack is not
+/// reported as an error even outside an in-flight run — it covers the sub-second
+/// windows `ingest.rs` itself documents as producing a transient deficit: between
+/// `delete_by_files` and its matching state-row deletes in `remove_orphans`, or
+/// between a tail-trim delete and its state upsert, for a small number of files.
+/// Deliberately not zero — a zero slack would treat that ordinary, self-correcting
+/// window as an incident. Deliberately small — the scenario this check exists to
+/// catch (Qdrant's data wiped while state.db survived) produces a deficit equal to
+/// the *entire* corpus's chunk count, orders of magnitude larger than any legitimate
+/// transient gap, so a generous slack is not needed to keep the signal clean.
+const QDRANT_DEFICIT_SLACK: i64 = 50;
 /// How long graceful shutdown waits for an in-flight indexing run to finish before
 /// giving up and letting the process exit anyway. A run this long is already an
 /// anomaly the reconcile sweep will retry after restart; shutdown should not hang
@@ -207,6 +220,17 @@ const SHUTDOWN_INDEX_WAIT: Duration = Duration::from_secs(75);
 /// so this bound exists only to keep the shutdown path itself from hanging forever —
 /// it does not hand git any headroom it didn't already have.
 const SHUTDOWN_GIT_QUIESCE_WAIT: Duration = Duration::from_secs(30);
+
+/// How long [`supervise_reindex_worker`] (#163) waits before respawning
+/// `reindex::run_worker` after it exits (panic, or — unreachably in production, since
+/// its own loop has no break — a plain return). A short, fixed delay rather than the
+/// exponential backoff `reindex.rs`'s per-unit retry logic uses for transient
+/// failures: a panic in the worker's own event loop is a programming bug, not a
+/// condition that clears with time, so backing off aggressively would only delay
+/// noticing (and indexing resuming) without improving the next attempt's odds. The
+/// delay exists purely so a worker that panics immediately on every restart doesn't
+/// spin the CPU and flood the logs.
+const REINDEX_WORKER_RESTART_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct StatusState {
@@ -293,6 +317,20 @@ pub struct StoreCounts {
     pub documents_missing_metadata: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qdrant_points: Option<u64>,
+    /// Sum of `indexed_files.chunk_count` — the number of Qdrant points state.db
+    /// believes are live (see [`crate::state::StateDb::total_chunk_count`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_count_total: Option<i64>,
+    /// `chunk_count_total - qdrant_points`. Zero in a healthy steady state.
+    /// Populated whenever both inputs are available, independent of whether a
+    /// deficit is currently large enough to be reported as an error below — so
+    /// `/metrics` stays alertable off this number directly rather than depending on
+    /// `errors`' in-flight suppression. See the one-sided comparison in
+    /// `collect_status` for why only a positive (deficit) value, past a small slack
+    /// and outside an in-flight run, is treated as a problem; a negative value
+    /// (surplus) is expected to persist and is not itself a fault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qdrant_points_deficit: Option<i64>,
     /// Populated when a backing store could not be read. The rest of the response is
     /// still served: "is it indexing" must stay answerable while Qdrant is down.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -326,6 +364,33 @@ fn store_error(prefix: &str, e: &anyhow::Error) -> String {
     crate::status::redact_error(&format!("{prefix}: {e:#}"))
 }
 
+/// The one-sided deficit check behind #155's passive Qdrant-wipe detection — see the
+/// call site in `collect_status` for the full rationale (steady-state equality, why
+/// only a deficit and not a surplus is a fault, why in-flight runs are suppressed).
+/// Pulled out as a pure function, rather than left inline, specifically so `mod
+/// tests` can drive the slack/one-sidedness/in-flight logic directly with arbitrary
+/// `chunk_sum`/`points`/`indexing` combinations — exercising it through
+/// `collect_status` itself would mean getting a real Qdrant connection to report a
+/// specific, wrong point count, which is exactly the failure mode this check exists
+/// to catch without one.
+///
+/// Returns the error message to push onto `store.errors`, or `None` if nothing is
+/// wrong (no deficit, a deficit within slack, or a deficit while indexing).
+fn qdrant_deficit_error(chunk_sum: i64, points: u64, indexing: bool) -> Option<String> {
+    let deficit = chunk_sum - points as i64;
+    if deficit > QDRANT_DEFICIT_SLACK && !indexing {
+        Some(format!(
+            "qdrant has {deficit} fewer point(s) than state.db's chunk_count sum \
+             ({points} vs {chunk_sum}); this can mean Qdrant's data was wiped while \
+             state.db survived, and search may be silently returning incomplete or \
+             empty results for the whole knowledge base. Run `md-kb-rag index --full` \
+             to force a reconcile."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Gather everything the status views need. Never fails: unreachable stores are
 /// reported as errors inside the response rather than as a failed request.
 pub async fn collect_status(state: &StatusState) -> StatusResponse {
@@ -345,6 +410,10 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
             match db.document_count().await {
                 Ok(n) => store.documents_with_metadata = Some(n),
                 Err(e) => store.errors.push(store_error("documents", &e)),
+            }
+            match db.total_chunk_count().await {
+                Ok(n) => store.chunk_count_total = Some(n),
+                Err(e) => store.errors.push(store_error("chunk count", &e)),
             }
             if let (Some(files), Some(docs)) = (store.indexed_files, store.documents_with_metadata)
             {
@@ -448,11 +517,51 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
         )),
     }
 
+    // Fetched once and reused below (for the deficit check's in-flight suppression
+    // and for the response's own `indexing` field) rather than snapshotting
+    // `INDEX_STATUS` twice — both reads must agree on whether a run is in flight,
+    // and a second, later snapshot could observe a run that started or finished
+    // between the two calls.
+    let indexing_snapshot = crate::status::INDEX_STATUS.snapshot();
+
+    // Passive detection of a Qdrant data wipe (#155 — passive `/status` half only;
+    // the active self-heal belongs to ingest.rs/qdrant.rs as a follow-up). In a
+    // healthy steady state `qdrant_points == chunk_count_total` exactly:
+    // `index_paths` writes exactly `chunks.len()` points per file and records that
+    // same count in the same bookkeeping step (`ingest.rs`'s `upsert_pending`). If
+    // Qdrant's data is wiped while state.db survives, `ensure_collection` silently
+    // recreates an empty collection, the reconcile scan finds nothing changed
+    // (state.db still matches the files on disk), and `qdrant_points` stays at/near
+    // zero forever while `chunk_count_total` stays at its old value — this is the
+    // signal that catches that.
+    //
+    // Deliberately one-sided: only a DEFICIT (points < chunk_sum) is flagged. A
+    // surplus (points > chunk_sum) is not a fault and can persist indefinitely —
+    // `ingest.rs` documents at least two conditions that produce one on purpose: a
+    // failed tail-trim leaves stale high-index points until the next `--full`, and a
+    // bookkeeping failure after a successful upsert leaves points with no matching
+    // state row. A symmetric "large gap either direction" check would false-alarm on
+    // exactly the states the code already tolerates.
+    //
+    // A small deficit is also legitimate mid-run — the sub-second window between
+    // `delete_by_files` and its state-row deletes in `remove_orphans`, or between a
+    // tail-trim delete and its state upsert — hence `QDRANT_DEFICIT_SLACK` plus
+    // suppressing the alarm (though `qdrant_points_deficit` itself is still
+    // populated either way — see its doc comment) while `indexing_snapshot.indexing`
+    // is true.
+    if let (Some(chunk_sum), Some(points)) = (store.chunk_count_total, store.qdrant_points) {
+        let deficit = chunk_sum - points as i64;
+        store.qdrant_points_deficit = Some(deficit);
+        if let Some(msg) = qdrant_deficit_error(chunk_sum, points, indexing_snapshot.indexing) {
+            store.errors.push(msg);
+        }
+    }
+
     StatusResponse {
         uptime_secs: crate::status::uptime_secs(),
         collection: config.qdrant.collection.clone(),
         data_path: config.data_path().to_string(),
-        indexing: crate::status::INDEX_STATUS.snapshot(),
+        indexing: indexing_snapshot,
         queue: state.reindex_queue.snapshot(),
         store,
         breakdown,
@@ -782,6 +891,18 @@ pub fn render_prometheus(status: &StatusResponse) -> String {
         metric(
             "kb_qdrant_points",
             "Points (chunks) stored in the Qdrant collection.",
+            "gauge",
+            &plain(n as f64),
+        );
+    }
+    if let Some(n) = status.store.qdrant_points_deficit {
+        metric(
+            "kb_qdrant_points_deficit",
+            "chunk_count_total minus qdrant_points. Persistently positive and well \
+             above a small slack usually means Qdrant lost data while state.db did \
+             not (#155) — e.g. the collection was wiped and silently recreated \
+             empty. A negative value (surplus) is benign and can persist \
+             indefinitely; alert on sustained positive values, not on nonzero.",
             "gauge",
             &plain(n as f64),
         );
@@ -1271,6 +1392,85 @@ fn compose_tool_overlay(config: &ResolvedConfig, data_path: &Path) -> HashMap<St
     descriptions::compose_tool_descriptions(extensions_dir.as_deref(), phrase_effective)
 }
 
+/// Supervises `reindex::run_worker` — the single task that drains `reindex_queue` and
+/// is the only thing that ever calls `ingest::index_paths` (see the doc comment on
+/// the call site below). A bare `tokio::spawn(run_worker(...))` with the `JoinHandle`
+/// discarded, which is what this replaces, has two problems (#163): a panic inside
+/// `ingest_runner`/`index_paths` kills the task silently — `tokio::spawn` swallows
+/// the panic, there is no join point to notice it, and indexing stops forever with
+/// nothing but `kb_reindex_queue_pending_paths` climbing to show for it — and the
+/// worker is never told about shutdown, unlike every sibling background loop in
+/// `run_server` (`reconcile_loop`, the metadata-refresh loop, the MCP transport),
+/// each of which takes a `ct.child_token()`.
+///
+/// `run_worker` itself never returns under normal operation (it loops on
+/// `queue.notify` forever, see its doc comment) and takes no `CancellationToken`
+/// parameter — `reindex.rs` is owned by another concurrent change right now, so that
+/// signature cannot be touched here. Cancellation is therefore achieved from this
+/// side instead: each attempt is its own `tokio::spawn` (so a panic surfaces as an
+/// `Err(JoinError)` from the handle rather than silently ending the task), raced via
+/// `tokio::select!` against `ct.cancelled()`. On cancellation this loop simply stops
+/// respawning — it does NOT abort the in-flight attempt's `JoinHandle`, so an
+/// index run already in progress keeps running and finishing exactly as before,
+/// which is what `run_server`'s shutdown sequence actually depends on
+/// (`wait_for_indexing_to_settle` polls `INDEX_STATUS`, unaffected by this change).
+///
+/// On a genuine exit (panic, or an unreachable plain return), this restarts the
+/// worker after `REINDEX_WORKER_RESTART_DELAY` rather than giving up — "skip this
+/// crash, keep indexing" instead of "one bad file permanently stops the pipeline."
+///
+/// `spawn_attempt` is injected rather than this function calling
+/// `crate::reindex::run_worker` directly — the same reasoning as `reconcile_loop`'s
+/// `on_fire` and `wait_for_indexing_to_settle`'s `is_indexing` just below: it lets
+/// `mod tests` drive the panic-restart and cancel-stops-respawning behavior against a
+/// fake task it fully controls (when it panics, how many times), instead of needing
+/// the real worker to panic on demand against live infrastructure. Production passes
+/// a closure that calls `crate::reindex::run_worker` with the process's real queue/
+/// config/schema-cache handles.
+async fn supervise_reindex_worker<F, Fut>(mut spawn_attempt: F, ct: CancellationToken)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        let attempt = tokio::spawn(spawn_attempt());
+
+        tokio::select! {
+            result = attempt => {
+                match result {
+                    // `run_worker`'s own loop has no break, so a plain return is
+                    // unreachable in production today — but treat it exactly like a
+                    // panic (log + restart) rather than letting the supervisor exit
+                    // quietly, so a future change that adds a return path to
+                    // `run_worker` can't silently reintroduce "indexing stops
+                    // forever with nothing to show for it."
+                    Ok(()) => error!(
+                        "reindex worker exited unexpectedly (returned rather than \
+                         looping forever); restarting in {:?}",
+                        REINDEX_WORKER_RESTART_DELAY
+                    ),
+                    Err(e) => error!(
+                        "reindex worker panicked: {e}; restarting in {:?}",
+                        REINDEX_WORKER_RESTART_DELAY
+                    ),
+                }
+            }
+            () = ct.cancelled() => {
+                // Shutdown requested. Deliberately not `.abort()`ed — see this
+                // function's doc comment for why the in-flight attempt is left to
+                // finish (or keep panicking) on its own rather than being killed
+                // here.
+                break;
+            }
+        }
+
+        tokio::select! {
+            () = tokio::time::sleep(REINDEX_WORKER_RESTART_DELAY) => {}
+            () = ct.cancelled() => break,
+        }
+    }
+}
+
 /// Periodic safety-net sweep loop: sleep for `indexing.reconcile_interval_secs`
 /// (read fresh from `shared_config` every iteration, not captured once outside the
 /// loop, so a `POST /admin/reload` that changes the interval governs the very next
@@ -1341,6 +1541,32 @@ const MCP_PATH: &str = "/mcp";
 /// `/health` and the UI routes carry no `bearer_auth` layer.
 const HEALTH_PATH: &str = "/health";
 
+/// The startup warning `run_server` logs when `mcp.allow_unauthenticated: true` and
+/// no bearer token is configured — i.e. every route in the `STATUS_PATH`/
+/// `METRICS_PATH`/`ADMIN_RELOAD_PATH`/`MCP_PATH` group above is reachable by anyone.
+///
+/// Pulled out as its own function, rather than left inline in the `warn!` call, for
+/// two reasons: it lets `mod tests` assert on the message's actual content instead of
+/// only on the fact that some `warn!` fired, and — the point of #154 — it forces the
+/// endpoint list to be built from the same path constants `assemble_router` uses to
+/// wire up `bearer_auth`, rather than retyped as string literals that can silently
+/// drift from the route group they describe. That drift is exactly what happened
+/// before this fix: the message named only `/mcp`, `/status` and `/metrics`, omitting
+/// `/admin/reload` even though `reload_handler`'s own doc comment says it "gets no
+/// weaker a gate than" those two — an operator reading only this warning had no way
+/// to know `/admin/reload` was equally exposed.
+fn unauthenticated_mcp_warning(bearer_token_env: &str) -> String {
+    format!(
+        "SECURITY: bearer token env var '{bearer_token_env}' is not set — {MCP_PATH}, \
+         {STATUS_PATH}, {METRICS_PATH} and {ADMIN_RELOAD_PATH} are all reachable WITHOUT \
+         authentication. {MCP_PATH} will serve full document content to any caller; \
+         {STATUS_PATH} and {METRICS_PATH} expose tag vocabularies, area names and document \
+         counts; {ADMIN_RELOAD_PATH} lets any caller force a config reload and an \
+         unconditional full reindex reconcile. Set the env var or restrict network access. \
+         (allow_unauthenticated is enabled in config)"
+    )
+}
+
 /// Everything `assemble_router` needs to build the exact `Router` `run_server`
 /// serves. Bundled into one struct — rather than a long parameter list — so
 /// `mod tests` can construct the same deps against fake/in-memory backends and
@@ -1376,7 +1602,15 @@ struct RouterAssemblyDeps {
 fn assemble_router(deps: RouterAssemblyDeps) -> Router {
     let mcp_router = Router::new()
         .nest_service(MCP_PATH, deps.mcp_service)
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        // NOT `DefaultBodyLimit`: that works only by inserting a marker into request
+        // extensions for axum's `Bytes`/`String`/`Json` extractors to consult, and
+        // rmcp's `StreamableHttpService` reads the body itself via a raw
+        // `Body::collect()` that never looks at that marker — so a `DefaultBodyLimit`
+        // layer here would be silently inert (#205; confirmed empirically, an
+        // 11.5 MB body reached `/mcp` and returned 200 OK). `RequestBodyLimitLayer`
+        // instead wraps the body type itself, so the cap applies no matter how the
+        // inner service reads it.
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10 MB
         .route_layer(middleware::from_fn_with_state(
             deps.auth_state.clone(),
             bearer_auth,
@@ -1591,10 +1825,26 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     // snapshot before every drain, so `indexing.include`/`exclude`/`exclude_files`,
     // `frontmatter.*`, `validation.*`, and `chunking.*` all observe a reload on the
     // worker's next wake rather than needing a restart.
-    tokio::spawn(crate::reindex::run_worker(
-        Arc::clone(&reindex_queue),
-        Arc::clone(&shared_config),
-        Arc::clone(&shared_schema_cache),
+    //
+    // Wrapped in `supervise_reindex_worker` (#163) rather than spawned bare: gives it
+    // panic-restart supervision and a `ct.child_token()`, matching every other
+    // background loop below (`reconcile_loop`, the metadata-refresh loop, the MCP
+    // transport) instead of being the one task with neither. See that function's doc
+    // comment for the full rationale, including why cancellation doesn't abort an
+    // in-flight run.
+    let worker_ct = ct.child_token();
+    let worker_queue = Arc::clone(&reindex_queue);
+    let worker_shared_config = Arc::clone(&shared_config);
+    let worker_schema_cache = Arc::clone(&shared_schema_cache);
+    tokio::spawn(supervise_reindex_worker(
+        move || {
+            crate::reindex::run_worker(
+                Arc::clone(&worker_queue),
+                Arc::clone(&worker_shared_config),
+                Arc::clone(&worker_schema_cache),
+            )
+        },
+        worker_ct,
     ));
 
     // Catch up on anything missed while this process was down (crash, deploy, a
@@ -1781,12 +2031,8 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
                 );
             }
             warn!(
-                "SECURITY: bearer token env var '{}' is not set — /mcp, /status and /metrics are \
-                 all reachable WITHOUT authentication. /mcp will serve full document content to \
-                 any caller; /status and /metrics expose tag vocabularies, area names and \
-                 document counts. Set the env var or restrict network access. \
-                 (allow_unauthenticated is enabled in config)",
-                config.mcp.bearer_token_env
+                "{}",
+                unauthenticated_mcp_warning(&config.mcp.bearer_token_env)
             );
             None
         }
@@ -1981,6 +2227,8 @@ mod tests {
                 documents_with_metadata: Some(300),
                 documents_missing_metadata: Some(29),
                 qdrant_points: Some(2481),
+                chunk_count_total: Some(2481),
+                qdrant_points_deficit: Some(0),
                 errors: vec![],
             },
             breakdown: vec![FieldBreakdown {
@@ -2252,6 +2500,110 @@ mod tests {
         assert_eq!(status.store.documents_with_metadata, Some(0));
         assert_eq!(status.store.documents_missing_metadata, Some(3));
         assert!(render_prometheus(&status).contains("kb_documents_missing_metadata 3"));
+    }
+
+    // --- #155 (passive half): qdrant_points vs. chunk_count_total ---
+
+    #[tokio::test]
+    async fn status_reports_total_chunk_count_from_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+
+        let db = crate::state::StateDb::new(std::path::Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        db.upsert("a.md", "h1", 3, "sh", 0, 0).await.unwrap();
+        db.upsert("b.md", "h2", 5, "sh", 0, 0).await.unwrap();
+
+        let state = StatusState {
+            qdrant: Arc::new(QdrantStore::new(&config.qdrant).unwrap()),
+            config: config::shared_config(config),
+            state_db: Arc::new(tokio::sync::OnceCell::new()),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+            reindex_queue: Arc::new(crate::reindex::ReindexQueue::new()),
+        };
+
+        let status = collect_status(&state).await;
+        assert_eq!(
+            status.store.chunk_count_total,
+            Some(8),
+            "must be the SUM of chunk_count across indexed_files, not e.g. the row count"
+        );
+        // Qdrant is unreachable in this test config (see `status_config`'s doc
+        // comment on the refusing port), so `qdrant_points` is `None` and the
+        // deficit — which needs both sides — must stay unpopulated rather than
+        // comparing against a bogus default.
+        assert!(status.store.qdrant_points.is_none());
+        assert!(status.store.qdrant_points_deficit.is_none());
+    }
+
+    /// Pure unit tests for `qdrant_deficit_error`, the one-sided check behind #155's
+    /// passive Qdrant-wipe detection — see its doc comment and the call site in
+    /// `collect_status` for the full rationale. Exercised directly (not through
+    /// `collect_status`) because getting a real `QdrantStore::collection_info` to
+    /// report an arbitrary, wrong point count would need live infrastructure this
+    /// check is specifically meant to work without.
+    mod qdrant_deficit_error_tests {
+        use super::*;
+
+        #[test]
+        fn flags_a_deficit_past_slack_when_idle() {
+            // Simulates the #155 failure scenario at a small scale: state.db
+            // believes 1000 chunks are indexed, Qdrant reports far fewer.
+            let msg = qdrant_deficit_error(1000, 10, false);
+            assert!(msg.is_some(), "a large deficit while idle must be flagged");
+            let msg = msg.unwrap();
+            assert!(msg.contains("990"), "message must state the deficit: {msg}");
+            assert!(
+                msg.contains("index --full"),
+                "message must tell the operator how to recover: {msg}"
+            );
+        }
+
+        #[test]
+        fn ignores_a_deficit_within_slack() {
+            assert_eq!(
+                qdrant_deficit_error(1000, (1000 - QDRANT_DEFICIT_SLACK) as u64, false),
+                None,
+                "exactly at the slack boundary must not alarm"
+            );
+            assert_eq!(
+                qdrant_deficit_error(1000, (1000 - QDRANT_DEFICIT_SLACK + 1) as u64, false),
+                None,
+                "one point of slack still available: must not alarm"
+            );
+        }
+
+        #[test]
+        fn flags_a_deficit_one_past_slack() {
+            assert!(
+                qdrant_deficit_error(1000, (1000 - QDRANT_DEFICIT_SLACK - 1) as u64, false)
+                    .is_some(),
+                "one point beyond the slack boundary must alarm"
+            );
+        }
+
+        #[test]
+        fn ignores_a_surplus_no_matter_how_large() {
+            // Stale tail-trim points and orphaned bookkeeping-failure points both
+            // leave Qdrant with MORE points than state.db's chunk_count sum — see
+            // this function's doc comment for why that is documented as benign,
+            // not the fault this check exists to catch.
+            assert_eq!(qdrant_deficit_error(10, 1_000_000, false), None);
+        }
+
+        #[test]
+        fn suppresses_a_large_deficit_while_indexing() {
+            // The same gap that would alarm at rest must not alarm mid-run — see
+            // the sub-second deficit windows documented on `collect_status`'s
+            // call site (between `delete_by_files` and its state-row deletes, or
+            // between a tail-trim delete and its state upsert).
+            assert_eq!(
+                qdrant_deficit_error(1000, 10, true),
+                None,
+                "must be suppressed while a run is in flight, however large the gap"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2671,6 +3023,137 @@ mod tests {
         );
 
         crate::config::test_support::clear_required_env();
+    }
+
+    // --- supervise_reindex_worker (#163) ---
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_reindex_worker_restarts_after_a_panic() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_for_closure = Arc::clone(&attempts);
+        let ct = CancellationToken::new();
+
+        let handle = tokio::spawn(supervise_reindex_worker(
+            move || {
+                let n = attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        panic!("simulated worker panic");
+                    }
+                    // Second and later attempts behave like the real
+                    // `run_worker` (loops forever on `queue.notify`) — the test
+                    // controls termination entirely via `ct`.
+                    std::future::pending::<()>().await;
+                }
+            },
+            ct.child_token(),
+        ));
+
+        // Let the first attempt spawn and panic, and the supervisor observe the
+        // resulting `JoinError`, before advancing time.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "exactly one attempt before the restart delay elapses"
+        );
+
+        tokio::time::advance(REINDEX_WORKER_RESTART_DELAY).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "must restart once the backoff delay elapses — a bare tokio::spawn \
+             with the JoinHandle discarded (the pre-#163 shape) would have left \
+             indexing stopped forever here instead"
+        );
+
+        ct.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled supervisor must return promptly, not hang")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_reindex_worker_stops_respawning_once_cancelled() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_for_closure = Arc::clone(&attempts);
+        let ct = CancellationToken::new();
+
+        let handle = tokio::spawn(supervise_reindex_worker(
+            move || {
+                attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+                async { panic!("simulated worker panic") }
+            },
+            ct.child_token(),
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        ct.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled supervisor must return promptly, not hang")
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a cancelled supervisor must never respawn, no matter how long time \
+             advances afterward"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_reindex_worker_does_not_abort_an_in_flight_attempt_on_cancel() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_for_closure = Arc::clone(&finished);
+        let ct = CancellationToken::new();
+
+        let handle = tokio::spawn(supervise_reindex_worker(
+            move || {
+                let finished = Arc::clone(&finished_for_closure);
+                async move {
+                    // Simulates an index run still in flight when shutdown
+                    // arrives — long enough that it is still running when
+                    // `ct.cancel()` below fires. Graceful shutdown's contract
+                    // (`wait_for_indexing_to_settle`, which polls `INDEX_STATUS`)
+                    // depends on this run being left alone to finish rather than
+                    // being killed here.
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    finished.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+            },
+            ct.child_token(),
+        ));
+
+        tokio::task::yield_now().await;
+        ct.cancel();
+        // The supervisor itself must stop (no more respawning) promptly...
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled supervisor must return promptly, not hang")
+            .unwrap();
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the in-flight attempt must not have finished yet at cancellation time \
+             — otherwise the assertion below proves nothing"
+        );
+
+        // ...but the in-flight attempt, now detached from the supervisor, must
+        // still be allowed to run to completion rather than being aborted.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "cancelling the supervisor must not abort an attempt already in flight"
+        );
     }
 
     // --- reconcile_loop ---
@@ -3451,6 +3934,36 @@ mod tests {
         }
     }
 
+    // --- #154 ---
+
+    /// Regression: this warning used to name only `/mcp`, `/status` and `/metrics`,
+    /// omitting `/admin/reload` even though it shares `AuthState` with the other
+    /// three and is documented (`reload_handler`'s own doc comment) as equally
+    /// sensitive. Assert on the actual message content, not just "a warning fires" —
+    /// a content-blind test would have kept passing against the old, incomplete
+    /// message.
+    #[test]
+    fn unauthenticated_warning_names_every_protected_path() {
+        let msg = unauthenticated_mcp_warning("MCP_BEARER_TOKEN");
+        for path in [MCP_PATH, STATUS_PATH, METRICS_PATH, ADMIN_RELOAD_PATH] {
+            assert!(
+                msg.contains(path),
+                "warning must name {path} as unauthenticated-reachable: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("MCP_BEARER_TOKEN"),
+            "warning must name the actual env var an operator needs to set: {msg}"
+        );
+        // `/health` is deliberately open regardless of auth config (see its own
+        // const doc comment) — it must not appear as if disabling auth were what
+        // exposed it, which would misdescribe the actual security boundary.
+        assert!(
+            !msg.contains(HEALTH_PATH),
+            "must not describe /health: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn router_assembly_rejects_unauthenticated_requests_on_every_protected_route() {
         let dir = tempfile::tempdir().unwrap();
@@ -3520,19 +4033,6 @@ mod tests {
     // `webhook_router` construction (including its position relative to
     // `handle_webhook`'s signature check, which the oversized body below never
     // reaches — `Bytes::from_request` rejects it before the handler runs).
-    //
-    // `mcp_router`'s 10 MB limit is deliberately NOT covered here: `nest_service`
-    // hands the request straight to rmcp's `StreamableHttpService`, which reads the
-    // body via `Body::collect()` rather than an axum extractor — and
-    // `DefaultBodyLimit` only take effect through `Bytes`/`String`/`Json`-style
-    // extractors reading the `DefaultBodyLimitKind` request extension it sets. A
-    // local check against rmcp 1.8.0 confirmed a body well over 10 MB reaches
-    // `/mcp` and is processed normally (200 OK), so the `// 10 MB` comment on
-    // `mcp_router`'s layer does not actually bound anything today. Writing a test
-    // that asserts today's (non-enforcing) behavior would just codify the bug;
-    // writing one that asserts the intended 413 would fail. Either needs a real fix
-    // to `mcp_router`'s body-limit mechanism, which is out of scope here — left for
-    // a separate issue.
     #[tokio::test]
     async fn webhook_router_enforces_the_1mb_body_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -3550,6 +4050,62 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "a webhook body over 1 MB must be rejected before signature \
              verification even runs"
+        );
+    }
+
+    // #205: `mcp_router`'s 10 MB limit used to be `DefaultBodyLimit`, which is a
+    // no-op here — `nest_service` hands the request straight to rmcp's
+    // `StreamableHttpService`, which reads the body itself via `Body::collect()`
+    // rather than an axum `Bytes`/`String`/`Json` extractor, and `DefaultBodyLimit`
+    // only takes effect through those extractors consulting the request-extension
+    // marker it sets. A local check against rmcp 1.8.0 confirmed a body well over
+    // 10 MB reached `/mcp` and was processed normally (200 OK) under the old layer
+    // — this test fails with `left: 200, right: 400` against that code.
+    //
+    // Asserting 400 rather than 413 (unlike the webhook test above) is deliberate,
+    // not an oversight: `RequestBodyLimitLayer` wraps the body type itself, so
+    // rmcp's `Body::collect()` gets an `Err` partway through reading rather than
+    // ever completing — which is what stops it from buffering the full oversized
+    // body in memory, the actual vulnerability. But because rmcp (out of scope to
+    // modify here — this fix has to sit somewhere it cannot bypass, not inside it)
+    // treats that as a generic body-read failure rather than recognizing the
+    // specific `LengthLimitError` axum's own extractors special-case into 413, it
+    // maps to a plain 400. The security property this test protects — the request
+    // is rejected rather than accepted, and the body is never fully buffered — holds
+    // either way; the status code is a secondary, rmcp-internal detail.
+    //
+    // `bearer_token: None` (unauthenticated) is deliberate, same as the webhook
+    // test above: this test is about the body-limit layer specifically, and auth
+    // has its own coverage elsewhere — see
+    // `router_assembly_rejects_unauthenticated_requests_on_every_protected_route`.
+    #[tokio::test]
+    async fn mcp_router_enforces_the_10mb_body_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = assemble_router(test_router_assembly_deps(dir.path(), None));
+
+        let oversized = vec![b'x'; 10 * 1024 * 1024 + 1];
+        let req = Request::builder()
+            .method("POST")
+            .uri(MCP_PATH)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(oversized))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "a /mcp body over 10 MB must not be accepted — it used to return 200 OK \
+             because DefaultBodyLimit is inert against rmcp's raw Body::collect()"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "RequestBodyLimitLayer stops rmcp's Body::collect() mid-read with an \
+             error, which rmcp surfaces as a generic 400 rather than the 413 axum's \
+             own extractors would produce for the same LengthLimitError — see the \
+             comment above for why that distinction doesn't matter for the bug \
+             this test guards against"
         );
     }
 

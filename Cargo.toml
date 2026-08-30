@@ -67,6 +67,16 @@ backoff = { version = "0.4", features = ["tokio"] }
 # Rate limiting
 tower_governor = "0.8"
 
+# `RequestBodyLimitLayer`: the `/mcp` body cap has to be enforced this way rather
+# than via `axum::extract::DefaultBodyLimit`, because rmcp's `StreamableHttpService`
+# reads the request body itself (`Body::collect()`) without going through an axum
+# body extractor — the marker `DefaultBodyLimit` inserts into request extensions is
+# never consulted, so that layer alone is a no-op for `/mcp` (#205). This layer wraps
+# the body itself, so it applies regardless of how the inner service reads it. Already
+# present transitively (via axum/rmcp); pulled in directly here because we now depend
+# on its API, not just its presence in the tree.
+tower-http = { version = "0.6", default-features = false, features = ["limit"] }
+
 # Misc
 anyhow = "1"
 thiserror = "2"

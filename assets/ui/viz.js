@@ -769,6 +769,122 @@
     return rest.slice(m.index + m[0].length);
   }
 
+  /** Escape a string for embedding inside HTML text content or a
+   * double-quoted HTML attribute value. Used only by the wiki-link marked
+   * extension below, which is the one place in this file that builds a raw
+   * HTML string instead of using textContent/createElement — see that
+   * extension's comment for why the escaping happens here AND the result
+   * still flows through DOMPurify. */
+  function escapeHtmlAttr(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  /** marked v12 inline extension recognizing ingest.rs's wiki-style
+   * `[[target]]` / `[[target|Display Text]]` link syntax (RawLinkKind::Wiki
+   * in ingest.rs) — see #170. CommonMark/GFM, what `marked.parse` implements
+   * out of the box, has no notion of double-bracket links, so without this
+   * extension `[[guide]]` renders as inert literal text even though
+   * ingest.rs indexes it as a real, tested link (see the extractor's own
+   * doc comment: "Use `[[guide]]` literally").
+   *
+   * Fenced code blocks never reach an inline extension at all — marked
+   * tokenizes a ``` fence as a block-level "code" token before any inline
+   * tokenizing happens over its contents. An inline code span is consumed
+   * whole by marked's built-in codespan tokenizer before this extension's
+   * tokenizer ever gets a look at what's inside it (codespans are
+   * unambiguous — they start with a backtick, which this extension's rule
+   * never matches — so there's no ordering race). Both properties are
+   * exactly what ingest.rs's own fence/code-span tracking
+   * (scan_link_occurrences / scan_line_constructs) does on the Rust side by
+   * hand, so this extension gets it for free from marked's tokenizer
+   * architecture rather than having to reimplement it.
+   *
+   * The tokenizer's rule deliberately excludes `\n` from the captured
+   * target — ingest.rs's `find_double_bracket_close` only ever scans a
+   * single physical LINE for the closing `]]` (`scan_link_occurrences`
+   * walks the document line by line), so a `[[` left unclosed on its own
+   * line is not a link there either, and this extension must not invent a
+   * multi-line form CommonMark's soft-break paragraph joining would
+   * otherwise make available to it.
+   *
+   * XSS note: the ONLY thing `renderer()` below emits is a fixed `<a ...>`
+   * shape with an escaped `data-wiki-target` attribute and an escaped text
+   * node (see escapeHtmlAttr) — never raw, un-escaped target text — and
+   * that string still flows through renderMarkdown's existing
+   * marked.parse() -> DOMPurify.sanitize() pipeline exactly like every
+   * other token marked produces. Escaping here is defense in depth, not a
+   * replacement for DOMPurify: even a malformed/adversarial target can, at
+   * worst, produce an inert `<a>` DOMPurify would leave untouched, never
+   * markup DOMPurify would need to strip. No `innerHTML` assignment is
+   * introduced anywhere else — this extension's output reaches the DOM
+   * through the same `renderMarkdown()` chokepoint every other markdown
+   * construct already does. */
+  function registerWikiLinkExtension() {
+    // Non-greedy: matches the FIRST "]]" found after the opening "[[",
+    // exactly like find_double_bracket_close's char-by-char scan (a lone
+    // "]" that isn't immediately followed by another "]" doesn't end the
+    // link — only a "]]" pair does).
+    const WIKI_LINK_RULE = /^\[\[([^\n]*?)\]\]/;
+    marked.use({
+      extensions: [
+        {
+          name: "wikilink",
+          level: "inline",
+          start(src) {
+            const idx = src.indexOf("[[");
+            return idx === -1 ? undefined : idx;
+          },
+          tokenizer(src) {
+            const match = WIKI_LINK_RULE.exec(src);
+            if (!match) return undefined;
+            return { type: "wikilink", raw: match[0], text: match[1] };
+          },
+          renderer(token) {
+            // Pipe-alias form [[path|Display Text]]: display the alias,
+            // link the path. ingest.rs itself does NOT resolve this form —
+            // it deliberately drops any wiki target containing "|" (see
+            // resolve_link_target's doc comment; fixing that on the ingest
+            // side is #131, the move-rewriter half of the same gap) — so
+            // rawTarget here is resolved independently, client-side, by
+            // rewriteWikiLinks/resolveWikiLink below applying ingest's
+            // Wiki-kind resolution rule to just the path half.
+            const pipeIdx = token.text.indexOf("|");
+            const rawTarget = (
+              pipeIdx >= 0 ? token.text.slice(0, pipeIdx) : token.text
+            ).trim();
+            const alias = pipeIdx >= 0 ? token.text.slice(pipeIdx + 1).trim() : "";
+            const display = alias || token.text.trim();
+            // href="#" here, NOT "javascript:void(0)" — this string is still
+            // headed through marked.parse() -> DOMPurify.sanitize() (see
+            // renderMarkdown below), and every OTHER href this codebase ever
+            // sets to "javascript:void(0)" (rewriteInternalLinks, and
+            // rewriteWikiLinks just below) does so via a direct
+            // a.setAttribute() call on an already-sanitized, already-live DOM
+            // node — never inside HTML that still has to pass through
+            // DOMPurify. "#" is a harmless placeholder that's always allowed
+            // through sanitization unmodified; rewriteWikiLinks overwrites it
+            // synchronously (before any paint) regardless of whether the
+            // target resolves, so a real "#" href is never actually
+            // clickable-live — see rewriteWikiLinks for why that overwrite
+            // has to be unconditional (an inert "#" would otherwise jump this
+            // hash-routed app to "#/", i.e. home, on click).
+            return (
+              `<a href="#" class="wiki-link" ` +
+              `data-wiki-target="${escapeHtmlAttr(rawTarget)}">` +
+              `${escapeHtmlAttr(display)}</a>`
+            );
+          },
+        },
+      ],
+    });
+  }
+  registerWikiLinkExtension();
+
   /** Render markdown to sanitized HTML: marked.parse() followed by
    * DOMPurify.sanitize(). marked does not sanitize its output, so every
    * call site that assigns parsed markdown to innerHTML must go through
@@ -778,6 +894,63 @@
   function renderMarkdown(md) {
     const html = marked.parse(md || "", { breaks: false, gfm: true });
     return DOMPurify.sanitize(html);
+  }
+
+  /** Resolve a wiki-style `[[target]]` link's PATH half (the pipe-alias
+   * form's `Display Text` is stripped by the caller before this runs)
+   * against the directory of `sourceId`, reproducing
+   * `resolve_link_target`'s Wiki-kind branch in ingest.rs EXACTLY —
+   * including two rules that read as surprising in isolation but are load-
+   * bearing for matching what the indexer actually resolved a given
+   * `[[target]]` occurrence to:
+   *   1. The target is truncated at its first whitespace character.
+   *      ingest.rs frames this as stripping an optional CommonMark link
+   *      title (`target "title"`), but the rule fires on ANY whitespace —
+   *      so an unquoted multi-word target like `[[my note]]` silently
+   *      resolves to `my.md`, not `my note.md`. Reproduced here verbatim
+   *      rather than "fixed", because a link the graph says exists must
+   *      navigate to the SAME document ingest.rs resolved it to.
+   *   2. A trailing `#fragment` is stripped before the `.md` extension
+   *      check runs, and that check is case-SENSITIVE — `[[guide.MD]]`
+   *      does not count as already having an extension, so it becomes
+   *      `guide.MD.md`, exactly as `resolve_link_target` would produce.
+   * Returns null for anything `resolve_link_target` would reject: empty,
+   * external (http/https/mailto/other `scheme://`), absolute, or a `../`
+   * climb above the KB root. */
+  function resolveWikiLink(sourceId, rawTarget) {
+    let target = (rawTarget || "").trim();
+
+    const wsIdx = target.search(/\s/);
+    if (wsIdx >= 0) target = target.slice(0, wsIdx);
+    const hashIdx = target.indexOf("#");
+    if (hashIdx >= 0) target = target.slice(0, hashIdx);
+    if (!target) return null;
+
+    const lower = target.toLowerCase();
+    if (
+      lower.startsWith("http://") ||
+      lower.startsWith("https://") ||
+      lower.startsWith("mailto:") ||
+      target.startsWith("/") ||
+      target.includes("://")
+    ) {
+      return null;
+    }
+
+    if (!target.endsWith(".md")) target = `${target}.md`;
+
+    const baseParts = sourceId.split("/");
+    baseParts.pop(); // drop the filename, keep the containing directory
+    for (const part of target.split("/")) {
+      if (part === "" || part === ".") continue;
+      if (part === "..") {
+        if (baseParts.length === 0) return null;
+        baseParts.pop();
+      } else {
+        baseParts.push(part);
+      }
+    }
+    return baseParts.length ? baseParts.join("/") : null;
   }
 
   /** Resolve a markdown link href against the directory of `sourceId`,
@@ -811,6 +984,12 @@
 
   function rewriteInternalLinks(root, sourceId) {
     root.querySelectorAll("a[href]").forEach((a) => {
+      // Wiki-style anchors (data-wiki-target, from registerWikiLinkExtension)
+      // carry a placeholder "#" href, not a real relative URL —
+      // resolveRelativeLink has no useful answer for that string, so
+      // they're resolved separately by rewriteWikiLinks below rather than
+      // falling through into this loop's "external" branch.
+      if (a.hasAttribute("data-wiki-target")) return;
       const href = a.getAttribute("href");
       if (!href) return;
       const target = resolveRelativeLink(sourceId, href);
@@ -826,6 +1005,47 @@
       a.className = "external";
       a.setAttribute("target", "_blank");
       a.setAttribute("rel", "noopener");
+    });
+    rewriteWikiLinks(root, sourceId);
+  }
+
+  /** Resolve every anchor `registerWikiLinkExtension`'s renderer produced
+   * (`a[data-wiki-target]`) against `sourceId`, using resolveWikiLink so a
+   * `[[target]]` navigates to the exact same document ingest.rs's extractor
+   * resolved it to. A target that doesn't resolve, or resolves to a
+   * document outside the currently loaded graph (nodeIndex — the same
+   * existence check rewriteInternalLinks uses for ordinary markdown links),
+   * is left un-clickable and marked `.wiki-link-missing` (see viz.css)
+   * rather than silently 404ing through a real navigation or being mislabeled
+   * "external" — the codebase already drops dangling edges at read time
+   * (build_graph_response in web.rs), so a wiki link with no resolvable
+   * target is exactly that same "dangling" case, just discovered client-side
+   * instead of at index time. */
+  function rewriteWikiLinks(root, sourceId) {
+    root.querySelectorAll("a[data-wiki-target]").forEach((a) => {
+      // Neutralize the placeholder "#" href (see registerWikiLinkExtension's
+      // renderer) unconditionally, BEFORE branching on whether the target
+      // resolves — this is a direct DOM mutation on an already-sanitized
+      // node, the same safe pattern rewriteInternalLinks uses, not a string
+      // headed back through DOMPurify. Unconditional matters: this app is
+      // hash-routed, so a stray "#" left on a MISSING link would navigate to
+      // "#/" (home) on click instead of just doing nothing.
+      a.setAttribute("href", "javascript:void(0)");
+      const raw = a.getAttribute("data-wiki-target") || "";
+      const target = resolveWikiLink(sourceId, raw);
+      if (target && nodeIndex[target]) {
+        a.classList.add("internal");
+        a.title = target;
+        a.addEventListener("click", (e) => {
+          e.preventDefault();
+          showDetail(target);
+        });
+        return;
+      }
+      a.classList.add("wiki-link-missing");
+      a.title = target
+        ? `Document not found: ${target}`
+        : `Unresolvable wiki link: [[${raw}]]`;
     });
   }
 
