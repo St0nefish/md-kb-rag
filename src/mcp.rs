@@ -27,7 +27,7 @@ use crate::{
     state::{DocumentIndex, DocumentQuery, FieldFilter, OrderBy, StateDb},
     validate,
     write::{
-        DirectoryMoveError, DirectoryMoveSuccess, WriteDeps, WriteError,
+        self, DirectoryMoveError, DirectoryMoveSuccess, FrontmatterEdit, WriteDeps, WriteError,
         WriteOutcome as CoreWriteOutcome, WriteRequest, WriteSuccess,
     },
 };
@@ -36,6 +36,19 @@ const MAX_QUERY_LEN: usize = 4096;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_FILTER_STR_LEN: usize = 256;
 const MAX_CONTENT_LEN: usize = 512 * 1024; // 512 KB
+/// Cap on the number of operations a single `write_document` `frontmatter_patch`
+/// call may carry — a document write should rarely need more than a handful of
+/// field edits at once; this bounds the work `write::apply_frontmatter_patch`
+/// does per call, mirroring `MAX_SCHEMA_VALUES`'s reasoning for `update_schema`.
+const MAX_FRONTMATTER_PATCH_OPS: usize = 20;
+/// Cap on the `values` list of a single `add_values`/`remove_values`
+/// `frontmatter_patch` operation.
+const MAX_FRONTMATTER_PATCH_VALUES: usize = 200;
+/// Cap on the serialized size of a single `frontmatter_patch` value —
+/// mirrors `MAX_SCHEMA_DEFINITION_LEN`'s identical reasoning for `update_schema`'s
+/// `set_field` definitions: a document's frontmatter is committed and re-parsed
+/// on every read, so an oversized value is a durable cost, not a transient one.
+const MAX_FRONTMATTER_VALUE_LEN: usize = 4 * 1024;
 
 /// Resolve a caller's requested `limit` against the configured default and ceiling.
 ///
@@ -1034,6 +1047,14 @@ pub struct WriteDocumentParams {
     /// Surgical edit: its replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_string: Option<String>,
+    /// Structured frontmatter edits; combines with `append`, not with `content`
+    /// or `old_string`/`new_string`. See `write::FrontmatterEdit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontmatter_patch: Option<Vec<FrontmatterPatchOp>>,
+    /// Append this text to the end of the document body; combines with
+    /// `frontmatter_patch`, not with `content` or `old_string`/`new_string`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append: Option<String>,
     /// Relocate here; combines with an edit, or stands alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_path: Option<String>,
@@ -1046,6 +1067,25 @@ pub struct WriteDocumentParams {
     /// Skip the near-duplicate check when creating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_new: Option<bool>,
+}
+
+/// One structured frontmatter edit, mirroring `update_schema`'s
+/// `operation`/`field`/`values`/`definition` shape — this codebase's
+/// established idiom for "a structured edit instead of a free-text patch"
+/// (see `UpdateSchemaParams`, `build_schema_edit`) — applied here to a
+/// document's own frontmatter values. See `write::FrontmatterEdit`.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct FrontmatterPatchOp {
+    /// "set_field" | "remove_field" | "add_values" | "remove_values".
+    pub operation: String,
+    /// Frontmatter field this operation targets (dot-path).
+    pub field: String,
+    /// New value, for set_field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    /// Values to add/remove, for add_values/remove_values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<serde_json::Value>>,
 }
 
 /// Parameters for `delete_document`.
@@ -1065,6 +1105,104 @@ pub enum EditMode {
     Surgical { old: String, new: String },
     /// Replace the entire document content.
     Full { content: String },
+    /// Structured frontmatter edits only — see `write::FrontmatterEdit`.
+    Patch { edits: Vec<FrontmatterEdit> },
+    /// Append only.
+    Append { text: String },
+    /// Structured frontmatter edits AND an append, in the same call — applied
+    /// patch-then-append (see `write_document_edit`).
+    PatchAppend {
+        edits: Vec<FrontmatterEdit>,
+        text: String,
+    },
+}
+
+/// Build a single `write::FrontmatterEdit` from the wire shape a caller sent,
+/// mirroring `build_schema_edit`'s identical role for `update_schema`.
+fn build_frontmatter_edit(op: &FrontmatterPatchOp) -> Result<FrontmatterEdit, String> {
+    if op.field.trim().is_empty() {
+        return Err("frontmatter_patch: field must not be empty".to_string());
+    }
+    if op.field.len() > MAX_FILTER_STR_LEN {
+        return Err(format!(
+            "frontmatter_patch: field name too long: {} chars (max {})",
+            op.field.len(),
+            MAX_FILTER_STR_LEN
+        ));
+    }
+    let check_value_size = |v: &serde_json::Value| -> Result<(), String> {
+        let size = serde_json::to_string(v)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if size > MAX_FRONTMATTER_VALUE_LEN {
+            return Err(format!(
+                "frontmatter_patch: value for '{}' too large (max {} bytes)",
+                op.field, MAX_FRONTMATTER_VALUE_LEN
+            ));
+        }
+        Ok(())
+    };
+
+    match op.operation.trim().to_ascii_lowercase().as_str() {
+        "set_field" => {
+            let value = op
+                .value
+                .clone()
+                .ok_or_else(|| "frontmatter_patch: 'set_field' requires a value".to_string())?;
+            check_value_size(&value)?;
+            Ok(FrontmatterEdit::SetField {
+                field: op.field.clone(),
+                value,
+            })
+        }
+        "remove_field" => Ok(FrontmatterEdit::RemoveField {
+            field: op.field.clone(),
+        }),
+        op_name @ ("add_values" | "remove_values") => {
+            let values = op.values.clone().filter(|v| !v.is_empty()).ok_or_else(|| {
+                format!("frontmatter_patch: '{op_name}' requires a non-empty values list")
+            })?;
+            if values.len() > MAX_FRONTMATTER_PATCH_VALUES {
+                return Err(format!(
+                    "frontmatter_patch: too many values for '{}': {} (max {})",
+                    op.field,
+                    values.len(),
+                    MAX_FRONTMATTER_PATCH_VALUES
+                ));
+            }
+            for v in &values {
+                check_value_size(v)?;
+            }
+            if op_name == "add_values" {
+                Ok(FrontmatterEdit::AddValues {
+                    field: op.field.clone(),
+                    values,
+                })
+            } else {
+                Ok(FrontmatterEdit::RemoveValues {
+                    field: op.field.clone(),
+                    values,
+                })
+            }
+        }
+        other => Err(format!(
+            "frontmatter_patch: unknown operation '{other}': expected set_field, remove_field, \
+             add_values, or remove_values"
+        )),
+    }
+}
+
+/// Parse every op in a `frontmatter_patch` list, in order, applying the same
+/// per-call size cap `MAX_FRONTMATTER_PATCH_OPS` bounds.
+fn parse_frontmatter_patch_ops(ops: &[FrontmatterPatchOp]) -> Result<Vec<FrontmatterEdit>, String> {
+    if ops.len() > MAX_FRONTMATTER_PATCH_OPS {
+        return Err(format!(
+            "frontmatter_patch: too many operations: {} (max {})",
+            ops.len(),
+            MAX_FRONTMATTER_PATCH_OPS
+        ));
+    }
+    ops.iter().map(build_frontmatter_edit).collect()
 }
 
 /// Parse and validate the content-edit fields of `WriteDocumentParams`,
@@ -1073,78 +1211,118 @@ pub enum EditMode {
 /// Rules:
 /// - SURGICAL = `old_string` AND `new_string` both `Some`, `content` is `None`.
 /// - FULL = `content` is `Some`, both `old_string` and `new_string` are `None`.
-/// - Neither SURGICAL nor FULL, but `new_path` is `Some`: `Ok(None)` — a pure
-///   move with content left unchanged. The caller (`write_document`'s edit path)
-///   reads the document's current content itself and passes it through unchanged.
-/// - Neither SURGICAL nor FULL, and `new_path` is also `None`: rejected — at
-///   least one of the three (surgical, full-replace, move) must be requested.
-/// - SURGICAL and FULL together are always rejected, regardless of `new_path` —
-///   the two edit modes remain mutually exclusive WITH EACH OTHER; `new_path` is
-///   an orthogonal, independent axis that may combine with either one (or
-///   neither).
-/// - Surgical with `old_string == new_string` is rejected (no-op).
+/// - PATCH/APPEND/PATCH_APPEND = `frontmatter_patch` and/or `append` is `Some`.
+///   These two combine freely with EACH OTHER (patch is applied first, then
+///   append — see `write_document_edit`), but neither may combine with FULL
+///   or SURGICAL: those are whole-document edits, these are structured edits
+///   to part of the document, and there is no well-defined way to apply both
+///   to the same call.
+/// - Neither FULL, SURGICAL, nor PATCH/APPEND, but `new_path` is `Some`:
+///   `Ok(None)` — a pure move with content left unchanged. The caller
+///   (`write_document`'s edit path) reads the document's current content
+///   itself and passes it through unchanged.
+/// - None of the above, and `new_path` is also `None`: rejected — at least
+///   one edit mode (or a move) must be requested.
+/// - FULL and SURGICAL together are always rejected, regardless of `new_path`
+///   — the two whole-document edit modes remain mutually exclusive WITH EACH
+///   OTHER; `new_path` is an orthogonal, independent axis that may combine
+///   with any one edit mode (or neither, for a pure move).
+/// - Surgical with `old_string == new_string` is rejected (no-op), same as an
+///   `append` that is empty or whitespace-only.
 pub fn parse_edit_mode(params: &WriteDocumentParams) -> Result<Option<EditMode>, String> {
     let has_content = params.content.is_some();
-    let has_old = params.old_string.is_some();
-    let has_new = params.new_string.is_some();
     let has_move = params.new_path.is_some();
 
-    match (has_content, has_old, has_new) {
-        // Full mode (optionally combined with a move — new_path is orthogonal
-        // and applied by the caller, not read here)
-        (true, false, false) => Ok(Some(EditMode::Full {
-            content: params.content.clone().unwrap(),
-        })),
-        // Surgical mode (optionally combined with a move, same as above)
-        (false, true, true) => {
-            let old = params.old_string.clone().unwrap();
-            let new = params.new_string.clone().unwrap();
-            if old == new {
-                return Err(
-                    "old_string and new_string are identical — no change would be made".to_string(),
-                );
-            }
-            Ok(Some(EditMode::Surgical { old, new }))
+    // old_string/new_string must arrive as a pair, independent of every other
+    // mode — checked first so a caller who supplied only one gets that
+    // specific error rather than a generic "mutually exclusive" one.
+    match (params.old_string.is_some(), params.new_string.is_some()) {
+        (true, false) => {
+            return Err(
+                "old_string requires new_string; provide both for a surgical edit. (If you only \
+                 meant to move the document, omit old_string entirely and pass new_path alone.)"
+                    .to_string(),
+            );
         }
-        // Both modes set: still mutually exclusive with each other even when
-        // new_path is also present — a move never resolves which of the two
-        // conflicting edits to apply before relocating.
-        (true, _, _) if has_old || has_new => {
-            Err("content is mutually exclusive with old_string/new_string; \
+        (false, true) => {
+            return Err(
+                "new_string requires old_string; provide both for a surgical edit. (If you only \
+                 meant to move the document, omit new_string entirely and pass new_path alone.)"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    let has_surgical = params.old_string.is_some();
+    let has_patch = params.frontmatter_patch.is_some();
+    let has_append = params.append.is_some();
+
+    if (has_content || has_surgical) && (has_patch || has_append) {
+        return Err(
+            "content and old_string/new_string are whole-document edits, mutually exclusive \
+             with frontmatter_patch/append (structured edits to part of the document). \
+             Provide one or the other — frontmatter_patch and append may combine with each \
+             other, just not with content or old_string/new_string."
+                .to_string(),
+        );
+    }
+    if has_content && has_surgical {
+        return Err("content is mutually exclusive with old_string/new_string; \
              provide either content (full replace) or old_string+new_string (surgical edit) \
              — not both. new_path may be combined with either one (or with neither, for a \
              pure move), but it does not resolve a conflict between the two edit modes \
              themselves."
-                .to_string())
+            .to_string());
+    }
+
+    if has_content {
+        return Ok(Some(EditMode::Full {
+            content: params.content.clone().unwrap(),
+        }));
+    }
+    if has_surgical {
+        let old = params.old_string.clone().unwrap();
+        let new = params.new_string.clone().unwrap();
+        if old == new {
+            return Err(
+                "old_string and new_string are identical — no change would be made".to_string(),
+            );
         }
-        // Only one of old_string/new_string. new_path does not change this —
-        // a surgical edit always needs both halves, move or no move.
-        (false, true, false) => Err(
-            "old_string requires new_string; provide both for a surgical edit. (If you only \
-             meant to move the document, omit old_string entirely and pass new_path alone.)"
-                .to_string(),
-        ),
-        (false, false, true) => Err(
-            "new_string requires old_string; provide both for a surgical edit. (If you only \
-             meant to move the document, omit new_string entirely and pass new_path alone.)"
-                .to_string(),
-        ),
-        // Neither edit mode: a pure move if new_path was given, otherwise an error.
-        (false, false, false) => {
-            if has_move {
-                Ok(None)
-            } else {
-                Err(
-                    "must provide content (full replace), old_string+new_string (surgical \
-                     edit), or new_path (move) — at least one is required"
-                        .to_string(),
-                )
+        return Ok(Some(EditMode::Surgical { old, new }));
+    }
+    if has_patch || has_append {
+        let edits = match &params.frontmatter_patch {
+            Some(ops) if !ops.is_empty() => Some(parse_frontmatter_patch_ops(ops)?),
+            Some(_) => {
+                return Err("frontmatter_patch must contain at least one operation".to_string());
             }
-        }
-        // Unreachable combinations (content=true, old=true, new=true or content=true, old/new only)
-        _ => Err("content is mutually exclusive with old_string/new_string; \
-             provide either content (full replace) or old_string+new_string (surgical edit)"
-            .to_string()),
+            None => None,
+        };
+        let text = match params.append.as_deref() {
+            Some(t) if !t.trim().is_empty() => Some(t.to_string()),
+            Some(_) => return Err("append must not be empty".to_string()),
+            None => None,
+        };
+        return Ok(Some(match (edits, text) {
+            (Some(edits), Some(text)) => EditMode::PatchAppend { edits, text },
+            (Some(edits), None) => EditMode::Patch { edits },
+            (None, Some(text)) => EditMode::Append { text },
+            (None, None) => unreachable!(
+                "has_patch || has_append guarantees at least one of edits/text is Some"
+            ),
+        }));
+    }
+
+    // No edit mode at all: a pure move if new_path was given, otherwise an error.
+    if has_move {
+        Ok(None)
+    } else {
+        Err(
+            "must provide content (full replace), old_string+new_string (surgical edit), \
+             frontmatter_patch (structured frontmatter edit), append (add to the end of the \
+             body), or new_path (move) — at least one is required"
+                .to_string(),
+        )
     }
 }
 
@@ -1320,18 +1498,14 @@ impl WriteOutcome {
 }
 
 /// Attach a machine-readable `{"outcome": ...}` discriminant to a successful
-/// `CallToolResult`, alongside its human-readable text content.
-fn with_outcome(mut result: CallToolResult, outcome: WriteOutcome) -> CallToolResult {
-    result.structured_content = Some(serde_json::json!({ "outcome": outcome.as_str() }));
-    result
-}
-
-/// Like [`with_outcome`], but for `write_document`'s create/edit path specifically:
-/// also attaches `rewritten_paths`, the repo-relative paths of OTHER documents a
-/// MOVE rewrote incoming links in (always `[]` for a non-move write, or a move
-/// with nothing to rewrite). A move that silently edits other documents without
-/// surfacing which ones is not acceptable, so this rides in `structured_content`
-/// on every create/edit result, not just moves.
+/// `CallToolResult`, alongside its human-readable text content — for
+/// `write_document`'s create/edit path specifically: also attaches
+/// `rewritten_paths`, the repo-relative paths of OTHER documents a MOVE
+/// rewrote incoming links in (always `[]` for a non-move write, or a move
+/// with nothing to rewrite). A move that silently edits other documents
+/// without surfacing which ones is not acceptable, so this rides in
+/// `structured_content` on every create/edit result, not just moves. See
+/// [`with_outcome_and_referencing`] for `delete_document`'s equivalent.
 fn with_outcome_and_rewrites(
     mut result: CallToolResult,
     outcome: WriteOutcome,
@@ -1340,6 +1514,26 @@ fn with_outcome_and_rewrites(
     result.structured_content = Some(serde_json::json!({
         "outcome": outcome.as_str(),
         "rewritten_paths": rewritten_paths,
+    }));
+    result
+}
+
+/// (#229) Like [`with_outcome_and_rewrites`], but for `delete_document`
+/// specifically: attaches `referencing_paths`, the repo-relative paths of
+/// OTHER documents that still link to the just-deleted document (always `[]`
+/// when none exist, or when no `StateDb` was available to check — see
+/// `write::WriteSuccess::referencing_paths`'s doc comment). This is the
+/// caller-visible half of the reverse-link check #181 already logs
+/// server-side — an agent has no access to that log, so the same information
+/// must reach it through the tool result too.
+fn with_outcome_and_referencing(
+    mut result: CallToolResult,
+    outcome: WriteOutcome,
+    referencing_paths: &[String],
+) -> CallToolResult {
+    result.structured_content = Some(serde_json::json!({
+        "outcome": outcome.as_str(),
+        "referencing_paths": referencing_paths,
     }));
     result
 }
@@ -1576,19 +1770,34 @@ fn create_edit_error_to_mcp_error(
 /// `CallToolResult`, preserving the exact text/`structured_content` shape the
 /// existing delete tests pin down.
 fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolResult {
+    // (#229) Named here so it can be included in both outcomes' text below —
+    // empty for every delete with nothing (or nothing known) still linking to
+    // the removed document.
+    let referencing_note = if success.referencing_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nStill linked from {} other document(s): {}. This delete did not rewrite \
+             or remove those links — they will dangle until each referencing document's own \
+             next reindex drops the now-stale edge.",
+            success.referencing_paths.len(),
+            success.referencing_paths.join(", ")
+        )
+    };
     match success.outcome {
         CoreWriteOutcome::Synced => {
             let summary = format!(
-                "Deleted '{}' (commit {}). Index cleanup has been queued and will complete shortly.",
-                rel_path, success.sha
+                "Deleted '{}' (commit {}). Index cleanup has been queued and will complete shortly.{}",
+                rel_path, success.sha, referencing_note
             );
             let mut result_text = summary;
             if !success.diff.is_empty() {
                 result_text = format!("{}\n\n{}", result_text, success.diff);
             }
-            with_outcome(
+            with_outcome_and_referencing(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::Synced,
+                &success.referencing_paths,
             )
         }
         CoreWriteOutcome::CommittedPendingSync => {
@@ -1599,16 +1808,17 @@ fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolRe
             let summary = format!(
                 "Deleted '{}' (commit {}) — committed locally, but the push to the remote \
                  failed: {}. It will sync on the next successful write or manual \
-                 intervention. Index cleanup has been queued from the local copy.",
-                rel_path, success.sha, cause
+                 intervention. Index cleanup has been queued from the local copy.{}",
+                rel_path, success.sha, cause, referencing_note
             );
             let mut result_text = summary;
             if !success.diff.is_empty() {
                 result_text = format!("{}\n\n{}", result_text, success.diff);
             }
-            with_outcome(
+            with_outcome_and_referencing(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::CommittedPendingSync,
+                &success.referencing_paths,
             )
         }
     }
@@ -3376,6 +3586,8 @@ impl KbSearchServer {
             ("content", params.content.is_some()),
             ("old_string", params.old_string.is_some()),
             ("new_string", params.new_string.is_some()),
+            ("frontmatter_patch", params.frontmatter_patch.is_some()),
+            ("append", params.append.is_some()),
             ("expected_hash", params.expected_hash.is_some()),
             ("force_new", params.force_new.is_some()),
         ] {
@@ -3439,6 +3651,21 @@ impl KbSearchServer {
         if params.old_string.is_some() || params.new_string.is_some() {
             return Err(McpError::invalid_params(
                 "cannot surgically edit a document that does not exist".to_string(),
+                None,
+            ));
+        }
+        if params.frontmatter_patch.is_some() {
+            return Err(McpError::invalid_params(
+                "cannot patch frontmatter on a document that does not exist — use content to \
+                 create it"
+                    .to_string(),
+                None,
+            ));
+        }
+        if params.append.is_some() {
+            return Err(McpError::invalid_params(
+                "cannot append to a document that does not exist — use content to create it"
+                    .to_string(),
                 None,
             ));
         }
@@ -3579,6 +3806,46 @@ impl KbSearchServer {
                         "write_document (surgical replace + move)"
                     } else {
                         "write_document (surgical replace)"
+                    },
+                )
+            }
+            Some(EditMode::Patch { edits }) => {
+                let result = write::apply_frontmatter_patch(&old_content, &edits)
+                    .map_err(|e| McpError::invalid_params(e, None))?;
+                (
+                    result,
+                    if dest_path.is_some() {
+                        "write_document (frontmatter patch + move)"
+                    } else {
+                        "write_document (frontmatter patch)"
+                    },
+                )
+            }
+            Some(EditMode::Append { text }) => {
+                let result = write::apply_append(&old_content, &text);
+                (
+                    result,
+                    if dest_path.is_some() {
+                        "write_document (append + move)"
+                    } else {
+                        "write_document (append)"
+                    },
+                )
+            }
+            Some(EditMode::PatchAppend { edits, text }) => {
+                // Patch first, then append — the patch only ever touches the
+                // frontmatter block, so applying it first and re-deriving the
+                // frontmatter/body split for the append (see `apply_append`'s
+                // own doc comment) composes cleanly with no ordering ambiguity.
+                let patched = write::apply_frontmatter_patch(&old_content, &edits)
+                    .map_err(|e| McpError::invalid_params(e, None))?;
+                let result = write::apply_append(&patched, &text);
+                (
+                    result,
+                    if dest_path.is_some() {
+                        "write_document (frontmatter patch + append + move)"
+                    } else {
+                        "write_document (frontmatter patch + append)"
                     },
                 )
             }
@@ -3749,6 +4016,16 @@ impl KbSearchServer {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // (#229) Best-effort, same as `run_document_write`'s and
+        // `write_document_move_dir`'s own lazy state-DB opens: a state DB that
+        // fails to open degrades `delete_document`'s inbound-link check to
+        // "skip it" (see `WriteDeps::state`'s doc comment), not a failed
+        // delete. Without this, `write::delete_document`'s reverse-link query
+        // never runs at all — `WriteDeps::state == None` — and
+        // `referencing_paths` would always come back empty regardless of what
+        // actually links to the document being deleted.
+        let state_db = self.state_db().await.ok();
+
         let deps = WriteDeps {
             retrieval: self.deps(),
             canonical_data_path: &self.canonical_data_path,
@@ -3763,10 +4040,7 @@ impl KbSearchServer {
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
             queue: &self.reindex_queue,
-            // `delete_document` never moves a document — `write::write_document_move`
-            // is the only reader of `WriteDeps::state` — so there is nothing here
-            // for a state DB to do. `None` per `WriteDeps::state`'s doc comment.
-            state: None,
+            state: state_db,
         };
 
         match crate::write::delete_document(&deps, &rel_path, params.message.as_deref()).await {
@@ -6596,7 +6870,13 @@ mod tests {
         let description = crate::descriptions::compose_tool_description(name, false, None)
             .unwrap_or_else(|| panic!("no compiled description for tool '{name}'"));
 
-        for mode in ["content", "old_string", "new_path"] {
+        for mode in [
+            "content",
+            "old_string",
+            "new_path",
+            "frontmatter_patch",
+            "append",
+        ] {
             assert!(
                 description.contains(mode),
                 "'{name}' description should document the '{mode}' mode: {description}"
@@ -7145,6 +7425,8 @@ mod tests {
             expected_hash: None,
             new_path: None,
             force_new: Some(true),
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7184,6 +7466,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7197,6 +7481,233 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(work.path().join("docs/existing.md")).unwrap(),
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_frontmatter_patch_end_to_end() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(
+            work.path().join("docs/log.md"),
+            "---\ntitle: Log\nstatus: draft\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "docs/log.md", "add docs/log.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let params = WriteDocumentParams {
+            path: "docs/log.md".to_string(),
+            content: None,
+            old_string: None,
+            new_string: None,
+            new_path: None,
+            message: None,
+            expected_hash: None,
+            force_new: None,
+            frontmatter_patch: Some(vec![FrontmatterPatchOp {
+                operation: "set_field".to_string(),
+                field: "status".to_string(),
+                value: Some(serde_json::json!("active")),
+                values: None,
+            }]),
+            append: None,
+        };
+        let result = server.write_document(Parameters(params)).await;
+        let result = result.expect("frontmatter_patch must succeed against an existing document");
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("Edited 'docs/log.md'"), "got: {text}");
+
+        let on_disk = std::fs::read_to_string(work.path().join("docs/log.md")).unwrap();
+        assert!(on_disk.contains("status: active"), "got: {on_disk}");
+        assert!(on_disk.contains("title: Log"), "title must be preserved");
+        assert!(
+            on_disk.ends_with("# Body\n"),
+            "body must be untouched: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_append_end_to_end() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(
+            work.path().join("docs/log.md"),
+            "---\ntitle: Log\n---\n\n# Log\n- entry one\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "docs/log.md", "add docs/log.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let params = WriteDocumentParams {
+            path: "docs/log.md".to_string(),
+            content: None,
+            old_string: None,
+            new_string: None,
+            new_path: None,
+            message: None,
+            expected_hash: None,
+            force_new: None,
+            frontmatter_patch: None,
+            append: Some("- entry two".to_string()),
+        };
+        let result = server.write_document(Parameters(params)).await;
+        result.expect("append must succeed against an existing document");
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("docs/log.md")).unwrap(),
+            "---\ntitle: Log\n---\n\n# Log\n- entry one\n- entry two\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_frontmatter_patch_and_append_combine_end_to_end() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("docs")).unwrap();
+        std::fs::write(
+            work.path().join("docs/log.md"),
+            "---\ntitle: Log\nstatus: draft\n---\n\n# Log\n- entry one\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "docs/log.md", "add docs/log.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let params = WriteDocumentParams {
+            path: "docs/log.md".to_string(),
+            content: None,
+            old_string: None,
+            new_string: None,
+            new_path: None,
+            message: None,
+            expected_hash: None,
+            force_new: None,
+            frontmatter_patch: Some(vec![FrontmatterPatchOp {
+                operation: "set_field".to_string(),
+                field: "status".to_string(),
+                value: Some(serde_json::json!("active")),
+                values: None,
+            }]),
+            append: Some("- entry two".to_string()),
+        };
+        let result = server.write_document(Parameters(params)).await;
+        result.expect("frontmatter_patch + append must succeed together");
+
+        let on_disk = std::fs::read_to_string(work.path().join("docs/log.md")).unwrap();
+        assert!(on_disk.contains("status: active"), "got: {on_disk}");
+        assert!(
+            on_disk.ends_with("- entry one\n- entry two\n"),
+            "got: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_frontmatter_patch_validation_failure_reports_error_and_writes_nothing()
+    {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("notes.md"),
+            "---\ntitle: T\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "notes.md", "add notes.md");
+
+        let mut config = make_test_resolved_config(work.path());
+        Arc::get_mut(&mut config).unwrap().write.dedup_enabled = false;
+        Arc::get_mut(&mut config).unwrap().frontmatter.required = vec!["title".into()];
+        let server = make_write_test_server(&work, &["**/*.md".to_string()], config);
+
+        // The patch removes the very field the schema requires.
+        let params = WriteDocumentParams {
+            path: "notes.md".to_string(),
+            content: None,
+            old_string: None,
+            new_string: None,
+            new_path: None,
+            message: None,
+            expected_hash: None,
+            force_new: None,
+            frontmatter_patch: Some(vec![FrontmatterPatchOp {
+                operation: "remove_field".to_string(),
+                field: "title".to_string(),
+                value: None,
+                values: None,
+            }]),
+            append: None,
+        };
+        let result = server.write_document(Parameters(params)).await;
+        let err = result.expect_err("a schema-violating patch must fail validation");
+        assert!(err.message.contains("validation"), "got: {}", err.message);
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("notes.md")).unwrap(),
+            "---\ntitle: T\n---\n\n# Body\n",
+            "a rejected patch must never touch the file on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_frontmatter_patch_on_a_nonexistent_document_is_rejected() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let params = WriteDocumentParams {
+            path: "does-not-exist.md".to_string(),
+            content: None,
+            old_string: None,
+            new_string: None,
+            new_path: None,
+            message: None,
+            expected_hash: None,
+            force_new: None,
+            frontmatter_patch: Some(vec![FrontmatterPatchOp {
+                operation: "set_field".to_string(),
+                field: "status".to_string(),
+                value: Some(serde_json::json!("active")),
+                values: None,
+            }]),
+            append: None,
+        };
+        let err = server
+            .write_document(Parameters(params))
+            .await
+            .expect_err("cannot patch frontmatter on a document that does not exist");
+        assert!(
+            err.message.contains("does not exist"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_append_on_a_nonexistent_document_is_rejected() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let params = WriteDocumentParams {
+            path: "does-not-exist.md".to_string(),
+            content: None,
+            old_string: None,
+            new_string: None,
+            new_path: None,
+            message: None,
+            expected_hash: None,
+            force_new: None,
+            frontmatter_patch: None,
+            append: Some("text".to_string()),
+        };
+        let err = server
+            .write_document(Parameters(params))
+            .await
+            .expect_err("cannot append to a document that does not exist");
+        assert!(
+            err.message.contains("does not exist"),
+            "got: {}",
+            err.message
         );
     }
 
@@ -7226,6 +7737,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7325,6 +7838,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7356,6 +7871,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7408,6 +7925,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7499,6 +8018,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7754,6 +8275,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7791,6 +8314,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: Some(true),
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7829,6 +8354,8 @@ mod tests {
             expected_hash: None,
             new_path: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8013,6 +8540,8 @@ mod tests {
             expected_hash: None,
             new_path: new_path.map(|s| s.to_string()),
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         }
     }
 
@@ -8093,6 +8622,192 @@ mod tests {
             err.contains("identical"),
             "expected 'identical' in error, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // (#179) parse_edit_mode: frontmatter_patch / append arms
+    // -----------------------------------------------------------------------
+
+    fn set_status_op(value: &str) -> FrontmatterPatchOp {
+        FrontmatterPatchOp {
+            operation: "set_field".to_string(),
+            field: "status".to_string(),
+            value: Some(serde_json::json!(value)),
+            values: None,
+        }
+    }
+
+    #[test]
+    fn parse_edit_mode_patch_alone_is_recognized() {
+        let mut params = make_edit_params(None, None, None, None);
+        params.frontmatter_patch = Some(vec![set_status_op("active")]);
+        let mode = parse_edit_mode(&params).unwrap();
+        match mode {
+            Some(EditMode::Patch { edits }) => {
+                assert_eq!(edits.len(), 1);
+                assert_eq!(
+                    edits[0],
+                    FrontmatterEdit::SetField {
+                        field: "status".to_string(),
+                        value: serde_json::json!("active"),
+                    }
+                );
+            }
+            other => panic!("expected Patch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_edit_mode_append_alone_is_recognized() {
+        let mut params = make_edit_params(None, None, None, None);
+        params.append = Some("- new entry".to_string());
+        let mode = parse_edit_mode(&params).unwrap();
+        assert_eq!(
+            mode,
+            Some(EditMode::Append {
+                text: "- new entry".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_patch_and_append_combine() {
+        let mut params = make_edit_params(None, None, None, None);
+        params.frontmatter_patch = Some(vec![set_status_op("active")]);
+        params.append = Some("- new entry".to_string());
+        let mode = parse_edit_mode(&params).unwrap();
+        match mode {
+            Some(EditMode::PatchAppend { edits, text }) => {
+                assert_eq!(edits.len(), 1);
+                assert_eq!(text, "- new entry");
+            }
+            other => panic!("expected PatchAppend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_edit_mode_patch_combined_with_move_is_recognized() {
+        let mut params = make_edit_params(None, None, None, Some("docs/new-home.md"));
+        params.frontmatter_patch = Some(vec![set_status_op("active")]);
+        let mode = parse_edit_mode(&params).unwrap();
+        assert!(matches!(mode, Some(EditMode::Patch { .. })));
+    }
+
+    #[test]
+    fn parse_edit_mode_patch_with_content_is_rejected() {
+        let mut params = make_edit_params(Some("full content"), None, None, None);
+        params.frontmatter_patch = Some(vec![set_status_op("active")]);
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected 'mutually exclusive' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_append_with_surgical_is_rejected() {
+        let mut params = make_edit_params(None, Some("old"), Some("new"), None);
+        params.append = Some("more text".to_string());
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected 'mutually exclusive' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_mode_empty_frontmatter_patch_list_is_rejected() {
+        let mut params = make_edit_params(None, None, None, None);
+        params.frontmatter_patch = Some(vec![]);
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(err.contains("at least one operation"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_edit_mode_blank_append_is_rejected() {
+        let mut params = make_edit_params(None, None, None, None);
+        params.append = Some("   ".to_string());
+        let err = parse_edit_mode(&params).unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // (#179) build_frontmatter_edit / parse_frontmatter_patch_ops
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_frontmatter_edit_set_field_requires_a_value() {
+        let op = FrontmatterPatchOp {
+            operation: "set_field".to_string(),
+            field: "status".to_string(),
+            value: None,
+            values: None,
+        };
+        let err = build_frontmatter_edit(&op).unwrap_err();
+        assert!(err.contains("set_field"), "got: {err}");
+    }
+
+    #[test]
+    fn build_frontmatter_edit_add_values_requires_non_empty_values() {
+        let op = FrontmatterPatchOp {
+            operation: "add_values".to_string(),
+            field: "tags".to_string(),
+            value: None,
+            values: Some(vec![]),
+        };
+        let err = build_frontmatter_edit(&op).unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+    }
+
+    #[test]
+    fn build_frontmatter_edit_rejects_unknown_operation() {
+        let op = FrontmatterPatchOp {
+            operation: "delete_everything".to_string(),
+            field: "status".to_string(),
+            value: None,
+            values: None,
+        };
+        let err = build_frontmatter_edit(&op).unwrap_err();
+        assert!(err.contains("unknown operation"), "got: {err}");
+    }
+
+    #[test]
+    fn build_frontmatter_edit_rejects_an_empty_field() {
+        let op = FrontmatterPatchOp {
+            operation: "remove_field".to_string(),
+            field: "  ".to_string(),
+            value: None,
+            values: None,
+        };
+        let err = build_frontmatter_edit(&op).unwrap_err();
+        assert!(err.contains("field"), "got: {err}");
+    }
+
+    #[test]
+    fn build_frontmatter_edit_remove_values_parses() {
+        let op = FrontmatterPatchOp {
+            operation: "remove_values".to_string(),
+            field: "tags".to_string(),
+            value: None,
+            values: Some(vec![serde_json::json!("a")]),
+        };
+        let edit = build_frontmatter_edit(&op).unwrap();
+        assert_eq!(
+            edit,
+            FrontmatterEdit::RemoveValues {
+                field: "tags".to_string(),
+                values: vec![serde_json::json!("a")],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_patch_ops_rejects_too_many_operations() {
+        let ops: Vec<FrontmatterPatchOp> = (0..(MAX_FRONTMATTER_PATCH_OPS + 1))
+            .map(|i| set_status_op(&i.to_string()))
+            .collect();
+        let err = parse_frontmatter_patch_ops(&ops).unwrap_err();
+        assert!(err.contains("too many operations"), "got: {err}");
     }
 
     // -----------------------------------------------------------------------
@@ -8432,6 +9147,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: Some(true),
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -8488,6 +9205,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: Some(true),
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
         assert!(
@@ -8522,6 +9241,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: Some(true),
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
         assert!(
@@ -8588,6 +9309,79 @@ mod tests {
             &server.reindex_queue,
             &["doomed-queued-cleanup-test.md"],
         );
+    }
+
+    #[tokio::test]
+    async fn delete_document_surfaces_referencing_paths_end_to_end() {
+        // (#229) The reverse-link check #181 added only ever reached a server
+        // log — this proves it now also reaches the caller, through both the
+        // human-readable text and `structured_content`.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("linked.md"),
+            "---\ntitle: Linked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "linked.md", "add linked.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        // Seed the reverse-link index directly (same shortcut other link-graph
+        // tests in this module use) rather than depending on a real reindex.
+        let db = server.state_db().await.unwrap();
+        db.replace_links(
+            "referencer.md",
+            "markdown",
+            &[("linked.md".to_string(), None)],
+        )
+        .await
+        .unwrap();
+
+        let result = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "linked.md".to_string(),
+                message: None,
+            }))
+            .await
+            .expect("an inbound link must not block the delete");
+
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("referencer.md"),
+            "the human-readable summary must name the referencing document: {text}"
+        );
+
+        let structured = result
+            .structured_content
+            .expect("delete_document must attach structured_content");
+        assert_eq!(
+            structured["referencing_paths"],
+            serde_json::json!(["referencer.md"])
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_reports_empty_referencing_paths_when_nothing_links_to_it() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("unlinked.md"),
+            "---\ntitle: Unlinked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "unlinked.md", "add unlinked.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "unlinked.md".to_string(),
+                message: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["referencing_paths"], serde_json::json!([]));
     }
 
     // -----------------------------------------------------------------------
@@ -8710,8 +9504,13 @@ mod tests {
             head_sha(&work),
             "HEAD must not move on a rolled-back pre-commit failure"
         );
+        // (#229) `delete_document` now unconditionally opens the state DB for
+        // the inbound-link check, which lazily materializes `state.db`/`-shm`/
+        // `-wal` under `work` — see `git_status_ignoring_state_db`'s doc
+        // comment for why that is an expected, unrelated side effect rather
+        // than evidence the rollback itself left something dirty.
         assert_eq!(
-            git_status(&work),
+            git_status_ignoring_state_db(&work),
             "",
             "working tree must be clean after rollback"
         );
@@ -8841,6 +9640,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: Some(true),
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -8896,6 +9697,8 @@ mod tests {
                 expected_hash: None,
                 new_path: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -8953,6 +9756,8 @@ mod tests {
                 expected_hash: None,
                 new_path: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9050,6 +9855,8 @@ mod tests {
                 expected_hash: Some(stale_hash),
                 new_path: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9097,6 +9904,8 @@ mod tests {
                 expected_hash: Some(correct_hash),
                 new_path: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9138,6 +9947,8 @@ mod tests {
                 expected_hash: None,
                 new_path: Some("docs/new-home.md".to_string()),
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9183,6 +9994,8 @@ mod tests {
                 expected_hash: None,
                 new_path: Some("archive/edit-me.md".to_string()),
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9230,6 +10043,8 @@ mod tests {
                 expected_hash: None,
                 new_path: Some("dest.md".to_string()),
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9290,6 +10105,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9326,6 +10143,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9355,6 +10174,8 @@ mod tests {
             message: None,
             expected_hash: None,
             force_new: None,
+            frontmatter_patch: None,
+            append: None,
         };
 
         let cases: Vec<(&str, WriteDocumentParams)> = vec![
@@ -9393,6 +10214,25 @@ mod tests {
                     ..base()
                 },
             ),
+            (
+                "frontmatter_patch",
+                WriteDocumentParams {
+                    frontmatter_patch: Some(vec![FrontmatterPatchOp {
+                        operation: "set_field".to_string(),
+                        field: "status".to_string(),
+                        value: Some(serde_json::json!("active")),
+                        values: None,
+                    }]),
+                    ..base()
+                },
+            ),
+            (
+                "append",
+                WriteDocumentParams {
+                    append: Some("more text".to_string()),
+                    ..base()
+                },
+            ),
         ];
 
         for (field, params) in cases {
@@ -9428,6 +10268,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9459,6 +10301,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: Some(true),
+                frontmatter_patch: None,
+                append: None,
             }))
             .await
             .expect_err("overlong path should return Err");
@@ -9492,6 +10336,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await
             .expect_err("overlong new_path should return Err");
@@ -9518,6 +10364,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9551,6 +10399,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: None,
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
 
@@ -9572,9 +10422,11 @@ mod tests {
     /// (`documents_broken_by`) opens the metadata index on first use, which lazily
     /// creates those files under `work` as an ordinary, expected side effect of
     /// running the tool at all — unrelated to whether a `commit_and_sync` rollback
-    /// left the WRITE ITSELF clean. `create_document`/`edit_document`/
-    /// `delete_document`'s equivalent tests never touch the metadata index this way,
-    /// which is why their plain `git_status` assertions can stay exact.
+    /// left the WRITE ITSELF clean. `delete_document` does the same (#229: it always
+    /// opens the state DB for the inbound-link check, unlike a MOVE's conditional
+    /// open), so its tests need this filtered helper too. `create_document`/plain
+    /// `edit_document` (no `new_path`) never touch the metadata index at all, so
+    /// their equivalent tests can keep the plain, exact `git_status` assertion.
     fn git_status_ignoring_state_db(work: &tempfile::TempDir) -> String {
         git_status(work)
             .lines()
@@ -9782,6 +10634,8 @@ mod tests {
                 message: None,
                 expected_hash: None,
                 force_new: Some(true),
+                frontmatter_patch: None,
+                append: None,
             }))
             .await;
         assert!(
