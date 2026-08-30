@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
-    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
-    Distance, FacetCountsBuilder, FacetHit, FieldCondition, FieldType, Filter, Fusion, Match,
-    Modifier, NamedVectors, PointStruct, PrefetchQuery, PrefetchQueryBuilder, Query,
+    Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
+    DeletePointsBuilder, Distance, FacetCountsBuilder, FacetHit, FieldCondition, FieldType, Filter,
+    Fusion, Match, Modifier, NamedVectors, PointStruct, PrefetchQuery, PrefetchQueryBuilder, Query,
     QueryPointGroupsBuilder, QueryPointsBuilder, Range, SearchPointsBuilder,
     SparseVectorParamsBuilder, SparseVectorsConfigBuilder, TextIndexParamsBuilder, TokenizerType,
     UpsertPointsBuilder, Value as QdrantValue, Vector, VectorInput, VectorParamsBuilder,
@@ -43,6 +43,20 @@ pub trait VectorStore: Send + Sync {
         indexed_fields: &[IndexedField],
         enable_phrase: bool,
     ) -> Result<()>;
+    /// Exact point count for `collection` (`0` if the collection does not exist), for
+    /// #155's active self-heal: `ingest::scan_and_index` compares this against
+    /// state.db's `total_chunk_count()` before a scoped reconcile sweep and escalates
+    /// to a full rebuild on a large deficit — see that call site for the full
+    /// rationale. In the trait (rather than only an inherent `QdrantStore` method) so
+    /// that escalation decision can be driven by test fakes instead of a live Qdrant,
+    /// same reasoning as `drop_collection`/`ensure_collection` above.
+    ///
+    /// Deliberately exact (`CountPointsBuilder::exact(true)`), unlike the approximate
+    /// `points_count` `collection_info` reports for `/status` (`QdrantStore::collection_info`,
+    /// server.rs's passive half of #155): that check only ever reports a number,
+    /// while this one decides whether to drop and rebuild the whole collection, so it
+    /// cannot afford eventual-consistency noise turning into a false-positive wipe.
+    async fn collection_point_count(&self, collection: &str) -> Result<u64>;
 }
 
 pub trait RetrievalStore: Send + Sync {
@@ -977,6 +991,32 @@ impl QdrantStore {
         );
         Ok(())
     }
+
+    /// See [`VectorStore::collection_point_count`] for the full rationale (exact vs.
+    /// `collection_info`'s approximate count, and why this exists on the trait at
+    /// all). Mirrors `drop_collection`/`ensure_collection`'s existence-check pattern:
+    /// a collection that does not exist has 0 points rather than being an error —
+    /// #155's caller needs a plain deficit number even when the collection was
+    /// dropped outright, not merely emptied.
+    pub async fn collection_point_count(&self, collection: &str) -> Result<u64> {
+        let exists = self
+            .client
+            .collection_exists(collection)
+            .await
+            .context("Failed to check if collection exists")?;
+
+        if !exists {
+            return Ok(0);
+        }
+
+        let response = self
+            .client
+            .count(CountPointsBuilder::new(collection).exact(true))
+            .await
+            .context("Failed to count points in collection")?;
+
+        Ok(response.result.map(|r| r.count).unwrap_or(0))
+    }
 }
 
 /// Thin delegation impls — each method calls the identically-named inherent method
@@ -1008,6 +1048,10 @@ impl VectorStore for QdrantStore {
     ) -> Result<()> {
         QdrantStore::ensure_collection(self, collection, vector_size, indexed_fields, enable_phrase)
             .await
+    }
+
+    async fn collection_point_count(&self, collection: &str) -> Result<u64> {
+        QdrantStore::collection_point_count(self, collection).await
     }
 }
 
