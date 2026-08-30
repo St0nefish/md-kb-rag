@@ -2157,6 +2157,89 @@ async fn index_paths_inner(config: &ResolvedConfig, paths: &[PathBuf], force: bo
     index_paths_generic(config, paths, force, run_start, &embedder, &store).await
 }
 
+/// Cross-process exclusion for the destructive `force=true` sequence (#155 review
+/// follow-up). Every `index_paths_generic` run — scoped or full, in this process or
+/// any other reachable from the same `data_path` (the CLI and the server both reach
+/// it) — takes this OS advisory lock for its ENTIRE duration: SHARED for a scoped
+/// run, EXCLUSIVE for `force=true`. This is a standard reader-writer lock: any
+/// number of scoped ("reader") runs proceed concurrently with each other, matching
+/// the pre-existing, unlocked concurrency model for ordinary upserts that this is
+/// not trying to change — but a full reindex ("writer") blocks until every other
+/// run anywhere touching this `data_path`, scoped or full, has released its lock,
+/// and blocks any new run from starting until it releases its own.
+///
+/// This is what actually closes the cross-process race a code review of #155 found:
+/// `detect_qdrant_wipe`'s deficit check is intentionally lock-free (it is a cheap
+/// read, run on every reconcile sweep, by any process) and can still observe a
+/// stale or transient deficit from another process's in-flight run — reordering
+/// `state.clear()` ahead of `drop_collection()` below closes the common,
+/// SELF-inflicted false-positive case (see that comment), but cannot stop a
+/// genuinely-triggered escalation — e.g. an operator's `index --full` run
+/// concurrent with the server's own automatic self-heal, which the review calls out
+/// as the likeliest real collision, since both are primed to fire off the same
+/// symptom — from being ACTED on twice. This lock is what makes acting on it twice
+/// safe: the second escalation's `force=true` call blocks here until the first's
+/// destructive sequence has fully released its lock, rather than interleaving
+/// drop/clear/upsert calls against the same collection and state.db from two
+/// processes at once. It may still redundantly re-embed once it unblocks — this
+/// does not re-check whether the first run already fixed things, so the rare
+/// genuine double-trigger case still pays for a second full embed — but it can no
+/// longer corrupt anything, which is the property that actually matters here.
+///
+/// Also closes the narrower instance of the same gap the review found in
+/// `remove_orphans`: a large batch's `delete_by_files` (Qdrant) landing before its
+/// per-file `state.delete*` calls produces the same transient-deficit shape as the
+/// force sequence, just smaller and bounded by batch size rather than corpus size.
+/// Reordering `remove_orphans` itself would trade that away for a worse regression —
+/// deleting the `indexed_files` row before the Qdrant point survives a mid-batch
+/// crash by leaving the point orphaned with nothing left to ever detect and clean it
+/// up, since orphan detection is driven off exactly that row (see `remove_orphans`'s
+/// own comment) — so it is deliberately left as-is. Under this lock, a concurrent
+/// force run cannot even start (and therefore cannot observe or be triggered by that
+/// window) until the scoped run that reached `remove_orphans` has fully released its
+/// shared lock.
+///
+/// `flock` (via `std::fs::File::{lock,lock_shared}`, stabilized in `std` — no new
+/// dependency), not a PID file or a state.db row: the lock is held by the OPEN FILE
+/// DESCRIPTOR, so a crashed or killed holder releases it automatically when the
+/// kernel reclaims the process's file descriptors. There is no stale-lock state to
+/// detect or clean up, and no way for a crash to wedge a future run.
+///
+/// Deliberately blocking, not `try_lock` — mirroring `git::GIT_LOCK`'s own
+/// philosophy (see its doc comment): the wait is bounded in practice by the
+/// holder's own bounded work, not by a policy this function has no way to set
+/// correctly. Run via `spawn_blocking` so the wait never stalls the tokio runtime —
+/// MCP requests, the webhook handler, and any other in-flight work keep running
+/// while a caller here waits its turn.
+///
+/// The lock file lives next to `state.db` — inside `data_path`, the same place
+/// `state.db` itself already lives, not some separate, unconventional location.
+/// Every write in this codebase stages an explicit path list, never a blanket `git
+/// add`, so an untracked file sitting next to `state.db` (which already lives
+/// there, also untracked) is never at risk of being swept into a commit and pushed.
+async fn acquire_reindex_lock(config: &ResolvedConfig, force: bool) -> Result<std::fs::File> {
+    let lock_path = format!("{}.reindex.lock", config.state_db_path());
+    tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open reindex lock file '{lock_path}'"))?;
+        if force {
+            file.lock().with_context(|| {
+                format!("Failed to acquire exclusive reindex lock '{lock_path}'")
+            })?;
+        } else {
+            file.lock_shared()
+                .with_context(|| format!("Failed to acquire shared reindex lock '{lock_path}'"))?;
+        }
+        Ok(file)
+    })
+    .await
+    .context("Reindex lock acquisition task panicked")?
+}
+
 /// The indexing pipeline body, generic over the embedding/vector-store dependencies
 /// so it can be exercised with fakes — no live Qdrant or embedding service required —
 /// while still being the exact code production runs. [`index_paths_inner`] is the
@@ -2177,6 +2260,12 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     store: &Q,
 ) -> Result<()> {
     // ── Infrastructure ──────────────────────────────────────────────────────
+    //
+    // Held for the rest of this function's lifetime (dropped, and so released,
+    // whichever of the many `?` early-returns below fires, or on a normal return) —
+    // see `acquire_reindex_lock`'s doc comment for what this closes and why.
+    let _reindex_lock = acquire_reindex_lock(config, force).await?;
+
     let db_path = config.state_db_path();
     let state = StateDb::new(Path::new(&db_path))
         .await
@@ -2237,8 +2326,56 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         );
     }
 
-    // ── force: drop Qdrant collection so it is recreated clean ───────────────
+    // ── force: clear state, THEN drop/recreate the Qdrant collection ─────────
+    //
+    // #155 review follow-up: `state.clear()` runs BEFORE `drop_collection()` —
+    // deliberately inverted from the original clear-after-ensure ordering. Between
+    // these two calls, ANY process's `detect_qdrant_wipe` (lock-free by design — see
+    // `acquire_reindex_lock`'s doc comment) reads a transient snapshot of this
+    // sequence; the two orderings produce opposite, and very differently dangerous,
+    // transient shapes:
+    //
+    //   - Old order (drop, then clear): state.db still holds the FULL pre-clear row
+    //     set (`state.count() > 0`, `total_chunk_count()` == the whole corpus) while
+    //     Qdrant has ~0 points — a DEFICIT the size of the entire corpus, which
+    //     `detect_qdrant_wipe` cannot distinguish from a genuine wipe. Any observer
+    //     sampling in that window escalates itself into a second, concurrent
+    //     destructive sequence against the same collection and state.db.
+    //   - This order (clear, then drop): state.db is immediately empty
+    //     (`state.count() == 0`), which is `detect_qdrant_wipe`'s own gate — it
+    //     returns `false` without even reading Qdrant's point count. Once state
+    //     starts repopulating (`upsert_pending`'s per-file `state.upsert` loop,
+    //     later), Qdrant already holds the full point set from that same file's
+    //     upsert (points are written before state rows within `upsert_pending`), so
+    //     state can only ever be at-or-behind Qdrant during the whole rebuild — a
+    //     SURPLUS, which `detect_qdrant_wipe` already treats as legitimate and
+    //     ignores. There is no point during a normal run where this ordering
+    //     produces a deficit for another process to misread.
+    //
+    // Crash semantics, since a destructive sequence is exactly the code a reviewer
+    // should distrust "recovers on the next run" claims about without tracing them:
+    //   - Crash between `clear()` and `drop_collection()`: state is empty, Qdrant
+    //     still holds the untouched OLD data — search keeps serving it correctly.
+    //     `detect_qdrant_wipe` stays gated off (state.count() == 0) for anyone
+    //     watching. A retry starts clean; if never retried, the next ordinary
+    //     reconcile sweep treats every path as new (no `indexed_files` row) and
+    //     re-embeds the whole corpus via the normal, non-destructive path —
+    //     expensive, but each upsert lands on the same deterministic point ID, so
+    //     nothing is orphaned or duplicated.
+    //   - Crash between `drop_collection()` and `ensure_collection()` (below): state
+    //     is empty and the collection is genuinely gone. `ensure_collection` runs
+    //     unconditionally at the top of every future `index_paths_generic` call
+    //     (scoped or full), so the very next indexing activity of any kind —
+    //     including an ordinary scoped write, not just a retried `--full` —
+    //     recreates it.
+    //   - Either way, this lock (`acquire_reindex_lock`) is still held across the
+    //     crash until the process dies, so no OTHER process's force run can
+    //     interleave with the incomplete one even mid-sequence; it releases
+    //     automatically (flock semantics) once the crashed process's file
+    //     descriptors are reclaimed, so a crash here cannot wedge future runs.
     if force {
+        state.clear().await.context("Failed to clear state DB")?;
+
         info!("Full reindex: dropping Qdrant collection");
         store
             .drop_collection(collection)
@@ -2255,12 +2392,6 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
         )
         .await
         .context("Failed to ensure Qdrant collection")?;
-
-    // Clear state only after the collection exists; a clear failure then leaves
-    // an empty collection + populated state, which recovers on the next run.
-    if force {
-        state.clear().await.context("Failed to clear state DB")?;
-    }
 
     INDEX_STATUS.set_files_total(paths.len() as u64);
 
@@ -2522,6 +2653,19 @@ const QDRANT_WIPE_DEFICIT_SLACK: i64 = 50;
 /// this gate is what keeps day-one startup from spuriously escalating to a full
 /// reindex before anything has been indexed at all.
 ///
+/// Also gated on `already_indexing`: mirrors `server.rs`'s passive `/status` check
+/// (`collect_status` suppresses `qdrant_deficit_error` while `INDEX_STATUS` reports
+/// a run in flight) for the same reason — a run genuinely in progress produces
+/// exactly the transient deficit shape this function exists to catch, most acutely
+/// during a force run's own drop/clear/rebuild sequence (see `index_paths_generic`'s
+/// force-block comment). `scan_and_index` passes `INDEX_STATUS.snapshot().indexing`
+/// here; this parameter (rather than reading the global itself) is what keeps this
+/// function testable with an arbitrary in-flight/not-in-flight combination instead
+/// of needing a real run actually in progress to exercise the gate. Note this only
+/// suppresses a SAME-process run — `acquire_reindex_lock`, not this gate, is what
+/// closes the cross-process case, since `INDEX_STATUS` is a process-global with no
+/// visibility into another process's activity.
+///
 /// Deliberately one-sided, mirroring `server.rs`'s `qdrant_deficit_error`: only a
 /// DEFICIT (fewer live points than state.db expects) is ever a fault. A surplus is
 /// legitimate and can persist indefinitely — `index_paths_generic` documents at
@@ -2537,7 +2681,12 @@ async fn detect_qdrant_wipe<Q: VectorStore>(
     state: &StateDb,
     store: &Q,
     collection: &str,
+    already_indexing: bool,
 ) -> Result<bool> {
+    if already_indexing {
+        return Ok(false);
+    }
+
     let indexed_rows = state
         .count()
         .await
@@ -2605,7 +2754,10 @@ pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigg
     let store = QdrantStore::new(&config.qdrant)
         .context("Failed to connect to Qdrant for wipe detection")?;
 
-    if detect_qdrant_wipe(&state, &store, &config.qdrant.collection).await? {
+    // Same-process in-flight suppression — see `detect_qdrant_wipe`'s doc comment
+    // for why this parameter exists and what it does (and does not) close.
+    let already_indexing = INDEX_STATUS.snapshot().indexing;
+    if detect_qdrant_wipe(&state, &store, &config.qdrant.collection, already_indexing).await? {
         error!(
             collection = %config.qdrant.collection,
             "Qdrant's point count is far below state.db's chunk_count sum — this looks like \
@@ -3897,7 +4049,7 @@ mod tests {
         // state.db survived.
         let store = FixedPointCountStore(3);
 
-        let wiped = detect_qdrant_wipe(&db, &store, "kb").await.unwrap();
+        let wiped = detect_qdrant_wipe(&db, &store, "kb", false).await.unwrap();
         assert!(
             wiped,
             "a deficit this large must be reported as a Qdrant wipe"
@@ -3915,7 +4067,7 @@ mod tests {
         // not a wipe.
         let store = FixedPointCountStore(1000 - QDRANT_WIPE_DEFICIT_SLACK as u64);
 
-        let wiped = detect_qdrant_wipe(&db, &store, "kb").await.unwrap();
+        let wiped = detect_qdrant_wipe(&db, &store, "kb", false).await.unwrap();
         assert!(
             !wiped,
             "a deficit within slack must not be treated as a wipe"
@@ -3933,7 +4085,7 @@ mod tests {
         // surplus (e.g. a failed tail-trim), never a wipe signal.
         let store = FixedPointCountStore(10_000);
 
-        let wiped = detect_qdrant_wipe(&db, &store, "kb").await.unwrap();
+        let wiped = detect_qdrant_wipe(&db, &store, "kb", false).await.unwrap();
         assert!(!wiped, "a surplus must never be reported as a wipe");
     }
 
@@ -3948,10 +4100,112 @@ mod tests {
         let db = test_state_db(&dir).await;
         let store = FixedPointCountStore(0);
 
-        let wiped = detect_qdrant_wipe(&db, &store, "kb").await.unwrap();
+        let wiped = detect_qdrant_wipe(&db, &store, "kb", false).await.unwrap();
         assert!(
             !wiped,
             "an empty state.db must never trigger the wipe escalation"
+        );
+    }
+
+    /// #155 review follow-up: reproduces the race deterministically without needing
+    /// two real processes — a fake store reports a corpus-sized deficit (exactly
+    /// what another process's in-flight force sequence transiently looks like from
+    /// the outside, before the reorder-based fix even applies) while a run is
+    /// notionally in flight in THIS process. Even a deficit this large must not
+    /// escalate while `already_indexing` is true.
+    #[tokio::test]
+    async fn detect_qdrant_wipe_is_suppressed_while_a_run_is_in_flight() {
+        let dir = TempDir::new().unwrap();
+        let db = test_state_db(&dir).await;
+        db.upsert("a.md", "hash-a", 500, "schema", 100, 10)
+            .await
+            .unwrap();
+        // The collection was just dropped and not yet rebuilt — exactly the
+        // transient shape a concurrent run's own drop/clear window (or a genuine
+        // wipe another process is already mid-repair on) produces.
+        let store = FixedPointCountStore(0);
+
+        let wiped = detect_qdrant_wipe(&db, &store, "kb", true).await.unwrap();
+        assert!(
+            !wiped,
+            "a run already in flight must suppress escalation regardless of how \
+             large the observed deficit is"
+        );
+
+        // Sanity check: the exact same state, without the in-flight flag, DOES
+        // escalate — proving the suppression above is doing something, not just
+        // coincidentally passing because the deficit was too small.
+        let wiped_when_idle = detect_qdrant_wipe(&db, &store, "kb", false).await.unwrap();
+        assert!(
+            wiped_when_idle,
+            "the same deficit must still escalate when nothing is in flight"
+        );
+    }
+
+    // -- acquire_reindex_lock (#155 review follow-up) --------------------------
+    //
+    // Exercises the actual `flock` primitive (via two independently-opened `File`
+    // handles to the same path, which is exactly how two real OS processes would
+    // contend for it — flock is scoped to the open file description, not the
+    // process) rather than mocking it, since the whole point of this lock is that
+    // its cross-process guarantee comes from the kernel, not from anything in this
+    // crate's control flow.
+
+    #[tokio::test]
+    async fn acquire_reindex_lock_blocks_a_force_run_while_a_scoped_run_holds_it() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+
+        // Simulates a scoped ("reader") run already in progress elsewhere.
+        let _shared = acquire_reindex_lock(&config, false).await.unwrap();
+
+        // A concurrent force ("writer") attempt must not be able to acquire
+        // exclusive access while that shared lock is held — probed non-blockingly
+        // so this test fails fast instead of hanging if the exclusion is broken.
+        let lock_path = format!("{}.reindex.lock", config.state_db_path());
+        let probe = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&lock_path).unwrap().try_lock()
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(probe, Err(std::fs::TryLockError::WouldBlock)),
+            "an exclusive (force) attempt must be blocked while a shared (scoped) \
+             lock is held: {probe:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_reindex_lock_allows_two_concurrent_scoped_runs() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+
+        // Two "readers" — this is the pre-existing, unlocked concurrency model for
+        // ordinary scoped upserts, which this lock must not change.
+        let first = acquire_reindex_lock(&config, false).await.unwrap();
+        let second = acquire_reindex_lock(&config, false).await.unwrap();
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn acquire_reindex_lock_blocks_a_scoped_run_while_a_force_run_holds_it() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+
+        // Simulates a force ("writer") run already in progress elsewhere.
+        let _exclusive = acquire_reindex_lock(&config, true).await.unwrap();
+
+        let lock_path = format!("{}.reindex.lock", config.state_db_path());
+        let probe = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&lock_path).unwrap().try_lock_shared()
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(probe, Err(std::fs::TryLockError::WouldBlock)),
+            "a scoped (shared) attempt must be blocked while a force (exclusive) \
+             lock is held: {probe:?}"
         );
     }
 
