@@ -3776,6 +3776,78 @@ mod tests {
         assert_eq!(git_status(&work), "");
     }
 
+    /// #147: the "rollback ITSELF also failed" branch of `write_document`'s
+    /// CREATE path (`rolled_back: false`) — previously exercised only by
+    /// `delete_document`'s equivalent test. Mirrors that test's technique:
+    /// point the harness at a plain temp directory with no `.git` at all, so
+    /// `git add` fails at `commit_and_sync`'s very first step (a `PreCommit`
+    /// failure, same as any other pre-commit failure), and the create
+    /// rollback's SECOND step — `git::unstage`, which runs after
+    /// `tokio::fs::remove_file` already succeeded — fails too, because there
+    /// is no repository to run `git reset` against.
+    #[tokio::test]
+    async fn create_rollback_failure_with_no_git_repo_reports_rolled_back_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_req(
+            "docs/new-no-repo.md",
+            "---\ntitle: New\n---\n\n# Body\n",
+            true,
+        );
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
+        }
+        // `remove_file` (the first of the two rollback steps) succeeded — the
+        // filesystem write really is undone. Only `git::unstage` (the second
+        // step) failed, which is exactly what makes this the "rollback
+        // itself also failed" case rather than a clean rollback.
+        assert!(!tmp.path().join("docs/new-no-repo.md").exists());
+    }
+
+    /// #147: the same "rollback itself also failed" branch, but for
+    /// `write_document`'s EDIT path, which rolls back via a single call to
+    /// `git::restore_from_head` instead of create's two-step remove+unstage —
+    /// a genuinely different call to fail, so the create test above does not
+    /// cover it.
+    #[tokio::test]
+    async fn edit_rollback_failure_with_no_git_repo_reports_rolled_back_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("edit-me-no-repo.md"),
+            "---\ntitle: Old\n---\n# Old",
+        )
+        .unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_req(
+            "docs/edit-me-no-repo.md",
+            "---\ntitle: New\n---\n# New",
+            false,
+        );
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
+        }
+        // The overwrite already landed on disk (an edit writes in place, with
+        // no separate "create the new file" step to undo) and `git restore`
+        // cannot put the old content back with no HEAD to restore from — the
+        // file is left holding the new, uncommitted content, which IS the
+        // inconsistency `rolled_back: false` is reporting.
+        assert_eq!(
+            std::fs::read_to_string(sub.join("edit-me-no-repo.md")).unwrap(),
+            "---\ntitle: New\n---\n# New"
+        );
+    }
+
     /// #142 regression: `expected_hash` must be re-verified against the file's
     /// LIVE on-disk content immediately before the overwrite, not just once,
     /// early, against the caller-supplied `old_content`. Simulates the failure
@@ -4443,6 +4515,43 @@ mod tests {
         );
         assert_eq!(head_before, head_sha(&work));
         assert_eq!(git_status(&work), "");
+    }
+
+    /// #147: `write_document_move`'s own "rollback itself also failed" branch
+    /// (`rolled_back: false`) — same no-git-repo technique as the create/edit
+    /// tests above and `delete_document`'s existing test. `rolled_back` here
+    /// is `source_restore.is_ok() && dest_rollback.is_ok() &&
+    /// rewrite_restore_failures.is_empty()`: with no `.git` at all, `git add`
+    /// fails first (`PreCommit`), and then BOTH `source_restore`
+    /// (`git::restore_from_head`) and the git half of `dest_rollback`
+    /// (`git::unstage`, reached after its own `tokio::fs::remove_file` step
+    /// already succeeded) fail too, since neither has a repository to run
+    /// against — so `rolled_back` ends up `false` on two independent counts
+    /// at once, not just one.
+    #[tokio::test]
+    async fn move_rollback_failure_with_no_git_repo_reports_rolled_back_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("old");
+        std::fs::create_dir_all(&sub).unwrap();
+        let source_original = "---\ntitle: Move Me\n---\n\n# Body\n";
+        std::fs::write(sub.join("loc.md"), source_original).unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
+        }
+        // The destination copy was written, then successfully removed during
+        // rollback (`remove_file` needs no git repo) — but `restore_from_head`
+        // on the source can't run with no HEAD to restore from, so the
+        // source is left gone too. Both paths now missing IS the
+        // inconsistency `rolled_back: false` reports.
+        assert!(!tmp.path().join("new/loc.md").exists());
+        assert!(!sub.join("loc.md").exists());
     }
 
     #[tokio::test]
@@ -6130,5 +6239,40 @@ mod tests {
         );
         assert_eq!(head_before, head_sha(&work));
         assert_eq!(git_status(&work), "");
+    }
+
+    /// #147: `move_directory`'s own "rollback itself also failed" branch
+    /// (`rolled_back: false`) — the fourth and last of the four
+    /// structurally-identical sites the issue names, and like the other
+    /// three, exercised only by `delete_document`'s test before this. Same
+    /// no-git-repo technique: `git add` fails first (`PreCommit`), and then
+    /// `git::restore_from_head` on the moved source ALSO fails (no
+    /// repository to restore from), which alone is enough to flip this
+    /// move's `rolled_back` to `false` — `move_directory` ORs a failure in
+    /// per-source, per-destination, and per-rewritten-document, and any
+    /// single one failing is enough.
+    #[tokio::test]
+    async fn move_directory_rollback_failure_with_no_git_repo_reports_rolled_back_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("old-dir-no-repo");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.md"), "---\ntitle: A\n---\n\n# A\n").unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let err = move_directory(&harness.deps(), "old-dir-no-repo", "new-dir-no-repo", None)
+            .await
+            .unwrap_err();
+        match err {
+            DirectoryMoveError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
+        }
+        // The destination copy was written, then successfully removed during
+        // rollback — but the source restore can't run with no HEAD to
+        // restore from, so the source is left gone too, same inconsistency
+        // as the single-document move's equivalent test above.
+        assert!(!tmp.path().join("new-dir-no-repo/a.md").exists());
+        assert!(!sub.join("a.md").exists());
     }
 }
