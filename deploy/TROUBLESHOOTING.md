@@ -151,6 +151,37 @@ docker run --rm -v <volume_name>:/data --user root --entrypoint chown \
 
 If you're running the container with a custom compose `user:` override instead of the image default, replace `65532:65532` with that uid:gid. This only needs to be done once per pre-existing volume.
 
+### `docker compose up` hangs; `kb-rag` never starts; `qdrant` shows `starting` then `unhealthy`
+
+**Symptom.** `docker compose ps` shows `qdrant` stuck in `(health: starting)` and then
+`(unhealthy)` once its `retries` are exhausted. `kb-rag` never even shows as `Created`
+starting a container — `depends_on: qdrant: condition: service_healthy` means compose
+won't start it until qdrant reports healthy, which here it never will. This hits a
+clean `docker compose up` on any host: a first-time deployment, a disaster-recovery
+rebuild, or a reboot. If the stack looks fine on your existing host, that's because
+Watchtower restarts the `qdrant` container directly on image updates, bypassing
+compose and its `depends_on` gate entirely — it doesn't mean the healthcheck works.
+
+**Cause.** Fixed as of #256: the qdrant healthcheck used to run `curl -f
+http://localhost:6333/health`, and both halves were wrong — the `qdrant/qdrant` image
+ships no `curl` (or `wget`), so the command can't execute at all, and even if it could,
+current Qdrant dropped `/health` in favor of `/readyz`/`/healthz`/`/livez`. The
+healthcheck could never report anything but `unhealthy`.
+
+**Fix.** If you're on a version of this repo before #256, `git pull` or update your
+compose file — `docker-compose.yml` and every template under `deploy/templates/` now
+probe the gRPC port directly with a `/dev/tcp` bash redirect instead of curl:
+
+```yaml
+healthcheck:
+  test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6334"]
+```
+
+If you're maintaining a compose file that forked from an older version of this repo,
+apply the same change by hand. Confirm it with `docker inspect --format
+'{{json .State.Health}}' <qdrant container>` — `"Status":"healthy"` after the
+`start_period` elapses.
+
 ## Embedding Service
 
 ### Container exits immediately
