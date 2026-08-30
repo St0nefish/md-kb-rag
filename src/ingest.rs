@@ -223,6 +223,38 @@ async fn file_mtime(path: &Path, label: &str) -> i64 {
         })
 }
 
+/// Nanosecond-precision filesystem modification time, as nanoseconds since the Unix
+/// epoch — for `scan_for_dirty`'s Reason-1b stat pre-filter and its stored baseline
+/// (`PendingFile::mtime`/`indexed_files.mtime`) exclusively (#141). [`file_mtime`]
+/// above truncates to whole seconds, so two writes to the same file — of the same
+/// resulting size — within the same integer second produce an identical `(mtime,
+/// size)` pair: a same-length, same-second edit is then invisible to the pre-filter
+/// until some later, unrelated change perturbs one of the two fields. This value is
+/// compared ONLY against a previous call's result, stored back via the same code
+/// path (never surfaced to search, the web UI, or anything outside this module's own
+/// stat-baseline bookkeeping), so its unit only has to stay internally consistent —
+/// not match `file_mtime`'s seconds convention, which is why the two are separate
+/// functions rather than one growing an inconsistent "sometimes nanos" return value.
+///
+/// A deployment upgrading from the whole-seconds baseline sees every file's stored
+/// value suddenly disagree with its live nanosecond value on the very next reconcile
+/// sweep — a one-time, self-correcting re-hash of the whole corpus (cheap: content
+/// hashing, no re-embed for unchanged content), the same one-time cost every other
+/// stat-baseline migration in this module has already accepted (see e.g. the empty-
+/// `schema_hash` upgrade path).
+async fn file_mtime_nanos(path: &Path, label: &str) -> i64 {
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or_else(|| {
+            warn!("Could not read mtime for '{}', defaulting to 0", label);
+            0
+        })
+}
+
 /// #164: one batched `git log` for every path in `rel_keys`, mapping each to the
 /// commit time of its most recent touch — the source of truth `process_file`/
 /// `backfill_document_metadata` fall back away from (to `file_mtime` above) only when
@@ -303,17 +335,22 @@ struct PendingFile {
     /// Number of chunks from the previous index run (0 for new files).
     /// Used to trim stale tail points after a successful upsert.
     old_chunk_count: usize,
-    /// Filesystem modification time as Unix timestamp (seconds), falling back to 0 on
-    /// metadata/clock error. **Internal bookkeeping only** — this is `indexed_files`'
-    /// stat pre-filter baseline (`StateDb::upsert`'s `mtime` column, compared against a
-    /// live `fs::metadata` read on every reconcile sweep — see `scan_for_dirty`'s
-    /// Reason 1b), never surfaced to search or the web UI. Deliberately NOT the
-    /// git-log-derived value in [`display_mtime`](Self::display_mtime) below: git
-    /// clone/checkout/pull do not preserve or reproduce filesystem mtimes, so a
-    /// stat-pre-filter baseline compared against a git timestamp would permanently
-    /// disagree with a live `fs::metadata` read and defeat the pre-filter on every
-    /// single sweep forever (#164's fix is scoped to keep this field exactly as it
-    /// always was, for exactly this reason).
+    /// Filesystem modification time as **nanoseconds** since the Unix epoch (#141;
+    /// see [`file_mtime_nanos`]), falling back to 0 on metadata/clock error.
+    /// **Internal bookkeeping only** — this is `indexed_files`' stat pre-filter
+    /// baseline (`StateDb::upsert`'s `mtime` column, compared against a live
+    /// `fs::metadata` read on every reconcile sweep — see `scan_for_dirty`'s
+    /// Reason 1b), never surfaced to search or the web UI. Nanosecond, not
+    /// whole-second, precision is deliberate: two writes to the same file, of the
+    /// same resulting size, within the same integer second used to produce an
+    /// identical `(mtime, size)` pair and escape the pre-filter entirely (#141).
+    /// Deliberately NOT the git-log-derived value in
+    /// [`display_mtime`](Self::display_mtime) below: git clone/checkout/pull do not
+    /// preserve or reproduce filesystem mtimes, so a stat-pre-filter baseline
+    /// compared against a git timestamp would permanently disagree with a live
+    /// `fs::metadata` read and defeat the pre-filter on every single sweep forever
+    /// (#164's fix is scoped to keep this field exactly as it always was, for
+    /// exactly this reason).
     mtime: i64,
     /// Byte length of `content` as read from disk. Stored alongside `mtime` so the
     /// next reconcile scan (`scan_for_dirty`) can stat-compare instead of re-reading
@@ -424,13 +461,19 @@ async fn process_file(
     let size = content.len() as i64;
 
     // Capture mtime now — used in PendingFile regardless of validation path. `mtime`
-    // (fs-stat) stays exactly as before — see its doc comment on `PendingFile` for
-    // why it must not become git-derived. `display_mtime` (#164) is the git-log time
-    // for this path when `git_mtimes` has one, falling back to the same fs-stat value
-    // otherwise (git integration disabled, or the path has no git history yet — e.g.
-    // a file created but not yet committed).
-    let mtime = file_mtime(path, &file_path).await;
-    let display_mtime = git_mtimes.get(&file_path).copied().unwrap_or(mtime);
+    // is the nanosecond-precision stat pre-filter baseline (#141) — see its doc
+    // comment on `PendingFile` for why it must not become git-derived (#164).
+    // `display_mtime` (#164) is the git-log time for this path when `git_mtimes` has
+    // one, falling back to whole-seconds fs-stat otherwise (git integration
+    // disabled, or the path has no git history yet — e.g. a file created but not yet
+    // committed) — `file_mtime`, not `file_mtime_nanos`, since this value is surfaced
+    // externally (Qdrant payload, `documents.mtime`) and every other consumer of it
+    // already assumes whole-second Unix time.
+    let mtime = file_mtime_nanos(path, &file_path).await;
+    let display_mtime = match git_mtimes.get(&file_path) {
+        Some(&ts) => ts,
+        None => file_mtime(path, &file_path).await,
+    };
 
     let old_chunk_count = state_entry
         .as_ref()
@@ -1941,6 +1984,12 @@ pub async fn scan_for_dirty(config: &ResolvedConfig) -> Result<Vec<PathBuf>> {
 
             // Reason 1b: stat pre-filter. The only per-file disk access this function
             // performs, and it is a metadata syscall, never a content read.
+            //
+            // #141: nanosecond, not whole-second, precision — matching
+            // `file_mtime_nanos`/`row.mtime`'s unit exactly (see `PendingFile::mtime`'s
+            // doc comment). Truncating to whole seconds here would let two writes to
+            // the same file, of the same resulting size, within the same integer
+            // second compare equal and never get flagged dirty.
             let abs = data_path.join(&row.file_path);
             match tokio::fs::metadata(&abs).await {
                 Ok(meta) => {
@@ -1948,7 +1997,7 @@ pub async fn scan_for_dirty(config: &ResolvedConfig) -> Result<Vec<PathBuf>> {
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
+                        .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0);
                     let size = meta.len() as i64;
                     if mtime != row.mtime || size != row.size {
@@ -3626,6 +3675,9 @@ mod tests {
             .unwrap()
     }
 
+    /// Nanosecond precision (#141) — must match `scan_for_dirty`'s own Reason-1b
+    /// computation exactly, or every test using this to predict the stored baseline
+    /// would be comparing two different units against each other.
     fn stat(path: &Path) -> (i64, i64) {
         let meta = std::fs::metadata(path).unwrap();
         let mtime = meta
@@ -3633,7 +3685,7 @@ mod tests {
             .unwrap()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64;
+            .as_nanos() as i64;
         (mtime, meta.len() as i64)
     }
 
@@ -3696,6 +3748,49 @@ mod tests {
 
         let dirty = scan_for_dirty(&config).await.unwrap();
         assert_eq!(dirty, vec![PathBuf::from("doc.md")]);
+    }
+
+    /// #141: a same-second, same-size edit must not escape the stat pre-filter.
+    /// Manufactures the stored baseline directly (a sub-second offset from the live
+    /// stat) rather than performing two real, timed writes — real writes fast enough
+    /// to land in the same wall-clock second are exactly what this bug is about, but
+    /// relying on write timing to reproduce it would make the test flaky on a slow
+    /// machine or a coarser filesystem clock. Manufacturing the stored value directly
+    /// exercises the same comparison deterministically: whole-second truncation would
+    /// make `stale_mtime` and the live stat compare equal; nanosecond precision must
+    /// not.
+    #[tokio::test]
+    async fn scan_for_dirty_catches_a_same_second_same_size_edit() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir);
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc A").unwrap();
+        let (real_mtime, real_size) = stat(&path);
+        let schema_hash = expected_schema_hash(dir.path(), &config.frontmatter);
+
+        // 500 microseconds earlier — comfortably within the same integer second as
+        // `real_mtime`, so `.as_secs()` truncation would make these compare equal.
+        let stale_mtime = real_mtime - 500_000;
+
+        let db = open_scan_test_db(&config).await;
+        db.upsert(
+            "doc.md",
+            "old-hash",
+            1,
+            &schema_hash,
+            stale_mtime,
+            real_size,
+        )
+        .await
+        .unwrap();
+
+        let dirty = scan_for_dirty(&config).await.unwrap();
+        assert_eq!(
+            dirty,
+            vec![PathBuf::from("doc.md")],
+            "a same-second, same-size edit must still be caught by nanosecond-precision \
+             mtime comparison, not silently skipped"
+        );
     }
 
     #[tokio::test]
@@ -4398,9 +4493,12 @@ mod tests {
     }
 
     /// #164: with no entry for the path in `git_mtimes` (git integration disabled, or
-    /// the path has no git history yet), `display_mtime` must fall back to the exact
-    /// same fs-stat value as `mtime` — this is the pre-#164 behavior, preserved as the
-    /// degrade path.
+    /// the path has no git history yet), `display_mtime` must fall back to fs-stat —
+    /// this is the pre-#164 behavior, preserved as the degrade path. `mtime` and
+    /// `display_mtime` are still deliberately different UNITS even on this fallback
+    /// path (#141: `mtime` is nanoseconds, `display_mtime` whole seconds — see
+    /// `PendingFile::mtime`'s doc comment), so the fs-stat-derived seconds value must
+    /// equal `mtime` truncated to seconds, not `mtime` itself.
     #[tokio::test]
     async fn process_file_display_mtime_falls_back_to_fs_mtime_without_a_git_entry() {
         let dir = TempDir::new().unwrap();
@@ -4424,8 +4522,10 @@ mod tests {
         .unwrap();
         match outcome {
             FileOutcome::Ready(pf) => assert_eq!(
-                pf.display_mtime, pf.mtime,
-                "with no git_mtimes entry, display_mtime must equal the fs-stat mtime"
+                pf.display_mtime,
+                pf.mtime / 1_000_000_000,
+                "with no git_mtimes entry, display_mtime (fs-stat seconds) must equal \
+                 mtime (fs-stat nanoseconds) truncated to whole seconds"
             ),
             other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
         }
