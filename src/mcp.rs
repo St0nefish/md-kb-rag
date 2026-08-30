@@ -2699,6 +2699,8 @@ impl KbSearchServer {
             mode,
             path_prefix_truncated,
             offset_truncated,
+            offset,
+            opts.rerank_candidate_limit,
         );
 
         let mut call_result = CallToolResult::success(vec![Content::text(text)]);
@@ -2832,8 +2834,12 @@ impl KbSearchServer {
         let offset_truncated = outcome.offset_truncated;
         let documents = outcome.documents;
 
-        let (text, structured) =
-            build_grouped_search_payload(&documents, path_prefix_truncated, offset_truncated);
+        let (text, structured) = build_grouped_search_payload(
+            &documents,
+            path_prefix_truncated,
+            offset_truncated,
+            offset,
+        );
 
         let mut call_result = CallToolResult::success(vec![Content::text(text)]);
         call_result.structured_content = Some(structured);
@@ -3460,6 +3466,13 @@ impl KbSearchServer {
     ///   the source, this is the destination. `None` (the default for a plain
     ///   create, and for an edit call with no `new_path`) is the existing
     ///   create/edit behavior. See `write::WriteRequest::dest_path`.
+    /// * `expected_hash` – the caller's `content_hash` from a prior read, threaded
+    ///   straight into `WriteRequest::expected_hash`. See that field's doc comment
+    ///   for why this is not redundant with `write_document_edit`'s own up-front
+    ///   check: this one is `write::write_document`'s live-disk re-check,
+    ///   immediately before the overwrite under `GIT_LOCK`, which catches a
+    ///   modification that landed during this call's own awaits (e.g. a slow
+    ///   `validation.lint_command`) — a window the up-front check cannot see.
     #[allow(clippy::too_many_arguments)]
     async fn run_document_write(
         &self,
@@ -3472,6 +3485,7 @@ impl KbSearchServer {
         force_new: Option<bool>,
         operation: &str,
         dest_path: Option<&str>,
+        expected_hash: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
         // One snapshot for the whole call, so a concurrent `POST /admin/reload`
         // cannot mix old and new values across this method's several config reads.
@@ -3532,14 +3546,18 @@ impl KbSearchServer {
             default_verb,
             force_new,
             operation,
-            // The edit path already enforces the stale-read guard itself, ahead
-            // of applying a surgical old_string/new_string replacement — so a
-            // stale read surfaces as an explicit "changed since you read it"
-            // error rather than a confusing old_string-not-found one. Passing
-            // `None` here avoids redundantly re-hashing the same in-memory
-            // `old_content` a second time; it can never disagree with the first
-            // check since both compare against the identical string.
-            expected_hash: None,
+            // Threaded straight from this method's own `expected_hash` parameter.
+            // `write_document_edit`'s up-front check (above) and this one check
+            // different things: the up-front check compares against the
+            // in-memory `old_content` this call already read, catching a stale
+            // caller read; this one is `write::write_document`'s live-disk
+            // re-check immediately before the overwrite under `GIT_LOCK`, which
+            // catches a concurrent modification that lands *during* this call —
+            // e.g. while awaiting `validate::validate_content`, which can exec an
+            // arbitrarily slow `validation.lint_command`. Passing `None` here
+            // would leave that second window unguarded, silently dropping #142's
+            // protection for every MCP write (see #243).
+            expected_hash,
             // Threaded straight from this method's own `dest_path` parameter —
             // `Some` turns this call into a move. See
             // `write::WriteRequest::dest_path`.
@@ -3730,6 +3748,7 @@ impl KbSearchServer {
             params.force_new,
             "write_document",
             None, // a create never moves a document
+            params.expected_hash.as_deref(),
         )
         .await
     }
@@ -3861,6 +3880,7 @@ impl KbSearchServer {
             None, // no dedup gate for edit
             operation,
             dest_path,
+            params.expected_hash.as_deref(),
         )
         .await
     }
@@ -4061,6 +4081,11 @@ impl KbSearchServer {
 /// `mode` is the caller-computed `explain` label (see `search_chunks`'s
 /// `phrase_arm_ran` derivation) — constant across the whole result set, never
 /// per-result. The empty-results branch lives here too, so one seam covers both.
+///
+/// `offset` and `rerank_candidate_limit` (#240) exist purely to hand to
+/// [`offset_truncated_note`] when `offset_truncated` is set — see that
+/// function's doc comment for why the note needs both to give accurate advice.
+#[allow(clippy::too_many_arguments)]
 fn build_chunk_search_payload(
     results: &[crate::qdrant::SearchResult],
     data_root: &Path,
@@ -4068,6 +4093,8 @@ fn build_chunk_search_payload(
     mode: &str,
     path_prefix_truncated: bool,
     offset_truncated: bool,
+    offset: u64,
+    rerank_candidate_limit: Option<u64>,
 ) -> (String, serde_json::Value) {
     if results.is_empty() {
         let mut text = "No results found.".to_string();
@@ -4078,7 +4105,7 @@ fn build_chunk_search_payload(
             );
         }
         if offset_truncated {
-            text.push_str(&offset_truncated_note());
+            text.push_str(&offset_truncated_note(offset, rerank_candidate_limit));
         }
         let structured = serde_json::json!({
             "returned": 0,
@@ -4245,7 +4272,7 @@ fn build_chunk_search_payload(
         );
     }
     if offset_truncated {
-        output.push_str(&offset_truncated_note());
+        output.push_str(&offset_truncated_note(offset, rerank_candidate_limit));
     }
 
     let structured = serde_json::json!({
@@ -4259,15 +4286,46 @@ fn build_chunk_search_payload(
 }
 
 /// Shared prose for both `build_chunk_search_payload` and
-/// `build_grouped_search_payload`'s `offset_truncated` note (#224) — kept as
-/// one function so the two text bodies can't drift on what the flag means.
-fn offset_truncated_note() -> String {
-    "\nNote: offset + limit reached past this query's ranked-candidate depth bound \
-     (reranking.candidate_limit when reranking is active, otherwise a fixed ceiling) — \
-     this page may be short or empty not because there are no more matches, but because \
-     paging that deep was never attempted. Narrow the query or lower offset to be sure \
-     this is exhaustive.\n"
-        .to_string()
+/// `build_grouped_search_payload`'s `offset_truncated` note (#224 / #240).
+///
+/// The bound this note explains can be tripped two different ways, and they
+/// need different advice:
+///
+/// - `offset == 0`: `limit` alone already exceeds the ranked-candidate depth
+///   bound — the whole first page is inside the untouched region, so there is
+///   no offset to lower (it's already zero). The actionable fix is raising the
+///   bound (`reranking.candidate_limit`, when a reranker sized it — passed as
+///   `rerank_candidate_limit`) or lowering `limit`. Telling a caller with
+///   `offset: 0` to "lower offset" is nonsensical advice pointing at a knob
+///   they never touched — that was #240.
+/// - `offset > 0`: the usual paging-too-deep case the original #224 note
+///   described — lowering `offset` (or narrowing the query so fewer pages are
+///   needed) is the real fix here.
+fn offset_truncated_note(offset: u64, rerank_candidate_limit: Option<u64>) -> String {
+    if offset == 0 {
+        match rerank_candidate_limit {
+            Some(limit) => format!(
+                "\nNote: limit alone already reached past this query's ranked-candidate depth \
+                 bound — reranking.candidate_limit is currently {limit}. This page may be short \
+                 or empty not because there are no more matches, but because paging that deep \
+                 was never attempted. Raise reranking.candidate_limit or lower limit to be sure \
+                 this is exhaustive.\n"
+            ),
+            None => "\nNote: limit alone already reached past this query's ranked-candidate \
+                 depth bound (a fixed ceiling; no reranker is configured to size a larger one) \
+                 — this page may be short or empty not because there are no more matches, but \
+                 because paging that deep was never attempted. Lower limit to be sure this is \
+                 exhaustive.\n"
+                .to_string(),
+        }
+    } else {
+        "\nNote: offset + limit reached past this query's ranked-candidate depth bound \
+         (reranking.candidate_limit when reranking is active, otherwise a fixed ceiling) — \
+         this page may be short or empty not because there are no more matches, but because \
+         paging that deep was never attempted. Narrow the query or lower offset to be sure \
+         this is exhaustive.\n"
+            .to_string()
+    }
 }
 
 /// Builds `search_grouped`'s text and structured payload from already-fetched
@@ -4280,6 +4338,7 @@ fn build_grouped_search_payload(
     documents: &[retrieval::GroupedDocument],
     path_prefix_truncated: bool,
     offset_truncated: bool,
+    offset: u64,
 ) -> (String, serde_json::Value) {
     let returned = documents.len();
 
@@ -4328,7 +4387,11 @@ fn build_grouped_search_payload(
         );
     }
     if offset_truncated {
-        text.push_str(&offset_truncated_note());
+        // Grouped search never runs a reranker (see `search_grouped`'s doc
+        // comment / `retrieval::GroupedSearchOutcome::offset_truncated`), so
+        // there is no `reranking.candidate_limit` to name here — the bound is
+        // always the fixed absolute ceiling.
+        text.push_str(&offset_truncated_note(offset, None));
     }
 
     (text.trim_end().to_string(), structured)
@@ -9922,6 +9985,97 @@ mod tests {
         );
     }
 
+    /// #243 regression, at the MCP layer specifically — `write.rs`'s own
+    /// `stale_hash_re_check_catches_a_change_made_after_the_first_check`
+    /// already covers the re-check itself, but that test (and every
+    /// `expected_hash` test above this one) constructs the concurrent change
+    /// BEFORE the call, which `write_document_edit`'s own up-front check
+    /// (comparing against the `old_content` it freshly reads from disk right
+    /// then) catches on its own regardless of whether `run_document_write`
+    /// threads `expected_hash` into `WriteRequest` at all — so none of those
+    /// would have failed before the fix. This test instead makes the change
+    /// land DURING the call, in the `validate::validate_content` await, via a
+    /// `lint_command` that overwrites the file mid-flight — the exact failure
+    /// scenario #243 describes (a webhook merge landing while an arbitrarily
+    /// slow lint command runs). Before the fix, `run_document_write` passed
+    /// `expected_hash: None` into `WriteRequest` no matter what the caller
+    /// sent, so `write::write_document`'s live-disk re-check was skipped
+    /// entirely and the write proceeded, silently clobbering the concurrent
+    /// change. After the fix, the re-check catches it and the write is
+    /// rejected before ever reaching the filesystem overwrite.
+    #[tokio::test]
+    async fn write_document_tool_re_checks_expected_hash_against_a_change_made_during_the_call() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+        let head_before = head_sha(&work);
+
+        // Simulates a concurrent change (a webhook merge, in production)
+        // landing between `write_document_edit`'s own read of the file and the
+        // actual overwrite inside `write::write_document` — modeled here as a
+        // `lint_command` that overwrites the file mid-flight, during the
+        // `validate::validate_content` await that runs before the re-check.
+        let concurrent = "---\ntitle: Concurrent\ndescription: d\ntype: guide\ntags: \
+                           [t]\n---\n\n# Concurrent body\n";
+        let abs_path = work.path().join("edit-me.md");
+
+        let mut config = make_test_resolved_config(work.path());
+        Arc::get_mut(&mut config).unwrap().validation.lint_command = Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf '%s' '{}' > '{}'", concurrent, abs_path.display()),
+        ]);
+        let server = make_write_test_server(&work, &["**/*.md".to_string()], config);
+
+        let expected_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
+        let concurrent_hash = crate::ingest::compute_hash_from_bytes(concurrent.as_bytes());
+        let new_content =
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "edit-me.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some(new_content.to_string()),
+                message: None,
+                expected_hash: Some(expected_hash),
+                new_path: None,
+                force_new: None,
+                frontmatter_patch: None,
+                append: None,
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "a concurrent on-disk change made during the call must be caught by the \
+             live-disk re-check, not silently clobbered",
+        );
+        assert!(
+            err.message.contains("changed since you read it"),
+            "expected the stale-hash message, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(&concurrent_hash),
+            "the rejection must report the LIVE on-disk hash (the lint_command's \
+             concurrent write), not the caller's original — got: {}",
+            err.message
+        );
+
+        // The concurrent write must survive untouched — that is the whole
+        // point of the re-check: it must never be silently clobbered.
+        assert_eq!(
+            std::fs::read_to_string(&abs_path).unwrap(),
+            concurrent,
+            "the concurrent change must survive the rejected write"
+        );
+        assert_eq!(head_before, head_sha(&work), "no commit must be made");
+    }
+
     // -----------------------------------------------------------------------
     // edit_document: new_path (move), end-to-end through the tool
     // -----------------------------------------------------------------------
@@ -10827,6 +10981,8 @@ mod tests {
             "dense cosine",
             false,
             false,
+            0,
+            None,
         );
 
         let arr = structured["results"]
@@ -10851,6 +11007,8 @@ mod tests {
             "dense cosine",
             false,
             false,
+            0,
+            None,
         );
 
         assert_eq!(text, "No results found.");
@@ -10878,6 +11036,8 @@ mod tests {
             "dense cosine",
             false,
             false,
+            0,
+            None,
         );
 
         let arr = structured["results"].as_array().unwrap();
@@ -10910,6 +11070,8 @@ mod tests {
             "dense cosine",
             true,
             false,
+            0,
+            None,
         );
 
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
@@ -10919,8 +11081,16 @@ mod tests {
         );
 
         // Same for the empty-results branch.
-        let (empty_text, empty_structured) =
-            build_chunk_search_payload(&[], Path::new("/data"), false, "dense cosine", true, false);
+        let (empty_text, empty_structured) = build_chunk_search_payload(
+            &[],
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            true,
+            false,
+            0,
+            None,
+        );
         assert_eq!(
             empty_structured["path_prefix_truncated"],
             serde_json::json!(true)
@@ -10936,7 +11106,10 @@ mod tests {
         // #224: mirrors the path_prefix_truncated test above, but for the
         // offset-depth-bound signal — proves the flag reaches structured_content
         // AND that the text body explains why the page may be short, on both
-        // the non-empty and empty-results branches.
+        // the non-empty and empty-results branches. `offset` is non-zero here
+        // (the "usual" paging-too-deep case), so the note still tells the
+        // caller to narrow the query or lower offset — see the offset == 0
+        // variant below (#240) for the case where that advice is wrong.
         let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
 
         let (text, structured) = build_chunk_search_payload(
@@ -10946,6 +11119,8 @@ mod tests {
             "dense cosine",
             false,
             true,
+            5,
+            None,
         );
 
         assert_eq!(structured["offset_truncated"], serde_json::json!(true));
@@ -10953,9 +11128,21 @@ mod tests {
             text.contains("offset + limit reached past"),
             "text must render the offset-truncation note; got: {text}"
         );
+        assert!(
+            text.contains("Narrow the query or lower offset"),
+            "a non-zero offset must still get the lower-offset advice; got: {text}"
+        );
 
-        let (empty_text, empty_structured) =
-            build_chunk_search_payload(&[], Path::new("/data"), false, "dense cosine", false, true);
+        let (empty_text, empty_structured) = build_chunk_search_payload(
+            &[],
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            true,
+            5,
+            None,
+        );
         assert_eq!(
             empty_structured["offset_truncated"],
             serde_json::json!(true)
@@ -10963,6 +11150,68 @@ mod tests {
         assert!(
             empty_text.contains("offset + limit reached past"),
             "empty-results text must also render the offset-truncation note; got: {empty_text}"
+        );
+    }
+
+    /// #240: at `offset == 0` the depth bound was tripped by `limit` alone —
+    /// there is no offset to lower (it's already zero), so telling the caller
+    /// to "narrow the query or lower offset" is nonsensical advice pointing at
+    /// a knob they never touched. The note must instead point at `limit` and
+    /// (when a reranker sized the bound) name `reranking.candidate_limit`
+    /// directly, rather than reuse the offset > 0 wording.
+    #[test]
+    fn build_chunk_search_payload_offset_truncated_at_offset_zero_names_the_right_knob() {
+        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
+
+        // No reranker configured: the bound is the fixed absolute ceiling, not
+        // a tunable `reranking.candidate_limit`.
+        let (text_no_reranker, _) = build_chunk_search_payload(
+            &results,
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            true,
+            0,
+            None,
+        );
+        assert!(
+            !text_no_reranker.contains("lower offset"),
+            "offset is already 0 — must not tell the caller to lower it: {text_no_reranker}"
+        );
+        assert!(
+            text_no_reranker.contains("Lower limit"),
+            "must point at limit instead: {text_no_reranker}"
+        );
+        assert!(
+            !text_no_reranker.contains("reranking.candidate_limit"),
+            "no reranker is configured, so the note must not name a knob that \
+             does not apply: {text_no_reranker}"
+        );
+
+        // Reranker configured with a candidate_limit: the note should name it
+        // directly, as the actual knob to raise.
+        let (text_reranker, _) = build_chunk_search_payload(
+            &results,
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            true,
+            0,
+            Some(50),
+        );
+        assert!(
+            !text_reranker.contains("lower offset"),
+            "offset is already 0 — must not tell the caller to lower it: {text_reranker}"
+        );
+        assert!(
+            text_reranker.contains("reranking.candidate_limit is currently 50"),
+            "must name the actual configured bound: {text_reranker}"
+        );
+        assert!(
+            text_reranker.contains("Raise reranking.candidate_limit or lower limit"),
+            "must give actionable advice naming the real knobs: {text_reranker}"
         );
     }
 
@@ -10977,6 +11226,8 @@ mod tests {
             "dense cosine",
             false,
             false,
+            0,
+            None,
         );
         assert!(!text_off.contains("Score breakdown"));
 
@@ -10987,6 +11238,8 @@ mod tests {
             "dense cosine",
             false,
             false,
+            0,
+            None,
         );
         assert!(text_on.contains("Score breakdown"));
     }
@@ -11001,8 +11254,16 @@ mod tests {
             "dense + phrase RRF",
             "dense cosine",
         ] {
-            let (text, _) =
-                build_chunk_search_payload(&results, Path::new("/data"), true, mode, false, false);
+            let (text, _) = build_chunk_search_payload(
+                &results,
+                Path::new("/data"),
+                true,
+                mode,
+                false,
+                false,
+                0,
+                None,
+            );
             assert!(
                 text.contains(&format!("mode={mode}")),
                 "expected mode label {mode:?} verbatim in: {text}"
@@ -11024,6 +11285,8 @@ mod tests {
             "dense + phrase RRF",
             false,
             false,
+            0,
+            None,
         );
 
         let arr = structured["results"].as_array().unwrap();
@@ -11056,7 +11319,7 @@ mod tests {
             payload_grouped_document("notes/b.md", "B", 0.5),
         ];
 
-        let (_text, structured) = build_grouped_search_payload(&documents, false, false);
+        let (_text, structured) = build_grouped_search_payload(&documents, false, false, 0);
 
         let obj = structured.as_object().unwrap();
         assert!(
@@ -11081,7 +11344,7 @@ mod tests {
 
     #[test]
     fn build_grouped_search_payload_empty_reports_zero() {
-        let (text, structured) = build_grouped_search_payload(&[], false, false);
+        let (text, structured) = build_grouped_search_payload(&[], false, false, 0);
         assert_eq!(text, "No documents matched.");
         assert_eq!(structured["returned"], serde_json::json!(0));
         assert_eq!(structured["documents"].as_array().unwrap().len(), 0);
@@ -11090,7 +11353,7 @@ mod tests {
     #[test]
     fn build_grouped_search_payload_path_prefix_truncated_note_and_flag() {
         let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
-        let (text, structured) = build_grouped_search_payload(&documents, true, false);
+        let (text, structured) = build_grouped_search_payload(&documents, true, false, 0);
 
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
         assert!(
@@ -11102,13 +11365,36 @@ mod tests {
     #[test]
     fn build_grouped_search_payload_offset_truncated_note_and_flag() {
         // #224: grouped granularity's mirror of the chunk-payload test above.
+        // `offset` is non-zero, so the note still tells the caller to narrow
+        // the query or lower offset.
         let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
-        let (text, structured) = build_grouped_search_payload(&documents, false, true);
+        let (text, structured) = build_grouped_search_payload(&documents, false, true, 5);
 
         assert_eq!(structured["offset_truncated"], serde_json::json!(true));
         assert!(
             text.contains("offset + limit reached past"),
             "text must render the offset-truncation note; got: {text}"
+        );
+        assert!(text.contains("Narrow the query or lower offset"));
+    }
+
+    /// #240: grouped granularity's mirror of the chunk-payload zero-offset
+    /// test above — grouped search never runs a reranker (there is no
+    /// `reranking.candidate_limit` for it to name), so the note must point at
+    /// `limit` and the fixed ceiling, not tell the caller to lower an offset
+    /// that is already 0.
+    #[test]
+    fn build_grouped_search_payload_offset_truncated_at_offset_zero_names_the_right_knob() {
+        let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
+        let (text, _) = build_grouped_search_payload(&documents, false, true, 0);
+
+        assert!(
+            !text.contains("lower offset"),
+            "offset is already 0 — must not tell the caller to lower it: {text}"
+        );
+        assert!(
+            text.contains("Lower limit"),
+            "must point at limit instead: {text}"
         );
     }
 }
