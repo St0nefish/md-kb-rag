@@ -45,7 +45,11 @@ fn print_component(name: &str, c: &server::ComponentHealth) {
 }
 
 #[derive(Parser)]
-#[command(name = "md-kb-rag", about = "Markdown knowledge base RAG server")]
+#[command(
+    name = "md-kb-rag",
+    about = "Markdown knowledge base RAG server",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "config.yaml")]
@@ -626,6 +630,7 @@ fn write_status(
     w: &mut impl std::io::Write,
     status: &server::StatusResponse,
 ) -> std::io::Result<()> {
+    writeln!(w, "Version:     {}", status.version)?;
     writeln!(w, "Collection:  {}", status.collection)?;
     writeln!(w, "Data path:   {}", status.data_path)?;
     writeln!(w)?;
@@ -922,6 +927,7 @@ mod tests {
 
     fn base_status() -> StatusResponse {
         StatusResponse {
+            version: "0.0.0-test".into(),
             uptime_secs: 1.0,
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
@@ -949,6 +955,7 @@ mod tests {
     #[test]
     fn status_renders_the_three_store_counts() {
         let out = render(&base_status());
+        assert!(out.contains("Version:     0.0.0-test"), "{out}");
         assert!(out.contains("Indexed files:  330"), "{out}");
         assert!(out.contains("Documents:      330"), "{out}");
         assert!(out.contains("Qdrant points:  2481"), "{out}");

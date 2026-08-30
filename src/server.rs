@@ -339,6 +339,11 @@ pub struct StoreCounts {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusResponse {
+    /// The running binary's version (`CARGO_PKG_VERSION`) — see issue #183. The
+    /// project's own docs say upgrading across a pre-hybrid-search version needs a
+    /// full reindex, so an operator troubleshooting a deployed instance needs a way
+    /// to ask it what it actually is without shelling in.
+    pub version: String,
     pub uptime_secs: f64,
     pub collection: String,
     pub data_path: String,
@@ -558,6 +563,7 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
     }
 
     StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: crate::status::uptime_secs(),
         collection: config.qdrant.collection.clone(),
         data_path: config.data_path().to_string(),
@@ -672,6 +678,21 @@ pub fn render_prometheus(status: &StatusResponse) -> String {
     };
 
     let plain = |v: f64| vec![(String::new(), v)];
+
+    // Standard Prometheus "build info" convention: a gauge that is always 1, whose
+    // only purpose is to carry the version as a label so `kb_build_info` can be
+    // joined against other series in a query (e.g. to annotate a dashboard with
+    // which version was running when a regression appeared) — see #183. The value
+    // itself is meaningless; only the label is.
+    metric(
+        "kb_build_info",
+        "Always 1; carries the running binary's version as a label.",
+        "gauge",
+        &[(
+            format!("{{version=\"{}\"}}", escape_label(&status.version)),
+            1.0,
+        )],
+    );
 
     metric(
         "kb_uptime_seconds",
@@ -2214,6 +2235,7 @@ mod tests {
         s.add_chunks_embedded(600);
 
         StatusResponse {
+            version: "0.0.0-test".into(),
             uptime_secs: 42.0,
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
@@ -2253,6 +2275,12 @@ mod tests {
     #[test]
     fn prometheus_output_covers_indexing_store_and_breakdown() {
         let out = render_prometheus(&sample_status());
+
+        // Build-info gauge (#183): version carried as a label, value always 1.
+        assert!(
+            out.contains(r#"kb_build_info{version="0.0.0-test"} 1"#),
+            "{out}"
+        );
 
         // Pending reindex-queue work.
         assert!(out.contains("kb_reindex_queue_pending_paths 3"));

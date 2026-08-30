@@ -24,6 +24,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime image
 FROM alpine:3.21
 
+# Populated by CI (`docker buildx build --build-arg VERSION=... --build-arg
+# REVISION=...`); default to "unknown" so a plain local `docker build .` with no
+# build args still produces a valid, if uninformative, label instead of an empty
+# one. REVISION matters beyond documentation: the arm64 nightly (fix #194) reads
+# org.opencontainers.image.revision back out of a previously-built image's config
+# to decide whether anything has changed since its last build, so CI actually
+# setting this is what makes that skip-if-unchanged check work at all.
+ARG VERSION=unknown
+ARG REVISION=unknown
+
+LABEL org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="https://github.com/St0nefish/md-kb-rag"
+
 RUN apk add --no-cache ca-certificates git
 
 COPY --from=builder /usr/local/bin/md-kb-rag /usr/local/bin/md-kb-rag
