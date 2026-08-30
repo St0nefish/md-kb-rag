@@ -439,6 +439,106 @@ pub async fn validate_all(
     indexed.into_iter().map(|(_, pair)| pair).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Broken-link report (#158)
+// ---------------------------------------------------------------------------
+
+/// One document's broken outbound links, grouped for `validate`'s BROKEN LINKS
+/// report — grouping by source rather than a flat list of pairs, because the
+/// source document is the thing a human actually has to go open and fix, same
+/// rationale `SCHEMA ERRORS`/`FROZEN` group by the file they apply to. Assumes
+/// its input pairs arrive pre-sorted by `source_path` (the raw query orders
+/// that way, see [`crate::state::StateDb::broken_markdown_links`]) so
+/// [`broken_links_report`] can group by run of equal keys instead of a hash-map
+/// pass, which would also lose the deterministic ordering a CLI report wants.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BrokenLinksBySource {
+    pub source_path: String,
+    pub broken_targets: Vec<String>,
+}
+
+/// Display cap on the number of `(source, target)` pairs [`broken_links_report`]
+/// groups into its output — this codebase never truncates silently (see
+/// `server::MAX_DISTINCT_FOR_BREAKDOWN`'s identical rationale for `status`'s
+/// field-value breakdown), so [`BrokenLinksReport::truncated`] plus the
+/// preserved `total` are what let a caller tell a capped report from a complete
+/// one. 200 pairs is already an unusual amount of link rot for one KB; the cap
+/// exists so a badly-drifted KB cannot make the report itself unreadable.
+pub const MAX_BROKEN_LINKS_SHOWN: usize = 200;
+
+/// The full broken-link report `validate` renders (as text or JSON) after its
+/// frontmatter checks.
+///
+/// Two staleness/false-positive caveats apply to every field here and must be
+/// preserved by whatever renders this struct — see
+/// [`crate::state::StateDb::broken_markdown_links`]'s doc comment for the first
+/// (this reflects the *last successful index run*, not the filesystem as of
+/// the moment `validate` runs) and [`broken_links_report`]'s doc comment for
+/// the second (a link to a file excluded from indexing is not reported here,
+/// because it is not actually broken).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BrokenLinksReport {
+    /// Broken pairs, grouped by source and capped at [`MAX_BROKEN_LINKS_SHOWN`].
+    pub by_source: Vec<BrokenLinksBySource>,
+    /// Total dangling `(source, target)` pairs, after the false-positive filter
+    /// but before the display cap — i.e. the count [`truncated`](Self::truncated)
+    /// is relative to, not the raw row count `broken_markdown_links` returned.
+    pub total: usize,
+    /// True if `by_source` does not list every pair `total` counts.
+    pub truncated: bool,
+}
+
+/// Build [`BrokenLinksReport`] from the raw dangling `(source_path, target_path)`
+/// pairs [`crate::state::StateDb::broken_markdown_links`] returns, resolving the
+/// false-positive trap #158 calls out and applying the display cap.
+///
+/// **The false-positive trap:** `broken_markdown_links`'s query can only ask
+/// "does this target have a `documents` row" — it has no filesystem access and
+/// so cannot distinguish a target that was never a file at all from one that
+/// exists on disk but was deliberately excluded from indexing
+/// (`indexing.exclude`/`exclude_files`, e.g. a link to `README.md` or
+/// `CLAUDE.md`). Reporting the latter as "broken" would be actively
+/// misleading — the link works, the file is right there — and would make the
+/// whole feature noisy enough to ignore. Rather than reimplementing
+/// `indexing.exclude`/`exclude_files`'s glob/filename matching here as a second
+/// copy that could drift from `ingest::discover_files`'s (the actual authority
+/// on what gets indexed), this asks the one question that actually settles it:
+/// does a file exist at `data_path.join(target_path)` at all. `target_path` is
+/// always KB-root-relative and already climb-checked by
+/// `ingest::extract_markdown_links`'s resolver, so the join is safe to stat
+/// directly.
+///
+/// `pairs` is consumed in whatever order it arrives; the caller
+/// (`broken_markdown_links`) already returns it `ORDER BY source_path,
+/// target_path`, which is what lets the grouping loop below key off "did the
+/// source change from the previous pair" instead of a hash map.
+pub fn broken_links_report(pairs: Vec<(String, String)>, data_path: &Path) -> BrokenLinksReport {
+    let live: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(_, target)| !data_path.join(target).is_file())
+        .collect();
+
+    let total = live.len();
+    let truncated = total > MAX_BROKEN_LINKS_SHOWN;
+
+    let mut by_source: Vec<BrokenLinksBySource> = Vec::new();
+    for (source, target) in live.into_iter().take(MAX_BROKEN_LINKS_SHOWN) {
+        match by_source.last_mut() {
+            Some(entry) if entry.source_path == source => entry.broken_targets.push(target),
+            _ => by_source.push(BrokenLinksBySource {
+                source_path: source,
+                broken_targets: vec![target],
+            }),
+        }
+    }
+
+    BrokenLinksReport {
+        by_source,
+        total,
+        truncated,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1142,5 +1242,131 @@ mod tests {
             .find(|e| e.rule == "lint")
             .expect("expected a lint error");
         assert!(fe.schema_origin.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // broken_links_report (#158)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn broken_links_report_groups_a_genuinely_dangling_target_by_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let pairs = vec![("a.md".to_string(), "missing.md".to_string())];
+
+        let report = broken_links_report(pairs, dir.path());
+
+        assert_eq!(report.total, 1);
+        assert!(!report.truncated);
+        assert_eq!(
+            report.by_source,
+            vec![BrokenLinksBySource {
+                source_path: "a.md".into(),
+                broken_targets: vec!["missing.md".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn broken_links_report_does_not_flag_a_target_excluded_from_indexing_but_present_on_disk() {
+        // README.md is a classic `indexing.exclude_files` entry: it has no `documents`
+        // row (never indexed) but the file genuinely exists on disk, so a link to it
+        // is not broken — the false-positive trap #158 calls out.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# hi").unwrap();
+        let pairs = vec![("a.md".to_string(), "README.md".to_string())];
+
+        let report = broken_links_report(pairs, dir.path());
+
+        assert_eq!(
+            report.total, 0,
+            "a target excluded from indexing but present on disk must not be reported broken"
+        );
+        assert!(report.by_source.is_empty());
+    }
+
+    #[test]
+    fn broken_links_report_mixes_a_real_break_with_an_excluded_but_present_target() {
+        // Both cases from the same source in one call, to prove the filter is applied
+        // per-pair rather than short-circuiting the whole source once one target checks
+        // out (or vice versa).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# hi").unwrap();
+        let pairs = vec![
+            ("a.md".to_string(), "README.md".to_string()),
+            ("a.md".to_string(), "actually-missing.md".to_string()),
+        ];
+
+        let report = broken_links_report(pairs, dir.path());
+
+        assert_eq!(report.total, 1);
+        assert_eq!(
+            report.by_source,
+            vec![BrokenLinksBySource {
+                source_path: "a.md".into(),
+                broken_targets: vec!["actually-missing.md".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn broken_links_report_groups_multiple_targets_under_one_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let pairs = vec![
+            ("a.md".to_string(), "one.md".to_string()),
+            ("a.md".to_string(), "two.md".to_string()),
+            ("b.md".to_string(), "three.md".to_string()),
+        ];
+
+        let report = broken_links_report(pairs, dir.path());
+
+        assert_eq!(report.total, 3);
+        assert_eq!(
+            report.by_source,
+            vec![
+                BrokenLinksBySource {
+                    source_path: "a.md".into(),
+                    broken_targets: vec!["one.md".into(), "two.md".into()],
+                },
+                BrokenLinksBySource {
+                    source_path: "b.md".into(),
+                    broken_targets: vec!["three.md".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn broken_links_report_caps_at_max_shown_and_reports_the_true_total() {
+        let dir = tempfile::tempdir().unwrap();
+        // One source per pair so the cap is exercised across `by_source` entries, not
+        // just within a single entry's target list.
+        let pairs: Vec<(String, String)> = (0..(MAX_BROKEN_LINKS_SHOWN + 10))
+            .map(|i| (format!("source-{i}.md"), format!("missing-{i}.md")))
+            .collect();
+
+        let report = broken_links_report(pairs, dir.path());
+
+        assert_eq!(
+            report.total,
+            MAX_BROKEN_LINKS_SHOWN + 10,
+            "total must report the true count, not the capped display size"
+        );
+        assert_eq!(
+            report.by_source.len(),
+            MAX_BROKEN_LINKS_SHOWN,
+            "display must be capped at MAX_BROKEN_LINKS_SHOWN"
+        );
+        assert!(report.truncated, "the cap must never be silent");
+    }
+
+    #[test]
+    fn broken_links_report_on_a_clean_kb_reports_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let report = broken_links_report(Vec::new(), dir.path());
+
+        assert_eq!(report.total, 0);
+        assert!(!report.truncated);
+        assert!(report.by_source.is_empty());
     }
 }

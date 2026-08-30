@@ -957,6 +957,52 @@ impl StateDb {
         Ok(out)
     }
 
+    /// Distinct `(source_path, target_path)` pairs among `document_links` rows whose
+    /// `kind` is `"markdown"` and whose `target_path` has no matching `documents` row
+    /// — the one-statement query #158 sketches, promoted to a named method rather
+    /// than embedding raw SQL in `main.rs`.
+    ///
+    /// Scoped to `kind = 'markdown'` deliberately: `"semantic"` edges are
+    /// machine-inferred kNN neighbors (`ingest::update_semantic_edges`) that can
+    /// legitimately point at any document in the collection, not something an
+    /// author wrote and could have mistyped — including them here would report a
+    /// modeling artifact as a broken link. `"markdown"` edges are author-written
+    /// and therefore both meaningful to report and actually fixable.
+    ///
+    /// Deliberately NOT on [`DocumentIndex`]: unlike [`Self::links_out`] /
+    /// [`Self::links_in`] (#157), which both `mcp::get_document` and any future
+    /// trait-object caller need, this exists purely to feed `validate`'s CLI
+    /// report and has exactly one caller — matching [`Self::list_all`] and
+    /// [`Self::reproject_all_fields`]'s precedent of staying an inherent
+    /// `StateDb` method rather than growing the trait for a single consumer.
+    ///
+    /// This reads a snapshot of the state DB, not the filesystem `validate`
+    /// otherwise walks when checking frontmatter — the result reflects the *last
+    /// successful index run*, not necessarily the files on disk right now. A
+    /// target removed from the KB since, or a target file added since but not yet
+    /// indexed, only shows up here (or stops showing up here) after the next
+    /// reindex. The caller is responsible for saying so in whatever it renders —
+    /// see `validate::broken_links_report`'s doc comment.
+    ///
+    /// Also does NOT filter out a target that exists on disk but was excluded
+    /// from indexing (`indexing.exclude`/`exclude_files`) — this query has no
+    /// filesystem access and cannot tell "never existed" from "exists but
+    /// excluded" apart; both simply have no `documents` row. `validate` is
+    /// responsible for that distinction (the false-positive trap #158 calls
+    /// out), since only it has the KB root path to stat against.
+    pub async fn broken_markdown_links(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT source_path, target_path FROM document_links
+             WHERE kind = 'markdown'
+               AND target_path NOT IN (SELECT file_path FROM documents)
+             ORDER BY source_path, target_path",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Remove every edge originating from `path`, in either direction of kind.
     ///
     /// Called when a document is deleted/purged (from [`Self::delete_document`]) so a
@@ -4154,6 +4200,78 @@ mod tests {
         assert_eq!(page.total, 0);
         assert!(page.links.is_empty());
         assert!(!page.has_more());
+    }
+
+    // -- broken_markdown_links (#158) --------------------------------------------
+
+    #[tokio::test]
+    async fn broken_markdown_links_reports_a_dangling_markdown_target() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("missing.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let dangling = db.broken_markdown_links().await.unwrap();
+
+        assert_eq!(
+            dangling,
+            vec![("a.md".to_string(), "missing.md".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_markdown_links_excludes_targets_that_are_indexed() {
+        let (db, _dir) = test_db().await;
+        db.upsert_document_metadata("b.md", &recipe_frontmatter(), 1700, "h1", 1)
+            .await
+            .unwrap();
+        db.replace_links("a.md", "markdown", &[("b.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        let dangling = db.broken_markdown_links().await.unwrap();
+
+        assert!(
+            dangling.is_empty(),
+            "a target with a documents row is not broken: {dangling:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_markdown_links_ignores_dangling_semantic_edges() {
+        let (db, _dir) = test_db().await;
+        // A semantic (kNN) edge to a target with no documents row must never be
+        // reported — it is a machine-inferred neighbor, not an author-written link
+        // that could be "fixed", and #158 scopes the report to `kind = 'markdown'`
+        // for exactly this reason.
+        db.replace_links("a.md", "semantic", &[("missing.md".to_string(), Some(0.9))])
+            .await
+            .unwrap();
+
+        let dangling = db.broken_markdown_links().await.unwrap();
+
+        assert!(
+            dangling.is_empty(),
+            "a dangling semantic edge must not be reported: {dangling:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_markdown_links_on_a_clean_kb_is_empty() {
+        let (db, _dir) = test_db().await;
+        db.upsert_document_metadata("b.md", &recipe_frontmatter(), 1700, "h1", 1)
+            .await
+            .unwrap();
+        db.replace_links("a.md", "markdown", &[("b.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("a.md", "semantic", &[("b.md".to_string(), Some(0.5))])
+            .await
+            .unwrap();
+
+        let dangling = db.broken_markdown_links().await.unwrap();
+
+        assert!(dangling.is_empty());
     }
 
     #[tokio::test]
