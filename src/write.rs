@@ -217,13 +217,15 @@ pub struct WriteDeps<'a, E: QueryEmbedder, Q: RetrievalStore> {
     /// `UiState`) holds an `Arc<ReindexQueue>` field and lends a plain
     /// reference in for the duration of one write.
     pub queue: &'a crate::reindex::ReindexQueue,
-    /// The document metadata index, used ONLY by `write_document_move` to find
-    /// documents whose body links to the move's SOURCE path
-    /// (`StateDb::links_targeting`) so their link text can be rewritten in the
-    /// same commit as the move.
+    /// The document metadata index. Three consumers, all going through
+    /// `StateDb::links_targeting`'s reverse lookup ("what points at this
+    /// path"): `write_document_move` and `move_directory` find documents whose
+    /// body links to the move's SOURCE path so their link text can be
+    /// rewritten in the same commit as the move, and `delete_document` warns
+    /// about documents that link to the file being removed.
     ///
-    /// `None` disables link rewriting entirely — `write_document_move` still
-    /// performs the move itself, it just skips the reverse-link query and
+    /// `None` disables all three — the move/delete itself still happens, the
+    /// reverse-link query is just skipped. For a move that means it
     /// leaves every other document's links exactly as they were (they still
     /// self-heal on that document's own next reindex, since `document_links`
     /// is rebuilt from each document's current on-disk body, not trusted as an
@@ -2969,6 +2971,52 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
         }
     })?;
 
+    // Best-effort: warn if anything else in the KB still links to the document
+    // about to be deleted (#181). `StateDb::links_targeting` is the exact same
+    // reverse-link query `write_document_move`'s step 10.5 already runs to find
+    // documents whose body needs rewriting — reused here purely to look, not to
+    // touch anything.
+    //
+    // Deliberately WARN, not refuse: this codebase's established stance on a
+    // stale/dangling link is "self-heal, don't block" — `write_document_move`
+    // and `move_directory` both skip a referencing document outright rather
+    // than fail the whole operation when a `document_links` row turns out to
+    // be stale, and a referencing document's OWN next reindex rebuilds its
+    // links from whatever its current on-disk body actually resolves to,
+    // silently dropping the edge that no longer exists. A delete leaving a
+    // dangling link behaves no differently from that already-accepted case.
+    // Refusing outright would also need a `force` escape hatch threaded
+    // through every caller's request shape — the MCP tool's parameter schema
+    // and the HTTP API's request body — which is a cross-cutting change to
+    // both transports, not something this transport-agnostic pipeline should
+    // decide unilaterally. `deps.state` is `None` for callers with no
+    // `StateDb` wired up (see that field's doc comment on `WriteDeps`); this
+    // is skipped silently in that case, same as the move path's own reverse-
+    // link query.
+    if let Some(state) = deps.state {
+        match state.links_targeting(rel_path, "markdown").await {
+            Ok(inbound) if !inbound.is_empty() => {
+                warn!(
+                    "Deleting '{}', which is still linked from {} other document(s): {}. \
+                     This delete does not rewrite or remove those links — they will dangle \
+                     until each referencing document's own next reindex drops the now-stale \
+                     edge.",
+                    rel_path,
+                    inbound.len(),
+                    inbound.join(", ")
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "Skipping inbound-link check before deleting '{}': the reverse-link \
+                     query failed: {:#}",
+                    rel_path, e
+                );
+            }
+        }
+    }
+
     // Re-verify immediately before removing — see `write_document`'s doc comment
     // for why this is re-resolved rather than reusing the path from above.
     let abs_path = safe_write_path(deps, rel_path)?;
@@ -3776,6 +3824,78 @@ mod tests {
         assert_eq!(git_status(&work), "");
     }
 
+    /// #147: the "rollback ITSELF also failed" branch of `write_document`'s
+    /// CREATE path (`rolled_back: false`) — previously exercised only by
+    /// `delete_document`'s equivalent test. Mirrors that test's technique:
+    /// point the harness at a plain temp directory with no `.git` at all, so
+    /// `git add` fails at `commit_and_sync`'s very first step (a `PreCommit`
+    /// failure, same as any other pre-commit failure), and the create
+    /// rollback's SECOND step — `git::unstage`, which runs after
+    /// `tokio::fs::remove_file` already succeeded — fails too, because there
+    /// is no repository to run `git reset` against.
+    #[tokio::test]
+    async fn create_rollback_failure_with_no_git_repo_reports_rolled_back_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_req(
+            "docs/new-no-repo.md",
+            "---\ntitle: New\n---\n\n# Body\n",
+            true,
+        );
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
+        }
+        // `remove_file` (the first of the two rollback steps) succeeded — the
+        // filesystem write really is undone. Only `git::unstage` (the second
+        // step) failed, which is exactly what makes this the "rollback
+        // itself also failed" case rather than a clean rollback.
+        assert!(!tmp.path().join("docs/new-no-repo.md").exists());
+    }
+
+    /// #147: the same "rollback itself also failed" branch, but for
+    /// `write_document`'s EDIT path, which rolls back via a single call to
+    /// `git::restore_from_head` instead of create's two-step remove+unstage —
+    /// a genuinely different call to fail, so the create test above does not
+    /// cover it.
+    #[tokio::test]
+    async fn edit_rollback_failure_with_no_git_repo_reports_rolled_back_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("edit-me-no-repo.md"),
+            "---\ntitle: Old\n---\n# Old",
+        )
+        .unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_req(
+            "docs/edit-me-no-repo.md",
+            "---\ntitle: New\n---\n# New",
+            false,
+        );
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
+        }
+        // The overwrite already landed on disk (an edit writes in place, with
+        // no separate "create the new file" step to undo) and `git restore`
+        // cannot put the old content back with no HEAD to restore from — the
+        // file is left holding the new, uncommitted content, which IS the
+        // inconsistency `rolled_back: false` is reporting.
+        assert_eq!(
+            std::fs::read_to_string(sub.join("edit-me-no-repo.md")).unwrap(),
+            "---\ntitle: New\n---\n# New"
+        );
+    }
+
     /// #142 regression: `expected_hash` must be re-verified against the file's
     /// LIVE on-disk content immediately before the overwrite, not just once,
     /// early, against the caller-supplied `old_content`. Simulates the failure
@@ -4060,6 +4180,203 @@ mod tests {
         assert_eq!(success.outcome, WriteOutcome::CommittedPendingSync);
         assert!(success.sync_failure_cause.is_some());
         assert!(!work.path().join("doomed.md").exists());
+
+        // #150: this is the ONLY trigger for the reindex worker to purge the
+        // deleted document's Qdrant points and state rows (see
+        // `ingest::index_paths`'s missing-file branch) — a regression that
+        // dropped this call would leave the document searchable forever,
+        // with every other assertion above still green.
+        crate::reindex::test_support::assert_marked_dirty(&harness.reindex_queue, &["doomed.md"]);
+    }
+
+    /// #150: `delete_document`'s OTHER success path — commit AND push both
+    /// succeed — was, per the issue, never exercised by any test at all
+    /// (only the `CommittedPendingSync` branch above was reached, and even
+    /// that omitted this assertion). Mirrors `create_synced_write_marks_the_path_dirty_and_returns_a_diff`'s
+    /// pattern for the create path.
+    #[tokio::test]
+    async fn delete_synced_write_marks_the_path_dirty() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("doomed-synced.md"),
+            "---\ntitle: D\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "doomed-synced.md", "add doomed-synced.md");
+
+        let harness = git_backed_harness(&work);
+
+        let success = delete_document(&harness.deps(), "doomed-synced.md", None)
+            .await
+            .unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(!work.path().join("doomed-synced.md").exists());
+
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["doomed-synced.md"],
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #181 — delete_document warns about inbound links instead of silently
+    // orphaning them. `WriteSuccess`/`WriteError` carry no field for this (a
+    // struct/enum change here would ripple into mcp.rs's and web.rs's own
+    // exhaustive matches and literals, outside this module's scope), so the
+    // only externally observable evidence the check ran at all is the
+    // `warn!` log line. `CapturedLogs` below is a minimal
+    // `tracing_subscriber::fmt::MakeWriter` that redirects exactly the calls
+    // made while its guard is alive into an in-memory buffer a test can
+    // assert on — `tracing::subscriber::set_default`'s guard scopes it to
+    // this one call, so it cannot leak into (or be polluted by) any other
+    // test's logging.
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Scoped to `WARN` and above so that unrelated `info!`/`debug!` output
+    /// elsewhere in the write pipeline (or in `git.rs`) can never show up in
+    /// `CapturedLogs::text()` and be mistaken for the inbound-link warning
+    /// this module's tests care about.
+    fn capture_warnings() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_target(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
+    #[tokio::test]
+    async fn delete_warns_about_inbound_links_but_does_not_refuse() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("linked.md"),
+            "---\ntitle: Linked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "linked.md", "add linked.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        // `referencer.md` need not exist on disk — the check queries the
+        // reverse-link INDEX, not the filesystem, same as
+        // `write_document_move`'s step 10.5.
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencer.md",
+                "markdown",
+                &[("linked.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let (captured, guard) = capture_warnings();
+        let success = delete_document(&harness.deps(), "linked.md", None)
+            .await
+            .expect("an inbound link must WARN, not refuse the delete — see #181's PR notes");
+        drop(guard);
+
+        assert_eq!(
+            success.outcome,
+            WriteOutcome::Synced,
+            "the delete itself must still succeed"
+        );
+        let log_text = captured.text();
+        assert!(
+            log_text.contains("referencer.md"),
+            "expected a warning naming the referencing document, got log: {log_text:?}"
+        );
+        assert!(
+            log_text.contains("linked.md"),
+            "expected the warning to name the document being deleted too, got log: {log_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_with_no_inbound_links_logs_no_warning() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("unlinked.md"),
+            "---\ntitle: Unlinked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "unlinked.md", "add unlinked.md");
+
+        // With a state DB wired up but no `document_links` row targeting this
+        // document, the query must come back empty and stay silent.
+        let harness = git_backed_harness_with_state_db(&work).await;
+
+        let (captured, guard) = capture_warnings();
+        delete_document(&harness.deps(), "unlinked.md", None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        assert!(
+            captured.text().is_empty(),
+            "no inbound links means no warning, got log: {:?}",
+            captured.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_with_no_state_db_skips_the_inbound_link_check_silently() {
+        // `WriteDeps::state == None` (no `with_state_db`) must not be treated
+        // as "querying failed" — it is a normal, documented degraded mode
+        // (see that field's doc comment), so the delete must proceed exactly
+        // as it always has, with no warning and no error.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("no-state-db.md"),
+            "---\ntitle: No State DB\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "no-state-db.md", "add no-state-db.md");
+
+        let harness = git_backed_harness(&work);
+
+        let (captured, guard) = capture_warnings();
+        let success = delete_document(&harness.deps(), "no-state-db.md", None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(captured.text().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -4443,6 +4760,43 @@ mod tests {
         );
         assert_eq!(head_before, head_sha(&work));
         assert_eq!(git_status(&work), "");
+    }
+
+    /// #147: `write_document_move`'s own "rollback itself also failed" branch
+    /// (`rolled_back: false`) — same no-git-repo technique as the create/edit
+    /// tests above and `delete_document`'s existing test. `rolled_back` here
+    /// is `source_restore.is_ok() && dest_rollback.is_ok() &&
+    /// rewrite_restore_failures.is_empty()`: with no `.git` at all, `git add`
+    /// fails first (`PreCommit`), and then BOTH `source_restore`
+    /// (`git::restore_from_head`) and the git half of `dest_rollback`
+    /// (`git::unstage`, reached after its own `tokio::fs::remove_file` step
+    /// already succeeded) fail too, since neither has a repository to run
+    /// against — so `rolled_back` ends up `false` on two independent counts
+    /// at once, not just one.
+    #[tokio::test]
+    async fn move_rollback_failure_with_no_git_repo_reports_rolled_back_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("old");
+        std::fs::create_dir_all(&sub).unwrap();
+        let source_original = "---\ntitle: Move Me\n---\n\n# Body\n";
+        std::fs::write(sub.join("loc.md"), source_original).unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
+        }
+        // The destination copy was written, then successfully removed during
+        // rollback (`remove_file` needs no git repo) — but `restore_from_head`
+        // on the source can't run with no HEAD to restore from, so the
+        // source is left gone too. Both paths now missing IS the
+        // inconsistency `rolled_back: false` reports.
+        assert!(!tmp.path().join("new/loc.md").exists());
+        assert!(!sub.join("loc.md").exists());
     }
 
     #[tokio::test]
@@ -5183,6 +5537,144 @@ mod tests {
             "the referencing document's link rewrite must be rolled back too, not just the move"
         );
 
+        assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status(&work), "");
+    }
+
+    /// Covers write.rs's step-10.5 self-contained rollback (fires when a
+    /// `tokio::fs::write` into a referencing document fails DURING the
+    /// rewrite loop, before git is touched at all) — a distinct code path
+    /// from `move_precommit_failure_with_rewrites_restores_the_referencing_document_too`
+    /// above, which exercises the LATER rollback triggered by `git commit`
+    /// itself failing (#145).
+    ///
+    /// Two referencing documents point at the source. `StateDb::links_targeting`
+    /// returns sources `ORDER BY source_path`, so `ref-a.md` is rewritten
+    /// FIRST and lands on disk successfully, then `ref-b.md`'s write is forced
+    /// to fail (its permission bits stripped to read-only) — standing in for
+    /// a permission race or a full disk hitting the SECOND of several
+    /// referencing documents mid-loop, which is exactly the scenario the
+    /// issue's "duplicated at both old and new locations, or another
+    /// document's content corrupted" failure mode depends on. The rollback
+    /// must undo THREE things, not just the failing write: the
+    /// already-rewritten `ref-a.md`, the source removal, and the destination
+    /// write — proving the loop's own by-hand unwind (not the later
+    /// git-commit-triggered one) is correct.
+    #[tokio::test]
+    async fn move_link_rewrite_write_failure_rolls_back_the_move_and_every_already_rewritten_document()
+     {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let ref_a_original = "---\ntitle: Ref A\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [the moved doc](old/loc.md) for more.\n";
+        let ref_b_original = "---\ntitle: Ref B\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [the moved doc](old/loc.md) too.\n";
+        std::fs::write(work.path().join("ref-a.md"), ref_a_original).unwrap();
+        std::fs::write(work.path().join("ref-b.md"), ref_b_original).unwrap();
+        git_commit_paths(&work, &["ref-a.md", "ref-b.md"], "add referencing docs");
+        let head_before = head_sha(&work);
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links("ref-a.md", "markdown", &[("old/loc.md".to_string(), None)])
+            .await
+            .unwrap();
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links("ref-b.md", "markdown", &[("old/loc.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        // Read-only: `read_to_string` (earlier in the same loop iteration)
+        // still succeeds, so the code genuinely reaches — and fails at — the
+        // write this test targets, rather than taking the earlier "stale
+        // row, skip" branch on a read failure. That read-succeeds/write-fails
+        // asymmetry is why this uses a permission bit rather than, say,
+        // replacing the file with a directory: EISDIR would fail the *read*
+        // and route around the branch under test entirely.
+        //
+        // The catch is that DAC permission bits do not stop a privileged
+        // writer. Root — or anything holding CAP_DAC_OVERRIDE — writes through
+        // 0o444 unimpeded, the move then succeeds, and `unwrap_err()` below
+        // panics on an `Ok`. This repo has already been bitten by exactly that:
+        // see `git::tests::reject_pushes`, whose doc comment records a
+        // read-only-remote test that passed locally and failed on the
+        // self-hosted CI runner for this reason.
+        //
+        // There is no privilege-independent way to make one regular file
+        // readable but not writable, so rather than assume the injection
+        // worked, probe it: if the permission bit does not actually block a
+        // write here, skip loudly instead of reporting a failure that says
+        // nothing about the code under test.
+        let ref_b_path = work.path().join("ref-b.md");
+        let mut perms = std::fs::metadata(&ref_b_path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&ref_b_path, perms).unwrap();
+
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&ref_b_path)
+            .is_ok()
+        {
+            let mut perms = std::fs::metadata(&ref_b_path).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&ref_b_path, perms).unwrap();
+            eprintln!(
+                "SKIP move_link_rewrite_write_failure_rolls_back_the_move_and_every_already_rewritten_document: \
+                 this process can write through a 0o444 file (running as root or with \
+                 CAP_DAC_OVERRIDE), so the write failure this test injects cannot be produced. \
+                 Run as an unprivileged user to exercise the link-rewrite rollback."
+            );
+            return;
+        }
+
+        let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(
+            matches!(err, WriteError::Io { .. }),
+            "expected Io (the write-failure branch, not a git failure), got {err:?}"
+        );
+
+        // Restore permissions before the assertions below (and the tempdir's
+        // own cleanup) touch the file again.
+        let mut perms = std::fs::metadata(&ref_b_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&ref_b_path, perms).unwrap();
+
+        assert!(
+            !work.path().join("new/loc.md").exists(),
+            "destination must be removed by the rollback"
+        );
+        assert!(
+            work.path().join("old/loc.md").exists(),
+            "source must be restored by the rollback"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("old/loc.md")).unwrap(),
+            source_original
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("ref-a.md")).unwrap(),
+            ref_a_original,
+            "the first (already-rewritten) referencing document must be restored too, not \
+             just the move itself"
+        );
+
+        // This rollback runs entirely before git is touched — no `git add`
+        // ever ran, so there is nothing to unstage and HEAD never moved.
         assert_eq!(head_before, head_sha(&work));
         assert_eq!(git_status(&work), "");
     }
@@ -6026,5 +6518,40 @@ mod tests {
         );
         assert_eq!(head_before, head_sha(&work));
         assert_eq!(git_status(&work), "");
+    }
+
+    /// #147: `move_directory`'s own "rollback itself also failed" branch
+    /// (`rolled_back: false`) — the fourth and last of the four
+    /// structurally-identical sites the issue names, and like the other
+    /// three, exercised only by `delete_document`'s test before this. Same
+    /// no-git-repo technique: `git add` fails first (`PreCommit`), and then
+    /// `git::restore_from_head` on the moved source ALSO fails (no
+    /// repository to restore from), which alone is enough to flip this
+    /// move's `rolled_back` to `false` — `move_directory` ORs a failure in
+    /// per-source, per-destination, and per-rewritten-document, and any
+    /// single one failing is enough.
+    #[tokio::test]
+    async fn move_directory_rollback_failure_with_no_git_repo_reports_rolled_back_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("old-dir-no-repo");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.md"), "---\ntitle: A\n---\n\n# A\n").unwrap();
+
+        let config = crate::mcp::make_test_resolved_config(tmp.path());
+        let harness = Harness::new(&tmp, config);
+
+        let err = move_directory(&harness.deps(), "old-dir-no-repo", "new-dir-no-repo", None)
+            .await
+            .unwrap_err();
+        match err {
+            DirectoryMoveError::PreCommitFailed { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("expected PreCommitFailed{{rolled_back: false}}, got {other:?}"),
+        }
+        // The destination copy was written, then successfully removed during
+        // rollback — but the source restore can't run with no HEAD to
+        // restore from, so the source is left gone too, same inconsistency
+        // as the single-document move's equivalent test above.
+        assert!(!tmp.path().join("new-dir-no-repo/a.md").exists());
+        assert!(!sub.join("a.md").exists());
     }
 }
