@@ -144,8 +144,12 @@ enum Commands {
         /// handler's comment for why that severity split is deliberate.
         #[arg(long)]
         strict: bool,
-        /// Emit the full report (frontmatter results, schema errors, broken links) as
-        /// one JSON document on stdout instead of the human-readable eprintln sections
+        /// Emit the BROKEN LINKS report as JSON on stdout
+        ///
+        /// Scoped deliberately to the broken-links report. Frontmatter results,
+        /// SCHEMA ERRORS and FROZEN still print as human-readable text on stderr
+        /// regardless of this flag — same stdout/stderr split `status --json`
+        /// uses, so the JSON on stdout is always parseable on its own.
         #[arg(long)]
         json: bool,
     },
