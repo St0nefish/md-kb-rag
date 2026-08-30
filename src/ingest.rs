@@ -282,17 +282,10 @@ async fn build_git_mtimes(config: &ResolvedConfig, rel_keys: &[String]) -> HashM
     }
 
     let lock = crate::git::lock_git().await;
-    match crate::git::git_log_mtimes(&lock, data_path, rel_keys).await {
-        Ok(map) => map,
-        Err(e) => {
-            warn!(
-                "Failed to compute git-log mtimes for this run — every file in it falls \
-                 back to filesystem mtime instead (see #164): {:#}",
-                e
-            );
-            HashMap::new()
-        }
-    }
+    // #237: `git_log_mtimes` itself now degrades a single failing path-chunk
+    // internally (logging its own `warn!`) rather than failing the whole call, so
+    // there is no `Err` case left here to handle — see its doc comment.
+    crate::git::git_log_mtimes(&lock, data_path, rel_keys).await
 }
 
 #[cfg(test)]

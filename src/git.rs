@@ -355,39 +355,153 @@ fn parse_git_log_mtimes(raw: &[u8]) -> HashMap<String, i64> {
     map
 }
 
-/// #164: batched, git-log-derived "true" last-modified time for every path in
-/// `paths`, one `git log` invocation total rather than one `git log -1` per file —
-/// the whole point, since a per-file invocation is what made this prohibitively slow
-/// across a large corpus. Local git only, no network.
+/// Conservative per-invocation byte budget for the pathspec arguments
+/// [`git_log_mtimes`] passes to a single `git log` call (#237).
 ///
-/// `paths` is passed straight through as `git log`'s trailing pathspec (`-- <paths>`),
-/// so this only ever walks history relevant to the exact files the caller is about to
-/// index — a single scoped write costs one narrowly-filtered log walk, not a full-repo
-/// one, and a full reconcile costs one walk scoped to the whole corpus instead of one
-/// walk per file. `paths.is_empty()` returns an empty map without spawning git at all:
-/// an unfiltered `git log` with no pathspec would walk (and return touched-path data
-/// for) the ENTIRE repository, which is not what an empty scope means here.
+/// The real OS `ARG_MAX` is typically far larger (multiple MB on Linux —
+/// `getconf ARG_MAX` commonly reports 2MB+), but this deliberately stays well under
+/// any real-world floor rather than trying to probe or compute the actual limit at
+/// call time: some container/exec environments cap lower than the host default, argv
+/// and the process's environment variables share the same kernel-enforced budget (so
+/// "how much room argv actually has" depends on how big `envp` happens to be, not
+/// just on `ARG_MAX` itself), and probing would cost a syscall to save an amount of
+/// slack that is an order of magnitude away from ever mattering at any corpus size
+/// this project targets. Sized in path BYTES, not path count, because path length
+/// varies wildly (a nested `domain/dev/subsystem/...` tree vs. a root-level file) and
+/// a byte budget is what `ARG_MAX` itself actually measures.
+const GIT_LOG_MTIMES_ARG_BUDGET_BYTES: usize = 100_000;
+
+/// Splits `paths` into chunks whose total byte length (plus a small per-entry
+/// separator allowance) stays under [`GIT_LOG_MTIMES_ARG_BUDGET_BYTES`], so
+/// [`git_log_mtimes`] never builds a single `git log` argv that risks exceeding
+/// `ARG_MAX` (#237) no matter how large the corpus.
+///
+/// A single path longer than the whole budget still gets its own one-entry chunk
+/// rather than being silently dropped: the `i > start` guard below only refuses to
+/// split a chunk BEFORE it holds anything, so the very first entry considered for a
+/// fresh chunk is always accepted into it regardless of size. An oversized chunk like
+/// that can still fail at the OS level if the one path itself is longer than real
+/// `ARG_MAX` — see [`git_log_mtimes`]'s per-chunk error handling for what happens
+/// then (that one chunk degrades; the others are unaffected).
+fn chunk_paths_by_byte_budget(paths: &[String]) -> Vec<&[String]> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut used = 0usize;
+    for (i, p) in paths.iter().enumerate() {
+        // +1: conservative per-entry allowance for the argv pointer/separator
+        // overhead the kernel also counts against the same budget as the string
+        // bytes themselves.
+        let cost = p.len() + 1;
+        if i > start && used + cost > GIT_LOG_MTIMES_ARG_BUDGET_BYTES {
+            chunks.push(&paths[start..i]);
+            start = i;
+            used = 0;
+        }
+        used += cost;
+    }
+    if start < paths.len() {
+        chunks.push(&paths[start..]);
+    }
+    chunks
+}
+
+/// #164: batched, git-log-derived "true" last-modified time for every path in
+/// `paths` — one (or, since #237, a handful of chunked) `git log` invocation(s)
+/// rather than one `git log -1` per file, the whole point, since a per-file
+/// invocation is what made this prohibitively slow across a large corpus. Local git
+/// only, no network.
+///
+/// `paths` is passed straight through as each chunk's `git log` pathspec (`--
+/// <paths>`), so this only ever walks history relevant to the exact files the caller
+/// is about to index — a single scoped write costs one narrowly-filtered log walk
+/// (or a couple, if its path list happens to cross the chunk budget), not a
+/// full-repo one, and a full reconcile costs walks scoped to the whole corpus
+/// instead of one walk per file. `paths.is_empty()` returns an empty map without
+/// spawning git at all: an unfiltered `git log` with no pathspec would walk (and
+/// return touched-path data for) the ENTIRE repository, which is not what an empty
+/// scope means here.
+///
+/// #237: unlike the pre-#237 version, this never builds one argv for the WHOLE
+/// `paths` list — [`chunk_paths_by_byte_budget`] splits it first, and each chunk
+/// runs as its own `git log` call via [`git_log_mtimes_chunk`], with results merged
+/// as they come back. This is what keeps a large corpus from exceeding `ARG_MAX` and
+/// silently losing git-derived mtimes for the ENTIRE run — see that constant's doc
+/// comment for the byte-budget rationale. A failing chunk (timeout, non-zero exit,
+/// or — even chunked — a single pathological path too long for `ARG_MAX` on its
+/// own) degrades only the paths in THAT chunk: they end up absent from the returned
+/// map, same as any path git has no history for, and every other chunk's results are
+/// still merged in. This function itself therefore never fails outright anymore —
+/// unlike its pre-#237 signature, there is no longer an `Err` case for a caller to
+/// handle, because a partial failure is now always something this function can
+/// recover from internally rather than something it needs to propagate.
 ///
 /// `--diff-filter=ACMR` excludes pure deletions (`D`): a path currently on disk that
 /// this function is being asked about was necessarily added or last modified more
 /// recently than any subsequent deletion of the same path could have been, so
 /// including `D` entries would only ever risk shadowing the real answer with a
 /// deletion timestamp for a path that was later recreated.
-///
-/// Returns an empty map on any failure (git not usable, non-zero exit, timeout)
-/// rather than propagating — callers treat a missing map entry as "fall back to
-/// filesystem mtime for this path," which is exactly the pre-#164 behavior, so a git
-/// hiccup degrades gracefully instead of failing an entire indexing run over a
-/// metadata nicety.
 pub async fn git_log_mtimes(
+    lock: &GitLock,
+    data_path: &str,
+    paths: &[String],
+) -> HashMap<String, i64> {
+    if paths.is_empty() {
+        return HashMap::new();
+    }
+
+    let chunks = chunk_paths_by_byte_budget(paths);
+    let chunk_count = chunks.len();
+    let mut merged = HashMap::new();
+    let mut failed_chunks = 0usize;
+    let mut failed_paths = 0usize;
+
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        match git_log_mtimes_chunk(lock, data_path, chunk).await {
+            Ok(map) => merged.extend(map),
+            Err(e) => {
+                // #237: a failing chunk degrades only the paths IN that chunk — they
+                // fall back to filesystem mtime, same as any path missing from the
+                // merged map already means — not the whole call, and not sibling
+                // chunks already merged in or still to come.
+                warn!(
+                    chunk = idx,
+                    of = chunk_count,
+                    paths_in_chunk = chunk.len(),
+                    "git log (mtime lookup) failed for one path chunk — those paths \
+                     fall back to filesystem mtime: {:#}",
+                    e
+                );
+                failed_chunks += 1;
+                failed_paths += chunk.len();
+            }
+        }
+    }
+
+    if failed_chunks > 0 {
+        warn!(
+            failed_chunks,
+            failed_paths,
+            total_chunks = chunk_count,
+            "git log (mtime lookup): {failed_chunks} of {chunk_count} chunk(s) failed \
+             ({failed_paths} path(s) affected); remaining chunks still contributed \
+             git-derived mtimes"
+        );
+    }
+
+    merged
+}
+
+/// Runs one `git log` invocation for a single chunk of paths — the command
+/// build/spawn/parse logic [`git_log_mtimes`] used to run exactly once, for the
+/// WHOLE path list, before #237 batched it by byte budget. Split into its own
+/// function so `git_log_mtimes` can call it per chunk and let one chunk's failure
+/// degrade independently of the others, rather than the all-or-nothing fallback the
+/// unbatched version had.
+async fn git_log_mtimes_chunk(
     _lock: &GitLock,
     data_path: &str,
     paths: &[String],
 ) -> Result<HashMap<String, i64>> {
-    if paths.is_empty() {
-        return Ok(HashMap::new());
-    }
-
     let safe_dir = format!("safe.directory={}", data_path);
     let mut args: Vec<&str> = vec![
         "-c",
@@ -1839,9 +1953,7 @@ pub(crate) mod tests {
         let lock = lock_git().await;
         // No repo needed at all — an empty `paths` short-circuits before spawning
         // git, so even a nonexistent directory is fine here.
-        let map = git_log_mtimes(&lock, "/nonexistent/does/not/matter", &[])
-            .await
-            .unwrap();
+        let map = git_log_mtimes(&lock, "/nonexistent/does/not/matter", &[]).await;
         assert!(map.is_empty());
     }
 
@@ -1900,9 +2012,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let lock = lock_git().await;
-        let map = git_log_mtimes(&lock, work_path, &["a.md".to_string(), "b.md".to_string()])
-            .await
-            .unwrap();
+        let map = git_log_mtimes(&lock, work_path, &["a.md".to_string(), "b.md".to_string()]).await;
 
         // 2020-01-01T00:00:00Z and 2021-06-15T12:00:00Z as Unix seconds.
         assert_eq!(
@@ -1927,12 +2037,185 @@ pub(crate) mod tests {
         // "untracked.md" was never committed — the caller must fall back to
         // filesystem mtime for it, which only works if this function leaves it
         // out of the map entirely rather than inventing a value.
-        let map = git_log_mtimes(&lock, work_path, &["untracked.md".to_string()])
-            .await
-            .unwrap();
+        let map = git_log_mtimes(&lock, work_path, &["untracked.md".to_string()]).await;
         assert!(
             !map.contains_key("untracked.md"),
             "a path git has no history for must be absent, not defaulted to 0 or similar"
+        );
+    }
+
+    // --- chunk_paths_by_byte_budget tests (#237) -------------------------------
+
+    #[test]
+    fn chunk_paths_by_byte_budget_splits_once_the_running_total_exceeds_the_budget() {
+        // 5 paths of 25_000 bytes each (cost 25_001 with the +1 separator
+        // allowance). Budget is 100_000: three entries fit (75_003 used), a fourth
+        // would push it to 100_004 — over budget — so the split lands right before
+        // it. The 4th and 5th then start a fresh chunk together (50_002, still under
+        // budget).
+        let paths: Vec<String> = (0..5).map(|_| "x".repeat(25_000)).collect();
+        let chunks = chunk_paths_by_byte_budget(&paths);
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            vec![3, 2],
+            "expected a 3-entry chunk then a 2-entry chunk, got chunk sizes {:?}",
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
+        // Every input path must still be present somewhere, in order, across the
+        // chunks — chunking must never drop or reorder a path.
+        let flattened: Vec<&String> = chunks.into_iter().flatten().collect();
+        assert_eq!(flattened, paths.iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn chunk_paths_by_byte_budget_keeps_a_single_oversized_path_in_its_own_chunk() {
+        // A path alone longer than the whole budget must not be dropped — it gets a
+        // one-entry chunk of its own rather than being silently excluded, and the
+        // small paths that follow it still get chunked together normally.
+        let huge = "x".repeat(200_000);
+        let paths = vec![huge.clone(), "a.md".to_string(), "b.md".to_string()];
+        let chunks = chunk_paths_by_byte_budget(&paths);
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the oversized path must stand alone in its own chunk, not merged with \
+             or dropped in favor of the smaller paths that follow it"
+        );
+        assert_eq!(chunks[0], [huge]);
+        assert_eq!(chunks[1], ["a.md".to_string(), "b.md".to_string()]);
+    }
+
+    #[test]
+    fn chunk_paths_by_byte_budget_empty_input_yields_no_chunks() {
+        let paths: Vec<String> = vec![];
+        assert!(chunk_paths_by_byte_budget(&paths).is_empty());
+    }
+
+    // --- git_log_mtimes ARG_MAX chunking tests (#237) ---------------------------
+
+    /// The regression test for #237 itself: a path list whose TOTAL byte length
+    /// comfortably exceeds a real OS `ARG_MAX` (this environment's `getconf ARG_MAX`
+    /// is 2_097_152 bytes; the decoy paths below total roughly twice that) must not
+    /// make the whole lookup come back empty.
+    ///
+    /// `git_log_mtimes_chunk` — the exact command-build/spawn logic the pre-#237
+    /// `git_log_mtimes` used to run ONCE against the whole list — is called directly
+    /// first, to prove the underlying OS limit is real and would have broken the
+    /// unbatched implementation (this is the "fails before" half): a single argv
+    /// this large cannot even be spawned, so it returns `Err`. `git_log_mtimes`
+    /// itself is then called with the identical oversized list and must still return
+    /// the correct answer for the one real tracked path folded in among the decoys —
+    /// proof that #237's chunking is what makes the difference, not some other
+    /// change to the fixture.
+    #[tokio::test]
+    async fn git_log_mtimes_survives_a_path_list_that_would_exceed_arg_max_unchunked() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("a.md"), "content").unwrap();
+        git_test_cmd(work_path)
+            .args(["add", "a.md"])
+            .output()
+            .unwrap();
+        git_test_cmd(work_path)
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add a.md",
+            ])
+            .env("GIT_AUTHOR_DATE", "@1600000000 +0000")
+            .env("GIT_COMMITTER_DATE", "@1600000000 +0000")
+            .output()
+            .unwrap();
+
+        // 6 decoy paths of 700_000 bytes each (4.2MB total) — none of them exist on
+        // disk or in git history, which is fine: `git log -- <pathspec>` does not
+        // require a pathspec entry to match anything, it just filters. Their only
+        // job is to make the combined argv large enough to blow past real
+        // `ARG_MAX` regardless of this environment's exact value.
+        let mut paths: Vec<String> = (0..6)
+            .map(|i| format!("decoy-{i}-{}", "x".repeat(700_000)))
+            .collect();
+        paths.push("a.md".to_string());
+
+        let lock = lock_git().await;
+
+        // "Before" half: the unbatched single-invocation logic really does fail
+        // against this input.
+        let unchunked = git_log_mtimes_chunk(&lock, work_path, &paths).await;
+        assert!(
+            unchunked.is_err(),
+            "a ~4MB single argv should exceed this environment's real ARG_MAX and \
+             fail to spawn — if this assertion itself fails, the fixture no longer \
+             proves anything about #237's fix"
+        );
+
+        // "After" half: the chunked, public entry point still gets the right answer.
+        let map = git_log_mtimes(&lock, work_path, &paths).await;
+        assert_eq!(
+            map.get("a.md"),
+            Some(&1_600_000_000),
+            "a.md's git-derived mtime must still come through despite the oversized \
+             combined path list, because #237 chunks it below ARG_MAX per invocation"
+        );
+    }
+
+    /// #237's "partial failure degrades its own batch, not the whole run": one
+    /// pathological chunk (here, a single path so long it alone exceeds real
+    /// `ARG_MAX` and lands in its own one-entry chunk — see
+    /// `chunk_paths_by_byte_budget_keeps_a_single_oversized_path_in_its_own_chunk`)
+    /// must not blank out the results of every OTHER, healthy chunk.
+    #[tokio::test]
+    async fn git_log_mtimes_a_failing_chunk_does_not_blank_out_other_chunks_results() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        std::fs::write(work.path().join("a.md"), "content").unwrap();
+        git_test_cmd(work_path)
+            .args(["add", "a.md"])
+            .output()
+            .unwrap();
+        git_test_cmd(work_path)
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add a.md",
+            ])
+            .env("GIT_AUTHOR_DATE", "@1600000000 +0000")
+            .env("GIT_COMMITTER_DATE", "@1600000000 +0000")
+            .output()
+            .unwrap();
+
+        // A single ~3MB path, alone, exceeds real ARG_MAX on its own — per the byte
+        // budget it forms its own one-entry chunk (never merged with `a.md`), so
+        // that chunk's `git log` invocation fails to spawn while `a.md`'s separate
+        // chunk succeeds normally.
+        let huge_path = "x".repeat(3_000_000);
+        let paths = vec![huge_path, "a.md".to_string()];
+
+        let lock = lock_git().await;
+        let map = git_log_mtimes(&lock, work_path, &paths).await;
+
+        assert_eq!(
+            map.get("a.md"),
+            Some(&1_600_000_000),
+            "the healthy chunk's result must survive the other chunk's failure"
+        );
+        assert_eq!(
+            map.len(),
+            1,
+            "the oversized path itself must simply be absent (falls back to \
+             filesystem mtime at the caller), not present with some invented value"
         );
     }
 
