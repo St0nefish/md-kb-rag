@@ -255,23 +255,161 @@ async fn file_mtime_nanos(path: &Path, label: &str) -> i64 {
         })
 }
 
-/// #164: one batched `git log` for every path in `rel_keys`, mapping each to the
-/// commit time of its most recent touch — the source of truth `process_file`/
-/// `backfill_document_metadata` fall back away from (to `file_mtime` above) only when
-/// a path has no entry here.
+/// Process-global memo of git-log-derived mtimes, keyed to the exact `(data_path,
+/// HEAD sha)` generation they were computed against — the #236 fix for
+/// `build_git_mtimes` holding `git::GIT_LOCK` for a full `git log` history walk on
+/// EVERY `index_paths_generic` call, scoped or full.
 ///
-/// Deliberately NOT one `git log -1` per file: across a large corpus that is a
-/// subprocess spawn per document, which is the exact cost this batches away into a
-/// single invocation covering the whole set at once (`git::git_log_mtimes`).
+/// ## Why caching, and not one of the other options #236 lists
+///
+/// `git log -- <pathspec>`'s cost is dominated by how far back it has to walk commit
+/// history looking for matches, not by how many paths are in the pathspec — a
+/// narrowly-scoped query over a long-history repo still walks the same history a
+/// broad one does, it just prints less of it. So "scope the query to the paths being
+/// indexed" (already true here — `rel_keys` was never the whole corpus for a scoped
+/// run) does not actually bound the walk cost the issue is about; the pathspec was
+/// always narrow, and the walk was expensive anyway.
+///
+/// "Only run it on full reindexes" — the option this module would otherwise reach
+/// for first, since it is by far the simplest — is unsound here specifically because
+/// of how this project's queue collapses trigger provenance: `reindex::run_worker`
+/// hands every scoped unit to `ingest::index_paths` tagged `Trigger::Worker`
+/// regardless of whether the underlying event was a `write_document` call (whose
+/// file WAS just written locally by this process — filesystem mtime is trustworthy)
+/// or a webhook-driven fetch+merge (whose files were just checked out by `git merge`,
+/// which sets filesystem mtime to the MERGE time, not preserving each commit's
+/// original time — exactly the collapse #164 exists to fix). There is no signal left
+/// by the time a path reaches `build_git_mtimes` that distinguishes those two cases,
+/// so gating this to full-only would silently reintroduce #164's bug for every
+/// webhook-driven update — likely the dominant path for a KB whose canonical copy
+/// lives on a separate Git host, per this project's own architecture. Weakening
+/// mtime accuracy to solve a lock-contention problem is the wrong trade.
+///
+/// Caching instead makes the EXPENSIVE case (a real history walk) run only once per
+/// commit landing — "document mtimes only change when commits land," per the issue
+/// — rather than once per write/webhook, with no accuracy cost at all: every call
+/// still gets a live, HEAD-correct answer, just served from memory once this
+/// process has already resolved it for the current HEAD.
+///
+/// ## Shape
+///
+/// `key` is `None` before the very first lookup and after every successful
+/// `resolve()` call against a DIFFERENT `(data_path, head)` pair, at which point
+/// `entries` is wiped — see `resolve`'s doc comment. Keyed on `data_path` as well as
+/// `head`, not `head` alone, so a hypothetical multi-repo process (this crate's own
+/// test suite spins up many independent temp repos in one binary) can never
+/// cross-contaminate one repo's entries into another's, even in the astronomically
+/// unlikely event two unrelated repos' HEAD commits happen to collide.
+///
+/// `entries` maps a path to `Some(mtime)` (a resolved git-derived mtime) or `None`
+/// (a CONFIRMED negative result: git has no history for this path at this HEAD) —
+/// caching the negative is what stops a path with no git history (never committed,
+/// only ever written to disk) from being re-queried by every subsequent call at the
+/// same HEAD, forever.
+///
+/// Not persisted anywhere: cold on every process start/restart. That is always SAFE
+/// (a cold cache just means the next call does a real, uncached lookup — exactly
+/// what every call did before this existed) and never WRONG (there is no on-disk
+/// cache file that could survive a restart to contradict a live git repo).
+struct GitMtimeCache {
+    key: Option<(String, String)>,
+    entries: HashMap<String, Option<i64>>,
+}
+
+impl GitMtimeCache {
+    fn empty() -> Self {
+        Self {
+            key: None,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Wipe `entries` if they belong to a different `(data_path, head)` generation
+    /// than the one being requested, then adopt the requested generation as current.
+    /// A no-op (keeps every already-resolved entry) when the generation matches.
+    ///
+    /// Pure state transition, no I/O or locking of its own beyond whatever the
+    /// caller already holds — deliberately factored out of `build_git_mtimes` so the
+    /// actual invalidate-vs-reuse decision, the one thing a caching layer can get
+    /// subtly wrong (silently serving a stale value after HEAD moved), can be
+    /// exercised directly in tests without a real git repo or subprocess.
+    fn resolve(&mut self, data_path: &str, head: &str) {
+        let want = (data_path.to_string(), head.to_string());
+        if self.key.as_ref() != Some(&want) {
+            self.entries.clear();
+            self.key = Some(want);
+        }
+    }
+
+    /// Split `rel_keys` into (already-cached answers, still-missing keys) against
+    /// the CURRENT generation — call `resolve` first if the generation might have
+    /// changed. A key with a cached `None` (confirmed no git history) counts as
+    /// resolved, not missing — see the struct doc comment.
+    fn split(&self, rel_keys: &[String]) -> (HashMap<String, i64>, Vec<String>) {
+        let mut found = HashMap::new();
+        let mut missing = Vec::new();
+        for key in rel_keys {
+            match self.entries.get(key) {
+                Some(Some(ts)) => {
+                    found.insert(key.clone(), *ts);
+                }
+                Some(None) => {}
+                None => missing.push(key.clone()),
+            }
+        }
+        (found, missing)
+    }
+
+    /// Merge a fresh, just-computed lookup for `missing` into the cache — but ONLY
+    /// if the cache is still at the exact `(data_path, head)` generation `fresh` was
+    /// computed against.
+    ///
+    /// This guard matters for a real race: between the `split()` call that produced
+    /// `missing` and this call, another concurrent caller could have observed a
+    /// NEWER HEAD and already invalidated the cache into a new generation via its
+    /// own `resolve()`. Merging `fresh` (computed against the OLD generation)
+    /// into that newer generation would silently resurrect stale, superseded values
+    /// under a key that is supposed to mean "current as of the new HEAD." Dropping
+    /// `fresh` on the floor in that rare case is strictly safer: the next caller
+    /// that needs these paths just repeats the (cheap, #237-chunked) lookup.
+    fn merge(
+        &mut self,
+        data_path: &str,
+        head: &str,
+        missing: &[String],
+        fresh: &HashMap<String, i64>,
+    ) {
+        if self.key.as_ref() != Some(&(data_path.to_string(), head.to_string())) {
+            return;
+        }
+        for key in missing {
+            self.entries.insert(key.clone(), fresh.get(key).copied());
+        }
+    }
+}
+
+static GIT_MTIME_CACHE: std::sync::LazyLock<tokio::sync::Mutex<GitMtimeCache>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(GitMtimeCache::empty()));
+
+/// #164: git-log-derived "true" last-modified time for every path in `rel_keys` that
+/// git has history for — the source of truth `process_file`/`backfill_document_metadata`
+/// fall back away from (to `file_mtime`) only when a path has no entry here.
+///
+/// #236: backed by [`GIT_MTIME_CACHE`], a process-global memo invalidated on HEAD
+/// change rather than a fresh `git log` walk on every call — see that struct's doc
+/// comment for the full rationale (and why the simpler "full reindexes only" or
+/// "narrow the pathspec" alternatives don't actually fix this). The `GIT_LOCK`
+/// acquisition below still covers the WHOLE sequence (HEAD resolution plus, on a
+/// cache miss, the chunked `git log` walk) as one logical operation, per this
+/// project's git-locking discipline — it is just usually a much shorter hold than
+/// before, because `rev_parse_head` does not walk history and a warm cache needs no
+/// subprocess at all.
 ///
 /// Gated on git integration actually being configured (`source.git_url`) and the
 /// data path actually being a git clone (`.git` present) — a config without git
 /// integration, or a data path that predates the first clone, has no git history to
 /// ask about, so this returns an empty map immediately rather than spawning a git
-/// process that can only fail. Any OTHER failure (git errors, times out) also
-/// degrades to an empty map rather than failing the calling indexing run — a stale or
-/// missing recency signal is a metadata nicety, not a reason to abort embedding and
-/// upserting content that otherwise indexed successfully.
+/// process that can only fail.
 async fn build_git_mtimes(config: &ResolvedConfig, rel_keys: &[String]) -> HashMap<String, i64> {
     if config.source.git_url.is_none() {
         return HashMap::new();
@@ -282,10 +420,37 @@ async fn build_git_mtimes(config: &ResolvedConfig, rel_keys: &[String]) -> HashM
     }
 
     let lock = crate::git::lock_git().await;
-    // #237: `git_log_mtimes` itself now degrades a single failing path-chunk
-    // internally (logging its own `warn!`) rather than failing the whole call, so
-    // there is no `Err` case left here to handle — see its doc comment.
-    crate::git::git_log_mtimes(&lock, data_path, rel_keys).await
+
+    // Cheap — no history walk — so a run at a HEAD this process has already fully
+    // resolved skips the expensive part entirely. Any failure here (repo mid-op,
+    // unreadable, etc.) falls back to one uncached, #237-chunked lookup for exactly
+    // this run rather than either serving a possibly-wrong-generation cache or
+    // failing the calling indexing run over a metadata nicety.
+    let head = match crate::git::rev_parse_head(&lock, data_path).await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(
+                "Failed to resolve HEAD for git-log-mtime caching — falling back to an \
+                 uncached lookup for this run only (see #236): {:#}",
+                e
+            );
+            return crate::git::git_log_mtimes(&lock, data_path, rel_keys).await;
+        }
+    };
+
+    let missing = {
+        let mut cache = GIT_MTIME_CACHE.lock().await;
+        cache.resolve(data_path, &head);
+        cache.split(rel_keys).1
+    };
+
+    if !missing.is_empty() {
+        let fresh = crate::git::git_log_mtimes(&lock, data_path, &missing).await;
+        let mut cache = GIT_MTIME_CACHE.lock().await;
+        cache.merge(data_path, &head, &missing, &fresh);
+    }
+
+    GIT_MTIME_CACHE.lock().await.split(rel_keys).0
 }
 
 #[cfg(test)]
@@ -4418,6 +4583,224 @@ mod tests {
             map.is_empty(),
             "a data path with no .git directory has no git history to ask about, \
              regardless of whether git integration is configured"
+        );
+    }
+
+    // -- GitMtimeCache (#236) ----------------------------------------------------
+
+    #[test]
+    fn git_mtime_cache_resolve_wipes_entries_on_a_different_head() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        cache.entries.insert("a.md".to_string(), Some(1_000));
+        assert_eq!(
+            cache.split(&["a.md".to_string()]).0.get("a.md"),
+            Some(&1_000)
+        );
+
+        // A DIFFERENT head must wipe the entry, not silently keep serving it — this
+        // is the exact bug a naive "just check the key on write, never on read"
+        // cache implementation could get wrong: a stale value surviving under a key
+        // that no longer means what it used to.
+        cache.resolve("/repo", "head-b");
+        let (found, missing) = cache.split(&["a.md".to_string()]);
+        assert!(
+            found.is_empty(),
+            "the old generation's entry must not survive a HEAD change"
+        );
+        assert_eq!(missing, vec!["a.md".to_string()]);
+    }
+
+    #[test]
+    fn git_mtime_cache_resolve_is_a_noop_when_the_generation_is_unchanged() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        cache.entries.insert("a.md".to_string(), Some(1_000));
+
+        // Same (data_path, head) again — the already-resolved entry must survive.
+        cache.resolve("/repo", "head-a");
+        assert_eq!(
+            cache.split(&["a.md".to_string()]).0.get("a.md"),
+            Some(&1_000)
+        );
+    }
+
+    #[test]
+    fn git_mtime_cache_split_reports_only_true_misses() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        cache.entries.insert("cached.md".to_string(), Some(1_000));
+
+        let (found, missing) = cache.split(&["cached.md".to_string(), "new.md".to_string()]);
+        assert_eq!(found.get("cached.md"), Some(&1_000));
+        assert_eq!(missing, vec!["new.md".to_string()]);
+    }
+
+    #[test]
+    fn git_mtime_cache_split_treats_a_confirmed_negative_result_as_not_missing() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        // `None` means "confirmed: git has no history for this path at this HEAD" —
+        // a resolved answer, not an open question that should be re-queried.
+        cache.entries.insert("untracked.md".to_string(), None);
+
+        let (found, missing) = cache.split(&["untracked.md".to_string()]);
+        assert!(
+            found.is_empty(),
+            "a confirmed-negative path has no timestamp to return"
+        );
+        assert!(
+            missing.is_empty(),
+            "a confirmed-negative path must not be reported as missing — that would \
+             make it get re-queried by every future call at this HEAD, forever"
+        );
+    }
+
+    #[test]
+    fn git_mtime_cache_merge_records_positive_and_negative_results() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        let mut fresh = HashMap::new();
+        fresh.insert("found.md".to_string(), 1_000_i64);
+        // "absent.md" is deliberately NOT in `fresh` — simulates git having no
+        // history for it, which `merge` must still record as a confirmed negative.
+        cache.merge(
+            "/repo",
+            "head-a",
+            &["found.md".to_string(), "absent.md".to_string()],
+            &fresh,
+        );
+
+        let (found, missing) = cache.split(&["found.md".to_string(), "absent.md".to_string()]);
+        assert_eq!(found.get("found.md"), Some(&1_000));
+        assert!(
+            missing.is_empty(),
+            "both keys are now resolved, one way or the other"
+        );
+        assert_eq!(cache.entries.get("absent.md"), Some(&None));
+    }
+
+    /// The race `merge`'s doc comment describes: between the `split()` that produced
+    /// `missing` and the `merge()` call, another concurrent caller observed a NEWER
+    /// HEAD and already invalidated the cache into a different generation. Merging
+    /// results computed against the OLD generation into that newer one would
+    /// resurrect stale data under a key that is supposed to mean "current as of the
+    /// new HEAD" — `merge` must refuse instead.
+    #[test]
+    fn git_mtime_cache_merge_is_a_noop_after_a_racing_invalidation() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+
+        // Simulate a concurrent caller moving the cache to a newer generation
+        // between this test's own `split()` (not shown — `missing` is constructed
+        // directly) and its `merge()` call below.
+        cache.resolve("/repo", "head-b");
+
+        let mut fresh = HashMap::new();
+        fresh.insert("a.md".to_string(), 1_000_i64);
+        // Merging against the OLD (data_path, "head-a") pair while the cache is now
+        // at "head-b" must be rejected.
+        cache.merge("/repo", "head-a", &["a.md".to_string()], &fresh);
+
+        let (found, missing) = cache.split(&["a.md".to_string()]);
+        assert!(
+            found.is_empty(),
+            "stale-generation results must never be merged into a newer generation"
+        );
+        assert_eq!(missing, vec!["a.md".to_string()]);
+    }
+
+    fn git_commit_dated(work: &TempDir, rel_path: &str, message: &str, unix_secs: i64) {
+        std::process::Command::new("git")
+            .args(["add", "--", rel_path])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                message,
+            ])
+            .current_dir(work.path())
+            // `@<unix-seconds> <tz-offset>` is git's own unambiguous date format —
+            // see `git.rs`'s `git_log_mtimes` tests for why this, not an ISO string.
+            .env("GIT_AUTHOR_DATE", format!("@{unix_secs} +0000"))
+            .env("GIT_COMMITTER_DATE", format!("@{unix_secs} +0000"))
+            .output()
+            .unwrap();
+    }
+
+    /// End-to-end proof that #236's cache stays correct across a real HEAD change —
+    /// the property that actually matters, since a caching bug that forgot to
+    /// invalidate would silently serve a stale mtime forever rather than failing
+    /// loudly. First call resolves `a.md` at the FIRST commit's timestamp; a second
+    /// commit updates `a.md` and moves HEAD; a second call must return the NEW
+    /// timestamp, not the cached old one.
+    #[tokio::test]
+    async fn build_git_mtimes_invalidates_its_cache_when_head_moves() {
+        let bare = crate::git::tests::create_bare_repo("main");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "main");
+
+        let mut config = scan_test_config(&work);
+        config.source.git_url = Some("https://example.com/repo.git".to_string());
+
+        std::fs::write(work.path().join("a.md"), "v1").unwrap();
+        git_commit_dated(&work, "a.md", "add a.md", 1_600_000_000);
+
+        let map = build_git_mtimes(&config, &["a.md".to_string()]).await;
+        assert_eq!(
+            map.get("a.md"),
+            Some(&1_600_000_000),
+            "first call must reflect the first commit"
+        );
+
+        std::fs::write(work.path().join("a.md"), "v2").unwrap();
+        git_commit_dated(&work, "a.md", "update a.md", 1_700_000_000);
+
+        let map = build_git_mtimes(&config, &["a.md".to_string()]).await;
+        assert_eq!(
+            map.get("a.md"),
+            Some(&1_700_000_000),
+            "second call must reflect the NEW HEAD, not a stale cached value from \
+             before this process ever saw the second commit"
+        );
+    }
+
+    /// A second call at the SAME HEAD for a path the first call never asked about
+    /// must still get a correct answer — the cache's incremental top-up
+    /// (`GitMtimeCache::split`'s `missing` half) has to actually fetch it, not treat
+    /// "not yet in the cache" as "confirmed absent."
+    #[tokio::test]
+    async fn build_git_mtimes_resolves_a_path_not_covered_by_an_earlier_call_at_the_same_head() {
+        let bare = crate::git::tests::create_bare_repo("main");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "main");
+
+        let mut config = scan_test_config(&work);
+        config.source.git_url = Some("https://example.com/repo.git".to_string());
+
+        std::fs::write(work.path().join("a.md"), "content").unwrap();
+        git_commit_dated(&work, "a.md", "add a.md", 1_600_000_000);
+        std::fs::write(work.path().join("b.md"), "content").unwrap();
+        git_commit_dated(&work, "b.md", "add b.md", 1_650_000_000);
+
+        // First call only ever asks about a.md.
+        let map = build_git_mtimes(&config, &["a.md".to_string()]).await;
+        assert_eq!(map.get("a.md"), Some(&1_600_000_000));
+
+        // Second call, same HEAD, now also asks about b.md — never previously
+        // queried by this process at this generation.
+        let map = build_git_mtimes(&config, &["a.md".to_string(), "b.md".to_string()]).await;
+        assert_eq!(map.get("a.md"), Some(&1_600_000_000));
+        assert_eq!(
+            map.get("b.md"),
+            Some(&1_650_000_000),
+            "a path outside the first call's scope must still resolve correctly on \
+             a later call at the same HEAD"
         );
     }
 
