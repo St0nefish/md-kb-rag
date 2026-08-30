@@ -2195,6 +2195,22 @@ fn find_double_bracket_close_for_pipe_alias(chars: &[char], open: usize) -> Opti
 /// `fn`s, not `pub(crate)` — this mirrors their judging rules, not a
 /// divergent policy. See this section's doc comment for why this
 /// duplication exists and what would let it be deleted.
+///
+/// KNOWN DIVERGENCE, found in review: `ingest::resolve_link_target` also cuts
+/// the target at its first whitespace character (the CommonMark inline-link
+/// title convention — `[target "Title"](...)`), applied to every kind, not just
+/// inline links. This function does not. The gap is only reachable for a target
+/// containing a literal non-trailing space before the `|`, e.g.
+/// `[[my page|Alias]]`, which slug-style KB paths do not produce — but it is a
+/// real difference, not a restatement.
+///
+/// It matters specifically when #131's remaining half lands: if the `ingest.rs`
+/// fix teaches `resolve_link_target` to split `[[target|alias]]` and keeps its
+/// whitespace cut, the extractor and this rewriter would resolve such a target
+/// to DIFFERENT paths — the extractor recording an edge the rewriter then fails
+/// to match, which is exactly the silent-broken-link class #131 is about.
+/// Making the originals `pub(crate)` and deleting this function is the fix that
+/// closes the whole question; short of that, re-check this divergence then.
 fn resolve_pipe_alias_wiki_target(raw_target: &str, source_rel_path: &str) -> Option<String> {
     let target = raw_target.trim();
     let target = match target.find('#') {
