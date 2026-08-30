@@ -209,12 +209,30 @@ fn backoff_for_attempt(attempt: u32) -> Duration {
 /// Whether a failed run should be dropped (permanent) rather than requeued
 /// (transient — the default).
 ///
-/// The only failure `ingest::index_paths` can currently produce that retrying can
-/// never fix is a `validation.strict` rejection: `ingest::process_file` bails with a
-/// message containing the literal substring `"(strict mode)"` for exactly that case,
-/// and nothing else on the indexing path produces that phrase. Everything else —
-/// embeddings unreachable, Qdrant unreachable, git or state-DB I/O errors — is
-/// environmental and often self-heals, so it is requeued with backoff by default.
+/// **Dead in practice as of #156/#159 — no current code path triggers this.** It used
+/// to exist for exactly one case: a `validation.strict` rejection, which
+/// `ingest::process_file` used to `bail!` with a message containing the literal
+/// substring `"(strict mode)"`. That rejection is no longer an `Err` at all —
+/// `process_file` now returns it as a typed `ingest::FileOutcome::Rejected` outcome
+/// that `index_paths`'s per-path loop accumulates and continues past, so the whole
+/// call succeeds even when individual files are rejected (see that type's doc comment
+/// for why: the old behavior let one bad file permanently disable reconciliation for
+/// every other file coalesced alongside it, and every future full reconcile besides,
+/// since a rejected file's state row is never updated and so it never stops being
+/// "the next bad file this classifier sees"). Nothing else on the indexing path ever
+/// produced the `"(strict mode)"` substring either — notably, the validation-*engine*
+/// error branch formatted as `"Validation error in strict mode for '{}'"`, with no
+/// parentheses, so it never matched this check despite an earlier version of this doc
+/// comment claiming it did (#159). That branch is now `Rejected` too, for the same
+/// reason and via the same fix.
+///
+/// The scaffolding stays — this function, its call site in [`run_with_retry`], and the
+/// substring-match shape below — because it is cheap, already well-tested, and exactly
+/// the right hook if a genuinely permanent (never-worth-retrying) failure class is
+/// identified on the indexing path in the future. Until then, every failure
+/// `run_with_retry` sees is classified transient and goes through the normal
+/// retry-with-backoff path, which is the strictly safe default per the reasoning
+/// below.
 ///
 /// This is a substring match on the rendered error rather than a typed error
 /// distinction, and that is deliberate, not a shortcut taken under time pressure: the
@@ -427,10 +445,20 @@ async fn run_with_retry(
         match run(Arc::clone(config), unit.clone()).await {
             Ok(()) => return,
             Err(e) if is_permanent_failure(&e) => {
+                // As of #156/#159 this arm is dead in practice — see
+                // `is_permanent_failure`'s doc comment for why nothing on the indexing
+                // path produces a "(strict mode)"-matching error anymore. Kept as the
+                // hook for a future permanent-failure class. The claim this log line
+                // used to make — "the writer that caused this already saw the
+                // rejection" — was already false for a webhook-originated push even
+                // before that fix: a webhook has no synchronous caller waiting on this
+                // run's result to relay a rejection to, unlike an MCP `write_document`
+                // call. Dropped rather than repeated here.
                 warn!(
                     ?unit,
-                    "Indexing run failed with a non-retryable error; dropping it — the \
-                     writer that caused this already saw the rejection: {:#}",
+                    "Indexing run failed with a non-retryable error; dropping it \
+                     rather than retrying — the periodic reconcile sweep will pick up \
+                     any legitimately dirty paths on its own schedule: {:#}",
                     e
                 );
                 return;
@@ -569,8 +597,17 @@ mod tests {
         assert_eq!(backoff_for_attempt(20), RETRY_MAX_BACKOFF);
     }
 
+    /// #156/#159: `ingest::process_file` no longer ever produces an `Err` containing
+    /// `"(strict mode)"` — a strict-mode rejection is now `Ok(FileOutcome::Rejected)`,
+    /// handled entirely inside `index_paths` without ever reaching `run_with_retry` or
+    /// this classifier. `is_permanent_failure`'s own logic is untouched by that fix
+    /// (see its doc comment: the scaffolding is kept deliberately), so this string
+    /// would still classify as permanent if anything ever produced it again — this
+    /// test now documents that as a property of otherwise-dead scaffolding, not of a
+    /// live path. Renamed from `strict_validation_failure_is_permanent` to make that
+    /// explicit.
     #[test]
-    fn strict_validation_failure_is_permanent() {
+    fn is_permanent_failure_still_matches_the_vestigial_strict_mode_wording() {
         let err =
             anyhow::anyhow!("Validation failed for 'x.md' (strict mode): [\"missing title\"]");
         assert!(is_permanent_failure(&err));

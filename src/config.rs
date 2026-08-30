@@ -1,11 +1,11 @@
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -44,7 +44,7 @@ pub struct Config {
 /// `GIT_URL` / `GIT_BRANCH` / `DATA_PATH` — see [`ResolvedSourceConfig`]. Setting any
 /// of them here now fails loudly via `deny_unknown_fields` rather than being
 /// silently ignored.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     /// Name of the env var containing the personal access token for git fetch
@@ -115,7 +115,7 @@ fn default_data_path() -> Option<String> {
     Some("/data".into())
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingConfig {
     #[serde(default = "default_include")]
@@ -175,7 +175,7 @@ fn default_reconcile_interval_secs() -> u64 {
     600
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FrontmatterConfig {
     #[serde(default)]
@@ -191,7 +191,7 @@ pub struct FrontmatterConfig {
     pub allowed: HashMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkingConfig {
     #[serde(default = "default_max_chunk_size")]
@@ -237,7 +237,7 @@ fn default_target_chunk_size() -> Option<usize> {
 /// `api_key_env` names the env var, never the key itself. `batch_size`,
 /// `request_timeout_secs`, and `batch_concurrency` are pure tuning knobs and stay
 /// YAML-only with no env override at all.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
     /// Name of the env var containing the API key for the embedding provider.
@@ -311,7 +311,7 @@ fn default_batch_concurrency() -> usize {
 /// identity — ENV-only, same reasoning as `embedding.base_url`/`model` — so they
 /// live on [`ResolvedRerankingConfig`] instead. `api_key_env` follows the same
 /// secret name-indirection pattern as `embedding.api_key_env`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RerankingConfig {
     #[serde(default)]
@@ -367,7 +367,7 @@ fn default_collection() -> String {
     "knowledge-base".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationConfig {
     #[serde(default = "default_true")]
@@ -410,7 +410,7 @@ fn default_lint_timeout_secs() -> u64 {
     30
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookProvider {
     #[default]
@@ -419,7 +419,7 @@ pub enum WebhookProvider {
     Gitlab,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     #[serde(default = "default_webhook_secret_env")]
@@ -445,7 +445,7 @@ fn default_webhook_secret_env() -> String {
 /// which port it is listening on without a restart), so it moved to `MCP_PORT` —
 /// see [`ResolvedMcpConfig`]. Everything else here is genuine runtime/tuning
 /// behaviour and stays YAML-only.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
     #[serde(default = "default_bearer_token_env")]
@@ -537,7 +537,7 @@ fn default_extensions_path() -> String {
     "meta/mcp".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     #[serde(default = "default_true")]
@@ -571,7 +571,7 @@ fn default_mcp_port() -> u16 {
 }
 
 /// Configuration for write-tool behaviour (create_document / edit_document).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriteConfig {
     /// If true, creating a new document runs a similarity check against the
@@ -630,7 +630,7 @@ fn default_bearer_token_env() -> String {
 }
 
 /// Configuration for retrieval (search) behaviour.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
     /// Enable hybrid sparse+dense retrieval with RRF fusion. When `false`, search
@@ -654,7 +654,19 @@ pub struct SearchConfig {
     pub phrase: bool,
     /// Global minimum relevance score floor. Results below this threshold are
     /// dropped before returning. `None` (the default) disables the floor.
-    /// Note: RRF scores are ~0.01–0.03 — set accordingly when hybrid is true.
+    ///
+    /// Note: RRF scores are ~0.01–0.03 — set accordingly whenever a fused arm
+    /// can run, which is NOT gated by `hybrid` alone. `retrieval::search`
+    /// dispatches to the fused `hybrid_search` path (RRF score) whenever sparse
+    /// is present (`hybrid: true`) OR a query contains a quoted phrase and
+    /// `phrase` is enabled — see [`SearchOptions::rrf_candidates`]'s doc comment
+    /// for the same "any fused arm" framing. `phrase` defaults to `true`, so a
+    /// deployment with `hybrid: false` still fuses (and lands on the RRF scale)
+    /// for any query with a `"quoted span"`; only a query with no quoted phrase
+    /// at all takes the plain dense-cosine path in that configuration. Setting a
+    /// dense-cosine-scale `min_score` (e.g. 0.5) under `hybrid: false` silently
+    /// zeroes out results for every phrase query rather than erroring, since the
+    /// fused score can never clear a cosine-appropriate floor.
     #[serde(default)]
     pub min_score: Option<f32>,
     /// Per-document result diversity: the maximum number of chunks from a single
@@ -723,7 +735,7 @@ fn default_max_search_limit() -> u64 {
 /// secrets, no bootstrap wiring, so unlike `source`/`embedding` there is no
 /// env-only split and no `Resolved*` counterpart: the parsed struct is copied
 /// straight onto `ResolvedConfig`, same as `rate_limit` and `search`.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UiConfig {
     #[serde(default)]
@@ -733,7 +745,7 @@ pub struct UiConfig {
 /// Precomputed semantic (kNN) graph edges shown alongside markdown-link edges
 /// in the web UI's graph view. Off by default: computing them costs a Qdrant
 /// `recommend` query per indexed document on every run.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticEdgesConfig {
     #[serde(default)]
@@ -908,6 +920,8 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("search.phrase", "search"),
     ("search.min_score", "search"),
     ("search.diversity_max_per_document", "search"),
+    ("search.default_limit", "search"),
+    ("search.max_limit", "search"),
     ("reranking.enabled", "reranking"),
     ("reranking.candidate_limit", "reranking"),
     ("reranking.api_key_env", "reranking"),
@@ -1313,6 +1327,16 @@ impl Config {
             if reranking_model.is_none() {
                 missing.push("RERANKING_MODEL");
             }
+        }
+        // Only meaningful while reranking is on — `ResolvedRerankingConfig` (and
+        // therefore this value) is only ever constructed inside the
+        // `self.reranking.enabled` branch below, same guard as the env-var checks
+        // above. Unlike `search.rrf_candidates`, this had no lower bound at all: a
+        // `candidate_limit: 0` loaded successfully and only surfaced at query time
+        // as `retrieval.rs`'s `rerank_candidate_limit` silently degrading every
+        // reranked search to zero candidates instead of failing loudly at startup.
+        if self.reranking.enabled && self.reranking.candidate_limit == 0 {
+            anyhow::bail!("reranking.candidate_limit must be >= 1");
         }
         if !missing.is_empty() {
             anyhow::bail!(
@@ -1744,6 +1768,39 @@ mcp:
         assert!(err.contains("RERANKING_BASE_URL"), "{err}");
         assert!(err.contains("RERANKING_MODEL"), "{err}");
 
+        clear_required_env();
+    }
+
+    #[test]
+    fn reranking_zero_candidate_limit_is_rejected_when_enabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        unsafe {
+            std::env::set_var("RERANKING_BASE_URL", "http://reranker:8081/v1");
+            std::env::set_var("RERANKING_MODEL", "reranker");
+        }
+
+        // Enabled with candidate_limit: 0 must fail loudly at load, the same way
+        // its sibling search.rrf_candidates already does, rather than silently
+        // asking the reranker to score zero candidates at query time (#149).
+        let yaml = format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: true\n  candidate_limit: 0\n");
+        let err = Config::from_str(&yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reranking.candidate_limit must be >= 1"),
+            "expected the candidate_limit validation message, got: {err}"
+        );
+
+        // Disabled with the same zero value must NOT fail — the check only
+        // applies while reranking is actually in use.
+        let yaml =
+            format!("{MINIMAL_CONFIG}\nreranking:\n  enabled: false\n  candidate_limit: 0\n");
+        Config::from_str(&yaml).expect("disabled reranking must ignore candidate_limit");
+
+        unsafe {
+            std::env::remove_var("RERANKING_BASE_URL");
+            std::env::remove_var("RERANKING_MODEL");
+        }
         clear_required_env();
     }
 
@@ -3001,5 +3058,73 @@ reranking:
 
         std::fs::remove_dir_all(&dir).ok();
         clear_required_env();
+    }
+
+    /// Recursively flattens a `serde_yaml_ng::Value` tree into dot-joined leaf
+    /// paths, mirroring `YAML_ONLY_SETTINGS`'s naming convention (e.g.
+    /// `"ui.semantic_edges.k"`). A non-empty mapping is a sub-struct and is
+    /// descended into; anything else — including an EMPTY mapping, which is how
+    /// a `HashMap`-typed field (`frontmatter.defaults`/`allowed`) serializes at
+    /// its default value — is treated as a leaf, since no real config sub-struct
+    /// in this file has zero fields.
+    fn collect_leaf_paths(value: &serde_yaml_ng::Value, prefix: String, out: &mut HashSet<String>) {
+        match value.as_mapping() {
+            Some(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let key = k.as_str().expect("Config keys are always strings");
+                    let path = if prefix.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    collect_leaf_paths(v, path, out);
+                }
+            }
+            _ => {
+                out.insert(prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_only_settings_matches_every_config_struct_field() {
+        // Regression test for #144: `YAML_ONLY_SETTINGS` is a hand-maintained
+        // second source of truth parallel to the actual `Config` struct fields,
+        // and it drifted exactly this way once already (`search.default_limit`/
+        // `search.max_limit` were added to `SearchConfig` — and validated at
+        // `resolve()` — without ever being added here, so `ConfigProvenance` had
+        // no entry for either and silently omitted them from `/status` and the
+        // startup log).
+        //
+        // Rather than hand-list every field a second time in the test too (the
+        // same drift-prone pattern, just moved), this derives the real leaf-field
+        // set straight from `Config`'s own `Default` impl via serialization, so
+        // ANY future field added to ANY YAML-deserializable config struct without
+        // a matching `YAML_ONLY_SETTINGS` entry fails this test — and any entry
+        // left behind after a field is renamed or removed fails it too.
+        let value = serde_yaml_ng::to_value(Config::default())
+            .expect("every Config field type must round-trip through serde_yaml_ng");
+
+        let mut leaves = HashSet::new();
+        collect_leaf_paths(&value, String::new(), &mut leaves);
+
+        let documented: HashSet<String> = YAML_ONLY_SETTINGS
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+
+        let undocumented: Vec<&String> = leaves.difference(&documented).collect();
+        assert!(
+            undocumented.is_empty(),
+            "Config field(s) present on the struct but missing from YAML_ONLY_SETTINGS — \
+             config provenance will silently omit them (see #144): {undocumented:?}"
+        );
+
+        let stale: Vec<&String> = documented.difference(&leaves).collect();
+        assert!(
+            stale.is_empty(),
+            "YAML_ONLY_SETTINGS entr(y/ies) with no matching Config field — renamed or \
+             removed without updating the table: {stale:?}"
+        );
     }
 }
