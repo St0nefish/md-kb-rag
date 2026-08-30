@@ -201,11 +201,12 @@ impl UiState {
     /// callers read it from the environment once per request and hold it in a
     /// local binding (see the handlers below), same convention `mcp.rs` uses.
     ///
-    /// `state_db`: pass `Some` only for a MOVE (`write::WriteRequest::dest_path`
-    /// set) — `write::write_document_move` is the only reader of
-    /// `WriteDeps::state`, so a plain create/edit or a delete has no use for it,
-    /// and `None` here avoids lazily materializing `state.db` on disk for a
-    /// request that will never touch it (mirrors `mcp.rs`'s identical scoping).
+    /// `state_db`: pass `Some` for a MOVE (`write::WriteRequest::dest_path` set)
+    /// or a DELETE — `write::write_document_move` and `write::delete_document`
+    /// are the only readers of `WriteDeps::state` (the latter for #229's
+    /// inbound-link check), so a plain create/edit has no use for it. `None`
+    /// there avoids lazily materializing `state.db` on disk for a request that
+    /// will never touch it (mirrors `mcp.rs`'s identical scoping).
     fn write_deps<'a>(
         &'a self,
         config: &'a ResolvedConfig,
@@ -1112,9 +1113,11 @@ fn resolve_write_target_error_response(err: retrieval::ResolveErr) -> Response {
 
 /// Map a successful `write::write_document`/`write::delete_document` result onto
 /// the fixed HTTP contract's 200 body: `{"outcome", "sha", "rebased_paths",
-/// "rewritten_paths"}`. `rewritten_paths` is always `[]` outside a move — a move
-/// silently editing other documents without surfacing which ones is not
-/// acceptable, so this is always present, not just when non-empty.
+/// "rewritten_paths", "referencing_paths"}`. `rewritten_paths` is always `[]`
+/// outside a move — a move silently editing other documents without surfacing
+/// which ones is not acceptable — and (#229) `referencing_paths` is always `[]`
+/// outside a delete with inbound links, for the identical reason: both ride in
+/// the response unconditionally, not just when non-empty.
 fn write_success_response(success: WriteSuccess) -> Response {
     let outcome = match success.outcome {
         WriteOutcome::Synced => "synced",
@@ -1132,6 +1135,7 @@ fn write_success_response(success: WriteSuccess) -> Response {
             "sha": success.sha,
             "rebased_paths": rebased_paths,
             "rewritten_paths": success.rewritten_paths,
+            "referencing_paths": success.referencing_paths,
         })),
     )
         .into_response()
@@ -1460,9 +1464,14 @@ async fn delete_doc_handler(
 
     let config = state.config();
     let token = state.git_token(&config);
-    // `delete_document` never moves a document, so there is nothing here for a
-    // state DB to do — see `UiState::write_deps`'s doc comment on `state_db`.
-    let deps = state.write_deps(&config, &token, None);
+    // (#229) Best-effort, same as `post_doc_handler`'s own lazy state-DB open
+    // for a MOVE: a state DB that fails to open degrades `delete_document`'s
+    // inbound-link check to "skip it" (see `UiState::write_deps`'s doc comment
+    // on `state_db`), not a failed delete. Without this, `write::delete_document`
+    // never sees a `StateDb` at all, and `referencing_paths` would always come
+    // back empty regardless of what actually links to the document being deleted.
+    let state_db = state.state_db().await.ok();
+    let deps = state.write_deps(&config, &token, state_db);
 
     match write::delete_document(&deps, &rel_path, body.commit_message.as_deref()).await {
         Ok(success) => write_success_response(success),
@@ -2695,6 +2704,7 @@ mod tests {
             diff: "+line".into(),
             rewritten_paths: Vec::new(),
             sync_failure_cause: None,
+            referencing_paths: vec!["referencer.md".to_string()],
         };
         let resp = write_success_response(success);
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3339,6 +3349,62 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn delete_doc_surfaces_referencing_paths_in_the_response() {
+        // (#229) Same proof as mcp.rs's equivalent test, for the HTTP transport:
+        // the reverse-link check must reach the response body, not just a log.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("linked.md"),
+            "---\ntitle: Linked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "--", "linked.md"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add linked.md",
+            ])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+
+        let state = git_backed_ui_state(&work);
+        let db = state.state_db().await.unwrap();
+        db.replace_links(
+            "referencer.md",
+            "markdown",
+            &[("linked.md".to_string(), None)],
+        )
+        .await
+        .unwrap();
+
+        let app = ui_router(state);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/doc/linked.md")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["referencing_paths"],
+            serde_json::json!(["referencer.md"])
+        );
     }
 
     #[tokio::test]

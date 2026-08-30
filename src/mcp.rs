@@ -1310,18 +1310,14 @@ impl WriteOutcome {
 }
 
 /// Attach a machine-readable `{"outcome": ...}` discriminant to a successful
-/// `CallToolResult`, alongside its human-readable text content.
-fn with_outcome(mut result: CallToolResult, outcome: WriteOutcome) -> CallToolResult {
-    result.structured_content = Some(serde_json::json!({ "outcome": outcome.as_str() }));
-    result
-}
-
-/// Like [`with_outcome`], but for `write_document`'s create/edit path specifically:
-/// also attaches `rewritten_paths`, the repo-relative paths of OTHER documents a
-/// MOVE rewrote incoming links in (always `[]` for a non-move write, or a move
-/// with nothing to rewrite). A move that silently edits other documents without
-/// surfacing which ones is not acceptable, so this rides in `structured_content`
-/// on every create/edit result, not just moves.
+/// `CallToolResult`, alongside its human-readable text content — for
+/// `write_document`'s create/edit path specifically: also attaches
+/// `rewritten_paths`, the repo-relative paths of OTHER documents a MOVE
+/// rewrote incoming links in (always `[]` for a non-move write, or a move
+/// with nothing to rewrite). A move that silently edits other documents
+/// without surfacing which ones is not acceptable, so this rides in
+/// `structured_content` on every create/edit result, not just moves. See
+/// [`with_outcome_and_referencing`] for `delete_document`'s equivalent.
 fn with_outcome_and_rewrites(
     mut result: CallToolResult,
     outcome: WriteOutcome,
@@ -1330,6 +1326,26 @@ fn with_outcome_and_rewrites(
     result.structured_content = Some(serde_json::json!({
         "outcome": outcome.as_str(),
         "rewritten_paths": rewritten_paths,
+    }));
+    result
+}
+
+/// (#229) Like [`with_outcome_and_rewrites`], but for `delete_document`
+/// specifically: attaches `referencing_paths`, the repo-relative paths of
+/// OTHER documents that still link to the just-deleted document (always `[]`
+/// when none exist, or when no `StateDb` was available to check — see
+/// `write::WriteSuccess::referencing_paths`'s doc comment). This is the
+/// caller-visible half of the reverse-link check #181 already logs
+/// server-side — an agent has no access to that log, so the same information
+/// must reach it through the tool result too.
+fn with_outcome_and_referencing(
+    mut result: CallToolResult,
+    outcome: WriteOutcome,
+    referencing_paths: &[String],
+) -> CallToolResult {
+    result.structured_content = Some(serde_json::json!({
+        "outcome": outcome.as_str(),
+        "referencing_paths": referencing_paths,
     }));
     result
 }
@@ -1566,19 +1582,34 @@ fn create_edit_error_to_mcp_error(
 /// `CallToolResult`, preserving the exact text/`structured_content` shape the
 /// existing delete tests pin down.
 fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolResult {
+    // (#229) Named here so it can be included in both outcomes' text below —
+    // empty for every delete with nothing (or nothing known) still linking to
+    // the removed document.
+    let referencing_note = if success.referencing_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nStill linked from {} other document(s): {}. This delete did not rewrite \
+             or remove those links — they will dangle until each referencing document's own \
+             next reindex drops the now-stale edge.",
+            success.referencing_paths.len(),
+            success.referencing_paths.join(", ")
+        )
+    };
     match success.outcome {
         CoreWriteOutcome::Synced => {
             let summary = format!(
-                "Deleted '{}' (commit {}). Index cleanup has been queued and will complete shortly.",
-                rel_path, success.sha
+                "Deleted '{}' (commit {}). Index cleanup has been queued and will complete shortly.{}",
+                rel_path, success.sha, referencing_note
             );
             let mut result_text = summary;
             if !success.diff.is_empty() {
                 result_text = format!("{}\n\n{}", result_text, success.diff);
             }
-            with_outcome(
+            with_outcome_and_referencing(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::Synced,
+                &success.referencing_paths,
             )
         }
         CoreWriteOutcome::CommittedPendingSync => {
@@ -1589,16 +1620,17 @@ fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolRe
             let summary = format!(
                 "Deleted '{}' (commit {}) — committed locally, but the push to the remote \
                  failed: {}. It will sync on the next successful write or manual \
-                 intervention. Index cleanup has been queued from the local copy.",
-                rel_path, success.sha, cause
+                 intervention. Index cleanup has been queued from the local copy.{}",
+                rel_path, success.sha, cause, referencing_note
             );
             let mut result_text = summary;
             if !success.diff.is_empty() {
                 result_text = format!("{}\n\n{}", result_text, success.diff);
             }
-            with_outcome(
+            with_outcome_and_referencing(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::CommittedPendingSync,
+                &success.referencing_paths,
             )
         }
     }
@@ -3679,6 +3711,16 @@ impl KbSearchServer {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // (#229) Best-effort, same as `run_document_write`'s and
+        // `write_document_move_dir`'s own lazy state-DB opens: a state DB that
+        // fails to open degrades `delete_document`'s inbound-link check to
+        // "skip it" (see `WriteDeps::state`'s doc comment), not a failed
+        // delete. Without this, `write::delete_document`'s reverse-link query
+        // never runs at all — `WriteDeps::state == None` — and
+        // `referencing_paths` would always come back empty regardless of what
+        // actually links to the document being deleted.
+        let state_db = self.state_db().await.ok();
+
         let deps = WriteDeps {
             retrieval: self.deps(),
             canonical_data_path: &self.canonical_data_path,
@@ -3693,10 +3735,7 @@ impl KbSearchServer {
             commit_author_name: &config.write.commit_author_name,
             commit_author_email: &config.write.commit_author_email,
             queue: &self.reindex_queue,
-            // `delete_document` never moves a document — `write::write_document_move`
-            // is the only reader of `WriteDeps::state` — so there is nothing here
-            // for a state DB to do. `None` per `WriteDeps::state`'s doc comment.
-            state: None,
+            state: state_db,
         };
 
         match crate::write::delete_document(&deps, &rel_path, params.message.as_deref()).await {
@@ -8442,6 +8481,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_document_surfaces_referencing_paths_end_to_end() {
+        // (#229) The reverse-link check #181 added only ever reached a server
+        // log — this proves it now also reaches the caller, through both the
+        // human-readable text and `structured_content`.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("linked.md"),
+            "---\ntitle: Linked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "linked.md", "add linked.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        // Seed the reverse-link index directly (same shortcut other link-graph
+        // tests in this module use) rather than depending on a real reindex.
+        let db = server.state_db().await.unwrap();
+        db.replace_links(
+            "referencer.md",
+            "markdown",
+            &[("linked.md".to_string(), None)],
+        )
+        .await
+        .unwrap();
+
+        let result = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "linked.md".to_string(),
+                message: None,
+            }))
+            .await
+            .expect("an inbound link must not block the delete");
+
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("referencer.md"),
+            "the human-readable summary must name the referencing document: {text}"
+        );
+
+        let structured = result
+            .structured_content
+            .expect("delete_document must attach structured_content");
+        assert_eq!(
+            structured["referencing_paths"],
+            serde_json::json!(["referencer.md"])
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_reports_empty_referencing_paths_when_nothing_links_to_it() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("unlinked.md"),
+            "---\ntitle: Unlinked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "unlinked.md", "add unlinked.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "unlinked.md".to_string(),
+                message: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["referencing_paths"], serde_json::json!([]));
+    }
+
     // -----------------------------------------------------------------------
     // Pre-commit vs. post-commit failure handling (git::CommitSyncError) —
     // create_document / edit_document / delete_document
@@ -8562,8 +8674,13 @@ mod tests {
             head_sha(&work),
             "HEAD must not move on a rolled-back pre-commit failure"
         );
+        // (#229) `delete_document` now unconditionally opens the state DB for
+        // the inbound-link check, which lazily materializes `state.db`/`-shm`/
+        // `-wal` under `work` — see `git_status_ignoring_state_db`'s doc
+        // comment for why that is an expected, unrelated side effect rather
+        // than evidence the rollback itself left something dirty.
         assert_eq!(
-            git_status(&work),
+            git_status_ignoring_state_db(&work),
             "",
             "working tree must be clean after rollback"
         );
@@ -9424,9 +9541,11 @@ mod tests {
     /// (`documents_broken_by`) opens the metadata index on first use, which lazily
     /// creates those files under `work` as an ordinary, expected side effect of
     /// running the tool at all — unrelated to whether a `commit_and_sync` rollback
-    /// left the WRITE ITSELF clean. `create_document`/`edit_document`/
-    /// `delete_document`'s equivalent tests never touch the metadata index this way,
-    /// which is why their plain `git_status` assertions can stay exact.
+    /// left the WRITE ITSELF clean. `delete_document` does the same (#229: it always
+    /// opens the state DB for the inbound-link check, unlike a MOVE's conditional
+    /// open), so its tests need this filtered helper too. `create_document`/plain
+    /// `edit_document` (no `new_path`) never touch the metadata index at all, so
+    /// their equivalent tests can keep the plain, exact `git_status` assertion.
     fn git_status_ignoring_state_db(work: &tempfile::TempDir) -> String {
         git_status(work)
             .lines()

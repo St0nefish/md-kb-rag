@@ -327,6 +327,17 @@ pub struct WriteSuccess {
     /// which ones is not acceptable — callers must report this list, not just
     /// the move's own source/destination.
     pub rewritten_paths: Vec<String>,
+    /// (#229) Repo-relative paths of OTHER documents that still link to the
+    /// document just DELETED, per `StateDb::links_targeting`'s reverse lookup.
+    /// Always empty for a create/edit/move — only `delete_document` populates
+    /// this, and only when `WriteDeps::state` is `Some` (see that field's doc
+    /// comment) and at least one referencing document exists. `delete_document`
+    /// does not refuse the delete or rewrite these documents — see its own
+    /// comment for why a dangling link here is treated as self-healing, same
+    /// as everywhere else in this pipeline — this field exists purely so a
+    /// caller with no access to server logs (the `warn!` #181 added) can still
+    /// learn what it warned about and decide whether follow-up work is needed.
+    pub referencing_paths: Vec<String>,
 }
 
 /// Every structured failure mode of the write pipeline. Callers map these onto
@@ -992,6 +1003,8 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
                 sync_failure_cause: Some(format!("{:#}", source)),
                 // Not a move — nothing else was rewritten.
                 rewritten_paths: Vec::new(),
+                // Not a delete — nothing else was checked for inbound links.
+                referencing_paths: Vec::new(),
             });
         }
     };
@@ -1014,6 +1027,8 @@ pub async fn write_document<E: QueryEmbedder, Q: RetrievalStore>(
         sync_failure_cause: None,
         // Not a move — nothing else was rewritten.
         rewritten_paths: Vec::new(),
+        // Not a delete — nothing else was checked for inbound links.
+        referencing_paths: Vec::new(),
     })
 }
 
@@ -1622,6 +1637,8 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
                 diff: render_unified_diff(old_content, &content_to_write, dest_rel),
                 sync_failure_cause: Some(format!("{:#}", source_err)),
                 rewritten_paths,
+                // Not a delete — nothing else was checked for inbound links.
+                referencing_paths: Vec::new(),
             });
         }
     };
@@ -1647,6 +1664,8 @@ async fn write_document_move<E: QueryEmbedder, Q: RetrievalStore>(
         rebased_paths: commit_outcome.rebased_paths,
         sync_failure_cause: None,
         rewritten_paths,
+        // Not a delete — nothing else was checked for inbound links.
+        referencing_paths: Vec::new(),
     })
 }
 
@@ -2972,13 +2991,16 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     })?;
 
     // Best-effort: warn if anything else in the KB still links to the document
-    // about to be deleted (#181). `StateDb::links_targeting` is the exact same
-    // reverse-link query `write_document_move`'s step 10.5 already runs to find
-    // documents whose body needs rewriting — reused here purely to look, not to
-    // touch anything.
+    // about to be deleted (#181), and (#229) carry the same paths through to
+    // `WriteSuccess::referencing_paths` — a `warn!` reaches an operator tailing
+    // the server, not the caller (usually an agent with no log access), which
+    // is the party actually deciding whether the delete was a good idea.
+    // `StateDb::links_targeting` is the exact same reverse-link query
+    // `write_document_move`'s step 10.5 already runs to find documents whose
+    // body needs rewriting — reused here purely to look, not to touch anything.
     //
-    // Deliberately WARN, not refuse: this codebase's established stance on a
-    // stale/dangling link is "self-heal, don't block" — `write_document_move`
+    // Deliberately WARN/report, not refuse: this codebase's established stance
+    // on a stale/dangling link is "self-heal, don't block" — `write_document_move`
     // and `move_directory` both skip a referencing document outright rather
     // than fail the whole operation when a `document_links` row turns out to
     // be stale, and a referencing document's OWN next reindex rebuilds its
@@ -2987,12 +3009,13 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
     // dangling link behaves no differently from that already-accepted case.
     // Refusing outright would also need a `force` escape hatch threaded
     // through every caller's request shape — the MCP tool's parameter schema
-    // and the HTTP API's request body — which is a cross-cutting change to
-    // both transports, not something this transport-agnostic pipeline should
-    // decide unilaterally. `deps.state` is `None` for callers with no
-    // `StateDb` wired up (see that field's doc comment on `WriteDeps`); this
-    // is skipped silently in that case, same as the move path's own reverse-
-    // link query.
+    // and the HTTP API's request body — which is a cross-cutting change this
+    // transport-agnostic pipeline should not decide unilaterally (see #229).
+    // `deps.state` is `None` for callers with no `StateDb` wired up (see that
+    // field's doc comment on `WriteDeps`); this is skipped silently in that
+    // case, same as the move path's own reverse-link query — `referencing_paths`
+    // then stays empty, indistinguishable from "checked, found nothing".
+    let mut referencing_paths: Vec<String> = Vec::new();
     if let Some(state) = deps.state {
         match state.links_targeting(rel_path, "markdown").await {
             Ok(inbound) if !inbound.is_empty() => {
@@ -3005,6 +3028,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                     inbound.len(),
                     inbound.join(", ")
                 );
+                referencing_paths = inbound;
             }
             Ok(_) => {}
             Err(e) => {
@@ -3124,6 +3148,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
                 // the referencing document's own next reindex, same as any
                 // other stale `document_links` row.
                 rewritten_paths: Vec::new(),
+                referencing_paths,
             });
         }
     };
@@ -3146,6 +3171,7 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
         rebased_paths: commit_outcome.rebased_paths,
         sync_failure_cause: None,
         rewritten_paths: Vec::new(),
+        referencing_paths,
     })
 }
 
@@ -4220,12 +4246,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #181 — delete_document warns about inbound links instead of silently
-    // orphaning them. `WriteSuccess`/`WriteError` carry no field for this (a
-    // struct/enum change here would ripple into mcp.rs's and web.rs's own
-    // exhaustive matches and literals, outside this module's scope), so the
-    // only externally observable evidence the check ran at all is the
-    // `warn!` log line. `CapturedLogs` below is a minimal
+    // #181 / #229 — delete_document warns about inbound links instead of
+    // silently orphaning them, AND (#229) surfaces the same referencing paths
+    // on `WriteSuccess::referencing_paths` so a caller with no access to
+    // server logs can see them too. `CapturedLogs` below is a minimal
     // `tracing_subscriber::fmt::MakeWriter` that redirects exactly the calls
     // made while its guard is alive into an in-memory buffer a test can
     // assert on — `tracing::subscriber::set_default`'s guard scopes it to
@@ -4322,6 +4346,12 @@ mod tests {
             log_text.contains("linked.md"),
             "expected the warning to name the document being deleted too, got log: {log_text:?}"
         );
+        assert_eq!(
+            success.referencing_paths,
+            vec!["referencer.md".to_string()],
+            "#229: the same referencing path must also reach the caller via \
+             WriteSuccess, not just the server log"
+        );
     }
 
     #[tokio::test]
@@ -4340,7 +4370,7 @@ mod tests {
         let harness = git_backed_harness_with_state_db(&work).await;
 
         let (captured, guard) = capture_warnings();
-        delete_document(&harness.deps(), "unlinked.md", None)
+        let success = delete_document(&harness.deps(), "unlinked.md", None)
             .await
             .unwrap();
         drop(guard);
@@ -4349,6 +4379,10 @@ mod tests {
             captured.text().is_empty(),
             "no inbound links means no warning, got log: {:?}",
             captured.text()
+        );
+        assert!(
+            success.referencing_paths.is_empty(),
+            "#229: no inbound links means an empty referencing_paths too"
         );
     }
 
@@ -4377,6 +4411,11 @@ mod tests {
 
         assert_eq!(success.outcome, WriteOutcome::Synced);
         assert!(captured.text().is_empty());
+        assert!(
+            success.referencing_paths.is_empty(),
+            "#229: with no state DB wired up, referencing_paths must stay empty, \
+             same as the warning it mirrors"
+        );
     }
 
     // -----------------------------------------------------------------------
