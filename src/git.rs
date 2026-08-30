@@ -962,6 +962,143 @@ async fn run_abort(_lock: &GitLock, repo: &Path, args: &[&str]) -> anyhow::Resul
 pub(crate) mod tests {
     use super::*;
 
+    /// Build a `git` `Command` for a test fixture, pinned against the escape
+    /// hatch in #218.
+    ///
+    /// Git resolves "the repository" by walking *up* from the working
+    /// directory until it finds a `.git`. Every fixture in this module runs
+    /// git inside a `tempfile::TempDir`, and several call sites (`init`,
+    /// `clone` into an empty dir, the first `add`/`commit` before either has
+    /// run) execute before that directory necessarily contains a `.git` of
+    /// its own. Normally `TMPDIR` is `/tmp`, which sits outside any repo, so
+    /// the upward walk finds nothing and the gap is invisible. Point `TMPDIR`
+    /// at a path inside a real checkout instead (done twice by agents working
+    /// in git worktrees, to dodge a full `/tmp` tmpfs) and that same walk
+    /// finds the checkout's `.git` and silently commits to it — see #218 for
+    /// two independent incidents.
+    ///
+    /// `GIT_CEILING_DIRECTORIES` tells git which directories it must not climb
+    /// *into* while searching upward. Critically that means the ceiling has to
+    /// be `dir`'s **parent**, not `dir` itself — `dir` is where the search
+    /// starts, so listing it as a ceiling is a no-op and the walk still
+    /// escapes (verified empirically: `GIT_CEILING_DIRECTORIES=$fixture` did
+    /// nothing, `GIT_CEILING_DIRECTORIES=$(dirname $fixture)` stopped it cold,
+    /// turning the escape into a clean "not a git repository" error). Every
+    /// git invocation in this test module must be built through this helper
+    /// rather than calling `std::process::Command::new("git")` directly —
+    /// the protection is only worth anything if it is uniform across all of
+    /// them (~40 call sites) — and `git_ceiling_directories_blocks_escape`
+    /// below is the regression test proving it holds.
+    fn git_test_cmd(dir: impl AsRef<Path>) -> std::process::Command {
+        let dir = dir.as_ref();
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(dir);
+        // Fall back to `dir` itself only if it has no parent (e.g. a root),
+        // which no real fixture path ever is — this just avoids a panic.
+        cmd.env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap_or(dir));
+        cmd
+    }
+
+    /// Regression test for #218: point a fixture's working directory inside a
+    /// real (scratch) git repository — the exact misconfiguration that let
+    /// git-backed tests silently commit to an enclosing checkout — and assert
+    /// that repo's `HEAD` is untouched after running fixture git commands
+    /// through [`git_test_cmd`]. Without the `GIT_CEILING_DIRECTORIES` guard
+    /// this test fails: `git add`/`commit` run from `enclosing/nested` (which
+    /// has no `.git` of its own) walk up, find `enclosing`'s `.git`, and stage
+    /// / commit into the real repo instead of erroring out.
+    #[test]
+    fn git_ceiling_directories_blocks_escape() {
+        let enclosing = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(enclosing.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(enclosing.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(enclosing.path())
+            .output()
+            .unwrap();
+        std::fs::write(enclosing.path().join("seed.md"), "seed").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "seed.md"])
+            .current_dir(enclosing.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "seed commit"])
+            .current_dir(enclosing.path())
+            .output()
+            .unwrap();
+        let head_before = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(enclosing.path())
+            .output()
+            .unwrap();
+        let head_before = String::from_utf8_lossy(&head_before.stdout).to_string();
+
+        // A fixture directory nested inside the "real" repo, with no `.git`
+        // of its own -- this is the shape `TMPDIR` pointed inside a worktree
+        // produces: every `tempfile::TempDir::new()` lands somewhere under
+        // an enclosing checkout.
+        let fixture = enclosing.path().join("nested_fixture");
+        std::fs::create_dir(&fixture).unwrap();
+        std::fs::write(fixture.join("stray.md"), "should never be committed").unwrap();
+
+        // Without the ceiling guard, both of these would walk up into
+        // `enclosing`'s `.git` and stage/commit `stray.md` there.
+        git_test_cmd(&fixture)
+            .args(["add", "stray.md"])
+            .output()
+            .unwrap();
+        let commit_out = git_test_cmd(&fixture)
+            .args(["commit", "-m", "should fail: no repo here"])
+            .output()
+            .unwrap();
+        assert!(
+            !commit_out.status.success(),
+            "commit from a non-repo fixture dir must fail once GIT_CEILING_DIRECTORIES \
+             blocks upward discovery, not silently land in the enclosing repo"
+        );
+
+        let head_after = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(enclosing.path())
+            .output()
+            .unwrap();
+        let head_after = String::from_utf8_lossy(&head_after.stdout).to_string();
+        assert_eq!(
+            head_before, head_after,
+            "the enclosing repo's HEAD must be untouched by a fixture command \
+             that never found a .git of its own"
+        );
+
+        // Check the INDEX specifically, not `git status --porcelain`: the
+        // fixture directory (`nested_fixture/`, containing `stray.md`) is a
+        // real subdirectory of `enclosing` and will show up there as an
+        // untracked path regardless of whether the ceiling guard worked --
+        // that's expected and not what this test is protecting against. What
+        // must never happen is `stray.md` landing in the enclosing repo's
+        // index (staged) or history (committed); the `HEAD` check above
+        // already covers history, so this covers staging.
+        let diff_cached = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(enclosing.path())
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&diff_cached.stdout).is_empty(),
+            "the enclosing repo's index must be untouched -- stray.md must \
+             never have been staged into it"
+        );
+    }
+
     // --- inject_token_into_url tests ---
 
     #[test]
@@ -1046,31 +1183,27 @@ pub(crate) mod tests {
         let bare_path = bare_dir.path();
 
         // Init bare repo
-        std::process::Command::new("git")
+        git_test_cmd(bare_path)
             .args(["init", "--bare", "--initial-branch", branch])
-            .current_dir(bare_path)
             .output()
             .unwrap();
 
         // Create a temporary working clone to make an initial commit
         let work_dir = tempfile::TempDir::new().unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_dir.path())
             .args(["clone", bare_path.to_str().unwrap(), "."])
-            .current_dir(work_dir.path())
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_dir.path())
             .args(["checkout", "-b", branch])
-            .current_dir(work_dir.path())
             .output()
             .unwrap();
         std::fs::write(work_dir.path().join("README.md"), "# Test repo").unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_dir.path())
             .args(["add", "README.md"])
-            .current_dir(work_dir.path())
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_dir.path())
             .args([
                 "-c",
                 "user.email=test@test.com",
@@ -1080,12 +1213,10 @@ pub(crate) mod tests {
                 "-m",
                 "initial commit",
             ])
-            .current_dir(work_dir.path())
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_dir.path())
             .args(["push", "origin", branch])
-            .current_dir(work_dir.path())
             .output()
             .unwrap();
 
@@ -1296,15 +1427,13 @@ pub(crate) mod tests {
     /// `pub(crate)` so `mcp.rs`'s write-tool tests can build a real repo fixture.
     pub(crate) fn clone_bare_repo(bare_path: &std::path::Path, branch: &str) -> tempfile::TempDir {
         let work_dir = tempfile::TempDir::new().unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_dir.path())
             .args(["clone", bare_path.to_str().unwrap(), "."])
-            .current_dir(work_dir.path())
             .output()
             .unwrap();
         // Ensure we're on the right branch
-        std::process::Command::new("git")
+        git_test_cmd(work_dir.path())
             .args(["checkout", branch])
-            .current_dir(work_dir.path())
             .output()
             .unwrap();
         work_dir
@@ -1349,7 +1478,7 @@ pub(crate) mod tests {
         );
 
         // The file should be committed (git show HEAD should include it)
-        let show_out = std::process::Command::new("git")
+        let show_out = git_test_cmd(work_path)
             .args([
                 "-c",
                 &format!("safe.directory={}", work_path),
@@ -1358,7 +1487,6 @@ pub(crate) mod tests {
                 "--format=",
                 "HEAD",
             ])
-            .current_dir(work_path)
             .output()
             .unwrap();
         let show_str = String::from_utf8_lossy(&show_out.stdout);
@@ -1410,9 +1538,8 @@ pub(crate) mod tests {
 
         // Verify the commit made it to the bare remote by cloning it fresh
         let verify_dir = tempfile::TempDir::new().unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(verify_dir.path())
             .args(["clone", bare.path().to_str().unwrap(), "."])
-            .current_dir(verify_dir.path())
             .output()
             .unwrap();
         assert!(
@@ -1457,9 +1584,8 @@ pub(crate) mod tests {
         // which we saved before A pushed. Since we can't travel back in time, instead:
         // - Let work_b clone from bare (which now has A's commit)
         // - Then use git reset --hard to go back to the parent and commit something diverging
-        let log_out = std::process::Command::new("git")
+        let log_out = git_test_cmd(work_b.path())
             .args(["log", "--format=%H", "-2"])
-            .current_dir(work_b.path())
             .output()
             .unwrap();
         let commits: Vec<&str> = std::str::from_utf8(&log_out.stdout)
@@ -1470,9 +1596,8 @@ pub(crate) mod tests {
         let parent_sha = commits[1].trim();
 
         // Reset to before A's commit
-        std::process::Command::new("git")
+        git_test_cmd(work_b.path())
             .args(["reset", "--hard", parent_sha])
-            .current_dir(work_b.path())
             .output()
             .unwrap();
 
@@ -1541,9 +1666,8 @@ pub(crate) mod tests {
         // Clone B was cloned BEFORE A pushed (from the original bare state), so its
         // own commit_and_sync call must fetch + rebase onto A's commit to push.
         let work_b = clone_bare_repo(bare.path(), "main");
-        let log_out = std::process::Command::new("git")
+        let log_out = git_test_cmd(work_b.path())
             .args(["log", "--format=%H", "-2"])
-            .current_dir(work_b.path())
             .output()
             .unwrap();
         let commits: Vec<&str> = std::str::from_utf8(&log_out.stdout)
@@ -1551,9 +1675,8 @@ pub(crate) mod tests {
             .lines()
             .collect();
         let parent_sha = commits[1].trim();
-        std::process::Command::new("git")
+        git_test_cmd(work_b.path())
             .args(["reset", "--hard", parent_sha])
-            .current_dir(work_b.path())
             .output()
             .unwrap();
 
@@ -1592,9 +1715,8 @@ pub(crate) mod tests {
         // while a machine WITHOUT one fails the rebase outright (the unwrap above
         // fails). Asserting only that the call succeeded would catch it in CI alone,
         // and would pass locally while shipping the bug.
-        let committer = std::process::Command::new("git")
+        let committer = git_test_cmd(work_b.path())
             .args(["log", "-1", "--format=%cn|%ce"])
-            .current_dir(work_b.path())
             .output()
             .unwrap();
         assert_eq!(
@@ -1620,12 +1742,11 @@ pub(crate) mod tests {
         let old_head = rev_parse_head(&lock, work_path).await.unwrap();
 
         std::fs::write(work.path().join("café.md"), "content").unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_path)
             .args(["add", "café.md"])
-            .current_dir(work_path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_path)
             .args([
                 "-c",
                 "user.email=test@test.com",
@@ -1635,7 +1756,6 @@ pub(crate) mod tests {
                 "-m",
                 "add café.md",
             ])
-            .current_dir(work_path)
             .output()
             .unwrap();
         let new_head = rev_parse_head(&lock, work_path).await.unwrap();
@@ -1734,12 +1854,11 @@ pub(crate) mod tests {
         // Commit 1: add both files.
         std::fs::write(work.path().join("a.md"), "a v1").unwrap();
         std::fs::write(work.path().join("b.md"), "b v1").unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_path)
             .args(["add", "a.md", "b.md"])
-            .current_dir(work_path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_path)
             .args([
                 "-c",
                 "user.email=test@test.com",
@@ -1755,19 +1874,17 @@ pub(crate) mod tests {
             // depend on whatever TZ the test happens to run under.
             .env("GIT_AUTHOR_DATE", "@1577836800 +0000")
             .env("GIT_COMMITTER_DATE", "@1577836800 +0000")
-            .current_dir(work_path)
             .output()
             .unwrap();
 
         // Commit 2: touch only a.md, well after commit 1 — this is the case #164
         // exists for: a.md's true last-modified time must move; b.md's must not.
         std::fs::write(work.path().join("a.md"), "a v2").unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_path)
             .args(["add", "a.md"])
-            .current_dir(work_path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_path)
             .args([
                 "-c",
                 "user.email=test@test.com",
@@ -1779,7 +1896,6 @@ pub(crate) mod tests {
             ])
             .env("GIT_AUTHOR_DATE", "@1623758400 +0000")
             .env("GIT_COMMITTER_DATE", "@1623758400 +0000")
-            .current_dir(work_path)
             .output()
             .unwrap();
 
@@ -1849,9 +1965,8 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let show_out = std::process::Command::new("git")
+        let show_out = git_test_cmd(work_path)
             .args(["show", "--name-only", "--format=", "HEAD"])
-            .current_dir(work_path)
             .output()
             .unwrap();
         let show_str = String::from_utf8_lossy(&show_out.stdout);
@@ -1860,13 +1975,12 @@ pub(crate) mod tests {
             "both paths should appear in the single commit, got: {show_str}"
         );
 
-        let log = std::process::Command::new("git")
+        let log = git_test_cmd(work_path)
             .args([
                 "rev-list",
                 "--count",
                 &format!("{head_before}..{}", outcome.sha),
             ])
-            .current_dir(work_path)
             .output()
             .unwrap();
         let count = String::from_utf8_lossy(&log.stdout).trim().to_string();
@@ -1921,13 +2035,12 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let log = std::process::Command::new("git")
+        let log = git_test_cmd(work_path)
             .args([
                 "rev-list",
                 "--count",
                 &format!("{head_before_move}..{}", outcome.sha),
             ])
-            .current_dir(work_path)
             .output()
             .unwrap();
         let count = String::from_utf8_lossy(&log.stdout).trim().to_string();
@@ -1936,9 +2049,8 @@ pub(crate) mod tests {
             "the move should land as exactly one commit, got {count}"
         );
 
-        let name_status = std::process::Command::new("git")
+        let name_status = git_test_cmd(work_path)
             .args(["show", "--name-status", "--format=", "HEAD"])
-            .current_dir(work_path)
             .output()
             .unwrap();
         let name_status_str = String::from_utf8_lossy(&name_status.stdout);
@@ -2077,13 +2189,12 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let log = std::process::Command::new("git")
+        let log = git_test_cmd(work_path)
             .args([
                 "rev-list",
                 "--count",
                 &format!("{head_before}..{}", outcome.sha),
             ])
-            .current_dir(work_path)
             .output()
             .unwrap();
         let count = String::from_utf8_lossy(&log.stdout).trim().to_string();
@@ -2323,9 +2434,8 @@ pub(crate) mod tests {
 
         // The commit must actually be present in the local repo's history — a
         // PostCommit failure must never be rolled back.
-        let show_out = std::process::Command::new("git")
+        let show_out = git_test_cmd(work_path)
             .args(["show", "--name-only", "--format=", "HEAD"])
-            .current_dir(work_path)
             .output()
             .unwrap();
         let show_str = String::from_utf8_lossy(&show_out.stdout);
@@ -2427,9 +2537,8 @@ pub(crate) mod tests {
         // Clone B, rewound to before A's push, so its own `commit_and_sync` call
         // below must fetch + rebase onto A's commit before attempting to push.
         let work_b = clone_bare_repo(bare.path(), "main");
-        let log_out = std::process::Command::new("git")
+        let log_out = git_test_cmd(work_b.path())
             .args(["log", "--format=%H", "-2"])
-            .current_dir(work_b.path())
             .output()
             .unwrap();
         let commits: Vec<&str> = std::str::from_utf8(&log_out.stdout)
@@ -2437,9 +2546,8 @@ pub(crate) mod tests {
             .lines()
             .collect();
         let parent_sha = commits[1].trim();
-        std::process::Command::new("git")
+        git_test_cmd(work_b.path())
             .args(["reset", "--hard", parent_sha])
-            .current_dir(work_b.path())
             .output()
             .unwrap();
 
@@ -2489,9 +2597,8 @@ pub(crate) mod tests {
             "the reported sha must be the CURRENT local HEAD (the post-rebase \
              replay), not the pre-rebase sha the replay orphaned"
         );
-        let cat_file = std::process::Command::new("git")
+        let cat_file = git_test_cmd(work_b.path())
             .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
-            .current_dir(work_b.path())
             .output()
             .unwrap();
         assert!(
@@ -2540,9 +2647,8 @@ pub(crate) mod tests {
         // (repo-locally), and setting it globally is a common enough habit that
         // the test must not depend on its absence. Repo-local config wins over
         // global, so writing it here makes the hook fire either way.
-        std::process::Command::new("git")
+        git_test_cmd(bare)
             .args(["config", "core.hooksPath", hooks_dir.to_str().unwrap()])
-            .current_dir(bare)
             .output()
             .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2564,9 +2670,8 @@ pub(crate) mod tests {
         // exists at HEAD — simulate `delete_document` staging its removal and then
         // failing before `git commit` lands.
         std::fs::remove_file(work.path().join("README.md")).unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_path)
             .args(["add", "--", "README.md"])
-            .current_dir(work_path)
             .output()
             .unwrap();
         assert!(!work.path().join("README.md").exists());
@@ -2585,9 +2690,8 @@ pub(crate) mod tests {
             "# Test repo",
             "restored content must match HEAD"
         );
-        let status = std::process::Command::new("git")
+        let status = git_test_cmd(work_path)
             .args(["status", "--porcelain"])
-            .current_dir(work_path)
             .output()
             .unwrap();
         assert!(
@@ -2648,15 +2752,13 @@ pub(crate) mod tests {
         let work_path = work.path().to_str().unwrap();
 
         std::fs::write(work.path().join("newfile.md"), "new content").unwrap();
-        std::process::Command::new("git")
+        git_test_cmd(work_path)
             .args(["add", "--", "newfile.md"])
-            .current_dir(work_path)
             .output()
             .unwrap();
 
-        let status_before = std::process::Command::new("git")
+        let status_before = git_test_cmd(work_path)
             .args(["status", "--porcelain"])
-            .current_dir(work_path)
             .output()
             .unwrap();
         assert_eq!(
@@ -2667,9 +2769,8 @@ pub(crate) mod tests {
         let lock = lock_git().await;
         unstage(&lock, work_path, "newfile.md").await.unwrap();
 
-        let status_after = std::process::Command::new("git")
+        let status_after = git_test_cmd(work_path)
             .args(["status", "--porcelain"])
-            .current_dir(work_path)
             .output()
             .unwrap();
         assert_eq!(
@@ -2771,10 +2872,9 @@ pub(crate) mod tests {
 
     /// Helper: `git` in `work_path` with `safe.directory` set, returning stdout.
     fn git_out(work_path: &str, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        let out = git_test_cmd(work_path)
             .args(["-c", &format!("safe.directory={}", work_path)])
             .args(args)
-            .current_dir(work_path)
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).to_string()
@@ -2972,7 +3072,7 @@ pub(crate) mod tests {
         // Fetch and rebase manually, WITHOUT aborting on failure — this is what
         // leaves `.git/rebase-merge` behind for recovery to find.
         git_out(work_b_path, &["fetch", &bare_url, "main"]);
-        let rebase_out = std::process::Command::new("git")
+        let rebase_out = git_test_cmd(work_b_path)
             .args([
                 "-c",
                 "user.email=test@test.com",
@@ -2981,7 +3081,6 @@ pub(crate) mod tests {
                 "rebase",
                 "FETCH_HEAD",
             ])
-            .current_dir(work_b_path)
             .output()
             .unwrap();
         assert!(
@@ -3050,7 +3149,7 @@ pub(crate) mod tests {
             ],
         );
 
-        let merge_out = std::process::Command::new("git")
+        let merge_out = git_test_cmd(work_path)
             .args([
                 "-c",
                 "user.email=test@test.com",
@@ -3059,7 +3158,6 @@ pub(crate) mod tests {
                 "merge",
                 "other",
             ])
-            .current_dir(work_path)
             .output()
             .unwrap();
         assert!(!merge_out.status.success(), "expected a genuine conflict");
