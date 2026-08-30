@@ -367,22 +367,46 @@ async fn main() -> anyhow::Result<()> {
             // filesystem `discover_files` just walked above — see
             // `state::StateDb::broken_markdown_links`'s doc comment for why that
             // distinction matters and why a stale report presented as live would be
-            // worse than none. `validate` may run against a KB that has never been
-            // indexed (state DB parent dir not yet created), so ensure it first —
-            // same as `Commands::Index`.
-            if let Some(parent) = std::path::Path::new(&cfg.state_db_path()).parent() {
-                std::fs::create_dir_all(parent)
-                    .context("Failed to create directory for state DB")?;
-            }
-            let state_for_links =
-                state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
-            let dangling_links = state_for_links.broken_markdown_links().await?;
-            let links_report = validate::broken_links_report(dangling_links, data_path);
+            // worse than none.
+            //
+            // Deliberately does NOT create the state DB (#238). `validate` is a
+            // read-only check an operator runs by hand, often as themselves and
+            // often before the stack has ever started; `StateDb::new` creates and
+            // migrates the file, so creating it here would leave
+            // `<data_path>/state.db` owned by the operator and unwritable by the
+            // container's uid 65532 — the same failure #192 needed a documented
+            // manual `chown` to escape. A report has no business creating the store
+            // it reads.
+            //
+            // No index yet is a normal state, not an error: say so and skip the
+            // section rather than failing a frontmatter check on a missing database.
+            let state_db_path = cfg.state_db_path();
+            if std::path::Path::new(&state_db_path).exists() {
+                let state_for_links =
+                    state::StateDb::new(std::path::Path::new(&state_db_path)).await?;
+                let dangling_links = state_for_links.broken_markdown_links().await?;
+                let links_report = validate::broken_links_report(dangling_links, data_path);
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&links_report)?);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&links_report)?);
+                } else {
+                    let _ = write_broken_links(&mut std::io::stderr().lock(), &links_report);
+                }
+            } else if json {
+                // Keep stdout parseable either way — a caller piping this into a
+                // parser should get a well-formed empty report, not nothing.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&validate::broken_links_report(
+                        Vec::new(),
+                        data_path
+                    ))?
+                );
             } else {
-                let _ = write_broken_links(&mut std::io::stderr().lock(), &links_report);
+                eprintln!(
+                    "\nBROKEN LINKS: skipped — no index at {state_db_path}. \
+                     Run `md-kb-rag index` first."
+                );
             }
 
             // Severity split from frontmatter failures, deliberately: a broken link
