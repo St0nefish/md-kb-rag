@@ -9,7 +9,7 @@ use qdrant_client::qdrant::{
     QueryPointGroupsBuilder, QueryPointsBuilder, Range, SearchPointsBuilder,
     SparseVectorParamsBuilder, SparseVectorsConfigBuilder, TextIndexParamsBuilder, TokenizerType,
     UpsertPointsBuilder, Value as QdrantValue, Vector, VectorInput, VectorParamsBuilder,
-    VectorsConfigBuilder, facet_value, value::Kind,
+    VectorsConfigBuilder, facet_value, value::Kind, vectors_config::Config as VectorsConfigOneof,
 };
 use tracing::{debug, error, info, warn};
 
@@ -729,6 +729,60 @@ impl QdrantStore {
             info!("Created collection '{}'", collection);
         } else {
             debug!("Collection '{}' already exists", collection);
+
+            // #159: an existing collection's dense-vector dimension is never revisited
+            // here otherwise — the block above only sets `vectors_config` when the
+            // collection is being created fresh. If an operator changes
+            // `embedding.vector_size` (or swaps to a differently-dimensioned embedding
+            // model) in config.yaml and restarts `serve` with a plain restart — not
+            // `md-kb-rag index --full`, which always `drop_collection`s before calling
+            // this (see `ingest::index_paths`) — the mismatch used to go uncaught here
+            // and surface only much later, as a dimension-mismatch error out of
+            // `upsert_pending`'s embed/upsert call. That error contains no
+            // `"(strict mode)"` substring, so `reindex::is_permanent_failure`
+            // misclassified it as transient: retried `MAX_RETRY_ATTEMPTS` times with
+            // backoff, then repeated by every subsequent periodic reconcile sweep,
+            // forever, with nothing in the log pointing at the actual cause. Catch it
+            // here instead, loudly and immediately, before a single point is ever
+            // embedded against the wrong dimension.
+            let info = self
+                .client
+                .collection_info(collection)
+                .await
+                .context("Failed to fetch existing collection info for a dimension check")?;
+
+            let existing_size = info
+                .result
+                .and_then(|r| r.config)
+                .and_then(|c| c.params)
+                .and_then(|p| {
+                    p.vectors_config
+                        .and_then(|vc| vc.config)
+                        .and_then(|cfg| match cfg {
+                            // The dense vector is always named "dense" (see the `!exists`
+                            // branch above), so a `ParamsMap` collection looks it up by name.
+                            // The unnamed `Params` variant is handled too, defensively — it
+                            // would only appear if a collection were ever created outside this
+                            // function's own vectors_config shape.
+                            VectorsConfigOneof::Params(p) => Some(p.size),
+                            VectorsConfigOneof::ParamsMap(m) => m.map.get("dense").map(|p| p.size),
+                        })
+                });
+
+            if let Some(existing_size) = existing_size
+                && existing_size != vector_size
+            {
+                anyhow::bail!(
+                    "Qdrant collection '{collection}' already exists with dense-vector \
+                     dimension {existing_size}, but the configured embedding model \
+                     produces dimension {vector_size}. This usually means \
+                     `embedding.vector_size` (or the embedding model itself) changed \
+                     without a full reindex — a plain restart cannot fix this, since it \
+                     never rebuilds the collection (only `index --full` does, by \
+                     dropping it first). Run `md-kb-rag index --full` to drop and \
+                     rebuild the collection at the new dimension, then restart `serve`."
+                );
+            }
         }
 
         for indexed in indexed_fields {
@@ -1603,6 +1657,90 @@ mod tests {
             result.payload.get("text").and_then(|v| v.as_str()),
             Some("Hello world chunk"),
         );
+
+        // Clean up
+        store
+            .client
+            .delete_collection(&config.collection)
+            .await
+            .unwrap();
+    }
+
+    /// #159: `ensure_collection` against an EXISTING collection must reject a
+    /// dense-vector dimension mismatch instead of silently proceeding.
+    ///
+    /// Before the fix, the `else` (collection-already-exists) branch never looked at
+    /// the collection's actual configured dimension at all, so `ensure_collection`
+    /// with a different `vector_size` than what the collection was created with
+    /// returned `Ok(())` — reproducing the operator mistake #159 describes (an
+    /// `embedding.vector_size` config change, or a model swap, applied with a plain
+    /// `serve` restart instead of `index --full`). The mismatch would then surface
+    /// only much later and far less clearly, out of `upsert_pending`'s embed/upsert
+    /// call — and be misclassified as a transient failure and retried forever (see
+    /// `reindex::is_permanent_failure`'s doc comment).
+    ///
+    /// This assertion fails before the fix (`ensure_collection` returns `Ok(())` even
+    /// though the collection was created at a different dimension) and passes after
+    /// it (`Err`, naming both dimensions and pointing at `index --full`).
+    ///
+    /// Stays live-only — the thing under test is reading back Qdrant's own
+    /// server-stored `VectorParams.size` for an existing collection via
+    /// `collection_info`, which no fake `VectorStore` can stand in for without just
+    /// re-asserting the comparison logic.
+    ///
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test ensure_collection_rejects_a_dimension_mismatch -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn ensure_collection_rejects_a_dimension_mismatch() {
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: "test-dimension-mismatch".into(),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        // Create the collection at dimension 4 — as if indexed by an older embedding
+        // model.
+        store
+            .ensure_collection(&config.collection, 4, &[], false)
+            .await
+            .unwrap();
+
+        // A plain restart with a reconfigured (or swapped) embedding model now produces
+        // a different dimension, with no `drop_collection` in between — exactly what
+        // `index --full` would do, and a plain `serve` restart never does.
+        let result = store
+            .ensure_collection(&config.collection, 8, &[], false)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a dimension mismatch against an existing collection must be rejected"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains('4'),
+            "error should name the existing dimension: {msg}"
+        );
+        assert!(
+            msg.contains('8'),
+            "error should name the configured dimension: {msg}"
+        );
+        assert!(
+            msg.contains("index --full"),
+            "error should point at the fix: {msg}"
+        );
+
+        // A matching call (same dimension as what the collection already holds) must
+        // still be a no-op success — this is the overwhelmingly common case (every
+        // ordinary scoped indexing run calls `ensure_collection` again) and must not
+        // regress.
+        store
+            .ensure_collection(&config.collection, 4, &[], false)
+            .await
+            .expect("a matching dimension must not be rejected");
 
         // Clean up
         store
