@@ -138,8 +138,20 @@ enum Commands {
     /// Validate all markdown files without indexing
     Validate {
         /// Exit non-zero if any file fails validation, regardless of config strict setting
+        ///
+        /// Governs frontmatter/lint failures only. The BROKEN LINKS report (#158)
+        /// never affects the exit code even under --strict — see the Commands::Validate
+        /// handler's comment for why that severity split is deliberate.
         #[arg(long)]
         strict: bool,
+        /// Emit the BROKEN LINKS report as JSON on stdout
+        ///
+        /// Scoped deliberately to the broken-links report. Frontmatter results,
+        /// SCHEMA ERRORS and FROZEN still print as human-readable text on stderr
+        /// regardless of this flag — same stdout/stderr split `status --json`
+        /// uses, so the JSON on stdout is always parseable on its own.
+        #[arg(long)]
+        json: bool,
     },
     /// Print collection stats and state DB info
     Status {
@@ -289,7 +301,7 @@ async fn main() -> anyhow::Result<()> {
             }
             ingest::scan_and_index(&cfg, full, status::Trigger::Cli).await?;
         }
-        Commands::Validate { strict } => {
+        Commands::Validate { strict, json } => {
             let data_path = Path::new(cfg.data_path());
             let files = ingest::discover_files(data_path, &cfg.indexing)?;
             info!("Validating {} files", files.len());
@@ -351,6 +363,33 @@ async fn main() -> anyhow::Result<()> {
                 "Validation complete"
             );
 
+            // Broken links (#158): reads the state DB's last-indexed snapshot, not the
+            // filesystem `discover_files` just walked above — see
+            // `state::StateDb::broken_markdown_links`'s doc comment for why that
+            // distinction matters and why a stale report presented as live would be
+            // worse than none. `validate` may run against a KB that has never been
+            // indexed (state DB parent dir not yet created), so ensure it first —
+            // same as `Commands::Index`.
+            if let Some(parent) = std::path::Path::new(&cfg.state_db_path()).parent() {
+                std::fs::create_dir_all(parent)
+                    .context("Failed to create directory for state DB")?;
+            }
+            let state_for_links =
+                state::StateDb::new(std::path::Path::new(&cfg.state_db_path())).await?;
+            let dangling_links = state_for_links.broken_markdown_links().await?;
+            let links_report = validate::broken_links_report(dangling_links, data_path);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&links_report)?);
+            } else {
+                let _ = write_broken_links(&mut std::io::stderr().lock(), &links_report);
+            }
+
+            // Severity split from frontmatter failures, deliberately: a broken link
+            // is fixable but does not mean the KB's content is wrong the way a
+            // missing/mistyped frontmatter field does, so it never joins `broken`
+            // (schema errors) or `invalid_count` in the exit-code decision below,
+            // regardless of --strict.
             let strict = cfg.validation.strict || strict;
             if strict && !broken.is_empty() {
                 // A broken schema silently loosens validation for a whole subtree,
@@ -698,6 +737,43 @@ fn write_status(
         }
     }
 
+    Ok(())
+}
+
+/// Human-readable rendering of `validate`'s BROKEN LINKS section (#158). A pure
+/// writer function, mirroring [`write_status`], so the truncation-cap line and
+/// the staleness caveat are both assertable in tests rather than only exercised
+/// by running the CLI against a real state DB. Writes nothing when the report is
+/// empty — same "no section when there's nothing to say" convention the SCHEMA
+/// ERRORS/FROZEN sections in `Commands::Validate` already follow.
+fn write_broken_links(
+    w: &mut impl std::io::Write,
+    report: &validate::BrokenLinksReport,
+) -> std::io::Result<()> {
+    if report.by_source.is_empty() {
+        return Ok(());
+    }
+    let shown: usize = report
+        .by_source
+        .iter()
+        .map(|s| s.broken_targets.len())
+        .sum();
+    writeln!(
+        w,
+        "BROKEN LINKS ({shown} of {} author-written link(s) whose target the last index run \
+         did not find — reflects the state DB as of the last successful index, not necessarily \
+         the files on disk right now):",
+        report.total
+    )?;
+    for entry in &report.by_source {
+        writeln!(w, "  {}", entry.source_path)?;
+        for target in &entry.broken_targets {
+            writeln!(w, "    -> {}", target)?;
+        }
+    }
+    if report.truncated {
+        writeln!(w, "  … {} more not shown", report.total - shown)?;
+    }
     Ok(())
 }
 
@@ -1056,5 +1132,68 @@ mod tests {
     #[test]
     fn status_omits_the_error_section_when_everything_is_reachable() {
         assert!(!render(&base_status()).contains("Errors:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // write_broken_links (#158)
+    // -----------------------------------------------------------------------
+
+    fn render_broken_links(report: &validate::BrokenLinksReport) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        write_broken_links(&mut buf, report).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn write_broken_links_is_silent_on_a_clean_report() {
+        let report = validate::BrokenLinksReport {
+            by_source: vec![],
+            total: 0,
+            truncated: false,
+        };
+        assert!(
+            render_broken_links(&report).is_empty(),
+            "a clean report must print nothing, matching the SCHEMA ERRORS/FROZEN \
+             sections' convention of no section when there's nothing to say"
+        );
+    }
+
+    #[test]
+    fn write_broken_links_renders_grouped_by_source_with_the_staleness_caveat() {
+        let report = validate::BrokenLinksReport {
+            by_source: vec![validate::BrokenLinksBySource {
+                source_path: "a.md".into(),
+                broken_targets: vec!["missing.md".into()],
+            }],
+            total: 1,
+            truncated: false,
+        };
+        let out = render_broken_links(&report);
+        assert!(out.contains("BROKEN LINKS"), "{out}");
+        assert!(out.contains("a.md"), "{out}");
+        assert!(out.contains("missing.md"), "{out}");
+        assert!(
+            out.contains("last successful index"),
+            "the report must be honest that it reflects the state DB, not the current \
+             filesystem: {out}"
+        );
+    }
+
+    #[test]
+    fn write_broken_links_reports_the_truncation_cap_with_a_remainder_line() {
+        let report = validate::BrokenLinksReport {
+            by_source: vec![validate::BrokenLinksBySource {
+                source_path: "a.md".into(),
+                broken_targets: vec!["one.md".into()],
+            }],
+            total: 5,
+            truncated: true,
+        };
+        let out = render_broken_links(&report);
+        assert!(
+            out.contains("… 4 more not shown"),
+            "the remainder must be total - shown (5 - 1), so a capped report is never \
+             mistaken for a complete one: {out}"
+        );
     }
 }

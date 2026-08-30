@@ -374,6 +374,18 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
              indexing run or MCP write.",
         );
     }
+    if old.validation.lint_timeout_secs != new.validation.lint_timeout_secs {
+        r.record(
+            ReloadEffect::Applied,
+            "validation.lint_timeout_secs",
+            d(&old.validation.lint_timeout_secs),
+            d(&new.validation.lint_timeout_secs),
+            "read fresh per file validated, the same call site as \
+             validation.lint_command above (validate.rs) — bounds how long a \
+             configured lint command is allowed to run before that file's \
+             validation fails with a timeout.",
+        );
+    }
 
     // ── webhook ──────────────────────────────────────────────────────────────
     if old.webhook.secret_env != new.webhook.secret_env {
@@ -539,6 +551,19 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
     }
 
     // ── search ───────────────────────────────────────────────────────────────
+    if old.search.phrase != new.search.phrase {
+        r.record(
+            ReloadEffect::Applied,
+            "search.phrase",
+            d(&old.search.phrase),
+            d(&new.search.phrase),
+            "read fresh from the live config on every search call (mcp.rs/web.rs, \
+             gated by phrase_matching_available) and by the metadata-refresh \
+             timer (server.rs compose_server_instructions/compose_tool_overlay) \
+             that recomposes the server/tool description overlay so it never \
+             advertises quoted-phrase support the config just turned off.",
+        );
+    }
     if old.search.hybrid != new.search.hybrid {
         r.record(
             ReloadEffect::Applied,
@@ -622,6 +647,59 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
              but only takes effect when reranking was already enabled at startup; a \
              server that started with it disabled has no RerankClient to hand this \
              to regardless.",
+        );
+    }
+
+    // ── ui.semantic_edges ────────────────────────────────────────────────────
+    // #226: previously missing from this table entirely — every change below it
+    // reported nothing on reload, which reads as "did not take effect" even
+    // though the config genuinely is re-read on the next indexing run.
+    //
+    // Classified ReindexRequired, NOT Applied, despite the values being read
+    // fresh: `ingest::index_paths` passes `&config.ui.semantic_edges` fresh to
+    // `update_semantic_edges` on every run, but that call only covers `pending`
+    // — the files THAT RUN actually re-chunked/re-embedded (ingest.rs, right
+    // after `upsert_pending`). A reload's automatic full reconcile
+    // (`queue.mark_full()`, unconditional — see this function's doc comment)
+    // still goes through the worker's ordinary `scan_for_dirty`, which skips any
+    // file whose content hash is unchanged; only `md-kb-rag index --full`
+    // (`force = true`) bypasses that skip and reprocesses everything. So exactly
+    // like `chunking.*` above: flipping `ui.semantic_edges.enabled` on does not
+    // retroactively populate semantic edges for the existing corpus, and
+    // flipping it off does not retroactively remove already-computed ones —
+    // both only apply to documents a future run actually touches, same caveat,
+    // same fix (`md-kb-rag index --full`).
+    if old.ui.semantic_edges.enabled != new.ui.semantic_edges.enabled {
+        r.record(
+            ReloadEffect::ReindexRequired,
+            "ui.semantic_edges.enabled",
+            d(&old.ui.semantic_edges.enabled),
+            d(&new.ui.semantic_edges.enabled),
+            "read fresh by the indexer on the next run (ingest.rs \
+             update_semantic_edges), but only for documents that run re-embeds — \
+             existing (or missing) semantic edges in the graph view are \
+             unchanged otherwise. Run `md-kb-rag index --full` for a consistent \
+             corpus.",
+        );
+    }
+    if old.ui.semantic_edges.k != new.ui.semantic_edges.k {
+        r.record(
+            ReloadEffect::ReindexRequired,
+            "ui.semantic_edges.k",
+            d(&old.ui.semantic_edges.k),
+            d(&new.ui.semantic_edges.k),
+            "same as ui.semantic_edges.enabled: applies to future re-embeds only. \
+             Run `md-kb-rag index --full` for a consistent corpus.",
+        );
+    }
+    if old.ui.semantic_edges.min_score != new.ui.semantic_edges.min_score {
+        r.record(
+            ReloadEffect::ReindexRequired,
+            "ui.semantic_edges.min_score",
+            d(&old.ui.semantic_edges.min_score),
+            d(&new.ui.semantic_edges.min_score),
+            "same as ui.semantic_edges.enabled: applies to future re-embeds only. \
+             Run `md-kb-rag index --full` for a consistent corpus.",
         );
     }
 
@@ -840,5 +918,201 @@ mod tests {
         assert!(!live.search.hybrid, "the swap must actually take effect");
 
         clear_required_env();
+    }
+
+    // --- #226: ui.* reporting -------------------------------------------------
+
+    #[test]
+    fn ui_semantic_edges_changes_are_reported_as_reindex_required() {
+        // Regression test for #226: before this change, `diff()` had no entries
+        // at all for `ui.*` — a changed `ui.semantic_edges.*` setting produced an
+        // EMPTY report despite genuinely taking effect (on the next indexing run
+        // that touches a document), which reads to an operator as "did not
+        // apply" when it did. This must fail against the pre-#226 `diff()` (no
+        // ui.semantic_edges branch at all, so `report.is_empty()`) and pass now
+        // that the branch exists — and it must land under `reindex_required`,
+        // not `applied`: see the `ui.semantic_edges` section's comment in
+        // `diff()` for why (only future re-embeds pick it up, exactly like
+        // `chunking.*`).
+        let mut old = base_config();
+        let mut new = base_config();
+        old.ui.semantic_edges.enabled = false;
+        new.ui.semantic_edges.enabled = true;
+        old.ui.semantic_edges.k = 5;
+        new.ui.semantic_edges.k = 10;
+        old.ui.semantic_edges.min_score = 0.6;
+        new.ui.semantic_edges.min_score = 0.8;
+
+        let report = diff(&old, &new);
+        assert!(
+            report.applied.is_empty(),
+            "ui.semantic_edges.* must never be claimed as applied: {:?}",
+            report.applied
+        );
+        assert!(report.restart_required.is_empty());
+        assert_eq!(report.reindex_required.len(), 3);
+        let settings: std::collections::BTreeSet<&str> = report
+            .reindex_required
+            .iter()
+            .map(|c| c.setting.as_str())
+            .collect();
+        assert_eq!(
+            settings,
+            std::collections::BTreeSet::from([
+                "ui.semantic_edges.enabled",
+                "ui.semantic_edges.k",
+                "ui.semantic_edges.min_score",
+            ])
+        );
+    }
+
+    #[test]
+    fn search_phrase_is_reported_as_applied() {
+        // Also previously missing from `diff()` entirely, discovered by the
+        // #226 drift test below rather than named in the issue itself — the
+        // same drift class, just a different field.
+        let mut old = base_config();
+        let mut new = base_config();
+        old.search.phrase = true;
+        new.search.phrase = false;
+
+        let report = diff(&old, &new);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(report.applied[0].setting, "search.phrase");
+        assert!(report.restart_required.is_empty());
+        assert!(report.reindex_required.is_empty());
+    }
+
+    #[test]
+    fn validation_lint_timeout_secs_is_reported_as_applied() {
+        // Same story as `search_phrase_is_reported_as_applied` above.
+        let mut old = base_config();
+        let mut new = base_config();
+        old.validation.lint_timeout_secs = 30;
+        new.validation.lint_timeout_secs = 60;
+
+        let report = diff(&old, &new);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(report.applied[0].setting, "validation.lint_timeout_secs");
+    }
+
+    /// Every dotted setting [`diff`] actually compares — one entry per
+    /// underlying `Config`/`ResolvedConfig` field, not per "(consumer)"-suffixed
+    /// display variant (`source.git_token_env` and `indexing.include` each
+    /// produce TWO [`SettingChange`] rows from ONE `if old.X != new.X` check, for
+    /// their two independently-lifetimed consumers — see `diff`'s own comments
+    /// on those sections). This is [`diff`]'s counterpart to `config.rs`'s
+    /// `YAML_ONLY_SETTINGS`: a hand-maintained list documenting what real code
+    /// covers, checked below against the same programmatically-derived ground
+    /// truth (`config::config_setting_leaf_paths`) #144's test already
+    /// established — see that test for why deriving the ground truth beats
+    /// hand-listing it a second time.
+    ///
+    /// Two settings are deliberately absent, matching `diff`'s own doc comment
+    /// on why: `embedding.api_key_env` and `reranking.api_key_env` have no
+    /// `ResolvedConfig` field to diff at all — `Config::resolve_inner` looks the
+    /// env var up once and keeps only the resolved secret VALUE
+    /// (`ResolvedEmbeddingConfig::api_key`/`ResolvedRerankingConfig::api_key`),
+    /// discarding the var's name — so there is nothing here for `diff` to
+    /// compare regardless of classification.
+    const RELOAD_DIFF_SETTINGS: &[&str] = &[
+        "source.git_token_env",
+        "indexing.include",
+        "indexing.exclude",
+        "indexing.exclude_files",
+        "indexing.reconcile_interval_secs",
+        "frontmatter.required",
+        "frontmatter.indexed_fields",
+        "frontmatter.defaults",
+        "frontmatter.allowed",
+        "chunking.max_chunk_size",
+        "chunking.target_chunk_size",
+        "chunking.prepend_description",
+        "embedding.batch_size",
+        "embedding.request_timeout_secs",
+        "embedding.batch_concurrency",
+        "validation.enabled",
+        "validation.strict",
+        "validation.lint_command",
+        "validation.lint_timeout_secs",
+        "webhook.secret_env",
+        "webhook.provider",
+        "mcp.bearer_token_env",
+        "mcp.allow_unauthenticated",
+        "mcp.instructions",
+        "mcp.metadata_refresh_secs",
+        "mcp.allowed_hosts",
+        "mcp.extensions_path",
+        "rate_limit.enabled",
+        "rate_limit.per_second",
+        "rate_limit.burst_size",
+        "write.dedup_enabled",
+        "write.dedup_threshold",
+        "write.commit_author_name",
+        "write.commit_author_email",
+        "search.hybrid",
+        "search.rrf_candidates",
+        "search.phrase",
+        "search.min_score",
+        "search.diversity_max_per_document",
+        "search.default_limit",
+        "search.max_limit",
+        "reranking.enabled",
+        "reranking.candidate_limit",
+        "ui.semantic_edges.enabled",
+        "ui.semantic_edges.k",
+        "ui.semantic_edges.min_score",
+    ];
+
+    /// Dotted [`Config`] leaf paths with no `ResolvedConfig` field to diff — see
+    /// [`RELOAD_DIFF_SETTINGS`]'s doc comment for why these two, specifically,
+    /// are excluded rather than covered.
+    const RELOAD_DIFF_EXCLUDED: &[&str] = &["embedding.api_key_env", "reranking.api_key_env"];
+
+    #[test]
+    fn reload_diff_settings_matches_every_yaml_reloadable_config_field() {
+        // Bidirectional drift test for #226, the same technique
+        // `yaml_only_settings_matches_every_config_struct_field` (config.rs,
+        // #144) already uses: derive the real leaf-field set from `Config`'s own
+        // `Default` impl rather than hand-listing it a second time, so a future
+        // YAML-settable field added anywhere without a matching `diff()` branch
+        // (and a matching `RELOAD_DIFF_SETTINGS` entry) fails this test — and a
+        // `RELOAD_DIFF_SETTINGS` entry left behind after a field is renamed or
+        // removed fails it too. `config_setting_leaf_paths` is `pub(crate)`
+        // specifically so this module can share the one derivation rather than
+        // re-implementing the YAML-value flattening a second time.
+        let leaves = crate::config::config_setting_leaf_paths();
+
+        let covered: std::collections::HashSet<String> = RELOAD_DIFF_SETTINGS
+            .iter()
+            .chain(RELOAD_DIFF_EXCLUDED)
+            .map(|s| s.to_string())
+            .collect();
+
+        let uncovered: Vec<&String> = leaves.difference(&covered).collect();
+        assert!(
+            uncovered.is_empty(),
+            "Config field(s) with no diff() coverage and no RELOAD_DIFF_EXCLUDED \
+             entry — POST /admin/reload will silently omit them from every \
+             report (see #226): {uncovered:?}"
+        );
+
+        let documented: std::collections::HashSet<String> =
+            RELOAD_DIFF_SETTINGS.iter().map(|s| s.to_string()).collect();
+        let stale: Vec<&String> = documented.difference(&leaves).collect();
+        assert!(
+            stale.is_empty(),
+            "RELOAD_DIFF_SETTINGS entr(y/ies) with no matching Config field — \
+             renamed or removed without updating this table: {stale:?}"
+        );
+
+        let excluded: std::collections::HashSet<String> =
+            RELOAD_DIFF_EXCLUDED.iter().map(|s| s.to_string()).collect();
+        let stale_excluded: Vec<&String> = excluded.difference(&leaves).collect();
+        assert!(
+            stale_excluded.is_empty(),
+            "RELOAD_DIFF_EXCLUDED entr(y/ies) with no matching Config field — \
+             renamed or removed without updating this table: {stale_excluded:?}"
+        );
     }
 }
