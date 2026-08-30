@@ -3047,6 +3047,45 @@ impl KbSearchServer {
                 // slice would hand back a token that can never match — turning every
                 // partial read into a dead end for the edit that motivated it.
                 let content_hash = crate::ingest::compute_hash_from_bytes(doc.content.as_bytes());
+                // Snapshot the link-graph neighborhood before `doc.content` is moved
+                // into `slice_or_whole` below — `doc.links_out`/`doc.links_in` are
+                // untouched by that move (distinct fields), so this ordering is not
+                // load-bearing, just where it reads most naturally alongside the hash.
+                //
+                // `has_more` mirrors `search`'s truncation contract: a hub document
+                // can have far more inbound links than `retrieval::MAX_LINKS_PER_DIRECTION`
+                // allows through, and silently dropping the tail would misrepresent
+                // the graph rather than just page it. `score` is `null` for every
+                // `markdown` edge (only `semantic` neighbors carry one) and `exists`
+                // appears only on `links_out`: an inbound edge's source cannot dangle
+                // by construction (`delete_document` removes a deleted file's own
+                // outgoing rows), but an outbound edge's target can point at a file
+                // that was never indexed or was renamed out from under it — see
+                // `OutboundLink`'s doc comment. Both kinds (`markdown`, author-written;
+                // `semantic`, a machine-inferred kNN neighbor, only populated when
+                // `ui.semantic_edges.enabled` is on) ride the same list, tagged by
+                // `kind`, rather than being split into separate fields — mirroring how
+                // `/api/graph` already exposes them, just without that endpoint's
+                // dangling-edge drop.
+                let links_out = serde_json::json!({
+                    "total": doc.links_out.total,
+                    "has_more": doc.links_out.has_more(),
+                    "links": doc.links_out.links.iter().map(|l| serde_json::json!({
+                        "target_path": l.target_path,
+                        "kind": l.kind,
+                        "score": l.score,
+                        "exists": l.exists,
+                    })).collect::<Vec<_>>(),
+                });
+                let links_in = serde_json::json!({
+                    "total": doc.links_in.total,
+                    "has_more": doc.links_in.has_more(),
+                    "links": doc.links_in.links.iter().map(|l| serde_json::json!({
+                        "source_path": l.source_path,
+                        "kind": l.kind,
+                        "score": l.score,
+                    })).collect::<Vec<_>>(),
+                });
                 let slice = retrieval::slice_or_whole(doc.content, range.as_ref())
                     .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
                 // structured_content must mirror the text block: MCP clients that
@@ -3067,6 +3106,8 @@ impl KbSearchServer {
                     "end_line": slice.end_line,
                     "total_lines": slice.total_lines,
                     "partial": slice.partial(),
+                    "links_out": links_out,
+                    "links_in": links_in,
                 });
                 let mut result = CallToolResult::success(vec![Content::text(slice.content)]);
                 result.structured_content = Some(structured);
@@ -6793,6 +6834,65 @@ mod tests {
             get_range(&server, Some(4), Some(2)).await.is_err(),
             "an inverted range should be refused, not silently swapped"
         );
+    }
+
+    #[tokio::test]
+    async fn get_document_reports_links_out_and_links_in() {
+        // End-to-end through the real adapter: seed `document_links` directly via
+        // the state DB (bypassing ingest, same shortcut `seed_document` takes for
+        // `documents`), then confirm the JSON shape `get_document` hands back —
+        // key names, the `exists` flag on a dangling outbound target, and both
+        // edge kinds riding the same list distinguished only by `kind`.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = range_test_server(&tmp);
+        let db = server.state_db().await.unwrap();
+
+        // "range_doc.md" is itself indexed as a document so the markdown edge
+        // below resolves to an existing target; "missing.md" never is, so the
+        // semantic edge to it must come back with exists: false.
+        db.upsert_document_metadata(
+            "range_doc.md",
+            &std::collections::HashMap::new(),
+            100,
+            "hash",
+            1,
+        )
+        .await
+        .unwrap();
+        db.replace_links(
+            "range_doc.md",
+            "markdown",
+            &[("missing.md".to_string(), None)],
+        )
+        .await
+        .unwrap();
+        db.replace_links(
+            "referrer.md",
+            "semantic",
+            &[("range_doc.md".to_string(), Some(0.42))],
+        )
+        .await
+        .unwrap();
+
+        let (_, structured) = get_range(&server, None, None).await.unwrap();
+
+        let links_out = &structured["links_out"];
+        assert_eq!(links_out["total"], 1);
+        assert_eq!(links_out["has_more"], false);
+        assert_eq!(links_out["links"][0]["target_path"], "missing.md");
+        assert_eq!(links_out["links"][0]["kind"], "markdown");
+        assert_eq!(links_out["links"][0]["score"], serde_json::Value::Null);
+        assert_eq!(
+            links_out["links"][0]["exists"], false,
+            "missing.md was never indexed, so the outbound edge must be flagged dangling"
+        );
+
+        let links_in = &structured["links_in"];
+        assert_eq!(links_in["total"], 1);
+        assert_eq!(links_in["has_more"], false);
+        assert_eq!(links_in["links"][0]["source_path"], "referrer.md");
+        assert_eq!(links_in["links"][0]["kind"], "semantic");
+        assert_eq!(links_in["links"][0]["score"], 0.42);
     }
 
     #[tokio::test]

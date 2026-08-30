@@ -157,6 +157,87 @@ pub trait DocumentIndex: Send + Sync {
         paths: &[String],
         fields: Option<&[String]>,
     ) -> Result<Vec<DocumentSummary>>;
+
+    /// Outbound `document_links` edges for `source_path`, both `kind`s together
+    /// (author-written `markdown` and machine-inferred `semantic`), capped at
+    /// `limit` with the true total attached so a caller can tell a page from the
+    /// whole set.
+    ///
+    /// Backs `get_document`'s `links_out` (#157). Unlike `links_targeting`
+    /// (the move-time link rewriter's helper, which filters to a single `kind`
+    /// and returns bare source paths because it only ever needs "who must be
+    /// rewritten"), this returns every kind at once with its `score` and an
+    /// `exists` flag per edge — `get_document`'s caller cannot assume `markdown`
+    /// like the rewriter can, and unlike `/api/graph` (which drops dangling edges
+    /// at read time) a broken outbound link is exactly the kind of thing an agent
+    /// traversing the KB wants surfaced, not hidden — see [`OutboundLink::exists`].
+    async fn links_out(&self, source_path: &str, limit: u64) -> Result<LinkPage<OutboundLink>>;
+
+    /// Inbound `document_links` edges targeting `target_path`, both kinds
+    /// together, capped at `limit` with the true total. The reverse-direction
+    /// sibling of [`Self::links_out`], using `idx_document_links_target` like
+    /// [`StateDb::links_targeting`]. Backs `get_document`'s `links_in` (#157).
+    async fn links_in(&self, target_path: &str, limit: u64) -> Result<LinkPage<InboundLink>>;
+}
+
+/// One outbound edge from a document, as exposed by `get_document`'s `links_out`.
+///
+/// `kind` is `"markdown"` for a link extracted from the document's own body at
+/// ingest time, or `"semantic"` for a machine-inferred kNN neighbor computed only
+/// when `ui.semantic_edges.enabled` is on (off by default) — see the
+/// `document_links` table's doc comment. Both kinds are returned undifferentiated
+/// except by this field: mixing them silently would let a reader mistake a
+/// similarity guess for something the author actually wrote, so the field is
+/// mandatory on every edge rather than assumed from context.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboundLink {
+    pub target_path: String,
+    pub kind: String,
+    /// Similarity score for a `semantic` edge; always `None` for `markdown`
+    /// (`document_links.score` is only ever written for semantic neighbors — see
+    /// `ingest::update_semantic_edges`).
+    pub score: Option<f64>,
+    /// Whether `target_path` currently exists as an indexed `documents` row.
+    /// `document_links` targets are not foreign-keyed to `documents` (see that
+    /// table's doc comment) — a link may point at a file that was never indexed,
+    /// or one that was renamed out from under it — so this lets a caller
+    /// distinguish a live link from a broken one without a second round trip.
+    /// `/api/graph` instead drops dangling edges at read time; `get_document`
+    /// surfaces them, since "this link is broken" is information worth having,
+    /// not noise to hide (the premise of #158's future `validate --links`
+    /// report, which this field is deliberately shaped to support without
+    /// implementing it).
+    pub exists: bool,
+}
+
+/// One inbound edge targeting a document, as exposed by `get_document`'s
+/// `links_in`. Same `kind`/`score` contract as [`OutboundLink`], but no `exists`
+/// flag: a source only ever appears here because its own `document_links` row is
+/// still live, and `delete_document` purges a deleted file's outgoing rows
+/// (`delete_links_for`) as part of removing it, so a source surviving in this
+/// list is — modulo the same one-indexing-run consistency window `get_document`'s
+/// fuzzy fallback already documents — a currently indexed document. The asymmetry
+/// with `OutboundLink::exists` is deliberate, not an oversight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboundLink {
+    pub source_path: String,
+    pub kind: String,
+    pub score: Option<f64>,
+}
+
+/// A capped page of link edges plus the true total, so a caller can always tell
+/// whether the list was truncated — the same `total`/`has_more`-style contract as
+/// [`DocumentQueryResult`], parameterized over which edge direction produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkPage<T> {
+    pub links: Vec<T>,
+    pub total: u64,
+}
+
+impl<T> LinkPage<T> {
+    pub fn has_more(&self) -> bool {
+        (self.links.len() as u64) < self.total
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1430,6 +1511,92 @@ impl DocumentIndex for StateDb {
             ));
         }
         Ok(out)
+    }
+
+    async fn links_out(&self, source_path: &str, limit: u64) -> Result<LinkPage<OutboundLink>> {
+        // Count and page share one transaction, same rationale as `query_documents`:
+        // without it, a concurrent reindex landing between the two statements could
+        // make `total` disagree with the page it is supposed to describe.
+        let mut tx = self.pool.begin().await?;
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM document_links WHERE source_path = ?")
+                .bind(source_path)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        // LEFT JOIN documents rather than a second query per row: `exists` is
+        // just "did the join find a match", computed as part of the same page
+        // fetch instead of an all_paths()-style full-table load per call.
+        let rows: Vec<(String, String, Option<f64>, Option<String>)> = sqlx::query_as(
+            "SELECT l.target_path, l.kind, l.score, d.file_path
+             FROM document_links l
+             LEFT JOIN documents d ON d.file_path = l.target_path
+             WHERE l.source_path = ?
+             ORDER BY l.kind, l.target_path
+             LIMIT ?",
+        )
+        .bind(source_path)
+        .bind(limit as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        let links = rows
+            .into_iter()
+            .map(|(target_path, kind, score, matched)| OutboundLink {
+                target_path,
+                kind,
+                score,
+                exists: matched.is_some(),
+            })
+            .collect();
+
+        Ok(LinkPage {
+            links,
+            total: total.max(0) as u64,
+        })
+    }
+
+    async fn links_in(&self, target_path: &str, limit: u64) -> Result<LinkPage<InboundLink>> {
+        let mut tx = self.pool.begin().await?;
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM document_links WHERE target_path = ?")
+                .bind(target_path)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        // Uses `idx_document_links_target`, same as `links_targeting` — the
+        // reverse lookup is not served by the (source_path, target_path, kind)
+        // primary key.
+        let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(
+            "SELECT source_path, kind, score FROM document_links
+             WHERE target_path = ?
+             ORDER BY kind, source_path
+             LIMIT ?",
+        )
+        .bind(target_path)
+        .bind(limit as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        let links = rows
+            .into_iter()
+            .map(|(source_path, kind, score)| InboundLink {
+                source_path,
+                kind,
+                score,
+            })
+            .collect();
+
+        Ok(LinkPage {
+            links,
+            total: total.max(0) as u64,
+        })
     }
 }
 
@@ -3847,6 +4014,146 @@ mod tests {
         db.delete_document("a.md").await.unwrap();
 
         assert!(db.all_links().await.unwrap().is_empty());
+    }
+
+    // -- links_out / links_in (#157) ---------------------------------------------
+
+    #[tokio::test]
+    async fn links_out_returns_both_kinds_and_flags_a_dangling_target() {
+        let (db, _dir) = test_db().await;
+        // "b.md" is a real indexed document; "missing.md" is a link target that
+        // was never indexed — exactly the dangling case `document_links`'s doc
+        // comment describes.
+        db.upsert_document_metadata("b.md", &recipe_frontmatter(), 1700, "h1", 1)
+            .await
+            .unwrap();
+        db.replace_links("a.md", "markdown", &[("b.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links(
+            "a.md",
+            "semantic",
+            &[("missing.md".to_string(), Some(0.75))],
+        )
+        .await
+        .unwrap();
+
+        let page = db.links_out("a.md", 10).await.unwrap();
+
+        assert_eq!(page.total, 2);
+        assert!(!page.has_more());
+        let mut links = page.links;
+        links.sort_by(|a, b| a.target_path.cmp(&b.target_path));
+        assert_eq!(
+            links,
+            vec![
+                OutboundLink {
+                    target_path: "b.md".to_string(),
+                    kind: "markdown".to_string(),
+                    score: None,
+                    exists: true,
+                },
+                OutboundLink {
+                    target_path: "missing.md".to_string(),
+                    kind: "semantic".to_string(),
+                    score: Some(0.75),
+                    exists: false,
+                },
+            ],
+            "a dangling target must still be returned, just flagged exists: false"
+        );
+    }
+
+    #[tokio::test]
+    async fn links_out_on_a_source_with_no_edges_is_empty() {
+        let (db, _dir) = test_db().await;
+        let page = db.links_out("lonely.md", 10).await.unwrap();
+        assert_eq!(page.total, 0);
+        assert!(page.links.is_empty());
+        assert!(!page.has_more());
+    }
+
+    #[tokio::test]
+    async fn links_out_caps_at_limit_and_reports_the_true_total() {
+        let (db, _dir) = test_db().await;
+        let targets: Vec<(String, Option<f64>)> =
+            (0..5).map(|i| (format!("target-{i}.md"), None)).collect();
+        db.replace_links("hub.md", "markdown", &targets)
+            .await
+            .unwrap();
+
+        let page = db.links_out("hub.md", 2).await.unwrap();
+
+        assert_eq!(page.links.len(), 2, "page must be capped at `limit`");
+        assert_eq!(
+            page.total, 5,
+            "total must report the true edge count, not the page size"
+        );
+        assert!(page.has_more());
+    }
+
+    #[tokio::test]
+    async fn links_in_returns_sources_across_kinds_ordered() {
+        let (db, _dir) = test_db().await;
+        db.replace_links("a.md", "markdown", &[("target.md".to_string(), None)])
+            .await
+            .unwrap();
+        db.replace_links("b.md", "semantic", &[("target.md".to_string(), Some(0.6))])
+            .await
+            .unwrap();
+
+        let page = db.links_in("target.md", 10).await.unwrap();
+
+        assert_eq!(page.total, 2);
+        assert!(!page.has_more());
+        assert_eq!(
+            page.links,
+            vec![
+                InboundLink {
+                    source_path: "a.md".to_string(),
+                    kind: "markdown".to_string(),
+                    score: None,
+                },
+                InboundLink {
+                    source_path: "b.md".to_string(),
+                    kind: "semantic".to_string(),
+                    score: Some(0.6),
+                },
+            ],
+            "ORDER BY kind, source_path: markdown before semantic"
+        );
+    }
+
+    #[tokio::test]
+    async fn links_in_caps_at_limit_and_reports_the_true_total() {
+        let (db, _dir) = test_db().await;
+        for i in 0..5 {
+            db.replace_links(
+                &format!("source-{i}.md"),
+                "markdown",
+                &[("hub.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+        }
+
+        let page = db.links_in("hub.md", 2).await.unwrap();
+
+        assert_eq!(page.links.len(), 2, "page must be capped at `limit`");
+        assert_eq!(
+            page.total, 5,
+            "total must report the true edge count, not the page size"
+        );
+        assert!(page.has_more());
+    }
+
+    #[tokio::test]
+    async fn links_in_on_a_target_with_no_edges_is_empty() {
+        let (db, _dir) = test_db().await;
+        let page = db.links_in("nobody-links-here.md", 10).await.unwrap();
+        assert_eq!(page.total, 0);
+        assert!(page.links.is_empty());
+        assert!(!page.has_more());
     }
 
     #[tokio::test]
