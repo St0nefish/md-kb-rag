@@ -1,4 +1,8 @@
-FROM rust:1.88-alpine AS builder
+# MSRV 1.89: `ingest::acquire_reindex_lock` uses `std::fs::File::lock` /
+# `lock_shared`, stabilized in 1.89.0. Do not lower this pin without replacing
+# that call — CI runs `dtolnay/rust-toolchain@stable`, so a too-old pin here
+# compiles clean in CI's cargo steps and then fails only in the Docker build.
+FROM rust:1.89-alpine AS builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static perl
 
