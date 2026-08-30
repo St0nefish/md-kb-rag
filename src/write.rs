@@ -2969,6 +2969,52 @@ pub async fn delete_document<E: QueryEmbedder, Q: RetrievalStore>(
         }
     })?;
 
+    // Best-effort: warn if anything else in the KB still links to the document
+    // about to be deleted (#181). `StateDb::links_targeting` is the exact same
+    // reverse-link query `write_document_move`'s step 10.5 already runs to find
+    // documents whose body needs rewriting — reused here purely to look, not to
+    // touch anything.
+    //
+    // Deliberately WARN, not refuse: this codebase's established stance on a
+    // stale/dangling link is "self-heal, don't block" — `write_document_move`
+    // and `move_directory` both skip a referencing document outright rather
+    // than fail the whole operation when a `document_links` row turns out to
+    // be stale, and a referencing document's OWN next reindex rebuilds its
+    // links from whatever its current on-disk body actually resolves to,
+    // silently dropping the edge that no longer exists. A delete leaving a
+    // dangling link behaves no differently from that already-accepted case.
+    // Refusing outright would also need a `force` escape hatch threaded
+    // through every caller's request shape — the MCP tool's parameter schema
+    // and the HTTP API's request body — which is a cross-cutting change to
+    // both transports, not something this transport-agnostic pipeline should
+    // decide unilaterally. `deps.state` is `None` for callers with no
+    // `StateDb` wired up (see that field's doc comment on `WriteDeps`); this
+    // is skipped silently in that case, same as the move path's own reverse-
+    // link query.
+    if let Some(state) = deps.state {
+        match state.links_targeting(rel_path, "markdown").await {
+            Ok(inbound) if !inbound.is_empty() => {
+                warn!(
+                    "Deleting '{}', which is still linked from {} other document(s): {}. \
+                     This delete does not rewrite or remove those links — they will dangle \
+                     until each referencing document's own next reindex drops the now-stale \
+                     edge.",
+                    rel_path,
+                    inbound.len(),
+                    inbound.join(", ")
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "Skipping inbound-link check before deleting '{}': the reverse-link \
+                     query failed: {:#}",
+                    rel_path, e
+                );
+            }
+        }
+    }
+
     // Re-verify immediately before removing — see `write_document`'s doc comment
     // for why this is re-resolved rather than reusing the path from above.
     let abs_path = safe_write_path(deps, rel_path)?;
@@ -4169,6 +4215,166 @@ mod tests {
             &harness.reindex_queue,
             &["doomed-synced.md"],
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #181 — delete_document warns about inbound links instead of silently
+    // orphaning them. `WriteSuccess`/`WriteError` carry no field for this (a
+    // struct/enum change here would ripple into mcp.rs's and web.rs's own
+    // exhaustive matches and literals, outside this module's scope), so the
+    // only externally observable evidence the check ran at all is the
+    // `warn!` log line. `CapturedLogs` below is a minimal
+    // `tracing_subscriber::fmt::MakeWriter` that redirects exactly the calls
+    // made while its guard is alive into an in-memory buffer a test can
+    // assert on — `tracing::subscriber::set_default`'s guard scopes it to
+    // this one call, so it cannot leak into (or be polluted by) any other
+    // test's logging.
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Scoped to `WARN` and above so that unrelated `info!`/`debug!` output
+    /// elsewhere in the write pipeline (or in `git.rs`) can never show up in
+    /// `CapturedLogs::text()` and be mistaken for the inbound-link warning
+    /// this module's tests care about.
+    fn capture_warnings() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_target(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
+    #[tokio::test]
+    async fn delete_warns_about_inbound_links_but_does_not_refuse() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("linked.md"),
+            "---\ntitle: Linked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "linked.md", "add linked.md");
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        // `referencer.md` need not exist on disk — the check queries the
+        // reverse-link INDEX, not the filesystem, same as
+        // `write_document_move`'s step 10.5.
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links(
+                "referencer.md",
+                "markdown",
+                &[("linked.md".to_string(), None)],
+            )
+            .await
+            .unwrap();
+
+        let (captured, guard) = capture_warnings();
+        let success = delete_document(&harness.deps(), "linked.md", None)
+            .await
+            .expect("an inbound link must WARN, not refuse the delete — see #181's PR notes");
+        drop(guard);
+
+        assert_eq!(
+            success.outcome,
+            WriteOutcome::Synced,
+            "the delete itself must still succeed"
+        );
+        let log_text = captured.text();
+        assert!(
+            log_text.contains("referencer.md"),
+            "expected a warning naming the referencing document, got log: {log_text:?}"
+        );
+        assert!(
+            log_text.contains("linked.md"),
+            "expected the warning to name the document being deleted too, got log: {log_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_with_no_inbound_links_logs_no_warning() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("unlinked.md"),
+            "---\ntitle: Unlinked\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "unlinked.md", "add unlinked.md");
+
+        // With a state DB wired up but no `document_links` row targeting this
+        // document, the query must come back empty and stay silent.
+        let harness = git_backed_harness_with_state_db(&work).await;
+
+        let (captured, guard) = capture_warnings();
+        delete_document(&harness.deps(), "unlinked.md", None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        assert!(
+            captured.text().is_empty(),
+            "no inbound links means no warning, got log: {:?}",
+            captured.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_with_no_state_db_skips_the_inbound_link_check_silently() {
+        // `WriteDeps::state == None` (no `with_state_db`) must not be treated
+        // as "querying failed" — it is a normal, documented degraded mode
+        // (see that field's doc comment), so the delete must proceed exactly
+        // as it always has, with no warning and no error.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("no-state-db.md"),
+            "---\ntitle: No State DB\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "no-state-db.md", "add no-state-db.md");
+
+        let harness = git_backed_harness(&work);
+
+        let (captured, guard) = capture_warnings();
+        let success = delete_document(&harness.deps(), "no-state-db.md", None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(captured.text().is_empty());
     }
 
     // -----------------------------------------------------------------------
