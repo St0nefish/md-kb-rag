@@ -9,11 +9,24 @@ use crate::{
     embed::QueryEmbedder,
     qdrant::{CHUNK_TEXT_KEY, RetrievalStore, SearchResult},
     rerank::Reranker,
-    state::{DocumentIndex, DocumentQuery, DocumentQueryResult, DocumentSummary},
+    state::{
+        DocumentIndex, DocumentQuery, DocumentQueryResult, DocumentSummary, InboundLink, LinkPage,
+        OutboundLink,
+    },
 };
 
 /// How many "did you mean?" suggestions to include when no basename matches.
 pub const FUZZY_SUGGESTION_COUNT: usize = 3;
+
+/// Hard cap on how many edges `get_document` reports per direction (`links_out`,
+/// `links_in`). A hub document's inbound edge count is unbounded in principle (any
+/// number of other documents can link to it), so this needs a ceiling the same way
+/// `search` caps its result count — the true total and whether the page was
+/// truncated ride alongside it (`LinkPage::total`/`has_more`) rather than silently
+/// dropping the tail, matching this codebase's `total`/`has_more` convention
+/// everywhere else it caps a list (`search`, `list_documents`, the schema-update
+/// casualty list).
+pub const MAX_LINKS_PER_DIRECTION: u64 = 100;
 
 /// Dependencies needed by the shared retrieval functions.
 /// Dependencies for document listing.
@@ -373,6 +386,13 @@ fn cap_reranked_by_document(
 pub struct Document {
     pub path: PathBuf,
     pub content: String,
+    /// Outbound `document_links` edges (both `markdown` and `semantic` kinds),
+    /// capped at [`MAX_LINKS_PER_DIRECTION`]. See [`document_links`]'s doc
+    /// comment for how a link-lookup failure is handled.
+    pub links_out: LinkPage<OutboundLink>,
+    /// Inbound `document_links` edges targeting this document, same cap and
+    /// failure handling as `links_out`.
+    pub links_in: LinkPage<InboundLink>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,15 +1159,19 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
     })
 }
 
-/// Resolve a document path and return its full content.
+/// Resolve a document path and return its full content, plus its link-graph
+/// neighborhood (`links_out`/`links_in` — #157).
 ///
-/// On success returns `Document { path, content }`. On failure returns a
-/// structured `GetDocumentError` — callers are responsible for turning these
-/// into user-facing error strings.
+/// On success returns `Document { path, content, links_out, links_in }`. On
+/// failure returns a structured `GetDocumentError` — callers are responsible for
+/// turning these into user-facing error strings.
 ///
 /// `document_index` backs the fuzzy fallback (see step 2 below) — the SQLite
 /// `documents` table, not Qdrant. See that step's comment for why, and for the
-/// consistency tradeoff that follows from the choice.
+/// consistency tradeoff that follows from the choice. It also now backs the
+/// link-graph lookup (step 3), unconditionally on every successful resolution —
+/// see [`document_links`]'s doc comment for why a failure there degrades instead
+/// of propagating.
 pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>(
     deps: &RetrievalDeps<'_, E, Q>,
     document_index: &D,
@@ -1159,9 +1183,13 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>
             let content = tokio::fs::read_to_string(&canonical)
                 .await
                 .map_err(|e| GetDocumentError::Io(e.to_string()))?;
+            let rel_path = relative_to_data(&canonical.to_string_lossy(), deps.data_path);
+            let (links_out, links_in) = document_links(document_index, &rel_path).await;
             return Ok(Document {
                 path: canonical,
                 content,
+                links_out,
+                links_in,
             });
         }
         Err(ResolveErr::NotFound) => {
@@ -1218,9 +1246,13 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>
                 let content = tokio::fs::read_to_string(&canonical)
                     .await
                     .map_err(|e| GetDocumentError::Io(e.to_string()))?;
+                let rel_path = relative_to_data(&canonical.to_string_lossy(), deps.data_path);
+                let (links_out, links_in) = document_links(document_index, &rel_path).await;
                 Ok(Document {
                     path: canonical,
                     content,
+                    links_out,
+                    links_in,
                 })
             }
             Err(_) => {
@@ -1259,6 +1291,44 @@ pub async fn get_document<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>
             Err(GetDocumentError::Ambiguous { matches })
         }
     }
+}
+
+/// Fetch `links_out`/`links_in` for `rel_path` (a `documents`-table-relative path,
+/// matching what `document_links.source_path`/`target_path` store), each capped at
+/// [`MAX_LINKS_PER_DIRECTION`].
+///
+/// Failures degrade to an empty, zero-total page rather than propagating —
+/// `get_document` is a hot read path, and the link graph is supplementary to the
+/// document body it serves: a transient failure on either of these two queries
+/// must not turn an otherwise-successful read into an error. Same non-fatal
+/// posture as the fuzzy fallback's `all_paths()` call above, and the same
+/// rationale as `capped_casualties` in `mcp.rs` for why the cap is reported
+/// (`LinkPage::total`/`has_more`) rather than silently applied.
+async fn document_links<D: DocumentIndex>(
+    document_index: &D,
+    rel_path: &str,
+) -> (LinkPage<OutboundLink>, LinkPage<InboundLink>) {
+    let links_out = document_index
+        .links_out(rel_path, MAX_LINKS_PER_DIRECTION)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(path = %rel_path, "Failed to fetch outbound links: {e:#}");
+            LinkPage {
+                links: Vec::new(),
+                total: 0,
+            }
+        });
+    let links_in = document_index
+        .links_in(rel_path, MAX_LINKS_PER_DIRECTION)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(path = %rel_path, "Failed to fetch inbound links: {e:#}");
+            LinkPage {
+                links: Vec::new(),
+                total: 0,
+            }
+        });
+    (links_out, links_in)
 }
 
 // ---------------------------------------------------------------------------
@@ -1846,6 +1916,19 @@ mod tests {
         /// `query_documents` and `all_paths` don't need this, so it stays empty for
         /// the fuzzy-fallback tests that only ever construct `with_paths`/`with_err`.
         summaries: Vec<DocumentSummary>,
+        /// Canned `links_out`/`links_in` pages, deliberately keyed on nothing but the
+        /// call itself (every path gets the same canned answer) — the link-lookup
+        /// tests below only ever query a single document, so this stays simple
+        /// rather than modeling a per-path graph.
+        outbound: Vec<OutboundLink>,
+        inbound: Vec<InboundLink>,
+        /// Separate from `err`: `err` fails `all_paths`/`get_summaries_by_paths`
+        /// (simulating the metadata index being unavailable at all), which would
+        /// also fail `get_document`'s fuzzy fallback and isn't what the
+        /// state-DB-unavailable link test wants to exercise — that test wants the
+        /// document resolve to succeed while only the link queries fail, to prove
+        /// `get_document` degrades rather than propagating.
+        links_err: Option<String>,
     }
 
     impl MockDocumentIndex {
@@ -1854,6 +1937,9 @@ mod tests {
                 paths,
                 err: None,
                 summaries: Vec::new(),
+                outbound: Vec::new(),
+                inbound: Vec::new(),
+                links_err: None,
             }
         }
         fn with_err(msg: &str) -> Self {
@@ -1861,6 +1947,9 @@ mod tests {
                 paths: Vec::new(),
                 err: Some(msg.to_string()),
                 summaries: Vec::new(),
+                outbound: Vec::new(),
+                inbound: Vec::new(),
+                links_err: None,
             }
         }
         fn with_summaries(summaries: Vec<DocumentSummary>) -> Self {
@@ -1868,6 +1957,37 @@ mod tests {
                 paths: Vec::new(),
                 err: None,
                 summaries,
+                outbound: Vec::new(),
+                inbound: Vec::new(),
+                links_err: None,
+            }
+        }
+        /// Paths resolve normally, but `links_out`/`links_in` both return `msg` as
+        /// an error — the state-DB-unavailable-for-links case.
+        fn with_paths_and_links_err(paths: Vec<String>, msg: &str) -> Self {
+            Self {
+                paths,
+                err: None,
+                summaries: Vec::new(),
+                outbound: Vec::new(),
+                inbound: Vec::new(),
+                links_err: Some(msg.to_string()),
+            }
+        }
+        /// Paths resolve normally and `links_out`/`links_in` return the given
+        /// canned pages — the happy-path wiring test.
+        fn with_paths_and_links(
+            paths: Vec<String>,
+            outbound: Vec<OutboundLink>,
+            inbound: Vec<InboundLink>,
+        ) -> Self {
+            Self {
+                paths,
+                err: None,
+                summaries: Vec::new(),
+                outbound,
+                inbound,
+                links_err: None,
             }
         }
     }
@@ -1901,6 +2021,32 @@ mod tests {
                 .filter(|s| paths.contains(&s.file_path))
                 .cloned()
                 .collect())
+        }
+
+        async fn links_out(
+            &self,
+            _source_path: &str,
+            limit: u64,
+        ) -> anyhow::Result<LinkPage<OutboundLink>> {
+            if let Some(ref msg) = self.links_err {
+                anyhow::bail!("{}", msg);
+            }
+            let total = self.outbound.len() as u64;
+            let links = self.outbound.iter().take(limit as usize).cloned().collect();
+            Ok(LinkPage { links, total })
+        }
+
+        async fn links_in(
+            &self,
+            _target_path: &str,
+            limit: u64,
+        ) -> anyhow::Result<LinkPage<InboundLink>> {
+            if let Some(ref msg) = self.links_err {
+                anyhow::bail!("{}", msg);
+            }
+            let total = self.inbound.len() as u64;
+            let links = self.inbound.iter().take(limit as usize).cloned().collect();
+            Ok(LinkPage { links, total })
         }
     }
 
@@ -2872,6 +3018,68 @@ mod tests {
 
         let doc = get_document(&deps, &index, "docs/guide.md").await.unwrap();
         assert!(doc.content.contains("Content here."));
+    }
+
+    #[tokio::test]
+    async fn get_document_populates_links_out_and_links_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().canonicalize().unwrap();
+        let docs = data_path.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("guide.md"), "# Guide").unwrap();
+
+        let gs = make_md_globset();
+        let embed = MockEmbedder::ok(vec![]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_paths_and_links(
+            vec![],
+            vec![OutboundLink {
+                target_path: "docs/other.md".to_string(),
+                kind: "markdown".to_string(),
+                score: None,
+                exists: true,
+            }],
+            vec![InboundLink {
+                source_path: "docs/referrer.md".to_string(),
+                kind: "semantic".to_string(),
+                score: Some(0.8),
+            }],
+        );
+
+        let doc = get_document(&deps, &index, "docs/guide.md").await.unwrap();
+
+        assert_eq!(doc.links_out.total, 1);
+        assert_eq!(doc.links_out.links[0].target_path, "docs/other.md");
+        assert_eq!(doc.links_in.total, 1);
+        assert_eq!(doc.links_in.links[0].source_path, "docs/referrer.md");
+    }
+
+    #[tokio::test]
+    async fn get_document_link_lookup_failure_degrades_instead_of_failing_the_read() {
+        // The state-DB-unavailable path: path resolution succeeds (no `all_paths`
+        // call needed for a literal path), but the link queries themselves error.
+        // `get_document` must still return the document, with empty/zero-total
+        // link pages rather than propagating the error.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().canonicalize().unwrap();
+        let docs = data_path.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("guide.md"), "# Guide\nStill readable.").unwrap();
+
+        let gs = make_md_globset();
+        let embed = MockEmbedder::ok(vec![]);
+        let store = MockRetrievalStore::with_results(vec![]);
+        let deps = make_deps(&embed, &store, &data_path, &gs);
+        let index = MockDocumentIndex::with_paths_and_links_err(vec![], "state db unavailable");
+
+        let doc = get_document(&deps, &index, "docs/guide.md").await.unwrap();
+
+        assert!(doc.content.contains("Still readable."));
+        assert_eq!(doc.links_out.total, 0);
+        assert!(doc.links_out.links.is_empty());
+        assert_eq!(doc.links_in.total, 0);
+        assert!(doc.links_in.links.is_empty());
     }
 
     #[tokio::test]
