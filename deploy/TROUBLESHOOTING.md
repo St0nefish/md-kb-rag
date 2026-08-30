@@ -2,6 +2,97 @@
 
 Common issues and fixes for md-kb-rag.
 
+## Backup and Recovery
+
+Of the three stateful things this project touches — the KB's git clone, `state.db`,
+and the Qdrant collection — **only the git repo is authoritative.** `state.db` (the
+SQLite state and metadata index) and Qdrant's vectors are both fully **derived** from
+the corpus: every row and every point can be rebuilt from the markdown files and their
+frontmatter via `md-kb-rag index --full`. So the short version of a backup policy
+here is: back up the git repo the way you'd back up any other git-hosted content
+(forge-level backups, a mirror remote, or trusting the forge's own durability), and
+you've covered the one thing that genuinely cannot be reconstructed. Backing up
+`state.db` or the `qdrant` volume is optional — see "What backing up the derived
+stores buys you" below for what it saves you over a rebuild.
+
+### Recovering after losing `state.db` and/or the Qdrant volume
+
+1. Confirm (or restore) that the KB clone is intact and reachable at `GIT_URL`/
+   `GIT_BRANCH`. If the container's data volume was wiped entirely, a fresh start
+   re-clones it automatically — see [Knowledge Base Storage](USAGE.md#knowledge-base-storage)
+   in USAGE.md.
+2. Run a full reindex:
+
+   ```bash
+   docker compose exec kb-rag md-kb-rag index --full
+   ```
+
+   This drops and recreates the Qdrant collection, clears `state.db`'s
+   `indexed_files`/`documents`/`document_fields` tables, and re-processes every file
+   from scratch — re-chunking, re-embedding, and rebuilding the metadata index.
+3. Confirm the recovery with `md-kb-rag status --json` (or `GET /status`): a healthy
+   result has `qdrant_points_deficit` at or near zero, and `indexed_files`/`documents`
+   counts matching your corpus size.
+
+### `index --full` refuses to run: a frozen schema blocks recovery
+
+If any `.kb-schema.yaml` in the tree is currently invalid, `index --full` **refuses to
+run at all**, naming the offending directories rather than silently skipping them —
+because a full run drops and rebuilds the whole collection, and a frozen scope's
+documents would be skipped during that rebuild, permanently losing their vectors
+instead of merely staying stale:
+
+```text
+Refusing a full reindex while 1 schema file(s) are invalid (food/recipes). A full
+run rebuilds the collection from scratch and cannot reindex frozen scopes, so
+their vectors would be lost. Fix the schema(s), or run a scoped/incremental
+index instead.
+```
+
+This means a disaster recovery can be blocked by a pre-existing, unrelated schema
+problem — see [Documents stop being reindexed after a schema edit](#documents-stop-being-reindexed-after-a-schema-edit-schema-frozen)
+below for how to find and fix it. Once the schema is valid again, retry
+`index --full`. An incremental `md-kb-rag index` (no `--full`) is unaffected by scopes
+frozen elsewhere in the tree and can make partial progress in the meantime, but it
+will not touch the frozen scope's own documents either way.
+
+### A Qdrant wipe with `state.db` intact
+
+If only the Qdrant volume is lost — a `docker volume rm` on the wrong volume, disk
+corruption isolated to Qdrant's storage — while `state.db` survives, the failure mode
+is different from a full loss: the server's startup `ensure_collection` step silently
+recreates an empty collection, and because `state.db` still believes every file is
+already indexed and unchanged, an ordinary incremental reindex or reconcile sweep
+finds nothing to do. Historically (#155) this was a **silent, permanent blackout** —
+search would run against an empty collection with no error surfaced anywhere.
+
+As of the current server, this is detected passively: `GET /status` and
+`GET /metrics` compare `state.db`'s summed chunk count against Qdrant's actual point
+count on every request, and report an error (in `store.errors`, and via the
+`kb_qdrant_points_deficit` Prometheus gauge) whenever Qdrant is short by more than a
+small slack — a real wipe blows past that slack by orders of magnitude, since it
+zeroes the whole collection at once rather than losing a handful of points. Detection
+is currently passive only — the check tells you something is wrong, it does not
+itself trigger a reindex. If you see this error, or a `kb_qdrant_points_deficit`
+metric that stays large and positive, run `md-kb-rag index --full` to force a full
+reconcile (subject to the frozen-schema caveat above).
+
+### What backing up the derived stores buys you
+
+Skipping a backup of `state.db`/the Qdrant volume is safe — nothing about document
+*content* is ever at risk, since that only ever lived in the git repo — but a rebuild
+from scratch isn't free:
+
+- **Time, and on a paid embedding endpoint, money.** A full reindex re-embeds every
+  chunk in the corpus from nothing; there's no partial-credit path. For a large KB, or
+  a metered embedding API, that's a real cost worth weighing against the effort of
+  also backing up the Qdrant volume and `state.db`.
+- **`indexed_at` history.** Rebuilt rows get a fresh `indexed_at`, so anything that
+  trends "when was this document last touched" loses that history across the rebuild.
+- **In-flight `/status` counters.** The last completed run's outcome tallies and any
+  run-in-progress state are process-global and reset on restart regardless of what's
+  backed up — they aren't part of either persisted store to begin with.
+
 ## Startup Failures
 
 ### `unknown field '...'` on startup
