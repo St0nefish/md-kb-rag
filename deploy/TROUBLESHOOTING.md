@@ -432,6 +432,27 @@ Your reverse proxy is redirecting HTTP to HTTPS, but the webhook is configured w
 
 **Fix:** Update the webhook URL in your forge to use `https://`.
 
+## Access and Networking
+
+### `curl` to `/health` or `/status` returns a 302 redirect to an SSO login page
+
+This is the default proxy-with-SSO posture doing exactly what it's configured to do — see [Deployment Posture: Network Exposure and Access Control](USAGE.md#deployment-posture-network-exposure-and-access-control) in USAGE.md for the full picture. The reverse proxy in front of the container (Authentik via Traefik, in the reference deployment) intercepts the request before it ever reaches md-kb-rag and redirects it to the identity provider's login page, because the proxy has no way to distinguish a diagnostic `curl` from a browser that can complete the SSO flow. The 302 never originates from the binary itself: `/health` handles GET with no gate at all, and `/status` is bearer-gated, not SSO-gated — neither returns a redirect on its own.
+
+Passing a bearer token doesn't change the outcome. This was confirmed against the reference deployment during verification: `curl` with `-H "Authorization: Bearer $MCP_BEARER_TOKEN"` and `curl` with no header at all returned the identical 302 to Authentik's login page, because the token is meaningless to the proxy's SSO layer — it redirects unauthenticated *browsers*, it does not inspect bearer credentials.
+
+**Two ways out, neither requiring an interactive SSO session from a script:**
+
+1. **Reach the container directly, bypassing the proxy.** From inside the Docker network: `docker compose exec kb-rag curl http://localhost:8001/health`. From the host, if the port happens to be published: `curl http://localhost:8001/health` against the mapped port. Either way skips the proxy hop entirely, so nothing intercepts the request or has a chance to redirect it.
+2. **Use the bearer token against a route the proxy doesn't intercept.** `/status` is gated inside the binary itself (the same `bearer_auth` layer that protects `/mcp`), which is a different mechanism from the proxy's SSO layer that's producing the 302:
+
+   ```bash
+   curl -H "Authorization: Bearer $MCP_BEARER_TOKEN" https://your-host/status
+   ```
+
+   This only helps if your proxy is configured to pass `/status` through without intercepting it — if the proxy blankets every path under SSO regardless of route, it will 302 this request too, and option 1 (reach the container directly) is the only way to get a diagnostic read.
+
+If you want `/health` and `/status` reachable from the LAN without a proxy hop or an SSO session at all, that's exactly what the LAN-only posture in [Deployment Posture: Network Exposure and Access Control](USAGE.md#deployment-posture-network-exposure-and-access-control) documents — publishing the port to a specific interface trades the SSO gate for LAN reachability as the access control, with the write-surface trade-off spelled out there.
+
 ## Model / Vector Issues
 
 ### Qdrant dimension mismatch after model change

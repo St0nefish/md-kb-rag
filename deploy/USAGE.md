@@ -483,6 +483,75 @@ With this approach, you're responsible for keeping the directory up to date. If 
 
 Without `GIT_URL`, you'll need an external process to update the bind-mounted directory and trigger a reindex (either via webhook or by running `docker compose exec kb-rag md-kb-rag index`).
 
+## Deployment Posture: Network Exposure and Access Control
+
+md-kb-rag serves everything — the MCP endpoint, diagnostics, and the web UI — off one port (8001, by default), but not everything on that port carries the same protection. `server.rs`'s `assemble_router` wraps `/mcp`, `/status`, `/metrics`, and `POST /admin/reload` in a `bearer_auth` middleware layer; `/health` and every route `web.rs`'s `ui_router` registers (`/`, the static UI assets, and the whole `/api/*` family) are merged into the app with no such layer at all, by design. Which of those two groups a given route falls in is fixed in the binary — it doesn't change based on how you deploy it. What *does* change based on deployment is who can reach the unguarded group in the first place, and that's the actual decision this section covers: two supported ways to answer "who can reach `/health` and `/api/*`," each with a different trade-off.
+
+### Posture A: reverse proxy with SSO (the default)
+
+This is the posture the project targets by default: the container's port is never published to the host at all (no `ports:` mapping, or one removed in favor of `docker-compose`'s internal network — see [`deploy/templates/traefik-labels.yml`](templates/traefik-labels.yml)'s own note that using Traefik means dropping the `ports:` mapping from the kb-rag service). An identity-aware reverse proxy — Authentik via Traefik, in the reference deployment — sits in front of the whole port, and every route the binary doesn't gate itself is gated by that proxy instead. `/mcp`, `/status`, `/metrics`, and `/admin/reload` still additionally require the bearer token even behind the proxy — the proxy and the bearer check are two independent layers, not a substitute for each other. See [README.md's Web UI section](../README.md#web-ui) for the full statement of what the web UI's routes grant if this proxy layer is ever missing, and [`deploy/templates/traefik-labels.yml`](templates/traefik-labels.yml) for the label set.
+
+This is a sound default, and it's the only posture worth reaching for on any network that isn't fully trusted. It has two costs worth naming, both confirmed against the reference deployment rather than theoretical:
+
+- **Non-interactive clients can't reach the routes the proxy intercepts.** SSO assumes a browser completing a redirect. `/api/graph` serves the same knowledge base content `/mcp` already hands any bearer-token holder, but a monitoring probe, a script, or an agent hitting it directly gets bounced into the identity provider's login flow instead of a response — `curl`, with or without a bearer token, gets an identical 302 to the SSO login page, because the bearer token means nothing to a gate the proxy applies before the request ever reaches md-kb-rag.
+- **There's no local diagnostic path when the proxy itself is the problem.** With the port unpublished, `curl` from the LAN can't reach `/health` or `/status` without completing an interactive SSO session first — backwards for the exact endpoints whose job is diagnosing a sick deployment, which may be sick *because* the proxy in front of it is misbehaving. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#curl-to-health-or-status-returns-a-302-redirect-to-an-sso-login-page) for the two ways around this without publishing the port.
+
+### Posture B: LAN-only, no proxy
+
+If you're content treating LAN reachability itself as the access control for the routes that carry no in-process gate — a single trusted subnet, a homelab, a tailnet where every peer is a device you already own — you can publish the port directly to a specific interface instead of routing everything through a proxy. This is a second supported posture, not a workaround for skipping Posture A's setup.
+
+The change is in the compose file's `ports:` mapping. Every GPU-backend template (`deploy/templates/compose-cpu.yml:61`, and the `-nvidia`/`-rocm`/`-vulkan`/`-apple-silicon` variants at the equivalent line) ships the same default:
+
+```yaml
+ports:
+  - "${MCP_PORT:-8001}:8001"
+```
+
+With no host address before the first colon, Docker binds to `0.0.0.0` — every interface the host has, including anything routable from outside the LAN. Naming an address is what actually confines the binding:
+
+```yaml
+ports:
+  - "192.168.1.50:8001:8001"       # a specific LAN interface
+  # or, for a tailnet address instead:
+  - "100.101.102.103:8001:8001"
+```
+
+If you want the address configurable per host rather than hardcoded, follow the same `${VAR:-default}` pattern the template already uses for `MCP_PORT`:
+
+```yaml
+ports:
+  - "${MCP_BIND_ADDR:-192.168.1.50}:${MCP_PORT:-8001}:8001"
+```
+
+and set `MCP_BIND_ADDR` in `.env` alongside the variables from [Set up environment variables](#3-set-up-environment-variables) — this is a `docker compose` host-side substitution, not something the binary itself reads, so any name works.
+
+#### Exactly what publishing the port grants access to
+
+Publishing the port doesn't change which routes are gated — it only changes who can reach the port at all. These four stay behind the bearer token no matter which posture you run, because `assemble_router` wraps them in `bearer_auth` regardless (`src/server.rs`):
+
+| Route | Method | Gate |
+|---|---|---|
+| `/mcp` | Streamable HTTP | `bearer_auth`, applied via `.route_layer` on `mcp_router` |
+| `/status` | GET | `bearer_auth`, applied via `.route_layer` on `status_router` |
+| `/metrics` | GET | `bearer_auth`, applied via `.route_layer` on `status_router` |
+| `/admin/reload` | POST | `bearer_auth`, applied via `.route_layer` on `admin_router` |
+
+Everything below carries no in-process gate at all in either posture — `assemble_router` merges `/health` in directly with no `bearer_auth` layer, and merges `web.rs`'s entire `ui_router` in the same unguarded way (`src/server.rs`; the individual routes are registered in `src/web.rs`'s `ui_router` function). On the LAN-only posture, this is the exact list of what "reachable by anyone who can reach the port" means:
+
+| Route | Method(s) |
+|---|---|
+| `/health` | GET |
+| `/` | GET |
+| `/assets/viz.css`, `/assets/viz.js`, `/assets/cytoscape.min.js`, `/assets/layout-base.js`, `/assets/cose-base.js`, `/assets/cytoscape-fcose.js`, `/assets/marked.min.js`, `/assets/dompurify.min.js`, `/assets/edit.js` | GET |
+| `/api/graph` | GET |
+| `/api/search` | GET |
+| `/api/schema/{*path}` | GET |
+| `/api/doc/{*path}` | **GET, POST, DELETE** |
+
+`/api/doc/{*path}` is the one worth reading twice. It isn't a read-only route with a write route sitting next to it — one `.route()` call in `ui_router` carries all three methods, and `POST`/`DELETE` are thin adapters over the exact same `write::write_document`/`write::delete_document` pipeline the MCP write tools use (see [Agent Write Tools](#agent-write-tools)), reachable with no credential check of any kind. **Stated plainly: on the LAN-only posture, anyone who can reach port 8001 can create, overwrite, or delete any document in the knowledge base.** That is a defensible trade on a network where every device reaching the port is already trusted — the same trust model an unauthenticated Prometheus exporter or a LAN-only NAS admin panel already relies on — and it is unstated risk if you adopt this posture assuming "unauthenticated" meant only the read routes.
+
+There is currently no way to get Posture B's diagnostic convenience — a `curl`-able `/health`, a script-reachable `/api/graph` — without also exposing `/api/doc/{*path}`'s write and delete surface. A read-only mode for the web UI doesn't exist today: no config flag makes `POST`/`DELETE /api/doc/{*path}` refuse while leaving the GET routes open. Until one does, "LAN-only" reads as "LAN-only, and LAN-only writes are possible," not "LAN-only reads only." A config flag that gated the UI's write routes independently of its read routes — so the safe half of this posture (open diagnostics, closed writes) didn't require accepting the unsafe half too — would be the natural follow-up here.
+
 ## Configuring Your Project
 
 ### 1. Prepare your knowledge base
