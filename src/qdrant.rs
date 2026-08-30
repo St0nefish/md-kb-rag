@@ -1924,22 +1924,40 @@ mod tests {
     }
 
     /// Integration test: `ensure_collection(enable_phrase: true)` creates a working
-    /// phrase-matching text index, and a phrase-filtered hybrid query ranks the chunk
-    /// containing the exact phrase above one that merely contains the same words in a
-    /// different order.
+    /// phrase-matching text index, a phrase-filtered *fused* (RRF) query ranks the
+    /// chunk containing the exact phrase above one that merely contains the same
+    /// words in a different order, and — #133 — the identical phrase condition
+    /// applied as a hard `Filter::must` genuinely EXCLUDES the non-matching chunk,
+    /// not just outranks it.
     ///
     /// #212: this test originally asserted the phrase-matching chunk was the ONLY
-    /// result (`results.len() == 1`) — i.e. that the phrase condition acts as a hard
-    /// filter. Against a real server (this test could not previously run at all — see
-    /// below) that assertion fails: both chunks come back, `/data/exact.md` first with
-    /// `/data/reordered.md` second. That is not a bug; it is exactly what
-    /// `build_fusion_arms`'s doc comment documents as deliberate — the phrase
-    /// condition only ever applies within ONE of the fused RRF arms (`dense` always
-    /// runs unfiltered too), so a document absent from the phrase arm can still
-    /// surface via the dense arm, just ranked lower because it only accumulates
-    /// reciprocal rank from one arm instead of two. Phrase matching is a ranking
-    /// signal, not an exclusion filter — the assertions below were rewritten to match
-    /// that actual, intended contract instead of loosening it to "don't crash".
+    /// result of the FUSED query (`results.len() == 1`) — i.e. that the phrase
+    /// condition acts as a hard filter there. Against a real server (this test could
+    /// not previously run at all — see below) that assertion fails: both chunks come
+    /// back, `/data/exact.md` first with `/data/reordered.md` second. That is not a
+    /// bug; it is exactly what `build_fusion_arms`'s doc comment documents as
+    /// deliberate — the phrase condition only ever applies within ONE of the fused
+    /// RRF arms (`dense` always runs unfiltered too), so a document absent from the
+    /// phrase arm can still surface via the dense arm, just ranked lower because it
+    /// only accumulates reciprocal rank from one arm instead of two. Phrase matching
+    /// is a *ranking* signal there, not an exclusion filter — the fused-query
+    /// assertions below were rewritten to match that actual, intended contract
+    /// instead of loosening it to "don't crash".
+    ///
+    /// #133: that rewrite, however, left NOTHING in the default (non-`--ignored`,
+    /// and — pre-#133 — not even CI-run) suite proving Qdrant's phrase filter
+    /// actually excludes anything server-side. Every other phrase test (offline,
+    /// mocked) only proves the *request* is shaped correctly — that the arm exists,
+    /// that `extract_phrases` splits quoted spans, that the filter condition is
+    /// present in what gets sent. None of that would catch the payload index
+    /// silently failing to build (`ensure_collection` tolerates that failure by
+    /// design and only logs), a tokenizer mismatch between indexing and querying, a
+    /// wrong field name in the phrase condition, or a Qdrant version whose phrase
+    /// semantics differ from what's assumed. The block at the end of this test closes
+    /// that gap directly: it applies the same phrase condition through `search`'s
+    /// `extra_conditions` (the plain dense-only path, which — unlike `hybrid_search`'s
+    /// fused arms — always compiles every condition into one real `Filter::must`) and
+    /// asserts the reordered chunk is gone from the result set entirely.
     ///
     /// Stays live-only — this exercises Qdrant's own phrase-matching text index
     /// end to end (index creation, then a real `Condition::matches_phrase` filter
@@ -2059,6 +2077,64 @@ mod tests {
                 results[1].phrase_score.is_none(),
                 "the reordered chunk never matched the phrase arm, so its phrase_score must \
                  be None — this is the actual signal the phrase-matching text index provides"
+            );
+
+            // #133: everything above proves phrase matching is a *ranking* signal
+            // inside the fused RRF query — and, per `build_fusion_arms`'s doc
+            // comment, that arm can never actually EXCLUDE a document, because the
+            // dense arm always runs alongside it unfiltered. That leaves the one
+            // claim the `phrase_matching` payload index actually exists to back —
+            // "Qdrant can filter results down to exactly the literal phrase" —
+            // completely unproven: a silently-failed index build (`ensure_collection`
+            // tolerates that by design and only logs — see its own doc comment), a
+            // tokenizer mismatch between how chunks were indexed and how phrases are
+            // queried, or a wrong field name in the phrase condition would all still
+            // let every assertion above pass, because nothing above ever asks Qdrant
+            // to exclude anything.
+            //
+            // Prove exclusion directly instead: apply the identical phrase condition
+            // as a hard `Filter::must` via `search`'s `extra_conditions` (the plain
+            // dense-only path, not the fused `hybrid_search` prefetch arm) and
+            // confirm the reordered chunk is excluded outright rather than merely
+            // out-ranked. This is what actually distinguishes "the server-side
+            // enforcement works" from "the request was shaped correctly" — the class
+            // of failure #133 was filed over.
+            let filtered = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .search(
+                            &config.collection,
+                            vec![1.0, 0.0, 0.0, 0.0],
+                            HashMap::new(),
+                            vec![Condition::matches_phrase(
+                                "text",
+                                "node:ares rocm".to_string(),
+                            )],
+                            10,
+                        )
+                        .await
+                        .unwrap()
+                },
+                |results| !results.is_empty(),
+            )
+            .await;
+
+            assert_eq!(
+                filtered.len(),
+                1,
+                "a hard phrase filter must exclude the reordered chunk outright, not merely \
+                 rank it lower — this is the server-side enforcement #133 asked to be proven"
+            );
+            assert_eq!(
+                filtered[0]
+                    .payload
+                    .get("file_path")
+                    .and_then(|v| v.as_str()),
+                Some("/data/exact.md"),
+                "the only survivor of a hard phrase filter must be the chunk that actually \
+                 contains the literal phrase"
             );
         })
         .await;

@@ -157,29 +157,32 @@ jobs:
             .
 
   # The mocked VectorStore suite proves nothing about real Qdrant wire
-  # semantics — filters, phrase matching, RRF, recommend. The six tests that
+  # semantics — filters, phrase matching, RRF, recommend. The seven tests that
   # do exercise a live server (src/qdrant.rs) are #[ignore]d, and plain
-  # `cargo test` (above) never passes --ignored, so none of them have ever
-  # run in CI (#186, and its narrower instance #133). Bring up the project's
-  # own qdrant service and run just those.
+  # `cargo test` (above) never passes --ignored, so none of them ran in CI
+  # before this job was added (#186, and its narrower instance #133). Bring up
+  # the project's own qdrant service and run just those.
   qdrant-integration:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: self-hosted
-    # Deliberately non-blocking for now: running this suite for the first time
-    # (while wiring it up) found phrase_index_enables_exact_phrase_matching
-    # and recommend_by_point_id_finds_nearest_neighbor FAILING against a real
-    # server — an invalid literal point-ID UUID in the phrase test's fixture,
-    # and a genuine assertion mismatch in the recommend test. Both are
-    # pre-existing bugs in the tests themselves (#133 already tracks the
-    # phrase one), not something this CI-wiring change fixes. Making the job
-    # required today would immediately red-flag every PR, including the one
-    # that adds it, over failures nobody here introduced. continue-on-error
-    # keeps the job's own pass/fail visible without letting it block, and it
-    # is deliberately left out of ci-pass's `needs` below for the same
-    # reason. Flip both once the underlying test bugs are fixed.
-    continue-on-error: true
-
+    # #133: this job shipped `continue-on-error: true` (and was left out of
+    # ci-pass's `needs`) specifically because running the suite for the first
+    # time, while wiring it up, found two pre-existing bugs in the tests
+    # themselves failing against a real server: an invalid literal point-ID
+    # UUID in phrase_index_enables_exact_phrase_matching's fixture (fixed by
+    # #212), and a genuine assertion mismatch in
+    # recommend_by_point_id_finds_nearest_neighbor (fixed by #231, which also
+    # made the whole suite safe to run with cargo's default multi-threaded
+    # test harness instead of forcing --test-threads=1). Both are closed, the
+    # phrase test has since been strengthened (same #133) to actually prove
+    # server-side exclusion rather than only a ranking effect, and this job's
+    # own health-wait step below was fixed alongside this change (see that
+    # step's comment) — a broken wait was the one thing that could still turn
+    # "the suite is green" into "the job times out for an unrelated reason."
+    # Twelve back-to-back local runs of the full ignored suite (multi-threaded,
+    # 16 threads) against a real Qdrant came back 7/7 green every time with no
+    # flakes observed — blocking now.
     steps:
       - uses: actions/checkout@v5
         with:
@@ -240,17 +243,28 @@ jobs:
 
       - name: Wait for Qdrant to be healthy
         run: |
-          # docker-compose.yml already defines qdrant's healthcheck; poll it
-          # directly instead of a fixed sleep (see deploy.sh's own fix, #198,
-          # for why a flat sleep isn't good enough here either).
+          # #133: this used to poll docker-compose.yml's own container
+          # healthcheck status via `docker compose ps ... Health`. Verified while
+          # making this job blocking that the healthcheck itself never reports
+          # `healthy` for the pinned qdrant/qdrant:v1.17.0 image: its `test`
+          # shells out to `curl`, which that image does not ship (`exec: "curl":
+          # executable file not found in $PATH`), and even a working `curl`
+          # would still hit a wall — that image dropped `/health` in favor of
+          # `/healthz`/`/readyz`/`/livez`, so the command it runs 404s regardless.
+          # The container itself comes up fine; only the healthcheck definition
+          # (out of scope here — docker-compose.yml is untouched by this change)
+          # is stale. Poll the real readiness endpoint directly from the runner
+          # instead of trusting that status — the REST port is already published
+          # to the host (`127.0.0.1:6333:6333` in docker-compose.yml), so this
+          # needs nothing from inside the container. Still poll-not-sleep (see
+          # deploy.sh's own fix, #198, for why a flat sleep isn't good enough).
           timeout=60
           elapsed=0
           while true; do
-            status=$(docker compose -f docker-compose.yml ps --format json qdrant |
-              jq -rs 'flatten | .[0].Health // empty')
-            [[ "$status" == "healthy" ]] && break
-            if [[ "$status" == "unhealthy" ]] || (( elapsed >= timeout )); then
-              echo "::error::qdrant did not become healthy within ${timeout}s (status: ${status:-none})"
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:6333/readyz || echo "000")
+            [[ "$code" == "200" ]] && break
+            if (( elapsed >= timeout )); then
+              echo "::error::qdrant did not become ready within ${timeout}s (last HTTP status: ${code})"
               docker compose -f docker-compose.yml logs qdrant
               exit 1
             fi
@@ -266,18 +280,29 @@ jobs:
         run: docker compose -f docker-compose.yml down -v
 
   # Gate job for branch protection — set "ci-pass" as the required status check.
-  # Passes when test succeeds or was skipped (doc-only changes).
-  # qdrant-integration is deliberately NOT in this list — see its own comment.
+  # Passes when both test and qdrant-integration succeed or were skipped
+  # (doc-only changes skip both identically, via the same `changes` gate).
+  # #133: qdrant-integration used to be deliberately left out of this list —
+  # see its own job comment for why that's no longer the case.
   ci-pass:
     if: always()
-    needs: [test]
+    needs: [test, qdrant-integration]
     runs-on: ubuntu-latest
     steps:
       - name: Check result
         run: |
-          if [[ "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
-            echo "CI passed (test: ${{ needs.test.result }})"
+          ok=true
+          if [[ ! "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "test: ${{ needs.test.result }}"
+            ok=false
+          fi
+          if [[ ! "${{ needs.qdrant-integration.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "qdrant-integration: ${{ needs.qdrant-integration.result }}"
+            ok=false
+          fi
+          if [[ "$ok" == "true" ]]; then
+            echo "CI passed (test: ${{ needs.test.result }}, qdrant-integration: ${{ needs.qdrant-integration.result }})"
           else
-            echo "CI failed (test: ${{ needs.test.result }})"
+            echo "CI failed"
             exit 1
           fi
