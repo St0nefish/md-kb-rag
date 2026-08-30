@@ -488,6 +488,65 @@ pub struct BrokenLinksReport {
     pub truncated: bool,
 }
 
+/// Whether `target` — a KB-root-relative link target from a `document_links`
+/// row — points at a real, present file, for [`broken_links_report`]'s
+/// false-positive filter (#239).
+///
+/// Two things this deliberately does NOT trust, even though both are true of
+/// every target that reaches this function today:
+///
+/// 1. **That `target` is symlink-free.** `ingest::discover_files` explicitly
+///    *skips* symlinks at index time — a symlink is never indexed, so a link
+///    to one is not something the indexer would ever resolve, and treating it
+///    as "present" would contradict the indexer's own policy. The old
+///    `is_file()` check followed symlinks and could not tell the difference.
+///    `symlink_metadata` below inspects the target's own leaf component
+///    without following it, so a target that IS a symlink is reported absent
+///    (broken) here, matching `discover_files` exactly.
+/// 2. **That `target` cannot point outside `data_path`.** It currently can't:
+///    `ingest::extract_markdown_links`'s resolver rejects absolute/scheme-
+///    prefixed targets and pops `..` components down to root before a target
+///    ever reaches a `document_links` row. But that invariant lives two
+///    modules away from this one, and #131 is an open issue about relaxing
+///    exactly that resolver — a change there would silently re-open a path-
+///    escape here if this function had no check of its own. `symlink_metadata`
+///    alone is not enough to catch this case: it inspects only the target's
+///    own leaf component, not a symlinked ANCESTOR directory earlier in the
+///    joined path (e.g. `data_path/linked-dir/real-file.md`, where
+///    `linked-dir` itself is a symlink out of `data_path`) — canonicalizing
+///    the full joined path and checking containment against `canonical_root`
+///    is what catches that.
+///
+/// `canonical_root` is `None` when `data_path` itself failed to canonicalize
+/// (a misconfigured or missing KB root) — containment can never be verified
+/// in that case, so every target is reported absent rather than silently
+/// trusting an unverifiable root.
+fn target_is_present(data_path: &Path, canonical_root: Option<&Path>, target: &str) -> bool {
+    let Some(canonical_root) = canonical_root else {
+        return false;
+    };
+
+    let joined = data_path.join(target);
+
+    // Leaf-only check, deliberately not following a symlink at `joined`
+    // itself — see point 1 above.
+    let Ok(meta) = std::fs::symlink_metadata(&joined) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return false;
+    }
+
+    // Containment check against an ancestor symlink `symlink_metadata` above
+    // cannot see — see point 2 above. `canonicalize` here additionally
+    // re-confirms the leaf itself isn't a symlink (it fully resolves the
+    // path), which is redundant with the check above but harmless.
+    let Ok(canonical_target) = joined.canonicalize() else {
+        return false;
+    };
+    canonical_target.starts_with(canonical_root)
+}
+
 /// Build [`BrokenLinksReport`] from the raw dangling `(source_path, target_path)`
 /// pairs [`crate::state::StateDb::broken_markdown_links`] returns, resolving the
 /// false-positive trap #158 calls out and applying the display cap.
@@ -503,19 +562,28 @@ pub struct BrokenLinksReport {
 /// `indexing.exclude`/`exclude_files`'s glob/filename matching here as a second
 /// copy that could drift from `ingest::discover_files`'s (the actual authority
 /// on what gets indexed), this asks the one question that actually settles it:
-/// does a file exist at `data_path.join(target_path)` at all. `target_path` is
-/// always KB-root-relative and already climb-checked by
-/// `ingest::extract_markdown_links`'s resolver, so the join is safe to stat
-/// directly.
+/// does a file exist at `data_path.join(target_path)`, per [`target_is_present`]
+/// below. `target_path` is always KB-root-relative and already climb-checked by
+/// `ingest::extract_markdown_links`'s resolver before it ever reaches a
+/// `document_links` row, so the join itself is safe — but see
+/// [`target_is_present`]'s own doc comment for why this function does not rely
+/// on that invariant alone (#239).
 ///
 /// `pairs` is consumed in whatever order it arrives; the caller
 /// (`broken_markdown_links`) already returns it `ORDER BY source_path,
 /// target_path`, which is what lets the grouping loop below key off "did the
 /// source change from the previous pair" instead of a hash map.
 pub fn broken_links_report(pairs: Vec<(String, String)>, data_path: &Path) -> BrokenLinksReport {
+    // Canonicalized once, not per-pair: every candidate target below is
+    // checked for containment against this. `None` (data_path itself doesn't
+    // canonicalize — a misconfigured/missing KB root) means containment can
+    // never be verified, so `target_is_present` below treats every target as
+    // absent rather than silently trusting an unverifiable root.
+    let canonical_root = data_path.canonicalize().ok();
+
     let live: Vec<(String, String)> = pairs
         .into_iter()
-        .filter(|(_, target)| !data_path.join(target).is_file())
+        .filter(|(_, target)| !target_is_present(data_path, canonical_root.as_deref(), target))
         .collect();
 
     let total = live.len();
@@ -1368,5 +1436,61 @@ mod tests {
         assert_eq!(report.total, 0);
         assert!(!report.truncated);
         assert!(report.by_source.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // broken_links_report: symlink policy and containment (#239)
+    // -----------------------------------------------------------------------
+
+    /// #239 regression: `ingest::discover_files` explicitly skips symlinks at
+    /// index time, so a link target that resolves to one is never something
+    /// the indexer would pick up — the old `is_file()` check followed the
+    /// symlink and would call this "present" (a false negative for
+    /// brokenness) purely because the file it points at happens to exist.
+    /// `symlink_metadata` must catch this even though the linked-to file is
+    /// perfectly real.
+    #[test]
+    fn broken_links_report_flags_a_target_that_is_itself_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.md"), "# real").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.md"), dir.path().join("link.md")).unwrap();
+        let pairs = vec![("a.md".to_string(), "link.md".to_string())];
+
+        let report = broken_links_report(pairs, dir.path());
+
+        assert_eq!(
+            report.total, 1,
+            "a target that is itself a symlink must be reported broken, even though the \
+             file it points at exists — the indexer will never pick up a symlink"
+        );
+        assert_eq!(report.by_source[0].broken_targets, vec!["link.md"]);
+    }
+
+    /// #239 regression: a target whose path CLIMBS THROUGH a symlinked
+    /// ancestor directory that escapes `data_path` must be reported broken,
+    /// even though the leaf component itself is an ordinary file and
+    /// `symlink_metadata` on the full joined path sees only that leaf (the OS
+    /// resolves intermediate path components normally, so `symlink_metadata`
+    /// alone cannot see an ancestor symlink). This is not reachable via the
+    /// current resolver (`ingest::extract_markdown_links` already rejects
+    /// paths that would need this), but the containment check must hold on
+    /// its own local invariant rather than depend on that — see #131.
+    #[test]
+    fn broken_links_report_flags_a_target_escaping_data_path_via_an_ancestor_symlink() {
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("secret.md"), "# secret").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outer.path(), dir.path().join("escape")).unwrap();
+        let pairs = vec![("a.md".to_string(), "escape/secret.md".to_string())];
+
+        let report = broken_links_report(pairs, dir.path());
+
+        assert_eq!(
+            report.total, 1,
+            "a target reached only through a symlinked ancestor directory that escapes \
+             data_path must be reported broken, not treated as present"
+        );
+        assert_eq!(report.by_source[0].broken_targets, vec!["escape/secret.md"]);
     }
 }
