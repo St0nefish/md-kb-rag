@@ -196,6 +196,122 @@ values: [one, two]             # replace outright
 - **`$values` with nothing to inherit** (no ancestor scope declares any `values` for this field, or there is no ancestor definition at all) resolves to contributing *no* values — a loud warning is logged naming the scope and field — rather than silently falling back to "no values declared at all." The field ends up with whatever literal values remain in the list (or a totally empty, closed set if the sentinel was the only token), not an unconstrained one: an empty closed set fails the moment a document sets the field, which is a visible, immediate signal that something upstream is missing; treating the whole `values:` declaration as absent would instead silently stop enforcing the field at all. Declare `values` on an ancestor, or drop the sentinel, to clear the warning.
 - **`extend: true` is deprecated** — it was the mechanism before `$values` existed, and is kept only so schema files written before this change keep parsing and cascading identically. `extend: true` behaves exactly like a leading `$values` (`values: [$values, ...]`); using it logs a warning naming the schema file. New schemas should write `$values` directly. Declaring both `extend: true` and an explicit `$values` on the same field is a parse error — the two ways of saying "inherit" must not be able to disagree about where the inherited values land.
 
+### Worked example: a three-level cascade
+
+The rules above are easiest to check against a real, end-to-end example. Take a knowledge base with a root schema, a `food/` schema that both adds a field and extends an inherited value list, and a `food/recipes/` schema that narrows one field's `values` without touching its other attributes.
+
+**Root `.kb-schema.yaml`** (at the knowledge-base root):
+
+```yaml
+fields:
+  title:       { type: text, required: true }
+  description: { type: text, required: true }
+  type:        { type: enum, required: true, indexed: true, values: [guide, reference, howto, recipe] }
+  status:      { type: enum, indexed: true, values: [draft, active, archived], default: active }
+  tags:        { type: list, indexed: true, values: [reference, howto] }
+```
+
+Resolved at the KB root — every field's `declared_in` is this file, since nothing has been inherited yet:
+
+| Field | Type | Required | Indexed | Values | Default |
+|---|---|---|---|---|---|
+| `title` | text | true | false | — | — |
+| `description` | text | true | false | — | — |
+| `type` | enum | true | true | `guide, reference, howto, recipe` | — |
+| `status` | enum | false | true | `draft, active, archived` | `active` |
+| `tags` | list | false | true | `reference, howto` | — |
+
+**`food/.kb-schema.yaml`** — adds a new field (`cuisine`) and extends the inherited `tags` vocabulary rather than replacing it:
+
+```yaml
+fields:
+  cuisine: { type: text, indexed: true }
+  tags:    { values: [$values, dinner, quick] }
+```
+
+Resolved for anything under `food/` (merged onto the root's resolved schema above — everything not re-declared here still inherits from it verbatim):
+
+| Field | Type | Required | Indexed | Values | Default | Declared in |
+|---|---|---|---|---|---|---|
+| `title` | text | true | false | — | — | `.kb-schema.yaml` (root) |
+| `description` | text | true | false | — | — | `.kb-schema.yaml` (root) |
+| `type` | enum | true | true | `guide, reference, howto, recipe` | — | `.kb-schema.yaml` (root) |
+| `status` | enum | false | true | `draft, active, archived` | `active` | `.kb-schema.yaml` (root) |
+| `tags` | list | false | true | `reference, howto, dinner, quick` | — | `food/.kb-schema.yaml` |
+| `cuisine` | text | false | true | — | — | `food/.kb-schema.yaml` |
+
+`tags`' merged `values` list is `reference, howto, dinner, quick` — the inherited pair first (the position `$values` sits at in the list), then the two new literals, deduplicated. `type`/`status`/`title`/`description` pass through unchanged because `food/.kb-schema.yaml` never mentions them at all: per-attribute inheritance means a scope that redeclares one field has no effect on every *other* field.
+
+**`food/recipes/.kb-schema.yaml`** — redefines `type`'s `values` wholesale (no `$values`, so this **replaces** rather than extends) and declares a nested `planning` object, reusing the [Authoring](#authoring) example above:
+
+```yaml
+fields:
+  type:
+    values: [recipe]
+  planning:
+    type: object
+    fields:
+      prep_minutes: { type: integer, indexed: true }
+      effort:       { type: enum, values: [low, medium, high], indexed: true }
+```
+
+Resolved for anything under `food/recipes/` — the final, fully-merged schema a document there actually validates against:
+
+| Field | Type | Required | Indexed | Values | Default | Declared in |
+|---|---|---|---|---|---|---|
+| `title` | text | true | false | — | — | `.kb-schema.yaml` (root) |
+| `description` | text | true | false | — | — | `.kb-schema.yaml` (root) |
+| `type` | enum | **true** | **true** | **`recipe`** | — | `food/recipes/.kb-schema.yaml` |
+| `status` | enum | false | true | `draft, active, archived` | `active` | `.kb-schema.yaml` (root) |
+| `tags` | list | false | true | `reference, howto, dinner, quick` | — | `food/.kb-schema.yaml` |
+| `cuisine` | text | false | true | — | — | `food/.kb-schema.yaml` |
+| `planning` | object | false | false | — | — | `food/recipes/.kb-schema.yaml` |
+| `planning.prep_minutes` | integer | false | true | — | — | `food/recipes/.kb-schema.yaml` |
+| `planning.effort` | enum | false | true | `low, medium, high` | — | `food/recipes/.kb-schema.yaml` |
+
+`type` is the wholesale-redefinition case the per-attribute merge rule exists for: `food/recipes/.kb-schema.yaml` writes *only* `values: [recipe]` — no `type:`, `required:`, or `indexed:` — and the resolved field still comes out `required: true, indexed: true`, inherited from the root's original declaration. Under the old whole-definition-replacement rule this narrowing would have silently reset `required`/`indexed` to their defaults (`false`); per-attribute merging is precisely what makes narrowing one attribute safe without restating every other one. `declared_in` still moves to `food/recipes/.kb-schema.yaml`, though, because that file is the one that most recently *mentioned* `type` — provenance tracks the nearest scope that touched a field, not which attributes it actually changed.
+
+Calling `get_schema` for a document in that directory (e.g. `food/recipes/lasagna.md`) returns exactly this merged view, with provenance per field — trimmed to two fields below for brevity, `fields` in the real response has one entry per row of the table above:
+
+```json
+{
+  "path": "food/recipes/lasagna.md",
+  "frozen": false,
+  "fields": [
+    {
+      "field": "type",
+      "type": "enum",
+      "required": true,
+      "indexed": true,
+      "values": ["recipe"],
+      "default": null,
+      "open": true,
+      "declared_in": "food/recipes/.kb-schema.yaml"
+    },
+    {
+      "field": "tags",
+      "type": "list",
+      "required": false,
+      "indexed": true,
+      "values": ["reference", "howto", "dinner", "quick"],
+      "default": null,
+      "open": true,
+      "declared_in": "food/.kb-schema.yaml"
+    }
+  ]
+}
+```
+
+**The deprecated equivalent.** `food/.kb-schema.yaml`'s `tags` redefinition above could also have been written with the deprecated `extend: true` flag instead of an explicit `$values` sentinel, with an identical result:
+
+```yaml
+tags:
+  values: [dinner, quick]
+  extend: true
+```
+
+`extend: true` is a shorthand for a leading `$values` — internally it becomes `values: [$values, dinner, quick]`, the same list spliced the same way — but using it logs a warning naming the schema file, since `$values` is the non-deprecated way to say the same thing. New schemas should write `$values` explicitly, as in the worked example above.
+
 ### Freezing
 
 A malformed `.kb-schema.yaml` **freezes its subtree**: nothing under it is indexed or re-indexed, and existing index entries are left untouched — it never silently falls back to the parent's rules. `md-kb-rag validate` reports broken schema files in a `SCHEMA ERRORS` section, and they count as a failure under `validation.strict: true`.
@@ -335,7 +451,7 @@ volumes:
   kb_data:
 ```
 
-On first start with an empty volume, the server automatically shallow-clones the repo and runs a full index. Subsequent updates come through the webhook (`git fetch` + `git merge --ff-only` + incremental reindex).
+On first start with an empty volume, the server automatically clones the repo (a full clone, not shallow — a later `commit_and_sync` from the write tools needs history to fetch/rebase/push) and runs a full index. Subsequent updates come through the webhook (`git fetch` + `git merge --ff-only` + incremental reindex).
 
 **Why this is preferred:**
 

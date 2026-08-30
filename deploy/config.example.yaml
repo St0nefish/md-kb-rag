@@ -454,6 +454,20 @@ search:
   # Set to false to treat quotes as literal characters and skip the index.
   phrase: true
 
+  # Global minimum relevance score floor. Results scoring below this are
+  # dropped before being returned. Unset (the default, shown here as `null`)
+  # disables the floor entirely.
+  #
+  # RRF (fused) scores are ~0.01-0.03, an entirely different scale from dense
+  # cosine similarity — and which scale actually applies is NOT simply
+  # decided by `hybrid` above: `phrase` defaults to true, so even with
+  # `hybrid: false` any query containing a "quoted phrase" still fuses and
+  # lands on the RRF scale; only a query with no quoted phrase at all stays
+  # on plain dense cosine. A dense-cosine-scale threshold (e.g. 0.5) set
+  # under `hybrid: false` will silently zero out results for every phrase
+  # query, since a fused score can never clear a cosine-appropriate floor.
+  min_score: null
+
   # Per-document result diversity (issue #86): the maximum number of chunks
   # from a single document allowed to occupy the final result set. Without
   # this, one long document with many indexed chunks can occupy several slots
@@ -534,6 +548,36 @@ reranking:
   # every candidate loses its reranking. Truncation is logged once per
   # request and affects only the reranker's view — returned content is
   # unchanged. See deploy/TROUBLESHOOTING.md for the bytes-vs-tokens caveat.
+
+
+# ----------------------------------------------------------------------------
+# ui — knowledge-base web UI tuning
+# ----------------------------------------------------------------------------
+# Pure YAML tuning knobs for the web UI served by this same binary (see
+# README.md's "Web UI" section). No secrets, no bootstrap wiring — everything
+# here is live-reloadable via POST /admin/reload.
+ui:
+
+  # Precomputed semantic (kNN) graph edges shown alongside markdown-link edges
+  # in the web UI's graph view, in addition to the links already discovered
+  # from `[[wiki-links]]` and markdown links between documents.
+  semantic_edges:
+
+    # Off by default: computing these costs one Qdrant `recommend` query per
+    # indexed document, on every run that touches the graph — real query
+    # volume proportional to corpus size, not a one-time cost. Enable only if
+    # the semantic-neighbor overlay is worth that cost for your deployment.
+    enabled: false
+
+    # Number of nearest-neighbor edges to keep per document, highest
+    # cosine-similarity score first, after dedup and the min_score filter
+    # below.
+    k: 5
+
+    # Minimum cosine similarity for a neighbor to be kept as an edge. Results
+    # scoring below this are discarded rather than shown as a weak/misleading
+    # connection.
+    min_score: 0.6
 
 
 # ============================================================================

@@ -3,6 +3,7 @@ mod config;
 mod descriptions;
 mod document_fields;
 mod embed;
+mod eval;
 mod git;
 mod ingest;
 mod mcp;
@@ -44,7 +45,11 @@ fn print_component(name: &str, c: &server::ComponentHealth) {
 }
 
 #[derive(Parser)]
-#[command(name = "md-kb-rag", about = "Markdown knowledge base RAG server")]
+#[command(
+    name = "md-kb-rag",
+    about = "Markdown knowledge base RAG server",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "config.yaml")]
@@ -85,6 +90,24 @@ struct SearchArgs {
     /// Output results as JSON
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct EvalArgs {
+    /// Path to a YAML file of eval cases — see `eval.rs`'s module doc comment for
+    /// the schema (`expect_paths` vs `expect_any`, optional per-case `filters`).
+    #[arg(long)]
+    queries: PathBuf,
+    /// Number of results requested per query, and the k in recall@k.
+    #[arg(short, long, default_value_t = 5)]
+    k: u64,
+    /// Emit the full report as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+    /// Exit non-zero if the aggregate recall@k (not MRR — see `eval.rs`) falls
+    /// below this value (0.0–1.0). Omit to always exit 0 regardless of score.
+    #[arg(long)]
+    threshold: Option<f64>,
 }
 
 #[derive(Args)]
@@ -140,11 +163,85 @@ enum Commands {
     Search(SearchArgs),
     /// Retrieve a document by path from the CLI
     Get(GetArgs),
+    /// Score retrieval quality (recall@k, MRR) against a fixed set of queries
+    ///
+    /// Runs every case in `--queries` through the same `retrieval::search` core the
+    /// server uses, with the deployed config's search/reranking knobs applied — see
+    /// `eval.rs` for the query file schema and the metric definitions.
+    Eval(EvalArgs),
     /// Rebuild the document field index from stored frontmatter
     ///
     /// Use after changing how frontmatter projects into filterable fields. Reads only
     /// the state DB — no markdown is re-read, nothing is re-embedded, Qdrant is untouched.
     ReprojectFields,
+}
+
+/// Shared plumbing for building a live `retrieval::RetrievalDeps` outside the
+/// server process.
+///
+/// Before this existed, the `search` CLI subcommand built its embed
+/// client/Qdrant store/reranker/include-globset by hand inline, and `eval` (#167)
+/// would otherwise have had to copy that block verbatim — exactly the "duplicate
+/// the CLI search subcommand's plumbing" this was pulled out to avoid. Both
+/// subcommands now call `RetrievalComponents::build` and `.deps(...)`. Kept in
+/// `main.rs` rather than `retrieval.rs`: constructing a live `QdrantStore`/
+/// `EmbedClient` pair from a loaded config is CLI process wiring, not retrieval
+/// logic — `retrieval.rs` stays entirely process-agnostic (per #84) by never doing
+/// this itself.
+struct RetrievalComponents {
+    embed_client: embed::EmbedClient,
+    qdrant: qdrant::QdrantStore,
+    reranker: Option<rerank::RerankClient>,
+    data_path: PathBuf,
+    include_patterns: globset::GlobSet,
+}
+
+impl RetrievalComponents {
+    fn build(cfg: &config::ResolvedConfig, want_reranker: bool) -> anyhow::Result<Self> {
+        let embed_client = embed::EmbedClient::new(&cfg.embedding);
+        let qdrant = qdrant::QdrantStore::new(&cfg.qdrant)?;
+        let reranker = if want_reranker {
+            cfg.reranking.as_ref().map(rerank::RerankClient::new)
+        } else {
+            None
+        };
+        let data_path = PathBuf::from(cfg.data_path());
+
+        // Build a permissive include GlobSet for CLI retrieval, same fallback the
+        // `search`/`get` subcommands have always used: a config whose `indexing.include`
+        // fails to compile should not take retrieval down with it.
+        let (gs_builder, _) = ingest::parse_globs(&cfg.indexing.include);
+        let include_patterns = gs_builder.build().unwrap_or_else(|_| {
+            let mut b = globset::GlobSetBuilder::new();
+            b.add(globset::Glob::new("**/*.md").unwrap());
+            b.build().unwrap()
+        });
+
+        Ok(Self {
+            embed_client,
+            qdrant,
+            reranker,
+            data_path,
+            include_patterns,
+        })
+    }
+
+    fn deps<'a>(
+        &'a self,
+        collection: &'a str,
+    ) -> retrieval::RetrievalDeps<'a, embed::EmbedClient, qdrant::QdrantStore> {
+        retrieval::RetrievalDeps {
+            embed_client: &self.embed_client,
+            qdrant: &self.qdrant,
+            collection,
+            data_path: &self.data_path,
+            include_patterns: &self.include_patterns,
+            reranker: self
+                .reranker
+                .as_ref()
+                .map(|r| r as &(dyn rerank::Reranker + Send + Sync)),
+        }
+    }
 }
 
 #[tokio::main]
@@ -343,30 +440,8 @@ async fn main() -> anyhow::Result<()> {
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            let embed_client = embed::EmbedClient::new(&cfg.embedding);
-            let qdrant = qdrant::QdrantStore::new(&cfg.qdrant)?;
-            let reranker: Option<rerank::RerankClient> =
-                cfg.reranking.as_ref().map(rerank::RerankClient::new);
-            let data_path = PathBuf::from(cfg.data_path());
-
-            // Build a permissive include GlobSet for CLI search
-            let (gs_builder, _) = ingest::parse_globs(&cfg.indexing.include);
-            let include_patterns = gs_builder.build().unwrap_or_else(|_| {
-                let mut b = globset::GlobSetBuilder::new();
-                b.add(globset::Glob::new("**/*.md").unwrap());
-                b.build().unwrap()
-            });
-
-            let deps = retrieval::RetrievalDeps {
-                embed_client: &embed_client,
-                qdrant: &qdrant,
-                collection: &cfg.qdrant.collection,
-                data_path: &data_path,
-                include_patterns: &include_patterns,
-                reranker: reranker
-                    .as_ref()
-                    .map(|r| r as &(dyn rerank::Reranker + Send + Sync)),
-            };
+            let components = RetrievalComponents::build(&cfg, true)?;
+            let deps = components.deps(&cfg.qdrant.collection);
 
             let filters = retrieval::plain_search_filters(
                 args.domain.as_deref(),
@@ -411,6 +486,47 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
                 print_search_results(&results, args.explain, cfg.search.hybrid);
+            }
+        }
+        Commands::Eval(args) => {
+            let cases = eval::load_cases(&args.queries)?;
+
+            let components = RetrievalComponents::build(&cfg, true)?;
+            let deps = components.deps(&cfg.qdrant.collection);
+
+            let search_cfg = eval::EvalSearchConfig {
+                k: args.k,
+                min_score: cfg.search.min_score,
+                hybrid: cfg.search.hybrid,
+                rrf_candidates: cfg.search.rrf_candidates as u64,
+                // Same caveat as the `search` subcommand above: this CLI path never
+                // runs `ensure_collection`, so phrase availability reflects nothing
+                // but config intent unless something else in this process already
+                // confirmed it.
+                phrase: cfg.search.phrase && status::INDEX_STATUS.phrase_matching_available(),
+                rerank_candidate_limit: cfg.reranking.as_ref().map(|r| r.candidate_limit as u64),
+                diversity_max_per_document: cfg.search.diversity_max_per_document,
+            };
+
+            let report = eval::run_eval(&deps, &cases, &search_cfg).await?;
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_eval_report(&report);
+            }
+
+            if let Some(threshold) = args.threshold
+                && report.mean_recall_at_k < threshold
+            {
+                // Printed above regardless, so a CI consumer that captured the
+                // output still sees exactly what fell short before the process
+                // exits non-zero.
+                eprintln!(
+                    "eval: aggregate recall@{} ({:.4}) is below --threshold {:.4}",
+                    report.k, report.mean_recall_at_k, threshold
+                );
+                std::process::exit(1);
             }
         }
         Commands::Get(args) => {
@@ -514,6 +630,7 @@ fn write_status(
     w: &mut impl std::io::Write,
     status: &server::StatusResponse,
 ) -> std::io::Result<()> {
+    writeln!(w, "Version:     {}", status.version)?;
     writeln!(w, "Collection:  {}", status.collection)?;
     writeln!(w, "Data path:   {}", status.data_path)?;
     writeln!(w)?;
@@ -627,6 +744,36 @@ fn print_search_results(results: &[qdrant::SearchResult], explain: bool, hybrid:
     }
 }
 
+/// Human-readable rendering of an `eval::EvalReport`.
+///
+/// Per-case detail only for failures — a passing case's retrieved list adds noise
+/// with no decision the reader has to make, while a failing case's `missing` list
+/// is exactly what an operator needs to start diagnosing (a chunking change that
+/// broke a document's boundaries, a filter that's now too strict, an embedding
+/// model swap that lost a synonym).
+fn print_eval_report(report: &eval::EvalReport) {
+    for c in &report.cases {
+        let mark = if c.passed { "PASS" } else { "FAIL" };
+        println!(
+            "[{mark}] recall@{}={:.2} rr={:.2}  {}",
+            report.k, c.recall_at_k, c.reciprocal_rank, c.query
+        );
+        if !c.passed {
+            println!("       missing: {}", c.missing.join(", "));
+        }
+    }
+    println!();
+    println!(
+        "{} passed, {} failed ({} case{})",
+        report.passed,
+        report.failed,
+        report.cases.len(),
+        if report.cases.len() == 1 { "" } else { "s" }
+    );
+    println!("recall@{}: {:.4}", report.k, report.mean_recall_at_k);
+    println!("MRR:      {:.4}", report.mrr);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +820,97 @@ mod tests {
         assert_eq!((end_only.start_line, end_only.end_line), (None, Some(20)));
     }
 
+    // --- `eval` argument parsing ---------------------------------------------
+
+    fn parse_eval(argv: &[&str]) -> EvalArgs {
+        let cli = Cli::parse_from(argv);
+        match cli.command {
+            Some(Commands::Eval(args)) => args,
+            _ => panic!("expected the eval subcommand"),
+        }
+    }
+
+    #[test]
+    fn eval_defaults_k_to_five_and_flags_to_off() {
+        let args = parse_eval(&["md-kb-rag", "eval", "--queries", "eval.yaml"]);
+        assert_eq!(args.queries, PathBuf::from("eval.yaml"));
+        assert_eq!(args.k, 5);
+        assert!(!args.json);
+        assert_eq!(args.threshold, None);
+    }
+
+    #[test]
+    fn eval_accepts_k_json_and_threshold() {
+        let args = parse_eval(&[
+            "md-kb-rag",
+            "eval",
+            "--queries",
+            "eval.yaml",
+            "-k",
+            "10",
+            "--json",
+            "--threshold",
+            "0.8",
+        ]);
+        assert_eq!(args.k, 10);
+        assert!(args.json);
+        assert_eq!(args.threshold, Some(0.8));
+    }
+
+    #[test]
+    fn eval_requires_queries() {
+        assert!(
+            Cli::try_parse_from(["md-kb-rag", "eval"]).is_err(),
+            "--queries has no default and must be required"
+        );
+    }
+
+    // --- eval report rendering ------------------------------------------------
+
+    #[test]
+    fn print_eval_report_does_not_panic_on_empty_and_mixed_reports() {
+        // Smoke test: rendering must not panic on the empty case or on a mix of
+        // passed/failed cases — the actual metric math is covered in eval.rs.
+        let empty = eval::EvalReport {
+            k: 5,
+            cases: vec![],
+            mean_recall_at_k: 0.0,
+            mrr: 0.0,
+            passed: 0,
+            failed: 0,
+        };
+        print_eval_report(&empty);
+
+        let mixed = eval::EvalReport {
+            k: 5,
+            cases: vec![
+                eval::score_case(
+                    &eval::EvalCase {
+                        query: "q1".into(),
+                        expect_paths: vec!["a.md".into()],
+                        expect_any: vec![],
+                        filters: eval::EvalFilters::default(),
+                    },
+                    &["a.md".to_string()],
+                ),
+                eval::score_case(
+                    &eval::EvalCase {
+                        query: "q2".into(),
+                        expect_paths: vec!["b.md".into()],
+                        expect_any: vec![],
+                        filters: eval::EvalFilters::default(),
+                    },
+                    &["z.md".to_string()],
+                ),
+            ],
+            mean_recall_at_k: 0.5,
+            mrr: 0.5,
+            passed: 1,
+            failed: 1,
+        };
+        print_eval_report(&mixed);
+    }
+
     #[test]
     fn get_rejects_a_negative_line_bound_at_parse_time() {
         assert!(
@@ -689,6 +927,7 @@ mod tests {
 
     fn base_status() -> StatusResponse {
         StatusResponse {
+            version: "0.0.0-test".into(),
             uptime_secs: 1.0,
             collection: "knowledge-base".into(),
             data_path: "/data".into(),
@@ -716,6 +955,7 @@ mod tests {
     #[test]
     fn status_renders_the_three_store_counts() {
         let out = render(&base_status());
+        assert!(out.contains("Version:     0.0.0-test"), "{out}");
         assert!(out.contains("Indexed files:  330"), "{out}");
         assert!(out.contains("Documents:      330"), "{out}");
         assert!(out.contains("Qdrant points:  2481"), "{out}");
