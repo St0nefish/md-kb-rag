@@ -137,10 +137,19 @@ jobs:
 
       - name: Build and push (sha tag)
         run: |
+          # VERSION/REVISION feed the Dockerfile's OCI image labels, which have
+          # two real readers: /status's build identity, and arm64-nightly.yml's
+          # skip-if-unchanged check, which compares
+          # org.opencontainers.image.revision against the commit it would build
+          # (#194). Without these args the Dockerfile's `unknown` defaults ship,
+          # so that check can never match and the nightly rebuilds every time.
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           docker buildx build \
             --builder ci-builder \
             --push \
             --build-arg RUST_VERSION=${{ steps.rust_version.outputs.version }} \
+            --build-arg VERSION="${VERSION}" \
+            --build-arg REVISION="${{ github.event.pull_request.head.sha }}" \
             --cache-from type=registry,ref=${{ steps.image.outputs.name }}:buildcache \
             --cache-to type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max \
             --tag ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }} \
