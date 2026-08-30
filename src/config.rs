@@ -930,6 +930,49 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("ui.semantic_edges.min_score", "ui"),
 ];
 
+/// Recursively flattens a `serde_yaml_ng::Value` tree into dot-joined leaf paths,
+/// mirroring [`YAML_ONLY_SETTINGS`]'s naming convention (e.g. `"ui.semantic_edges.k"`).
+/// A non-empty mapping is a sub-struct and is descended into; anything else —
+/// including an EMPTY mapping, which is how a `HashMap`-typed field
+/// (`frontmatter.defaults`/`allowed`) serializes at its default value — is treated
+/// as a leaf, since no real config sub-struct in this file has zero fields.
+#[cfg(test)]
+fn collect_leaf_paths(value: &serde_yaml_ng::Value, prefix: String, out: &mut HashSet<String>) {
+    match value.as_mapping() {
+        Some(map) if !map.is_empty() => {
+            for (k, v) in map {
+                let key = k.as_str().expect("Config keys are always strings");
+                let path = if prefix.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_leaf_paths(v, path, out);
+            }
+        }
+        _ => {
+            out.insert(prefix);
+        }
+    }
+}
+
+/// The dotted leaf-path set of every YAML-deserializable [`Config`] field, derived
+/// from `Config::default()`'s own serialization rather than hand-listed a second
+/// time. This is the ground truth [`YAML_ONLY_SETTINGS`]'s own bidirectional
+/// drift test (below) checks itself against — and, `pub(crate)` so it is not
+/// duplicated, the exact same ground truth `reload::diff`'s bidirectional drift
+/// test (#226, `reload.rs`) checks its own hand-maintained table against. One
+/// derivation, two hand-maintained lists it polices, rather than two ad hoc
+/// re-derivations that could themselves drift apart from each other.
+#[cfg(test)]
+pub(crate) fn config_setting_leaf_paths() -> HashSet<String> {
+    let value = serde_yaml_ng::to_value(Config::default())
+        .expect("every Config field type must round-trip through serde_yaml_ng");
+    let mut leaves = HashSet::new();
+    collect_leaf_paths(&value, String::new(), &mut leaves);
+    leaves
+}
+
 /// Every top-level section name [`YAML_ONLY_SETTINGS`] can point at. Used to filter
 /// a parsed document's top-level keys down to ones this project actually resolves,
 /// so an already-rejected (`deny_unknown_fields`) or renamed section cannot end up
@@ -3060,32 +3103,6 @@ reranking:
         clear_required_env();
     }
 
-    /// Recursively flattens a `serde_yaml_ng::Value` tree into dot-joined leaf
-    /// paths, mirroring `YAML_ONLY_SETTINGS`'s naming convention (e.g.
-    /// `"ui.semantic_edges.k"`). A non-empty mapping is a sub-struct and is
-    /// descended into; anything else — including an EMPTY mapping, which is how
-    /// a `HashMap`-typed field (`frontmatter.defaults`/`allowed`) serializes at
-    /// its default value — is treated as a leaf, since no real config sub-struct
-    /// in this file has zero fields.
-    fn collect_leaf_paths(value: &serde_yaml_ng::Value, prefix: String, out: &mut HashSet<String>) {
-        match value.as_mapping() {
-            Some(map) if !map.is_empty() => {
-                for (k, v) in map {
-                    let key = k.as_str().expect("Config keys are always strings");
-                    let path = if prefix.is_empty() {
-                        key.to_string()
-                    } else {
-                        format!("{prefix}.{key}")
-                    };
-                    collect_leaf_paths(v, path, out);
-                }
-            }
-            _ => {
-                out.insert(prefix);
-            }
-        }
-    }
-
     #[test]
     fn yaml_only_settings_matches_every_config_struct_field() {
         // Regression test for #144: `YAML_ONLY_SETTINGS` is a hand-maintained
@@ -3098,15 +3115,13 @@ reranking:
         //
         // Rather than hand-list every field a second time in the test too (the
         // same drift-prone pattern, just moved), this derives the real leaf-field
-        // set straight from `Config`'s own `Default` impl via serialization, so
-        // ANY future field added to ANY YAML-deserializable config struct without
-        // a matching `YAML_ONLY_SETTINGS` entry fails this test — and any entry
-        // left behind after a field is renamed or removed fails it too.
-        let value = serde_yaml_ng::to_value(Config::default())
-            .expect("every Config field type must round-trip through serde_yaml_ng");
-
-        let mut leaves = HashSet::new();
-        collect_leaf_paths(&value, String::new(), &mut leaves);
+        // set straight from `Config`'s own `Default` impl via serialization
+        // (`config_setting_leaf_paths`, shared with reload.rs's own #226 drift
+        // test over `reload::diff`'s table), so ANY future field added to ANY
+        // YAML-deserializable config struct without a matching
+        // `YAML_ONLY_SETTINGS` entry fails this test — and any entry left behind
+        // after a field is renamed or removed fails it too.
+        let leaves = config_setting_leaf_paths();
 
         let documented: HashSet<String> = YAML_ONLY_SETTINGS
             .iter()
