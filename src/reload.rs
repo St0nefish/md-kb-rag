@@ -306,6 +306,19 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
              a consistent corpus.",
         );
     }
+    if old.chunking.prepend_heading_path != new.chunking.prepend_heading_path {
+        r.record(
+            ReloadEffect::ReindexRequired,
+            "chunking.prepend_heading_path",
+            d(&old.chunking.prepend_heading_path),
+            d(&new.chunking.prepend_heading_path),
+            "changes the text every future chunk embeds — a chunk's heading-ancestry \
+             breadcrumb is prepended before embedding, so existing chunks were embedded \
+             without it (or with it). Same basis-change as prepend_description above, \
+             including the dedup query text. Run `md-kb-rag index --full` for a \
+             consistent corpus.",
+        );
+    }
 
     // ── embedding ────────────────────────────────────────────────────────────
     // EmbedClient is built exactly once, at server startup, from a `&ResolvedEmbeddingConfig`
@@ -1028,6 +1041,7 @@ mod tests {
         "chunking.max_chunk_size",
         "chunking.target_chunk_size",
         "chunking.prepend_description",
+        "chunking.prepend_heading_path",
         "embedding.batch_size",
         "embedding.request_timeout_secs",
         "embedding.batch_concurrency",
