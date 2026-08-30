@@ -13,6 +13,7 @@ use crate::{
         DocumentIndex, DocumentQuery, DocumentQueryResult, DocumentSummary, InboundLink, LinkPage,
         OutboundLink,
     },
+    status::QUERY_METRICS,
 };
 
 /// How many "did you mean?" suggestions to include when no basename matches.
@@ -985,6 +986,15 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
         results.retain(|r| r.score >= s);
     }
 
+    // #245: which rerank outcome (if any) to report to `record_query` at
+    // whichever return point this call actually takes. `None` until a reranker
+    // is genuinely attempted below (`deps.reranker` absent, or `docs.is_empty()`
+    // short-circuits before ever calling it); set to `Some((rerank_ms, success))`
+    // by every branch that DOES attempt one, including the "response was
+    // entirely unusable" fallback below, which is the same silent-degradation
+    // shape as the `Err(e)` arm and is recorded identically (`success: false`).
+    let mut rerank_outcome: Option<(u64, bool)> = None;
+
     if let Some(reranker) = deps.reranker {
         // Diversity, pass 1 of 2 — generous pre-rerank cap on the candidate pool.
         // See `PRERANK_DIVERSITY_MULTIPLIER`'s doc comment for why this uses a
@@ -1027,12 +1037,20 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
             }
             results.truncate(retain_depth);
             let results = paginate(results, offset, opts.limit);
+            // #245: this early return produces zero results and, unmodified,
+            // never reaches the timing `debug!`/`record_query` call at the
+            // bottom of this function — without this call zero-result queries
+            // are systematically undercounted whenever reranking is enabled,
+            // exactly the gap the issue was filed over. `rerank: None` since no
+            // rerank was attempted (there were no candidates to send it).
+            QUERY_METRICS.record_query(embed_ms as u64, search_ms as u64, None, results.len());
             return Ok(SearchOutcome {
                 results,
                 path_prefix_truncated,
                 offset_truncated,
             });
         }
+        let rerank_start = std::time::Instant::now();
         match reranker.rerank(query, &docs).await {
             Ok(ranked) => {
                 // The reranker's response is untrusted external input, deserialized
@@ -1112,6 +1130,19 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
                     }
                     results.truncate(retain_depth);
                     let results = paginate(results, offset, opts.limit);
+                    // #245: a third `Ok(SearchOutcome)` return that bypasses the
+                    // timing `debug!`/`record_query` call at the bottom of this
+                    // function — the rerank WAS attempted (docs was non-empty),
+                    // it just came back entirely unusable, which is the same
+                    // "reranker is unusable" outcome the `Err(e)` arm below
+                    // already records as a failure.
+                    let rerank_ms = rerank_start.elapsed().as_millis() as u64;
+                    QUERY_METRICS.record_query(
+                        embed_ms as u64,
+                        search_ms as u64,
+                        Some((rerank_ms, false)),
+                        results.len(),
+                    );
                     return Ok(SearchOutcome {
                         results,
                         path_prefix_truncated,
@@ -1146,9 +1177,11 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
                         })
                     })
                     .collect();
+                rerank_outcome = Some((rerank_start.elapsed().as_millis() as u64, true));
             }
             Err(e) => {
                 warn!("Reranker unavailable, falling back to fused order: {e:#}");
+                rerank_outcome = Some((rerank_start.elapsed().as_millis() as u64, false));
                 // Fused order stands in for a relevance ranking here, same as the
                 // no-reranker branch below — cap it the same way before truncating.
                 if let Some(max_per_document) = opts.diversity_max_per_document {
@@ -1182,6 +1215,12 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
         search_ms,
         results = results.len(),
         "search timing"
+    );
+    QUERY_METRICS.record_query(
+        embed_ms as u64,
+        search_ms as u64,
+        rerank_outcome,
+        results.len(),
     );
 
     Ok(SearchOutcome {
@@ -1274,11 +1313,13 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
         (query.to_string(), Vec::new())
     };
 
+    let embed_start = std::time::Instant::now();
     let vector = deps
         .embed_client
         .embed_query(&flat_query)
         .await
         .map_err(SearchError::Embed)?;
+    let embed_ms = embed_start.elapsed().as_millis();
 
     let sparse = if opts.hybrid {
         let sparse = crate::sparse::tokenize(&flat_query);
@@ -1304,6 +1345,7 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
 
     let fetch_limit = path_prefix_fetch_limit(page_depth, opts.path_prefix.as_deref());
 
+    let search_start = std::time::Instant::now();
     let mut results = deps
         .qdrant
         .search_grouped(
@@ -1320,6 +1362,7 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
         )
         .await
         .map_err(SearchError::Search)?;
+    let search_ms = search_start.elapsed().as_millis();
 
     let pre_prefix_count = results.len() as u64;
     apply_path_prefix(&mut results, opts.path_prefix.as_deref(), deps.data_path);
@@ -1380,6 +1423,18 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
     // the very last step now that this list is in its final settled order.
     documents.truncate(page_depth as usize);
     let documents = paginate(documents, offset, opts.limit);
+
+    debug!(
+        embed_ms,
+        search_ms,
+        results = documents.len(),
+        "search timing (grouped)"
+    );
+    // #245: this path has no reranker at all, so `rerank` is always `None` —
+    // unlike `search_paged`, `search_grouped` has exactly one return point (no
+    // early "zero candidates" branch, since there is no reranker candidate
+    // pool to be empty), so one call site here covers every query.
+    QUERY_METRICS.record_query(embed_ms as u64, search_ms as u64, None, documents.len());
 
     Ok(GroupedSearchOutcome {
         documents,
@@ -4752,6 +4807,138 @@ mod tests {
         assert!(
             outcome.offset_truncated,
             "offset 498 + limit 5 = 503 exceeds the 500 depth ceiling"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #245: retrieval metrics are actually recorded by the real search path
+    // -----------------------------------------------------------------------
+    //
+    // The bug these tests target is specifically that `record_query` was correct
+    // and covered by its own unit tests in `status.rs`, but nothing in this
+    // module ever called it — "after ~15 real searches every counter read 0" per
+    // the live-deployment verification in the issue. A test that calls
+    // `QUERY_METRICS.record_query(...)` directly would have passed before this
+    // fix just as easily as after it, since `record_query` itself was never
+    // broken. These tests instead go through `retrieval::search`/`search_grouped`
+    // — the real, only caller in production — and assert the counters moved.
+    //
+    // `QUERY_METRICS` is a process-global `LazyLock`, and `cargo test` runs tests
+    // in this crate concurrently in one process, so a test cannot assert an
+    // exact absolute count (another test's search could race in between). Taking
+    // a before/after snapshot and asserting the delta is at least what this
+    // test's own call should have produced is safe under that concurrency: only
+    // `fetch_add` ever touches these atomics, so a snapshot taken before this
+    // test's own `search` call can only ever be a lower bound, never invalidated
+    // by a concurrent increment.
+
+    #[tokio::test]
+    async fn search_records_query_metrics_via_the_real_search_path() {
+        let before = crate::status::QUERY_METRICS.snapshot();
+
+        let results = vec![make_result_with_content("doc.md", 0.9, "hello world")];
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let outcome = search(&deps, "q", &SearchFilters::default(), &default_opts())
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+
+        let after = crate::status::QUERY_METRICS.snapshot();
+        assert!(
+            after.queries_total > before.queries_total,
+            "queries_total must increase after a real retrieval::search call \
+             (before={}, after={}) — this is the exact gap #245 was filed over: \
+             record_query existed and worked, but nothing called it",
+            before.queries_total,
+            after.queries_total
+        );
+        assert!(
+            after.embed_latency_ms.count > before.embed_latency_ms.count,
+            "the embed-latency histogram must record a sample from the real call"
+        );
+        assert!(
+            after.qdrant_latency_ms.count > before.qdrant_latency_ms.count,
+            "the qdrant-latency histogram must record a sample from the real call"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_zero_results_with_reranker_configured_still_records_a_query() {
+        // The specific gap called out in #245: `search_paged`'s `docs.is_empty()`
+        // early return (Qdrant found nothing to send the reranker) bypasses the
+        // function's normal timing/record_query call entirely. Missing this call
+        // site would systematically undercount the single most useful metric —
+        // the zero-result rate — for every zero-hit query while reranking is on.
+        let before = crate::status::QUERY_METRICS.snapshot();
+
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(Vec::new());
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let outcome = search(&deps, "q", &SearchFilters::default(), &default_opts())
+            .await
+            .unwrap();
+        assert!(outcome.results.is_empty());
+
+        let after = crate::status::QUERY_METRICS.snapshot();
+        assert!(
+            after.queries_total > before.queries_total,
+            "the docs.is_empty() early return must still record a query"
+        );
+        assert!(
+            after.zero_result_total > before.zero_result_total,
+            "a zero-result query must increment zero_result_total even when a \
+             reranker is configured but never gets any candidates to rerank"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_grouped_records_query_metrics_via_the_real_path() {
+        // `search_grouped` has no reranker and, unlike `search_paged`, no early
+        // "zero candidates" return — one call site covers it, added alongside
+        // the `search_paged` fix since #241's task explicitly called out
+        // checking this function's return paths rather than assuming.
+        let before = crate::status::QUERY_METRICS.snapshot();
+
+        let embed = MockEmbedder::ok(vec![0.1, 0.2]);
+        let store = MockRetrievalStore::with_results(vec![make_grouped_hit("docs/a.md", 0.9)]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+        let index = MockDocumentIndex::with_summaries(vec![make_summary("docs/a.md", "A")]);
+
+        let outcome = search_grouped(
+            &deps,
+            &index,
+            "query",
+            &SearchFilters::default(),
+            &default_opts(),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.documents.len(), 1);
+
+        let after = crate::status::QUERY_METRICS.snapshot();
+        assert!(
+            after.queries_total > before.queries_total,
+            "search_grouped must also record a query on its real return path"
         );
     }
 
