@@ -255,6 +255,17 @@ const PATH_PREFIX_OVERFETCH_MULTIPLIER: u64 = 5;
 /// `rerank_candidate_limit`) cannot turn into an unbounded Qdrant fetch.
 const PATH_PREFIX_OVERFETCH_CEILING: u64 = 500;
 
+/// Absolute ceiling on how deep into the ranked candidate pool `offset` may
+/// reach in query mode (#224), mirroring [`PATH_PREFIX_OVERFETCH_CEILING`]'s
+/// role for `path_prefix`: both cap the same dimension — how many ranked
+/// candidates the funnel is ever asked to produce — so an unbounded `offset`
+/// alone (no reranker in play, see [`search_paged`]'s doc comment for the
+/// other, reranker-specific bound) cannot turn into an unbounded Qdrant fetch
+/// any more than an unbounded `path_prefix` over-fetch already can't. Reusing
+/// the same value isn't required for correctness, only chosen because the two
+/// knobs cap the same dimension and there's no reason for them to drift apart.
+const MAX_OFFSET_DEPTH: u64 = PATH_PREFIX_OVERFETCH_CEILING;
+
 /// Scale `fetch_limit` up for the `path_prefix` over-fetch when a prefix is set,
 /// otherwise return it unchanged. Shared by [`search`] and [`search_grouped`] so
 /// the two apply the same policy.
@@ -380,6 +391,26 @@ fn cap_reranked_by_document(
             }
         })
         .collect()
+}
+
+/// Apply `offset` then `limit` to an already-fully-ranked (best-first) list —
+/// the LAST step of the funnel (#224), run only once fusion, reranking, and
+/// the diversity cap have all already finished settling the true order. See
+/// [`search_paged`]'s doc comment for why offset can't be satisfied any
+/// earlier than this (a pre-fusion or pre-rerank offset would page over a
+/// different ranking than the one the caller ends up seeing).
+///
+/// `items` is expected to already hold at most as many entries as the funnel
+/// was bounded to produce (`page_depth` in the callers below) — this only
+/// windows into what's there, it cannot recover entries the funnel was never
+/// asked to fetch in the first place.
+fn paginate<T>(mut items: Vec<T>, offset: u64, limit: u64) -> Vec<T> {
+    if offset > 0 {
+        let skip = (offset as usize).min(items.len());
+        items = items.split_off(skip);
+    }
+    items.truncate(limit as usize);
+    items
 }
 
 /// A successfully retrieved document.
@@ -720,6 +751,16 @@ pub(crate) fn resolve_within_data(
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
     pub path_prefix_truncated: bool,
+    /// True when the caller's requested `offset + limit` exceeded the ranked-
+    /// candidate depth the funnel was bounded to produce (#224) — see
+    /// [`search_paged`]'s doc comment for the exact bound (`rerank_candidate_limit`
+    /// when reranking is active, [`MAX_OFFSET_DEPTH`] otherwise). When true,
+    /// `results` may look short (or empty) not because the corpus is
+    /// exhausted but because paging that deep was never attempted — the same
+    /// "can't prove there isn't more" signal `path_prefix_truncated` already
+    /// gives for its own best-effort retain, just for a different stage of
+    /// the funnel.
+    pub offset_truncated: bool,
 }
 
 impl IntoIterator for SearchOutcome {
@@ -753,11 +794,45 @@ fn docs_for_rerank(results: &[SearchResult]) -> Vec<(usize, &str)> {
 
 /// Embed the query, apply filters, search Qdrant, apply min_score floor, and
 /// return raw results. Does NOT format any output — callers do that.
-pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
+///
+/// `offset` (#224) pages over the SAME funnel `limit` truncates — fusion,
+/// reranking, and the diversity cap all have to finish running before either
+/// applies, so paging cannot be satisfied by re-querying Qdrant "starting at
+/// offset" (that would page over Qdrant's pre-fusion order, not the
+/// caller-visible ranked one). Instead the funnel below is asked to produce
+/// `offset + limit` ranked candidates instead of just `limit` (`page_depth`),
+/// and the leading `offset` of them is sliced off at the very end — see
+/// [`paginate`] — only once everything above has already settled the true
+/// order.
+///
+/// That depth is bounded, not unlimited, by whichever cap already governs how
+/// many candidates the funnel is willing to produce:
+///   - `rerank_candidate_limit` (`reranking.candidate_limit`), when a
+///     reranker is configured: the funnel never asks the cross-encoder to
+///     score more than this many candidates in the first place, so nothing
+///     past it can ever be reordered into the caller-visible ranking no
+///     matter how deep `offset` reaches. This bound already existed before
+///     offset paging did — it's sized independently of `opts.limit` to give
+///     the reranker a real pool to choose from — and simply doubles as
+///     offset's ceiling too now.
+///   - [`MAX_OFFSET_DEPTH`], always: an absolute ceiling for the case above
+///     (when no reranker is configured, or one is but `rerank_candidate_limit`
+///     is unset), so a very large `offset` alone can't turn into an unbounded
+///     Qdrant fetch — the same role [`PATH_PREFIX_OVERFETCH_CEILING`] plays
+///     for `path_prefix`.
+///
+/// A page whose depth exceeds this bound gets [`SearchOutcome::offset_truncated`]
+/// set rather than a silently short/empty result: past that depth this
+/// function cannot distinguish "the corpus has no more matches" from "the
+/// funnel was never asked to fetch that deep," so it says so explicitly,
+/// mirroring `path_prefix_truncated`'s reasoning for its own best-effort
+/// retain.
+pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
     deps: &RetrievalDeps<'_, E, Q>,
     query: &str,
     filters: &SearchFilters,
     opts: &SearchOptions,
+    offset: u64,
 ) -> Result<SearchOutcome, SearchError> {
     // Double-quoted spans become phrase conditions; the flattened (dequoted) text
     // still feeds the embedding and the sparse tokenizer below. When `opts.phrase`
@@ -780,10 +855,31 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
 
     let filter_map = mtime_filter_map(opts);
 
+    // See this function's doc comment for the full reasoning — `page_depth` is
+    // how many ranked candidates the funnel needs to produce to serve
+    // `offset + limit`, bounded by whichever depth cap already applies.
+    let requested_depth = offset.saturating_add(opts.limit);
+    let max_depth = match deps.reranker {
+        Some(_) => opts
+            .rerank_candidate_limit
+            .unwrap_or(opts.limit)
+            .min(MAX_OFFSET_DEPTH),
+        None => MAX_OFFSET_DEPTH,
+    };
+    let offset_truncated = requested_depth > max_depth;
+    let page_depth = requested_depth.min(max_depth);
+
     let fetch_limit = if deps.reranker.is_some() {
+        // Unchanged by offset paging: already sized to the reranker's own
+        // candidate pool, independent of `opts.limit` — see this function's
+        // doc comment for why that pool already has enough headroom for
+        // `offset` (up to `max_depth`) without needing to grow further here.
         opts.rerank_candidate_limit.unwrap_or(opts.limit)
     } else {
-        opts.limit
+        // No reranker: the funnel's only candidate-depth knob is `opts.limit`
+        // itself, so it has to grow to `page_depth` for `offset` to have
+        // anything to page into.
+        page_depth
     };
     let fetch_limit = path_prefix_fetch_limit(fetch_limit, opts.path_prefix.as_deref());
 
@@ -843,9 +939,12 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
 
     let pre_prefix_count = results.len() as u64;
     apply_path_prefix(&mut results, opts.path_prefix.as_deref(), deps.data_path);
+    // Measured against `page_depth`, not `opts.limit`: with `offset` set, the
+    // retain needs to have kept `page_depth` survivors to serve the requested
+    // page, not merely `opts.limit` of them — see this function's doc comment.
     let path_prefix_truncated = path_prefix_truncated(
         opts.path_prefix.as_deref(),
-        opts.limit,
+        page_depth,
         fetch_limit,
         pre_prefix_count,
         results.len() as u64,
@@ -888,15 +987,21 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
 
         let docs_with_indices: Vec<(usize, &str)> = docs_for_rerank(&results);
         let docs: Vec<&str> = docs_with_indices.iter().map(|(_, s)| *s).collect();
-        let top_k = opts.limit as usize;
+        // Retain up to `page_depth` candidates — not just `opts.limit` — so
+        // there's something for `offset` to page into; the final `paginate`
+        // call at the bottom of this function is what narrows that back down
+        // to the caller's actual page.
+        let retain_depth = page_depth as usize;
         if docs.is_empty() {
             if let Some(max_per_document) = opts.diversity_max_per_document {
                 results = apply_diversity_cap(results, max_per_document);
             }
-            results.truncate(top_k);
+            results.truncate(retain_depth);
+            let results = paginate(results, offset, opts.limit);
             return Ok(SearchOutcome {
                 results,
                 path_prefix_truncated,
+                offset_truncated,
             });
         }
         match reranker.rerank(query, &docs).await {
@@ -953,8 +1058,8 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
 
                 // Diversity, pass 2 of 2 — the real, user-tunable cap, applied to
                 // the cross-encoder's own ranking (the best relevance signal
-                // available) and BEFORE truncating to `top_k`. Order matters here:
-                // capping before truncation lets the next-best chunk from an
+                // available) and BEFORE truncating to `retain_depth`. Order matters
+                // here: capping before truncation lets the next-best chunk from an
                 // under-represented document backfill the slot a capped chunk
                 // would have taken, rather than just shrinking the result count.
                 if let Some(max_per_document) = opts.diversity_max_per_document {
@@ -963,7 +1068,7 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
 
                 results = indexed
                     .into_iter()
-                    .take(top_k)
+                    .take(retain_depth)
                     .filter_map(|(orig_i, score)| {
                         results.get(orig_i).map(|r| {
                             let mut hit = r.clone();
@@ -984,20 +1089,28 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
                 if let Some(max_per_document) = opts.diversity_max_per_document {
                     results = apply_diversity_cap(results, max_per_document);
                 }
-                results.truncate(top_k);
+                results.truncate(retain_depth);
             }
         }
     } else {
         // No reranker: the fused (hybrid) or dense-cosine order IS the relevance
         // ranking, so the diversity cap applies directly to it, before truncating
-        // to the caller's requested `limit` — same backfill reasoning as pass 2
-        // above (capping pre-truncation lets a lower-ranked, under-represented
-        // document's chunk fill the slot a capped chunk would have taken).
+        // to `page_depth` — same backfill reasoning as pass 2 above (capping
+        // pre-truncation lets a lower-ranked, under-represented document's
+        // chunk fill the slot a capped chunk would have taken). `page_depth`
+        // rather than `opts.limit` for the same reason as the reranker branch:
+        // there needs to be something left for `offset` to page into below.
         if let Some(max_per_document) = opts.diversity_max_per_document {
             results = apply_diversity_cap(results, max_per_document);
         }
-        results.truncate(opts.limit as usize);
+        results.truncate(page_depth as usize);
     }
+
+    // Offset applies as the very LAST step of the funnel — see this function's
+    // doc comment for why it can't run any earlier than this. Everything
+    // above (fusion, min_score, reranking, diversity) has already settled the
+    // true best-first order by this point; `paginate` only windows into it.
+    let results = paginate(results, offset, opts.limit);
 
     debug!(
         embed_ms,
@@ -1009,7 +1122,25 @@ pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
     Ok(SearchOutcome {
         results,
         path_prefix_truncated,
+        offset_truncated,
     })
+}
+
+/// Query-mode search with no result paging (`offset` fixed at 0) — see
+/// [`search_paged`] for the funnel/offset-bound reasoning and the
+/// paging-capable version `search_chunks`/`search_grouped` in `mcp.rs` call
+/// to honor the `search` tool's `offset` parameter (#224). Kept as a
+/// separate, thin entry point so this crate's non-MCP callers — the CLI
+/// `search` subcommand (`main.rs`), the write-path dedup gate (`write.rs`),
+/// the web UI's `/api/search` (`web.rs`), and the eval harness (`eval.rs`) —
+/// don't need to carry an `offset` argument they will never set.
+pub async fn search<E: QueryEmbedder, Q: RetrievalStore>(
+    deps: &RetrievalDeps<'_, E, Q>,
+    query: &str,
+    filters: &SearchFilters,
+    opts: &SearchOptions,
+) -> Result<SearchOutcome, SearchError> {
+    search_paged(deps, query, filters, opts, 0).await
 }
 
 /// One document from a query+document (grouped) search: Qdrant's best-scoring chunk
@@ -1027,6 +1158,12 @@ pub struct GroupedDocument {
 pub struct GroupedSearchOutcome {
     pub documents: Vec<GroupedDocument>,
     pub path_prefix_truncated: bool,
+    /// True when the caller's requested `offset + limit` exceeded
+    /// [`MAX_OFFSET_DEPTH`] — same meaning as [`SearchOutcome::offset_truncated`],
+    /// just for grouped-document results. This path has no reranker and no
+    /// `rerank_candidate_limit` bound (see [`search_grouped`]'s doc comment),
+    /// so `MAX_OFFSET_DEPTH` is the only depth cap that ever applies here.
+    pub offset_truncated: bool,
 }
 
 /// Semantic search collapsed to one result per document — the `search` tool's
@@ -1046,6 +1183,16 @@ pub struct GroupedSearchOutcome {
 /// exhaustive total: grouped vector search has no notion of "how many documents
 /// match", so the `search` tool's response for this combination reports `returned`
 /// but omits `total`/`has_more` rather than claim a count this path cannot back up.
+///
+/// `offset` (#224): same end-of-funnel placement as [`search_paged`], but
+/// simpler — this path runs no reranker and no diversity pass (one row per
+/// document already), so the only depth bound is the absolute
+/// [`MAX_OFFSET_DEPTH`] ceiling; there is no `rerank_candidate_limit` to also
+/// consider. Unlike [`search`]/[`search_paged`], there is no separate
+/// `offset`-free wrapper here — this crate's only caller
+/// (`mcp.rs`'s `search_grouped` tool handler) always has an `offset` in hand
+/// (`0` when the caller didn't ask for paging), so a second entry point would
+/// have no real caller of its own.
 pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentIndex>(
     deps: &RetrievalDeps<'_, E, Q>,
     document_index: &D,
@@ -1053,8 +1200,9 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
     filters: &SearchFilters,
     opts: &SearchOptions,
     fields: Option<&[String]>,
+    offset: u64,
 ) -> Result<GroupedSearchOutcome, SearchError> {
-    // See `search`'s identical block above — same phrase-flattening contract.
+    // See `search_paged`'s identical block above — same phrase-flattening contract.
     let (flat_query, phrases) = if opts.phrase {
         extract_phrases(query)
     } else {
@@ -1079,7 +1227,17 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
     };
 
     let filter_map = mtime_filter_map(opts);
-    let fetch_limit = path_prefix_fetch_limit(opts.limit, opts.path_prefix.as_deref());
+
+    // See `search_paged`'s doc comment for the full reasoning — `page_depth` is
+    // how many ranked candidates the funnel needs to produce to serve
+    // `offset + limit`. No reranker exists on this path, so `MAX_OFFSET_DEPTH`
+    // is the only bound (`search_paged`'s other, reranker-specific bound
+    // doesn't apply here).
+    let requested_depth = offset.saturating_add(opts.limit);
+    let offset_truncated = requested_depth > MAX_OFFSET_DEPTH;
+    let page_depth = requested_depth.min(MAX_OFFSET_DEPTH);
+
+    let fetch_limit = path_prefix_fetch_limit(page_depth, opts.path_prefix.as_deref());
 
     let mut results = deps
         .qdrant
@@ -1100,9 +1258,11 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
 
     let pre_prefix_count = results.len() as u64;
     apply_path_prefix(&mut results, opts.path_prefix.as_deref(), deps.data_path);
+    // Measured against `page_depth`, not `opts.limit` — see `search_paged`'s
+    // identical adjustment for why.
     let path_prefix_truncated = path_prefix_truncated(
         opts.path_prefix.as_deref(),
-        opts.limit,
+        page_depth,
         fetch_limit,
         pre_prefix_count,
         results.len() as u64,
@@ -1148,14 +1308,18 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
         .collect();
 
     // `fetch_limit` above may be an over-fetch (path_prefix multiplies it up to
-    // 500), and prefix/min_score filtering can leave more survivors than the
-    // caller actually asked for. Truncate here, mirroring `search`'s own
-    // truncation to `opts.limit` in both its reranker and no-reranker branches.
-    documents.truncate(opts.limit as usize);
+    // 500, and `page_depth` itself grows for `offset`), and prefix/min_score
+    // filtering can leave more survivors than the caller actually asked for.
+    // Truncate to `page_depth` — not `opts.limit` — first, mirroring
+    // `search_paged`'s own retain-then-paginate split, then apply `offset` as
+    // the very last step now that this list is in its final settled order.
+    documents.truncate(page_depth as usize);
+    let documents = paginate(documents, offset, opts.limit);
 
     Ok(GroupedSearchOutcome {
         documents,
         path_prefix_truncated,
+        offset_truncated,
     })
 }
 
@@ -2476,6 +2640,191 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // offset paging (#224)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn search_paged_pages_do_not_overlap_no_reranker() {
+        // The actual #224 bug: `offset: 0`, `offset: 2`, `offset: 4` against the
+        // same query used to return byte-identical results every time, because
+        // `search` never read `offset` at all. Prove the fix by paging through a
+        // 6-result pool two at a time and asserting every page is disjoint from
+        // every other AND that, reassembled, the pages reproduce the full
+        // fused order exactly.
+        let results: Vec<SearchResult> = (0..6)
+            .map(|i| make_result_with_content(&format!("doc{i}.md"), 0.9 - i as f32 * 0.1, "x"))
+            .collect();
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let mut opts = default_opts();
+        opts.limit = 2;
+
+        let page0 = search_paged(&deps, "q", &SearchFilters::default(), &opts, 0)
+            .await
+            .unwrap()
+            .results;
+        let page1 = search_paged(&deps, "q", &SearchFilters::default(), &opts, 2)
+            .await
+            .unwrap()
+            .results;
+        let page2 = search_paged(&deps, "q", &SearchFilters::default(), &opts, 4)
+            .await
+            .unwrap()
+            .results;
+
+        let paths0 = file_paths_of(&page0);
+        let paths1 = file_paths_of(&page1);
+        let paths2 = file_paths_of(&page2);
+
+        assert_eq!(paths0, vec!["doc0.md", "doc1.md"]);
+        assert_eq!(paths1, vec!["doc2.md", "doc3.md"]);
+        assert_eq!(paths2, vec!["doc4.md", "doc5.md"]);
+
+        // No pairwise overlap between any two pages.
+        for (a, b) in [(&paths0, &paths1), (&paths0, &paths2), (&paths1, &paths2)] {
+            assert!(
+                a.iter().all(|p| !b.contains(p)),
+                "pages must not overlap: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_paged_offset_zero_matches_search_wrapper() {
+        // `search()` is a thin `offset: 0` wrapper around `search_paged` — prove
+        // the two stay equivalent rather than silently diverging.
+        let results: Vec<SearchResult> = (0..3)
+            .map(|i| make_result_with_content(&format!("doc{i}.md"), 0.9 - i as f32 * 0.1, "x"))
+            .collect();
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let opts = default_opts();
+
+        let via_wrapper = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap();
+        let via_paged = search_paged(&deps, "q", &SearchFilters::default(), &opts, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            file_paths_of(&via_wrapper.results),
+            file_paths_of(&via_paged.results)
+        );
+        assert_eq!(via_wrapper.offset_truncated, via_paged.offset_truncated);
+    }
+
+    #[tokio::test]
+    async fn search_paged_offset_truncated_past_absolute_depth_bound() {
+        // No reranker configured, so the only depth cap is `MAX_OFFSET_DEPTH`
+        // (500). `offset + limit` past that must be flagged rather than
+        // silently returning whatever happened to be available.
+        let results: Vec<SearchResult> = (0..3)
+            .map(|i| make_result_with_content(&format!("doc{i}.md"), 0.9 - i as f32 * 0.1, "x"))
+            .collect();
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let mut opts = default_opts();
+        opts.limit = 5;
+
+        let outcome = search_paged(&deps, "q", &SearchFilters::default(), &opts, 498)
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.offset_truncated,
+            "offset 498 + limit 5 = 503 exceeds the 500 depth ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_paged_offset_not_truncated_within_absolute_depth_bound() {
+        let results: Vec<SearchResult> = (0..3)
+            .map(|i| make_result_with_content(&format!("doc{i}.md"), 0.9 - i as f32 * 0.1, "x"))
+            .collect();
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+
+        let mut opts = default_opts();
+        opts.limit = 5;
+
+        let outcome = search_paged(&deps, "q", &SearchFilters::default(), &opts, 10)
+            .await
+            .unwrap();
+
+        assert!(
+            !outcome.offset_truncated,
+            "offset 10 + limit 5 = 15 is well within the 500 depth ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_paged_offset_bounded_by_rerank_candidate_limit() {
+        // With a reranker configured, `rerank_candidate_limit` — not
+        // `MAX_OFFSET_DEPTH` — is the binding depth cap: the funnel never asks
+        // the cross-encoder to score more candidates than this, so `offset`
+        // cannot reach past it even though 500 is nowhere close.
+        let results = vec![
+            make_result_with_content("a.md", 0.9, "a"),
+            make_result_with_content("b.md", 0.8, "b"),
+            make_result_with_content("c.md", 0.7, "c"),
+        ];
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let store = MockRetrievalStore::with_results(results);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockReranker { fail: false };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 2,
+            rerank_candidate_limit: Some(3),
+            ..default_opts()
+        };
+
+        // offset 2 + limit 2 = depth 4, past the configured candidate_limit of 3.
+        let outcome = search_paged(&deps, "q", &SearchFilters::default(), &opts, 2)
+            .await
+            .unwrap();
+        assert!(
+            outcome.offset_truncated,
+            "depth 4 exceeds rerank_candidate_limit 3, even though it's far under \
+             MAX_OFFSET_DEPTH"
+        );
+        // Only 1 candidate is left to page into (3 retained, skip 2).
+        assert_eq!(outcome.results.len(), 1);
+
+        // offset 0 + limit 2 = depth 2, within candidate_limit 3 — not truncated.
+        let outcome_ok = search_paged(&deps, "q", &SearchFilters::default(), &opts, 0)
+            .await
+            .unwrap();
+        assert!(!outcome_ok.offset_truncated);
+        assert_eq!(outcome_ok.results.len(), 2);
+    }
+
     #[tokio::test]
     async fn search_conditions_passed_through_unchanged() {
         // `SearchFilters` carries already-lowered Qdrant conditions now — building
@@ -2983,6 +3332,7 @@ mod tests {
             &SearchFilters::default(),
             &opts,
             None,
+            0,
         )
         .await
         .unwrap();
@@ -4003,6 +4353,7 @@ mod tests {
             &SearchFilters::default(),
             &default_opts(),
             None,
+            0,
         )
         .await
         .unwrap()
@@ -4034,6 +4385,7 @@ mod tests {
             &SearchFilters::default(),
             &default_opts(),
             None,
+            0,
         )
         .await
         .unwrap()
@@ -4078,6 +4430,7 @@ mod tests {
             &SearchFilters::default(),
             &opts,
             None,
+            0,
         )
         .await
         .unwrap()
@@ -4087,6 +4440,98 @@ mod tests {
             documents.len(),
             2,
             "search_grouped must truncate to opts.limit like search() does"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_grouped_pages_do_not_overlap() {
+        // Document-granularity mirror of `search_paged_pages_do_not_overlap_no_reranker`
+        // — #224 applies to `granularity: document` too.
+        let embed = MockEmbedder::ok(vec![0.1, 0.2]);
+        let store = MockRetrievalStore::with_results(vec![
+            make_grouped_hit("docs/a.md", 0.9),
+            make_grouped_hit("docs/b.md", 0.8),
+            make_grouped_hit("docs/c.md", 0.7),
+            make_grouped_hit("docs/d.md", 0.6),
+        ]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+        let index = MockDocumentIndex::with_summaries(vec![
+            make_summary("docs/a.md", "A"),
+            make_summary("docs/b.md", "B"),
+            make_summary("docs/c.md", "C"),
+            make_summary("docs/d.md", "D"),
+        ]);
+
+        let mut opts = default_opts();
+        opts.limit = 2;
+
+        let page0 = search_grouped(
+            &deps,
+            &index,
+            "query",
+            &SearchFilters::default(),
+            &opts,
+            None,
+            0,
+        )
+        .await
+        .unwrap()
+        .documents;
+        let page1 = search_grouped(
+            &deps,
+            &index,
+            "query",
+            &SearchFilters::default(),
+            &opts,
+            None,
+            2,
+        )
+        .await
+        .unwrap()
+        .documents;
+
+        let paths0: Vec<&str> = page0.iter().map(|d| d.summary.file_path.as_str()).collect();
+        let paths1: Vec<&str> = page1.iter().map(|d| d.summary.file_path.as_str()).collect();
+
+        assert_eq!(paths0, vec!["docs/a.md", "docs/b.md"]);
+        assert_eq!(paths1, vec!["docs/c.md", "docs/d.md"]);
+        assert!(
+            paths0.iter().all(|p| !paths1.contains(p)),
+            "pages must not overlap: {paths0:?} vs {paths1:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_grouped_offset_truncated_past_absolute_depth_bound() {
+        // No reranker/diversity pass exists on this path, so `MAX_OFFSET_DEPTH`
+        // is the only depth cap — see `search_grouped`'s doc comment.
+        let embed = MockEmbedder::ok(vec![0.1, 0.2]);
+        let store = MockRetrievalStore::with_results(vec![make_grouped_hit("docs/a.md", 0.9)]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let deps = make_deps(&embed, &store, data_path, &gs);
+        let index = MockDocumentIndex::with_summaries(vec![make_summary("docs/a.md", "A")]);
+
+        let mut opts = default_opts();
+        opts.limit = 5;
+
+        let outcome = search_grouped(
+            &deps,
+            &index,
+            "query",
+            &SearchFilters::default(),
+            &opts,
+            None,
+            498,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            outcome.offset_truncated,
+            "offset 498 + limit 5 = 503 exceeds the 500 depth ceiling"
         );
     }
 

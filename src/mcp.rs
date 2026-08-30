@@ -977,7 +977,12 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 
-    /// Number to skip, for paging.
+    /// Number to skip, for paging. Exhaustive (no depth limit) in enumeration
+    /// mode. In query mode (chunk or document granularity), pages over the
+    /// already-ranked results, so `offset + limit` is capped at
+    /// reranking.candidate_limit when reranking is enabled, or a fixed depth
+    /// otherwise — a request past that bound gets `offset_truncated: true` in
+    /// the response instead of a silently short or empty page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
 
@@ -2419,7 +2424,11 @@ impl KbSearchServer {
         // lie in exactly the situation someone turned `explain` on to diagnose.
         let phrase_arm_ran = opts.phrase && !retrieval::extract_phrases(query).1.is_empty();
 
-        let outcome = retrieval::search(&self.deps(), query, &filters, &opts)
+        // #224: `offset` pages over the already fused/reranked/diversity-capped
+        // ranking — see `retrieval::search_paged`'s doc comment for the funnel
+        // placement and the depth bound `offset_truncated` reports against.
+        let offset = params.offset.unwrap_or(0);
+        let outcome = retrieval::search_paged(&self.deps(), query, &filters, &opts, offset)
             .await
             .map_err(|e| match e {
                 retrieval::SearchError::Embed(err) => {
@@ -2436,11 +2445,12 @@ impl KbSearchServer {
                 }
             })?;
         let path_prefix_truncated = outcome.path_prefix_truncated;
+        let offset_truncated = outcome.offset_truncated;
         let results = outcome.results;
 
         debug!(
             result_count = results.len(),
-            path_prefix_truncated, "search returned results"
+            path_prefix_truncated, offset_truncated, "search returned results"
         );
 
         let mode = match (config.search.hybrid, phrase_arm_ran) {
@@ -2456,6 +2466,7 @@ impl KbSearchServer {
             explain,
             mode,
             path_prefix_truncated,
+            offset_truncated,
         );
 
         let mut call_result = CallToolResult::success(vec![Content::text(text)]);
@@ -2527,6 +2538,9 @@ impl KbSearchServer {
             McpError::internal_error(format!("Document index unavailable: {}", e), None)
         })?;
 
+        // #224: same paging entry point and depth-bound reasoning as
+        // `search_chunks` — see `retrieval::search_grouped`'s doc comment.
+        let offset = params.offset.unwrap_or(0);
         let outcome = retrieval::search_grouped(
             &self.deps(),
             index,
@@ -2534,6 +2548,7 @@ impl KbSearchServer {
             &filters,
             &opts,
             params.fields.as_deref(),
+            offset,
         )
         .await
         .map_err(|e| match e {
@@ -2551,9 +2566,11 @@ impl KbSearchServer {
             }
         })?;
         let path_prefix_truncated = outcome.path_prefix_truncated;
+        let offset_truncated = outcome.offset_truncated;
         let documents = outcome.documents;
 
-        let (text, structured) = build_grouped_search_payload(&documents, path_prefix_truncated);
+        let (text, structured) =
+            build_grouped_search_payload(&documents, path_prefix_truncated, offset_truncated);
 
         let mut call_result = CallToolResult::success(vec![Content::text(text)]);
         call_result.structured_content = Some(structured);
@@ -3723,6 +3740,7 @@ fn build_chunk_search_payload(
     explain: bool,
     mode: &str,
     path_prefix_truncated: bool,
+    offset_truncated: bool,
 ) -> (String, serde_json::Value) {
     if results.is_empty() {
         let mut text = "No results found.".to_string();
@@ -3732,10 +3750,14 @@ fn build_chunk_search_payload(
                  so this may not be exhaustive — narrow the prefix or lower limit to be sure.",
             );
         }
+        if offset_truncated {
+            text.push_str(&offset_truncated_note());
+        }
         let structured = serde_json::json!({
             "returned": 0,
             "results": [],
             "path_prefix_truncated": path_prefix_truncated,
+            "offset_truncated": offset_truncated,
         });
         return (text, structured);
     }
@@ -3895,14 +3917,30 @@ fn build_chunk_search_payload(
              prefix or lower limit to be sure this is exhaustive.\n",
         );
     }
+    if offset_truncated {
+        output.push_str(&offset_truncated_note());
+    }
 
     let structured = serde_json::json!({
         "returned": structured_results.len(),
         "results": structured_results,
         "path_prefix_truncated": path_prefix_truncated,
+        "offset_truncated": offset_truncated,
     });
 
     (output.trim().to_string(), structured)
+}
+
+/// Shared prose for both `build_chunk_search_payload` and
+/// `build_grouped_search_payload`'s `offset_truncated` note (#224) — kept as
+/// one function so the two text bodies can't drift on what the flag means.
+fn offset_truncated_note() -> String {
+    "\nNote: offset + limit reached past this query's ranked-candidate depth bound \
+     (reranking.candidate_limit when reranking is active, otherwise a fixed ceiling) — \
+     this page may be short or empty not because there are no more matches, but because \
+     paging that deep was never attempted. Narrow the query or lower offset to be sure \
+     this is exhaustive.\n"
+        .to_string()
 }
 
 /// Builds `search_grouped`'s text and structured payload from already-fetched
@@ -3914,12 +3952,14 @@ fn build_chunk_search_payload(
 fn build_grouped_search_payload(
     documents: &[retrieval::GroupedDocument],
     path_prefix_truncated: bool,
+    offset_truncated: bool,
 ) -> (String, serde_json::Value) {
     let returned = documents.len();
 
     let structured = serde_json::json!({
         "returned": returned,
         "path_prefix_truncated": path_prefix_truncated,
+        "offset_truncated": offset_truncated,
         "documents": documents
             .iter()
             .map(|d| serde_json::json!({
@@ -3959,6 +3999,9 @@ fn build_grouped_search_payload(
              fewer results than `limit` were returned and more may exist — narrow the \
              prefix or lower limit to be sure this is exhaustive.\n",
         );
+    }
+    if offset_truncated {
+        text.push_str(&offset_truncated_note());
     }
 
     (text.trim_end().to_string(), structured)
@@ -9818,8 +9861,14 @@ mod tests {
             payload_search_result("/data/notes/b.md", "B", 0.5),
         ];
 
-        let (_text, structured) =
-            build_chunk_search_payload(&results, Path::new("/data"), false, "dense cosine", false);
+        let (_text, structured) = build_chunk_search_payload(
+            &results,
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            false,
+        );
 
         let arr = structured["results"]
             .as_array()
@@ -9836,8 +9885,14 @@ mod tests {
 
     #[test]
     fn build_chunk_search_payload_empty_results_report_zero_not_missing_key() {
-        let (text, structured) =
-            build_chunk_search_payload(&[], Path::new("/data"), false, "dense cosine", false);
+        let (text, structured) = build_chunk_search_payload(
+            &[],
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            false,
+        );
 
         assert_eq!(text, "No results found.");
         assert_eq!(structured["returned"], serde_json::json!(0));
@@ -9857,8 +9912,14 @@ mod tests {
             payload_search_result("/data/notes/c.md", "C", 0.1),
         ];
 
-        let (text, structured) =
-            build_chunk_search_payload(&results, Path::new("/data"), false, "dense cosine", false);
+        let (text, structured) = build_chunk_search_payload(
+            &results,
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            false,
+        );
 
         let arr = structured["results"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
@@ -9883,8 +9944,14 @@ mod tests {
     fn build_chunk_search_payload_path_prefix_truncated_note_and_flag() {
         let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
 
-        let (text, structured) =
-            build_chunk_search_payload(&results, Path::new("/data"), false, "dense cosine", true);
+        let (text, structured) = build_chunk_search_payload(
+            &results,
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            true,
+            false,
+        );
 
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
         assert!(
@@ -9894,7 +9961,7 @@ mod tests {
 
         // Same for the empty-results branch.
         let (empty_text, empty_structured) =
-            build_chunk_search_payload(&[], Path::new("/data"), false, "dense cosine", true);
+            build_chunk_search_payload(&[], Path::new("/data"), false, "dense cosine", true, false);
         assert_eq!(
             empty_structured["path_prefix_truncated"],
             serde_json::json!(true)
@@ -9906,15 +9973,62 @@ mod tests {
     }
 
     #[test]
+    fn build_chunk_search_payload_offset_truncated_note_and_flag() {
+        // #224: mirrors the path_prefix_truncated test above, but for the
+        // offset-depth-bound signal — proves the flag reaches structured_content
+        // AND that the text body explains why the page may be short, on both
+        // the non-empty and empty-results branches.
+        let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
+
+        let (text, structured) = build_chunk_search_payload(
+            &results,
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            true,
+        );
+
+        assert_eq!(structured["offset_truncated"], serde_json::json!(true));
+        assert!(
+            text.contains("offset + limit reached past"),
+            "text must render the offset-truncation note; got: {text}"
+        );
+
+        let (empty_text, empty_structured) =
+            build_chunk_search_payload(&[], Path::new("/data"), false, "dense cosine", false, true);
+        assert_eq!(
+            empty_structured["offset_truncated"],
+            serde_json::json!(true)
+        );
+        assert!(
+            empty_text.contains("offset + limit reached past"),
+            "empty-results text must also render the offset-truncation note; got: {empty_text}"
+        );
+    }
+
+    #[test]
     fn build_chunk_search_payload_explain_toggles_score_breakdown_line() {
         let results = vec![payload_search_result("/data/notes/a.md", "A", 0.9)];
 
-        let (text_off, _) =
-            build_chunk_search_payload(&results, Path::new("/data"), false, "dense cosine", false);
+        let (text_off, _) = build_chunk_search_payload(
+            &results,
+            Path::new("/data"),
+            false,
+            "dense cosine",
+            false,
+            false,
+        );
         assert!(!text_off.contains("Score breakdown"));
 
-        let (text_on, _) =
-            build_chunk_search_payload(&results, Path::new("/data"), true, "dense cosine", false);
+        let (text_on, _) = build_chunk_search_payload(
+            &results,
+            Path::new("/data"),
+            true,
+            "dense cosine",
+            false,
+            false,
+        );
         assert!(text_on.contains("Score breakdown"));
     }
 
@@ -9929,7 +10043,7 @@ mod tests {
             "dense cosine",
         ] {
             let (text, _) =
-                build_chunk_search_payload(&results, Path::new("/data"), true, mode, false);
+                build_chunk_search_payload(&results, Path::new("/data"), true, mode, false, false);
             assert!(
                 text.contains(&format!("mode={mode}")),
                 "expected mode label {mode:?} verbatim in: {text}"
@@ -9949,6 +10063,7 @@ mod tests {
             Path::new("/data"),
             false,
             "dense + phrase RRF",
+            false,
             false,
         );
 
@@ -9982,7 +10097,7 @@ mod tests {
             payload_grouped_document("notes/b.md", "B", 0.5),
         ];
 
-        let (_text, structured) = build_grouped_search_payload(&documents, false);
+        let (_text, structured) = build_grouped_search_payload(&documents, false, false);
 
         let obj = structured.as_object().unwrap();
         assert!(
@@ -10007,7 +10122,7 @@ mod tests {
 
     #[test]
     fn build_grouped_search_payload_empty_reports_zero() {
-        let (text, structured) = build_grouped_search_payload(&[], false);
+        let (text, structured) = build_grouped_search_payload(&[], false, false);
         assert_eq!(text, "No documents matched.");
         assert_eq!(structured["returned"], serde_json::json!(0));
         assert_eq!(structured["documents"].as_array().unwrap().len(), 0);
@@ -10016,12 +10131,25 @@ mod tests {
     #[test]
     fn build_grouped_search_payload_path_prefix_truncated_note_and_flag() {
         let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
-        let (text, structured) = build_grouped_search_payload(&documents, true);
+        let (text, structured) = build_grouped_search_payload(&documents, true, false);
 
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
         assert!(
             text.contains("path_prefix matched more candidates"),
             "text must render the truncation note; got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_grouped_search_payload_offset_truncated_note_and_flag() {
+        // #224: grouped granularity's mirror of the chunk-payload test above.
+        let documents = vec![payload_grouped_document("notes/a.md", "A", 0.9)];
+        let (text, structured) = build_grouped_search_payload(&documents, false, true);
+
+        assert_eq!(structured["offset_truncated"], serde_json::json!(true));
+        assert!(
+            text.contains("offset + limit reached past"),
+            "text must render the offset-truncation note; got: {text}"
         );
     }
 }
