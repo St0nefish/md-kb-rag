@@ -922,6 +922,171 @@ async fn update_semantic_edges<N: NeighborStore>(
     }
 }
 
+/// Files accumulated in `index_paths_generic`'s `pending: Vec<PendingFile>` before a
+/// mid-scan flush through [`flush_pending_batch`] (#160).
+///
+/// Each `PendingFile` carries a full parsed document body, its chunk text
+/// (duplicated out of the body — see `PendingFile::body`'s doc comment), and, once
+/// `upsert_pending` runs, a full embedding vector per chunk plus the `QdrantPoint`
+/// built from it. Left unbounded, that is the entire changed-file delta of a run —
+/// up to the whole corpus on a `--full` reindex or a fresh bootstrap clone — held
+/// resident at once before a single byte reaches Qdrant or `indexed_files`. This
+/// constant bounds that to a fixed-size window instead: peak resident memory for the
+/// pending batch becomes a function of this number, not of corpus size, and (see
+/// [`flush_pending_batch`]'s doc comment) a mid-run crash only ever loses the batch
+/// currently in flight rather than the whole run's progress.
+///
+/// Not derived from `embedding.batch_size` (`config.rs`, default 32): that knob
+/// counts CHUNK TEXTS per HTTP embedding call, a different unit from files — one
+/// document can produce anywhere from one chunk to dozens, so a files-denominated
+/// threshold and a chunks-denominated one don't convert into each other without
+/// knowing the corpus's chunk-per-file distribution up front, which this module has
+/// no cheap way to know before it has already chunked (and therefore already paid
+/// most of the memory cost of) the batch in question. `config.rs` is out of scope
+/// for this change, so this stays a hardcoded constant rather than a new knob; if an
+/// operator ever needs to tune it, the field to add is `indexing.index_batch_size`
+/// (`usize`, default 200) next to `reconcile_interval_secs` in `IndexingConfig`.
+///
+/// 200 is chosen to keep a single flush's `PendingFile` batch (bodies + chunk text +,
+/// once embedded, vectors) in the low tens of MB for a typical markdown KB document,
+/// while still being large enough that a big corpus's per-batch overhead (one
+/// `embed_texts` HTTP round trip, one Qdrant `upsert_points` call, one state-DB
+/// transaction per file) stays a small fraction of total run time rather than
+/// dominating it with per-batch fixed costs.
+const PENDING_FLUSH_BATCH_SIZE: usize = 200;
+
+/// Flush `pending` through `upsert_pending` (embed + Qdrant upsert + state-DB write)
+/// and `update_semantic_edges`, then empty it — the sub-batching fix for #160.
+///
+/// Called twice from `index_paths_generic`'s per-path loop: mid-scan, whenever
+/// `pending.len()` reaches [`PENDING_FLUSH_BATCH_SIZE`], and once more after the loop
+/// for whatever remainder (`< PENDING_FLUSH_BATCH_SIZE` files) never hit that
+/// threshold. Both call sites hand this the SAME `pending` `Vec` and drive it through
+/// the same `upsert_pending` — the one and only function permitted to mutate
+/// Qdrant/state.db — so sub-batching adds no second mutator; it only changes how many
+/// times the existing one is called and how much of `pending` it sees per call.
+///
+/// ## Partial-progress semantics (mid-run crash)
+///
+/// This is the property #160 exists to fix, so it is worth stating exactly what a
+/// crash leaves behind. Say a run has 10 batches of work; the process dies during
+/// (or between) batch 3's flush:
+///
+///   - Batches 1 and 2 already completed a full `upsert_pending` call each: their
+///     files' points are in Qdrant AND their `indexed_files`/`documents` rows are
+///     written. That work survives the crash intact — nothing about it depended on
+///     the run finishing.
+///   - Batch 3, whichever step it died on, is exactly as safe as a *whole-corpus*
+///     `upsert_pending` call dying at that same step always was — `upsert_pending`'s
+///     own doc comment already covers this (points are written before state, so a
+///     crash between the two leaves a harmless SURPLUS: Qdrant points with no
+///     matching state row yet, self-healing on retry, never a deficit). Sub-batching
+///     does not change that internal ordering at all; it only shrinks how much of
+///     the corpus can be "batch 3" at once.
+///   - Batches 4 through 10 were never reached: the scan loop simply never got to
+///     those paths, so their `indexed_files` rows are untouched — whatever they were
+///     before this run started (stale, or absent for a new file). Because nothing
+///     about their state changed, the NEXT run's `scan_for_dirty` re-detects them as
+///     dirty exactly as if this run had never touched them, and they are retried
+///     from scratch. Nothing here needs a resume checkpoint or a "where did we leave
+///     off" marker: dirty detection already IS that mechanism, for free.
+///
+/// Net effect: a mid-run death loses at most one batch's worth of in-flight work (at
+/// most `PENDING_FLUSH_BATCH_SIZE` files' embeddings, recomputed on retry) instead of
+/// the WHOLE run's worth — the whole point, since before this change every file in
+/// `pending` was one un-recoverable unit spanning the entire corpus delta.
+///
+/// ## Orphan removal and tail-trim stay correct
+///
+/// `remove_orphans` is deliberately NOT called from here or from anywhere inside the
+/// scan loop — it still runs exactly once, in `index_paths_generic`, after the loop
+/// (and therefore after every `flush_pending_batch` call, this trailing one
+/// included) has finished. `remove_orphans` acts on `missing` — paths absent from
+/// disk — which is entirely disjoint from `pending` — paths present and (re)indexed.
+/// Sub-batching `pending` cannot make `remove_orphans` run early against a path a
+/// later batch hasn't written yet, because `remove_orphans` never reads `pending` at
+/// all; the two lists don't interact. Calling it per-flush here would be the bug
+/// this doc comment is warning the next reader away from — DON'T.
+///
+/// Tail-trim (stale high-index point cleanup for a file that shrank) is unaffected
+/// for a different reason: it is already per-file, driven off `PendingFile::
+/// old_chunk_count`, which comes from `state_map` — loaded ONCE, for the whole
+/// worklist, before the scan loop even starts. It was never a whole-`pending`-view
+/// operation to begin with, so chopping `pending` into smaller calls changes nothing
+/// about its correctness.
+///
+/// ## #155's Qdrant-wipe deficit-detector window
+///
+/// `detect_qdrant_wipe` flags a DEFICIT: state.db believes more chunks exist than
+/// Qdrant actually has. `upsert_pending` writes Qdrant points before it writes the
+/// matching state rows (see its own doc comment), so mid-batch it can only ever
+/// produce a SURPLUS (Qdrant ahead of state), which the detector already treats as
+/// legitimate. Sub-batching does not change that per-batch ordering — it only means
+/// there are now several smaller such windows across a run instead of one huge one
+/// spanning the whole corpus. If anything this NARROWS the aggregate surplus window
+/// versus the pre-#160 code, which mid-run held the ENTIRE pending batch's points
+/// written and NONE of its state rows written until the single terminal call's
+/// per-file state loop finished — a bigger, not smaller, surplus window than any one
+/// sub-batch here produces. The one deficit-producing sequence in this module
+/// (`index_paths_generic`'s `force` block: `state.clear()` before
+/// `drop_collection()`) runs entirely BEFORE the scan loop / any flush, so it is
+/// untouched by this change; `acquire_reindex_lock`'s cross-process exclusivity is
+/// what actually closes that race, not batch sizing.
+async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
+    pending: &mut Vec<PendingFile>,
+    embedder: &E,
+    store: &Q,
+    state: &StateDb,
+    collection: &str,
+    semantic_edges: &SemanticEdgesConfig,
+) -> Result<usize> {
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    // `mem::take` rather than `drain(..)`: hands `upsert_pending`/`update_semantic_edges`
+    // an owned `Vec` (both want `&[PendingFile]`, satisfied either way) while leaving
+    // `pending` valid and empty for the scan loop to keep pushing into. The batch's
+    // allocation — bodies, chunk text, and (after `upsert_pending` embeds them)
+    // vectors, the actual memory #160 is about — drops with `batch` when this function
+    // returns, which is what makes peak resident memory bounded by batch size rather
+    // than growing for the rest of the run.
+    let batch = std::mem::take(pending);
+    let count = batch.len();
+
+    INDEX_STATUS.set_phase(Phase::Embedding);
+    info!("Embedding chunks for {} changed file(s)…", count);
+    upsert_pending(&batch, embedder, store, state, collection).await?;
+
+    // Precompute semantic (kNN) edges for the web UI graph view, same as the
+    // pre-#160 single terminal call — no-ops when `semantic_edges.enabled` is false.
+    update_semantic_edges(&batch, store, state, collection, semantic_edges).await;
+
+    // Hand status back to "Scanning": if more paths remain, the loop resumes
+    // immediately after this call, and `/status` should reflect that rather than
+    // continuing to claim "Embedding" for whatever's left of the scan. If this was
+    // the FINAL flush instead, the next phase this run sets (Backfilling,
+    // RemovingOrphans, or nothing at all) overwrites this before it's ever visible,
+    // so there is no cost to setting it unconditionally here.
+    //
+    // One observability regression worth naming rather than hiding: `upsert_pending`
+    // calls `INDEX_STATUS.set_chunks_total`, which resets `chunks_embedded` to 0
+    // every time it is called (see `status.rs`). Pre-#160, that fired once per run
+    // against the WHOLE pending set, so `/status`'s chunks progress bar swept
+    // 0→100% once per run. Post-#160 it fires once per flush against just that
+    // batch, so the same bar now resets and re-sweeps once per batch instead — a
+    // choppier, less informative progress signal for a run with many batches.
+    // `files_done`/`files_total` (set for every path in the scan loop, not just on a
+    // flush) still gives an accurate whole-run progress read throughout, so this is
+    // a real but secondary regression in one of two progress signals, not a loss of
+    // progress visibility altogether — and fixing it properly would mean threading a
+    // whole-run chunk-count total into `status.rs`, out of scope for a change
+    // touching only `ingest.rs`/`git.rs`.
+    INDEX_STATUS.set_phase(Phase::Scanning);
+
+    Ok(count)
+}
+
 /// Remove orphaned files (deleted from disk but still in the index).
 async fn remove_orphans<Q: VectorStore>(
     orphaned: &[String],
@@ -2439,6 +2604,10 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     let mut read_errors = 0usize;
     let mut frozen = 0usize;
     let mut rejected = 0usize;
+    // #160: running total across every `flush_pending_batch` call (mid-loop and the
+    // trailing one), since `pending.len()` after the loop is no longer a meaningful
+    // count of files indexed this run — every mid-loop flush resets it to 0.
+    let mut indexed_count = 0usize;
 
     INDEX_STATUS.set_phase(Phase::Scanning);
     let mut scanned = 0usize;
@@ -2547,28 +2716,45 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                 // to this file's validity, and is retried at the run level regardless.
                 INDEX_STATUS.record_strict_rejection(rel_key, None);
                 pending.push(pf);
+
+                // #160: flush as soon as `pending` reaches the bounded batch size,
+                // rather than letting it grow for the rest of the scan loop. This is
+                // what keeps peak resident memory a function of
+                // `PENDING_FLUSH_BATCH_SIZE` instead of the run's total changed-file
+                // count — see `flush_pending_batch`'s doc comment for the full
+                // partial-progress/orphan-removal/#155 analysis. `scanned` (not
+                // `pending.len()` after this call, which is always 0 right after a
+                // flush) is what `INDEX_STATUS.set_files_done` above already tracks,
+                // so a mid-loop flush changes nothing about the scan progress signal.
+                if pending.len() >= PENDING_FLUSH_BATCH_SIZE {
+                    indexed_count += flush_pending_batch(
+                        &mut pending,
+                        embedder,
+                        store,
+                        &state,
+                        collection,
+                        &config.ui.semantic_edges,
+                    )
+                    .await?;
+                }
             }
         }
     }
 
-    // ── Batch embedding & upsert ────────────────────────────────────────────
-    let pending_count = pending.len();
-    if !pending.is_empty() {
-        INDEX_STATUS.set_phase(Phase::Embedding);
-        info!("Embedding chunks for {} changed file(s)…", pending_count);
-        upsert_pending(&pending, embedder, store, &state, collection).await?;
-
-        // Precompute semantic (kNN) edges for the web UI graph view. No-ops when
-        // `ui.semantic_edges` is disabled (the default) — see `update_semantic_edges`.
-        update_semantic_edges(
-            &pending,
-            store,
-            &state,
-            collection,
-            &config.ui.semantic_edges,
-        )
-        .await;
-    }
+    // ── Final flush ───────────────────────────────────────────────────────────
+    //
+    // Whatever never reached `PENDING_FLUSH_BATCH_SIZE` inside the loop above — for
+    // a run smaller than one batch, this is the ONLY flush, identical in effect to
+    // the pre-#160 single terminal call.
+    indexed_count += flush_pending_batch(
+        &mut pending,
+        embedder,
+        store,
+        &state,
+        collection,
+        &config.ui.semantic_edges,
+    )
+    .await?;
 
     // ── Backfill metadata for unchanged files ────────────────────────────────
     let backfilled = if backfill_queue.is_empty() {
@@ -2595,7 +2781,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     // filesystem walk count, which is now `scan_for_dirty`'s concern entirely.
     let counters = crate::status::RunCounters {
         discovered: paths.len() as u64,
-        indexed: pending_count as u64,
+        indexed: indexed_count as u64,
         skipped: skipped as u64,
         invalid: invalid as u64,
         empty: empty as u64,
@@ -5441,6 +5627,290 @@ mod tests {
         ) -> Result<Vec<SearchResult>> {
             Ok(vec![])
         }
+    }
+
+    /// Echoes back one stub embedding vector per input text, unlike `MockEmbedClient`
+    /// (which returns a fixed-length `Vec` regardless of how many texts it was given).
+    /// `upsert_pending`'s embedding-count mismatch check (`all_embeddings.len() !=
+    /// all_texts.len()`) means a fixed-length fake only works when every call happens
+    /// to receive exactly that many texts — true for a single terminal upsert, but
+    /// not for #160's sub-batched flushes, where consecutive `upsert_pending` calls
+    /// can (and, for the last, partial batch, deliberately do) receive different
+    /// text counts. This is what the #160 sub-batching tests below need instead.
+    struct EchoEmbedClient;
+
+    impl EmbedStore for EchoEmbedClient {
+        async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0_f32]).collect())
+        }
+    }
+
+    /// Records the SIZE of every `upsert_points` call (not just the accumulated
+    /// total, which `TrackingMockVectorStore` already gives — the #160 sub-batching
+    /// tests need to see the call BOUNDARIES to prove multiple bounded flushes
+    /// happened instead of one giant one) and, optionally, fails a specific
+    /// 1-indexed call to prove a mid-run failure leaves earlier, already-flushed
+    /// batches intact while never recording points for the failing batch itself —
+    /// mirroring how a real Qdrant upsert failure leaves no partial points behind for
+    /// that specific call.
+    struct BatchTrackingVectorStore {
+        /// Point count of each `upsert_points` call, in call order.
+        upsert_call_sizes: Mutex<Vec<usize>>,
+        /// Every point actually recorded as upserted — excludes any call selected by
+        /// `fail_at_call` below.
+        upserted_points: Mutex<Vec<crate::qdrant::QdrantPoint>>,
+        /// 1-indexed call number to fail (e.g. `Some(2)` fails the SECOND
+        /// `upsert_points` call and every one after it never happens, since
+        /// `index_paths_generic` propagates the error via `?` and stops scanning).
+        /// `None` means every call succeeds.
+        fail_at_call: Option<usize>,
+    }
+
+    impl BatchTrackingVectorStore {
+        fn new(fail_at_call: Option<usize>) -> Self {
+            Self {
+                upsert_call_sizes: Mutex::new(Vec::new()),
+                upserted_points: Mutex::new(Vec::new()),
+                fail_at_call,
+            }
+        }
+    }
+
+    impl VectorStore for BatchTrackingVectorStore {
+        async fn upsert_points(
+            &self,
+            _collection: &str,
+            points: Vec<crate::qdrant::QdrantPoint>,
+        ) -> Result<()> {
+            let call_number = {
+                let mut sizes = self.upsert_call_sizes.lock().unwrap();
+                sizes.push(points.len());
+                sizes.len()
+            };
+            if self.fail_at_call == Some(call_number) {
+                anyhow::bail!(
+                    "simulated upsert failure on call {} (test-injected)",
+                    call_number
+                );
+            }
+            self.upserted_points.lock().unwrap().extend(points);
+            Ok(())
+        }
+
+        async fn delete_by_files(&self, _collection: &str, _file_paths: &[&str]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_points_by_ids(&self, _collection: &str, _ids: Vec<String>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn drop_collection(&self, _collection: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_collection(
+            &self,
+            _collection: &str,
+            _vector_size: u64,
+            _indexed_fields: &[crate::qdrant::IndexedField],
+            _enable_phrase: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    // `ui.semantic_edges.enabled` defaults to `false` (see `config_no_validation`'s
+    // base config), so none of the #160 tests below ever actually call this — a
+    // trivial empty-Ok stub, same posture as `TrackingMockVectorStore`'s own.
+    impl NeighborStore for BatchTrackingVectorStore {
+        async fn recommend_by_point_id(
+            &self,
+            _collection: &str,
+            _point_id: &str,
+            _limit: u64,
+            _filter: Option<Filter>,
+        ) -> Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+    }
+
+    /// #160: before the fix, `index_paths_generic` accumulated every changed file
+    /// into one `pending: Vec<PendingFile>` across the whole scan loop and called
+    /// `upsert_pending` exactly ONCE, at the very end, no matter how many files were
+    /// in scope. This test writes `PENDING_FLUSH_BATCH_SIZE + 50` distinct files (250
+    /// with the current constant) — enough to force at least one mid-scan flush —
+    /// and asserts the vector store saw MORE than one `upsert_points` call, each no
+    /// larger than the batch size.
+    ///
+    /// Before #160: fails — exactly one call, sized `PENDING_FLUSH_BATCH_SIZE + 50`.
+    /// After #160: passes — two calls, sized `PENDING_FLUSH_BATCH_SIZE` and `50`.
+    #[tokio::test]
+    async fn index_paths_generic_flushes_pending_in_bounded_sub_batches() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let extra = 50;
+        let total = PENDING_FLUSH_BATCH_SIZE + extra;
+        let mut paths = Vec::with_capacity(total);
+        for i in 0..total {
+            let name = format!("doc-{i:04}.md");
+            std::fs::write(dir.path().join(&name), format!("# Doc {i}\n\nBody {i}.")).unwrap();
+            paths.push(PathBuf::from(name));
+        }
+
+        let embedder = EchoEmbedClient;
+        let store = BatchTrackingVectorStore::new(None);
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let call_sizes = store.upsert_call_sizes.lock().unwrap().clone();
+        assert_eq!(
+            call_sizes,
+            vec![PENDING_FLUSH_BATCH_SIZE, extra],
+            "expected one bounded flush at the batch size threshold plus one trailing \
+             flush for the remainder, not a single call covering everything"
+        );
+        assert_eq!(
+            store.upserted_points.lock().unwrap().len(),
+            total,
+            "every file must still end up indexed, just across multiple flushes"
+        );
+
+        let state = StateDb::new(Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.count().await.unwrap(),
+            total as i64,
+            "every file's state row must be written regardless of which flush it landed in"
+        );
+    }
+
+    /// #160's partial-progress guarantee: a mid-run failure must leave Qdrant and
+    /// `indexed_files` mutually coherent, not just for the batch that failed but for
+    /// every batch around it.
+    ///
+    /// This writes `2 * PENDING_FLUSH_BATCH_SIZE + 10` files (410 with the current
+    /// constant) and fails the SECOND `upsert_points` call — i.e. the second
+    /// mid-scan flush, covering files 201-400. Expected shape after the run:
+    ///
+    ///   - Batch 1 (files 1-200): flushed successfully BEFORE the failure. Its
+    ///     points are in the store and its state rows are written — this is the
+    ///     "already-committed work survives the crash" half of the guarantee.
+    ///   - Batch 2 (files 201-400): its `upsert_points` call fails. No points are
+    ///     recorded for it (mirroring a real failed Qdrant upsert) and, because
+    ///     `upsert_pending` writes points before state rows, no state rows either —
+    ///     so this batch is cleanly retryable, not half-written.
+    ///   - Batch 3 (files 401-410): the scan loop never reaches them at all — the
+    ///     `?` on batch 2's failed flush returns out of `index_paths_generic`
+    ///     immediately. Their `indexed_files` rows (there are none, same as before
+    ///     this run started) are exactly as untouched as if this run had never
+    ///     happened, which is what lets the next `scan_for_dirty` sweep re-detect
+    ///     and retry files 201-410 as a normal dirty set.
+    ///
+    /// Before #160 there was no batch boundary to fail mid-run at all — a single
+    /// `upsert_pending` call either indexed everything or (on failure) left NOTHING
+    /// indexed, so this specific "some committed, some cleanly retryable, some never
+    /// touched" three-way split could not previously occur. This test's assertions
+    /// (state count == exactly one batch's worth, not 0 and not everything) are what
+    /// would fail against that old, coarser failure granularity.
+    #[tokio::test]
+    async fn index_paths_generic_mid_run_failure_leaves_coherent_partial_progress() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let batch = PENDING_FLUSH_BATCH_SIZE;
+        let tail = 10;
+        let total = 2 * batch + tail;
+        let mut paths = Vec::with_capacity(total);
+        for i in 0..total {
+            let name = format!("doc-{i:04}.md");
+            std::fs::write(dir.path().join(&name), format!("# Doc {i}\n\nBody {i}.")).unwrap();
+            paths.push(PathBuf::from(name));
+        }
+
+        let embedder = EchoEmbedClient;
+        let store = BatchTrackingVectorStore::new(Some(2));
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the second flush's injected upsert failure must propagate out of the run"
+        );
+
+        // Exactly two calls were attempted: the first (successful, batch-sized) and
+        // the second (failed). A third, for the never-scanned tail, must never
+        // happen — proof the run stopped rather than plowing on past the failure.
+        assert_eq!(
+            store.upsert_call_sizes.lock().unwrap().clone(),
+            vec![batch, batch],
+            "batch 1 succeeds at the full batch size; batch 2 is attempted (and then \
+             fails) at the full batch size too; batch 3 (the tail) is never attempted"
+        );
+        assert_eq!(
+            store.upserted_points.lock().unwrap().len(),
+            batch,
+            "only the first, successful batch's points were actually recorded"
+        );
+
+        let state = StateDb::new(Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.count().await.unwrap(),
+            batch as i64,
+            "state.db must hold rows for exactly the first batch — the second \
+             batch's failed flush wrote no state rows (Qdrant-before-state ordering \
+             inside upsert_pending), and the tail was never scanned at all"
+        );
+
+        // Spot-check specific files rather than only the aggregate count: batch 1's
+        // first file must be tracked, batch 2's first file must not be, and the
+        // never-reached tail's first file must not be either.
+        assert!(
+            state.get("doc-0000.md").await.unwrap().is_some(),
+            "batch 1's files must be tracked"
+        );
+        assert!(
+            state
+                .get(&format!("doc-{batch:04}.md"))
+                .await
+                .unwrap()
+                .is_none(),
+            "batch 2's files must NOT be tracked — cleanly retryable, not half-written"
+        );
+        assert!(
+            state
+                .get(&format!("doc-{:04}.md", 2 * batch))
+                .await
+                .unwrap()
+                .is_none(),
+            "the tail batch was never scanned, so it must be untouched"
+        );
     }
 
     async fn test_state_db(dir: &TempDir) -> StateDb {
