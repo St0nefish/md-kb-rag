@@ -1054,6 +1054,42 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
                     );
                 }
 
+                // #210: a `200` response whose entries are ALL invalid (every
+                // index out of range, or repeats of the same handful of valid
+                // ones) leaves `indexed` empty despite the reranker technically
+                // succeeding — a deliberately non-empty `ranked` guards against
+                // conflating this with "the reranker legitimately had nothing to
+                // rank" (which can't happen here: `docs` was already checked
+                // non-empty above, so a `ranked.is_empty()` response is itself
+                // just as "unusable" as an all-invalid one and falls into this
+                // branch too). Before this fix, that condition filtered the
+                // caller down to a near-empty page even though the fused
+                // ranking computed above is a perfectly serviceable fallback —
+                // the SAME "reranker is unusable" condition the `Err` arm below
+                // already degrades gracefully from. Converge the two: fall back
+                // to fused order here exactly as the `Err` arm does, rather than
+                // let a `200`-with-garbage-body and a network failure produce
+                // two very different user-visible outcomes.
+                if indexed.is_empty() {
+                    warn!(
+                        "Reranker returned {} entries but none were usable ({out_of_range} \
+                         out-of-range, {duplicate} duplicate, against {} documents sent); \
+                         falling back to fused order",
+                        ranked.len(),
+                        docs_with_indices.len(),
+                    );
+                    if let Some(max_per_document) = opts.diversity_max_per_document {
+                        results = apply_diversity_cap(results, max_per_document);
+                    }
+                    results.truncate(retain_depth);
+                    let results = paginate(results, offset, opts.limit);
+                    return Ok(SearchOutcome {
+                        results,
+                        path_prefix_truncated,
+                        offset_truncated,
+                    });
+                }
+
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Diversity, pass 2 of 2 — the real, user-tunable cap, applied to
@@ -3928,6 +3964,122 @@ mod tests {
             .filter(|r| r.payload.get(CHUNK_TEXT_KEY).and_then(|v| v.as_str()) == Some("doc A"))
             .count();
         assert_eq!(doc_a_count, 1, "doc A must appear exactly once");
+    }
+
+    #[tokio::test]
+    async fn reranker_entirely_invalid_indices_falls_back_to_fused_order() {
+        // #210: before this fix, a `200` response whose every entry is invalid
+        // (all out of range here) left `indexed` empty, so the caller got a
+        // near-empty result set even though the fused ranking computed just
+        // above is a perfectly good page — a strictly worse outcome than the
+        // `Err` arm's graceful fallback for the SAME underlying condition (the
+        // reranker being unusable). Prove the two converge: this response is
+        // "successful" at the transport level (`Ok`, not a network error) yet
+        // must still produce the full fused-order page, not an almost-empty one.
+        let mut r0 = make_search_result(0.9);
+        r0.payload
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc A"));
+        let mut r1 = make_search_result(0.8);
+        r1.payload
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc B"));
+
+        let store = MockRetrievalStore::with_results(vec![r0, r1]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockRerankerFixed {
+            ranked: vec![
+                crate::rerank::RerankResult {
+                    index: 5,
+                    relevance_score: 0.9,
+                },
+                crate::rerank::RerankResult {
+                    index: 9,
+                    relevance_score: 0.8,
+                },
+            ],
+        };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 2,
+            rerank_candidate_limit: None,
+            ..default_opts()
+        };
+
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
+
+        // Before the fix: `indexed` is empty (both indices out of range), so
+        // `results` would end up empty too — this assertion is what fails
+        // without the fallback.
+        assert_eq!(
+            results.len(),
+            2,
+            "an all-invalid rerank response must fall back to the full fused \
+             page, not an empty one: got {} results",
+            results.len()
+        );
+        // Fused order is score-descending: doc A (0.9) before doc B (0.8) —
+        // proves this really is the pre-rerank order, not a coincidence of length.
+        assert_eq!(
+            results[0]
+                .payload
+                .get(CHUNK_TEXT_KEY)
+                .and_then(|v| v.as_str()),
+            Some("doc A"),
+            "fallback must preserve fused (pre-rerank) order"
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_empty_response_falls_back_to_fused_order() {
+        // A reranker that returns `Ok(vec![])` — zero entries, not an error —
+        // is just as unusable as one returning garbage indices; #210's fix
+        // covers this too since `indexed` ends up empty either way.
+        let mut r0 = make_search_result(0.9);
+        r0.payload
+            .insert(CHUNK_TEXT_KEY.into(), serde_json::json!("doc A"));
+
+        let store = MockRetrievalStore::with_results(vec![r0]);
+        let embed = MockEmbedder::ok(vec![0.1]);
+        let gs = make_md_globset();
+        let data_path = Path::new("/data");
+        let reranker = MockRerankerFixed { ranked: vec![] };
+        let deps = RetrievalDeps {
+            embed_client: &embed,
+            qdrant: &store,
+            collection: "test-col",
+            data_path,
+            include_patterns: &gs,
+            reranker: Some(&reranker as &(dyn crate::rerank::Reranker + Send + Sync)),
+        };
+
+        let opts = SearchOptions {
+            limit: 1,
+            rerank_candidate_limit: None,
+            ..default_opts()
+        };
+
+        let results = search(&deps, "q", &SearchFilters::default(), &opts)
+            .await
+            .unwrap()
+            .results;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "an empty rerank response must still fall back to fused order"
+        );
     }
 
     #[tokio::test]
