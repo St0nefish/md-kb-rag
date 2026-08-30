@@ -1,8 +1,19 @@
+# Single source of truth for the pinned Rust version is rust-toolchain.toml
+# at the repo root (`[toolchain] channel = "..."`, #235). CI reads that
+# file's channel and passes it here via `--build-arg RUST_VERSION=...`, so
+# this pin can no longer silently drift from what CI's own cargo steps (and
+# `dtolnay/rust-toolchain`) actually use. The default below only matters for
+# a plain local `docker build .` run with no build args — same convention as
+# the VERSION/REVISION ARGs further down.
+#
 # MSRV 1.89: `ingest::acquire_reindex_lock` uses `std::fs::File::lock` /
-# `lock_shared`, stabilized in 1.89.0. Do not lower this pin without replacing
-# that call — CI runs `dtolnay/rust-toolchain@stable`, so a too-old pin here
-# compiles clean in CI's cargo steps and then fails only in the Docker build.
-FROM rust:1.89-alpine AS builder
+# `lock_shared`, stabilized in 1.89.0. Do not lower this pin (here or in
+# rust-toolchain.toml) without replacing that call. Before #235, this pin and
+# CI's `dtolnay/rust-toolchain@stable` had no relationship at all: a too-old
+# pin here compiled clean through every cargo step CI ran and failed only in
+# this Docker build, at the end of a long job.
+ARG RUST_VERSION=1.89
+FROM rust:${RUST_VERSION}-alpine AS builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static perl
 

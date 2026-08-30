@@ -2,6 +2,11 @@
 name = "md-kb-rag"
 version = "0.1.0"
 edition = "2024"
+# Keep in lockstep with `channel` in rust-toolchain.toml and `RUST_VERSION`
+# in Dockerfile (#235) -- this makes cargo itself refuse a too-old local
+# toolchain with a clear "package requires rustc X but Y is installed"
+# message, instead of a confusing compile error deep in a build log.
+rust-version = "1.89"
 
 [dependencies]
 # Async runtime
