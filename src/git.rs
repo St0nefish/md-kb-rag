@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -302,6 +303,121 @@ pub(crate) async fn git_diff_name_status(
     Ok(parse_diff_name_status(&String::from_utf8_lossy(
         &out.stdout,
     )))
+}
+
+/// Parse `git log --format=%x02%ct%x03 --name-only --diff-filter=ACMR -z` output into
+/// a map from repo-relative path to the Unix timestamp (`%ct`, committer time) of the
+/// most recent commit that touched it — see [`git_log_mtimes`] for why this exists
+/// and why it is one batched call rather than one `git log -1` per file.
+///
+/// Byte-level shape (verified empirically, not assumed from docs): `-z` NUL-delimits
+/// path records exactly as it does for [`parse_diff_name_status`] above, but a plain
+/// `--format` string is NOT itself NUL-terminated by `-z` — only the diff/name-only
+/// machinery is. So each commit's formatted line still ends with git's own `\n`, and
+/// with `--name-only` that newline becomes the record separator immediately before
+/// the commit's first touched path, landing as a literal leading `\n` on the NUL-split
+/// token right after the format token. The `\x02…\x03` wrapper around `%ct` is what
+/// makes format tokens unambiguously distinguishable from path tokens regardless of
+/// that stray newline or of what characters appear in a path (an all-digit filename
+/// would otherwise be indistinguishable from a bare timestamp).
+///
+/// `git log`'s default order is newest-first, so the FIRST time a path is seen here
+/// is its most recent touch — `.or_insert` below is what makes that stick.
+fn parse_git_log_mtimes(raw: &[u8]) -> HashMap<String, i64> {
+    let mut map = HashMap::new();
+    let mut current_ts: Option<i64> = None;
+
+    for token in raw.split(|&b| b == 0) {
+        // Strip the record-separator artifact described above: a literal leading
+        // newline on the token immediately following a timestamp token (whether that
+        // token turns out to be a path, or — when a commit's diff touched nothing
+        // matching `--diff-filter`, e.g. a merge or a delete-only commit — the NEXT
+        // commit's own timestamp token).
+        let token = token.strip_prefix(b"\n").unwrap_or(token);
+        if token.is_empty() {
+            continue;
+        }
+
+        if token.len() >= 2 && token[0] == 0x02 && token[token.len() - 1] == 0x03 {
+            let inner = &token[1..token.len() - 1];
+            current_ts = std::str::from_utf8(inner)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok());
+            continue;
+        }
+
+        if let Some(ts) = current_ts {
+            let path = String::from_utf8_lossy(token).into_owned();
+            map.entry(path).or_insert(ts);
+        }
+    }
+
+    map
+}
+
+/// #164: batched, git-log-derived "true" last-modified time for every path in
+/// `paths`, one `git log` invocation total rather than one `git log -1` per file —
+/// the whole point, since a per-file invocation is what made this prohibitively slow
+/// across a large corpus. Local git only, no network.
+///
+/// `paths` is passed straight through as `git log`'s trailing pathspec (`-- <paths>`),
+/// so this only ever walks history relevant to the exact files the caller is about to
+/// index — a single scoped write costs one narrowly-filtered log walk, not a full-repo
+/// one, and a full reconcile costs one walk scoped to the whole corpus instead of one
+/// walk per file. `paths.is_empty()` returns an empty map without spawning git at all:
+/// an unfiltered `git log` with no pathspec would walk (and return touched-path data
+/// for) the ENTIRE repository, which is not what an empty scope means here.
+///
+/// `--diff-filter=ACMR` excludes pure deletions (`D`): a path currently on disk that
+/// this function is being asked about was necessarily added or last modified more
+/// recently than any subsequent deletion of the same path could have been, so
+/// including `D` entries would only ever risk shadowing the real answer with a
+/// deletion timestamp for a path that was later recreated.
+///
+/// Returns an empty map on any failure (git not usable, non-zero exit, timeout)
+/// rather than propagating — callers treat a missing map entry as "fall back to
+/// filesystem mtime for this path," which is exactly the pre-#164 behavior, so a git
+/// hiccup degrades gracefully instead of failing an entire indexing run over a
+/// metadata nicety.
+pub async fn git_log_mtimes(
+    _lock: &GitLock,
+    data_path: &str,
+    paths: &[String],
+) -> Result<HashMap<String, i64>> {
+    if paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let safe_dir = format!("safe.directory={}", data_path);
+    let mut args: Vec<&str> = vec![
+        "-c",
+        &safe_dir,
+        "log",
+        "--format=%x02%ct%x03",
+        "--name-only",
+        "--diff-filter=ACMR",
+        "-z",
+        "--",
+    ];
+    args.extend(paths.iter().map(|p| p.as_str()));
+
+    let out = timeout(
+        GIT_TIMEOUT,
+        Command::new("git")
+            .args(&args)
+            .current_dir(data_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git log timed out after {:?}", GIT_TIMEOUT))?
+    .context("Failed to spawn git log")?;
+
+    if !out.status.success() {
+        let stderr = redact_url(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git log (mtime lookup) failed: {}", stderr);
+    }
+
+    Ok(parse_git_log_mtimes(&out.stdout))
 }
 
 /// The outcome of a failed [`commit_and_sync`] call, split by whether a commit landed.
@@ -1531,6 +1647,176 @@ pub(crate) mod tests {
             paths,
             vec![std::path::PathBuf::from("café.md")],
             "the real, unmangled filename must come back — not git's quoted/escaped form"
+        );
+    }
+
+    // --- parse_git_log_mtimes tests (#164) ------------------------------------
+    //
+    // Pure byte-parsing, no git subprocess — the byte layouts below were verified
+    // empirically against a real `git log --format=%x02%ct%x03 --name-only
+    // --diff-filter=ACMR -z` invocation (see `git_log_mtimes`'s doc comment), not
+    // guessed from documentation.
+
+    #[test]
+    fn parse_git_log_mtimes_empty_input_yields_empty_map() {
+        assert!(parse_git_log_mtimes(b"").is_empty());
+    }
+
+    #[test]
+    fn parse_git_log_mtimes_one_commit_multiple_files() {
+        // `\x02<ts>\x03` NUL `\n<path1>` NUL `<path2>` NUL — one commit's format
+        // token followed by both files it touched.
+        let raw = b"\x021700000000\x03\0\na/one.md\0a/two.md\0";
+        let map = parse_git_log_mtimes(raw);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("a/one.md"), Some(&1_700_000_000));
+        assert_eq!(map.get("a/two.md"), Some(&1_700_000_000));
+    }
+
+    #[test]
+    fn parse_git_log_mtimes_first_occurrence_wins_as_the_most_recent_touch() {
+        // git log's default order is newest-first, so a path appearing under two
+        // different commits' timestamps must keep the FIRST (newest) one.
+        let raw = b"\x021700000200\x03\0\na.md\0\x021700000100\x03\0\na.md\0";
+        let map = parse_git_log_mtimes(raw);
+        assert_eq!(map.get("a.md"), Some(&1_700_000_200));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn parse_git_log_mtimes_multiple_commits_each_get_their_own_paths() {
+        let raw = b"\x021700000300\x03\0\nnew.md\0\x021700000100\x03\0\nold.md\0";
+        let map = parse_git_log_mtimes(raw);
+        assert_eq!(map.get("new.md"), Some(&1_700_000_300));
+        assert_eq!(map.get("old.md"), Some(&1_700_000_100));
+    }
+
+    #[test]
+    fn parse_git_log_mtimes_tolerates_back_to_back_timestamp_tokens() {
+        // Defensive: a commit whose formatted header prints but whose diff (under
+        // `--diff-filter`) is empty — never actually observed against real git in
+        // this codebase's testing (merge and filtered-out commits are omitted
+        // entirely, not printed with an empty file list — see the doc comment on
+        // `git_log_mtimes`), but the parser must not panic or misattribute a path
+        // to the wrong commit if it ever does happen.
+        let raw = b"\x021700000300\x03\0\x021700000100\x03\0\nold.md\0";
+        let map = parse_git_log_mtimes(raw);
+        assert_eq!(map.get("old.md"), Some(&1_700_000_100));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn parse_git_log_mtimes_handles_non_ascii_paths() {
+        let raw = "\x021700000000\x03\0\ncafé.md\0".as_bytes();
+        let map = parse_git_log_mtimes(raw);
+        assert_eq!(map.get("café.md"), Some(&1_700_000_000));
+    }
+
+    // --- git_log_mtimes tests (#164) -------------------------------------------
+
+    #[tokio::test]
+    async fn git_log_mtimes_returns_empty_map_for_an_empty_path_list() {
+        let lock = lock_git().await;
+        // No repo needed at all — an empty `paths` short-circuits before spawning
+        // git, so even a nonexistent directory is fine here.
+        let map = git_log_mtimes(&lock, "/nonexistent/does/not/matter", &[])
+            .await
+            .unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_log_mtimes_returns_each_paths_most_recent_commit_time() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        // Commit 1: add both files.
+        std::fs::write(work.path().join("a.md"), "a v1").unwrap();
+        std::fs::write(work.path().join("b.md"), "b v1").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "a.md", "b.md"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add a.md and b.md",
+            ])
+            // `@<unix-seconds> <tz-offset>` is git's own unambiguous date format —
+            // deliberately not an ISO string with no offset, which git parses in
+            // the LOCAL timezone and would make the expected epoch value below
+            // depend on whatever TZ the test happens to run under.
+            .env("GIT_AUTHOR_DATE", "@1577836800 +0000")
+            .env("GIT_COMMITTER_DATE", "@1577836800 +0000")
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+
+        // Commit 2: touch only a.md, well after commit 1 — this is the case #164
+        // exists for: a.md's true last-modified time must move; b.md's must not.
+        std::fs::write(work.path().join("a.md"), "a v2").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "a.md"])
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "update a.md",
+            ])
+            .env("GIT_AUTHOR_DATE", "@1623758400 +0000")
+            .env("GIT_COMMITTER_DATE", "@1623758400 +0000")
+            .current_dir(work_path)
+            .output()
+            .unwrap();
+
+        let lock = lock_git().await;
+        let map = git_log_mtimes(&lock, work_path, &["a.md".to_string(), "b.md".to_string()])
+            .await
+            .unwrap();
+
+        // 2020-01-01T00:00:00Z and 2021-06-15T12:00:00Z as Unix seconds.
+        assert_eq!(
+            map.get("a.md"),
+            Some(&1_623_758_400),
+            "a.md's most recent touch is commit 2"
+        );
+        assert_eq!(
+            map.get("b.md"),
+            Some(&1_577_836_800),
+            "b.md was never touched again after commit 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_log_mtimes_omits_a_path_with_no_history() {
+        let bare = create_bare_repo("main");
+        let work = clone_bare_repo(bare.path(), "main");
+        let work_path = work.path().to_str().unwrap();
+
+        let lock = lock_git().await;
+        // "untracked.md" was never committed — the caller must fall back to
+        // filesystem mtime for it, which only works if this function leaves it
+        // out of the map entirely rather than inventing a value.
+        let map = git_log_mtimes(&lock, work_path, &["untracked.md".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            !map.contains_key("untracked.md"),
+            "a path git has no history for must be absent, not defaulted to 0 or similar"
         );
     }
 

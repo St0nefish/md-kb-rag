@@ -223,6 +223,46 @@ async fn file_mtime(path: &Path, label: &str) -> i64 {
         })
 }
 
+/// #164: one batched `git log` for every path in `rel_keys`, mapping each to the
+/// commit time of its most recent touch — the source of truth `process_file`/
+/// `backfill_document_metadata` fall back away from (to `file_mtime` above) only when
+/// a path has no entry here.
+///
+/// Deliberately NOT one `git log -1` per file: across a large corpus that is a
+/// subprocess spawn per document, which is the exact cost this batches away into a
+/// single invocation covering the whole set at once (`git::git_log_mtimes`).
+///
+/// Gated on git integration actually being configured (`source.git_url`) and the
+/// data path actually being a git clone (`.git` present) — a config without git
+/// integration, or a data path that predates the first clone, has no git history to
+/// ask about, so this returns an empty map immediately rather than spawning a git
+/// process that can only fail. Any OTHER failure (git errors, times out) also
+/// degrades to an empty map rather than failing the calling indexing run — a stale or
+/// missing recency signal is a metadata nicety, not a reason to abort embedding and
+/// upserting content that otherwise indexed successfully.
+async fn build_git_mtimes(config: &ResolvedConfig, rel_keys: &[String]) -> HashMap<String, i64> {
+    if config.source.git_url.is_none() {
+        return HashMap::new();
+    }
+    let data_path = config.data_path();
+    if !Path::new(data_path).join(".git").exists() {
+        return HashMap::new();
+    }
+
+    let lock = crate::git::lock_git().await;
+    match crate::git::git_log_mtimes(&lock, data_path, rel_keys).await {
+        Ok(map) => map,
+        Err(e) => {
+            warn!(
+                "Failed to compute git-log mtimes for this run — every file in it falls \
+                 back to filesystem mtime instead (see #164): {:#}",
+                e
+            );
+            HashMap::new()
+        }
+    }
+}
+
 #[cfg(test)]
 pub async fn compute_hash(path: &Path) -> Result<String> {
     let content = tokio::fs::read(path)
@@ -263,12 +303,33 @@ struct PendingFile {
     /// Number of chunks from the previous index run (0 for new files).
     /// Used to trim stale tail points after a successful upsert.
     old_chunk_count: usize,
-    /// File modification time as Unix timestamp (seconds). Falls back to 0 on metadata/clock error.
+    /// Filesystem modification time as Unix timestamp (seconds), falling back to 0 on
+    /// metadata/clock error. **Internal bookkeeping only** — this is `indexed_files`'
+    /// stat pre-filter baseline (`StateDb::upsert`'s `mtime` column, compared against a
+    /// live `fs::metadata` read on every reconcile sweep — see `scan_for_dirty`'s
+    /// Reason 1b), never surfaced to search or the web UI. Deliberately NOT the
+    /// git-log-derived value in [`display_mtime`](Self::display_mtime) below: git
+    /// clone/checkout/pull do not preserve or reproduce filesystem mtimes, so a
+    /// stat-pre-filter baseline compared against a git timestamp would permanently
+    /// disagree with a live `fs::metadata` read and defeat the pre-filter on every
+    /// single sweep forever (#164's fix is scoped to keep this field exactly as it
+    /// always was, for exactly this reason).
     mtime: i64,
     /// Byte length of `content` as read from disk. Stored alongside `mtime` so the
     /// next reconcile scan (`scan_for_dirty`) can stat-compare instead of re-reading
     /// and re-hashing unchanged files.
     size: i64,
+    /// The document's true last-modified time, as far as any caller outside this
+    /// module should ever be concerned: `git log -1`'s committer time for this path
+    /// when git integration is enabled and the path has git history, falling back to
+    /// filesystem mtime (`mtime` above) otherwise (#164). This is what lands in the
+    /// Qdrant payload's `mtime` field and `documents.mtime` — the values
+    /// `search(modified_after/modified_before)`/`order_by: "mtime"` and the web UI
+    /// actually read — and is the fix for #164: filesystem mtime alone collapses to
+    /// git-clone time for the WHOLE corpus on day one of any deployment (git does not
+    /// preserve original commit times through a clone), making every recency signal
+    /// wrong until a file is incidentally touched again.
+    display_mtime: i64,
     /// Fingerprint of the schema this file was validated against.
     schema_hash: String,
 }
@@ -356,13 +417,20 @@ async fn process_file(
     config: &ResolvedConfig,
     schema: &ResolvedSchema,
     schema_hash: &str,
+    git_mtimes: &HashMap<String, i64>,
 ) -> Result<FileOutcome> {
     let file_path = rel_key.to_string();
     let hash = compute_hash_from_bytes(content.as_bytes());
     let size = content.len() as i64;
 
-    // Capture mtime now — used in PendingFile regardless of validation path.
+    // Capture mtime now — used in PendingFile regardless of validation path. `mtime`
+    // (fs-stat) stays exactly as before — see its doc comment on `PendingFile` for
+    // why it must not become git-derived. `display_mtime` (#164) is the git-log time
+    // for this path when `git_mtimes` has one, falling back to the same fs-stat value
+    // otherwise (git integration disabled, or the path has no git history yet — e.g.
+    // a file created but not yet committed).
     let mtime = file_mtime(path, &file_path).await;
+    let display_mtime = git_mtimes.get(&file_path).copied().unwrap_or(mtime);
 
     let old_chunk_count = state_entry
         .as_ref()
@@ -412,6 +480,7 @@ async fn process_file(
                     old_chunk_count,
                     mtime,
                     size,
+                    display_mtime,
                     schema_hash: schema_hash.to_string(),
                 }))
             }
@@ -478,6 +547,7 @@ async fn process_file(
             old_chunk_count,
             mtime,
             size,
+            display_mtime,
             schema_hash: schema_hash.to_string(),
         }))
     }
@@ -535,7 +605,10 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
                 "file_path".to_string(),
                 serde_json::Value::String(pf.file_path.clone()),
             );
-            payload.insert("mtime".to_string(), serde_json::json!(pf.mtime));
+            // #164: the searchable/orderable "mtime" is the git-log-derived (or
+            // fs-fallback) value, NOT `pf.mtime` — see `PendingFile::mtime`'s doc
+            // comment for why those two must stay separate.
+            payload.insert("mtime".to_string(), serde_json::json!(pf.display_mtime));
             payload.insert(
                 "chunk_index".to_string(),
                 serde_json::Value::Number(chunk.index.into()),
@@ -618,7 +691,10 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
             .upsert_document_metadata(
                 &pf.file_path,
                 &with_derived_domain(&pf.frontmatter, &pf.file_path),
-                pf.mtime,
+                // #164: same rationale as the Qdrant payload above — this is the
+                // user/search-facing mtime, so it must be the git-derived value, not
+                // the fs-stat pre-filter baseline.
+                pf.display_mtime,
                 &pf.hash,
                 *count as i64,
             )
@@ -1645,6 +1721,7 @@ async fn backfill_document_metadata(
     state: &StateDb,
     indexed: &HashMap<String, IndexedFile>,
     schemas: &SchemaCache,
+    git_mtimes: &HashMap<String, i64>,
 ) -> usize {
     let mut filled = 0usize;
 
@@ -1661,7 +1738,14 @@ async fn backfill_document_metadata(
         let schema = schemas.resolve_for(Path::new(rel_key));
         let (frontmatter, body) = validate::parse_frontmatter(&content, schema);
         let frontmatter = with_derived_domain(&frontmatter, rel_key);
-        let mtime = file_mtime(path, rel_key).await;
+        // #164: same git-derived-with-fs-fallback mtime `process_file`/`upsert_pending`
+        // use for the user-facing value — `documents.mtime` is the only thing this
+        // function writes, so there is no fs-stat-pre-filter baseline to keep separate
+        // here the way `PendingFile::mtime` has to.
+        let mtime = match git_mtimes.get(rel_key) {
+            Some(&ts) => ts,
+            None => file_mtime(path, rel_key).await,
+        };
         let chunk_count = indexed.get(rel_key).map(|e| e.chunk_count).unwrap_or(0);
 
         match state
@@ -2158,6 +2242,13 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             .context("Failed to load document metadata hashes for the given paths")?
     };
 
+    // #164: one batched git-log lookup for every path this run is about to touch,
+    // reused below by both `process_file` (the incremental/changed-file path) and
+    // `backfill_document_metadata` (the unchanged-content path) — see
+    // `build_git_mtimes`'s doc comment for why this must be computed once here
+    // rather than once per file.
+    let git_mtimes = build_git_mtimes(config, &rel_keys).await;
+
     // ── Per-path processing ──────────────────────────────────────────────────
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut backfill_queue: Vec<(String, PathBuf)> = Vec::new();
@@ -2226,6 +2317,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             config,
             schema,
             &schema_hash,
+            &git_mtimes,
         )
         .await?
         {
@@ -2307,7 +2399,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
             "Backfilling document metadata for {} unchanged file(s)",
             backfill_queue.len()
         );
-        backfill_document_metadata(&backfill_queue, &state, &state_map, &schemas).await
+        backfill_document_metadata(&backfill_queue, &state, &state_map, &schemas, &git_mtimes).await
     };
 
     // ── Handle missing (deleted) files ───────────────────────────────────────
@@ -2359,27 +2451,128 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
 // Synchronous scan-then-index, for callers with no worker
 // ---------------------------------------------------------------------------
 
+/// Slack for #155's active self-heal deficit check in [`detect_qdrant_wipe`] — the
+/// same value and the same rationale as `server.rs`'s `QDRANT_DEFICIT_SLACK` behind
+/// `/status`'s passive half (a small deficit is an ordinary, self-correcting
+/// mid-write window, not an incident), duplicated rather than shared because the two
+/// checks live in different modules with no existing coupling between them and a
+/// Qdrant wipe produces a deficit orders of magnitude larger than this slack either
+/// way.
+const QDRANT_WIPE_DEFICIT_SLACK: i64 = 50;
+
+/// #155's active self-heal: compares state.db's `total_chunk_count()` — the number
+/// of Qdrant points state.db believes are live — against `store`'s actual point
+/// count for `collection`, and reports whether the gap is large enough to mean
+/// Qdrant's data was wiped out from under an intact state.db (operator error, a
+/// botched restore, `docker volume rm` on the Qdrant volume) rather than an ordinary
+/// transient window.
+///
+/// Gated on `state.count() > 0`: an empty `indexed_files` table means nothing has
+/// ever been indexed in this state.db (a genuinely fresh deployment, or state.db
+/// itself was just recreated), and a 0-vs-0 comparison there is healthy, not a wipe —
+/// this gate is what keeps day-one startup from spuriously escalating to a full
+/// reindex before anything has been indexed at all.
+///
+/// Deliberately one-sided, mirroring `server.rs`'s `qdrant_deficit_error`: only a
+/// DEFICIT (fewer live points than state.db expects) is ever a fault. A surplus is
+/// legitimate and can persist indefinitely — `index_paths_generic` documents at
+/// least two conditions that produce one on purpose (a failed tail-trim leaves stale
+/// high-index points until the next `--full`; a bookkeeping failure after a
+/// successful upsert leaves points with no matching state row) — so this function
+/// must never be tempted to key off `!=` instead of `>`.
+///
+/// Generic over `Q: VectorStore` purely so the round trip through
+/// `collection_point_count` can be driven by a test fake instead of a live Qdrant —
+/// see that trait method's doc comment.
+async fn detect_qdrant_wipe<Q: VectorStore>(
+    state: &StateDb,
+    store: &Q,
+    collection: &str,
+) -> Result<bool> {
+    let indexed_rows = state
+        .count()
+        .await
+        .context("Failed to count indexed_files for Qdrant-wipe detection")?;
+    if indexed_rows <= 0 {
+        return Ok(false);
+    }
+
+    let chunk_sum = state
+        .total_chunk_count()
+        .await
+        .context("Failed to sum chunk_count for Qdrant-wipe detection")?;
+    let points = store
+        .collection_point_count(collection)
+        .await
+        .context("Failed to read Qdrant's point count for wipe detection")?;
+
+    let deficit = chunk_sum - points as i64;
+    Ok(deficit > QDRANT_WIPE_DEFICIT_SLACK)
+}
+
 /// Scan, then index whatever the scan found — for callers that have no background
 /// worker to hand a dirty-path queue to: the `md-kb-rag index` CLI subcommand, and the
 /// server's own pre-worker bootstrap immediately after a fresh git clone. Both need a
 /// synchronous, in-process "bring the index up to date" call, which this provides by
-/// composing [`scan_for_dirty`] and [`index_paths`].
+/// composing [`scan_for_dirty`] and [`index_paths`]. It is also, since #155, the
+/// periodic reconcile sweep's own entry point (`reindex.rs`'s worker calls this with
+/// `force = false` on every sweep) — which is exactly the call path this function's
+/// self-heal escalation below needs to sit on to catch a Qdrant wipe automatically.
 ///
 /// `force = true` is `--full`: rather than scanning (which would compare against state
 /// this call is about to clear, and would trivially mark everything dirty once state
 /// IS clear), it discovers every file directly and indexes all of them with
 /// `force = true` — see [`index_paths`] for why that combination is only ever safe with
 /// a complete path list, which a fresh discovery walk guarantees.
+///
+/// #155 active self-heal: when `force` is `false` (a plain reconcile sweep, never an
+/// explicit `--full`), this first checks [`detect_qdrant_wipe`] and, if it reports a
+/// deficit, escalates internally to the exact same `force = true` path described
+/// above — discover every file, then `index_paths(.., true, ..)` — instead of running
+/// the scoped scan. That escalation is the ONE exception to the invariant documented
+/// on `index_paths` that nothing in the worker/queue path ever sets `force`; it is
+/// deliberately routed through this existing branch rather than spliced in
+/// elsewhere (e.g. after `ensure_collection` inside `index_paths_generic`) because
+/// this branch already carries the guard that refuses a full reindex while any
+/// schema scope is broken (frozen scopes would otherwise lose their vectors to the
+/// drop-and-rebuild with no way to restore them), the collection drop, and the
+/// `state.clear()` — all "for free," rather than needing to be re-derived at a second
+/// call site. Escalating here also means the check runs once per reconcile sweep
+/// rather than once per write, keeping the added Qdrant round trip cheap.
 pub async fn scan_and_index(config: &ResolvedConfig, force: bool, trigger: Trigger) -> Result<()> {
     if force {
         let (_data_path, all_paths) = discover_relative(config).await?;
-        index_paths(config, &all_paths, true, trigger).await
-    } else {
-        let dirty = scan_for_dirty(config)
-            .await
-            .context("Reconcile scan failed")?;
-        index_paths(config, &dirty, false, trigger).await
+        return index_paths(config, &all_paths, true, trigger).await;
     }
+
+    // The wipe-detection round trip below needs its own state DB handle and its own
+    // live Qdrant store — `index_paths` (called either branch below) opens both of
+    // these itself too, but only after this function has already decided which
+    // branch to take, so there is no way to hand it a reused connection here.
+    let db_path = config.state_db_path();
+    let state = StateDb::new(Path::new(&db_path))
+        .await
+        .context("Failed to open state DB for Qdrant-wipe detection")?;
+    let store = QdrantStore::new(&config.qdrant)
+        .context("Failed to connect to Qdrant for wipe detection")?;
+
+    if detect_qdrant_wipe(&state, &store, &config.qdrant.collection).await? {
+        error!(
+            collection = %config.qdrant.collection,
+            "Qdrant's point count is far below state.db's chunk_count sum — this looks like \
+             Qdrant's data was wiped while state.db survived (see #155). Escalating this \
+             reconcile sweep to a full reindex (the same destructive collection \
+             drop-and-rebuild `index --full` performs) to self-heal automatically instead of \
+             leaving search silently empty until an operator notices."
+        );
+        let (_data_path, all_paths) = discover_relative(config).await?;
+        return index_paths(config, &all_paths, true, trigger).await;
+    }
+
+    let dirty = scan_for_dirty(config)
+        .await
+        .context("Reconcile scan failed")?;
+    index_paths(config, &dirty, false, trigger).await
 }
 
 #[cfg(test)]
@@ -3592,6 +3785,114 @@ mod tests {
         );
     }
 
+    // -- detect_qdrant_wipe (#155 active self-heal) ---------------------------
+
+    #[tokio::test]
+    async fn detect_qdrant_wipe_flags_a_deficit_past_slack() {
+        let dir = TempDir::new().unwrap();
+        let db = test_state_db(&dir).await;
+        // 500 chunks tracked as live across a handful of files...
+        db.upsert("a.md", "hash-a", 250, "schema", 100, 10)
+            .await
+            .unwrap();
+        db.upsert("b.md", "hash-b", 250, "schema", 100, 10)
+            .await
+            .unwrap();
+        // ...but Qdrant reports only 3 points — the collection was wiped while
+        // state.db survived.
+        let store = FixedPointCountStore(3);
+
+        let wiped = detect_qdrant_wipe(&db, &store, "kb").await.unwrap();
+        assert!(
+            wiped,
+            "a deficit this large must be reported as a Qdrant wipe"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_qdrant_wipe_ignores_a_deficit_within_slack() {
+        let dir = TempDir::new().unwrap();
+        let db = test_state_db(&dir).await;
+        db.upsert("a.md", "hash-a", 1000, "schema", 100, 10)
+            .await
+            .unwrap();
+        // Just inside QDRANT_WIPE_DEFICIT_SLACK (50) — an ordinary mid-write window,
+        // not a wipe.
+        let store = FixedPointCountStore(1000 - QDRANT_WIPE_DEFICIT_SLACK as u64);
+
+        let wiped = detect_qdrant_wipe(&db, &store, "kb").await.unwrap();
+        assert!(
+            !wiped,
+            "a deficit within slack must not be treated as a wipe"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_qdrant_wipe_ignores_a_surplus() {
+        let dir = TempDir::new().unwrap();
+        let db = test_state_db(&dir).await;
+        db.upsert("a.md", "hash-a", 10, "schema", 100, 10)
+            .await
+            .unwrap();
+        // Qdrant has MORE points than state.db expects — a legitimate, one-sided-safe
+        // surplus (e.g. a failed tail-trim), never a wipe signal.
+        let store = FixedPointCountStore(10_000);
+
+        let wiped = detect_qdrant_wipe(&db, &store, "kb").await.unwrap();
+        assert!(!wiped, "a surplus must never be reported as a wipe");
+    }
+
+    #[tokio::test]
+    async fn detect_qdrant_wipe_is_gated_on_a_nonempty_state_db() {
+        let dir = TempDir::new().unwrap();
+        // Nothing has ever been indexed — indexed_files is empty, so a 0-vs-0
+        // comparison here is healthy day-one startup, not a wipe. Without the
+        // `state.count() > 0` gate this would still read as "no deficit" (0 - 0 = 0),
+        // but the gate exists so a state.db that's merely been *cleared* deliberately
+        // (not wiped-Qdrant-under-it) never gets second-guessed either.
+        let db = test_state_db(&dir).await;
+        let store = FixedPointCountStore(0);
+
+        let wiped = detect_qdrant_wipe(&db, &store, "kb").await.unwrap();
+        assert!(
+            !wiped,
+            "an empty state.db must never trigger the wipe escalation"
+        );
+    }
+
+    // -- build_git_mtimes (#164) -----------------------------------------------
+
+    #[tokio::test]
+    async fn build_git_mtimes_returns_empty_when_git_integration_is_disabled() {
+        let dir = TempDir::new().unwrap();
+        let config = scan_test_config(&dir); // source.git_url is None by default
+        assert!(config.source.git_url.is_none());
+
+        let map = build_git_mtimes(&config, &["doc.md".to_string()]).await;
+        assert!(
+            map.is_empty(),
+            "no git_url configured means no git history to ask about"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_git_mtimes_returns_empty_when_data_path_predates_the_first_clone() {
+        let dir = TempDir::new().unwrap();
+        let mut config = scan_test_config(&dir);
+        config.source.git_url = Some("https://example.com/repo.git".to_string());
+        // Deliberately no `.git` directory under `dir` — the data path exists (this
+        // fixture wrote nothing to it either, but the directory itself is real) yet
+        // has never actually been cloned into.
+        assert!(!dir.path().join(".git").exists());
+
+        let map = build_git_mtimes(&config, &["doc.md".to_string()]).await;
+        assert!(
+            map.is_empty(),
+            "a data path with no .git directory has no git history to ask about, \
+             regardless of whether git integration is configured"
+        );
+    }
+
     // -- domain derivation ---------------------------------------------------
 
     #[test]
@@ -3729,7 +4030,9 @@ mod tests {
             .collect();
         let queue = vec![("recipe.md".to_string(), path.clone())];
 
-        let filled = backfill_document_metadata(&queue, &db, &indexed, &empty_schemas()).await;
+        let filled =
+            backfill_document_metadata(&queue, &db, &indexed, &empty_schemas(), &HashMap::new())
+                .await;
 
         assert_eq!(filled, 1);
         assert_eq!(db.document_count().await.unwrap(), 1);
@@ -3776,8 +4079,14 @@ mod tests {
         );
 
         let queue = vec![("recipes/chili.md".to_string(), path)];
-        let filled =
-            backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas()).await;
+        let filled = backfill_document_metadata(
+            &queue,
+            &db,
+            &HashMap::new(),
+            &empty_schemas(),
+            &HashMap::new(),
+        )
+        .await;
         assert_eq!(filled, 1);
 
         let links = db.all_links().await.unwrap();
@@ -3810,7 +4119,14 @@ mod tests {
         .unwrap();
 
         let queue = vec![("recipe.md".to_string(), path)];
-        backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas()).await;
+        backfill_document_metadata(
+            &queue,
+            &db,
+            &HashMap::new(),
+            &empty_schemas(),
+            &HashMap::new(),
+        )
+        .await;
 
         let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(
             "SELECT field, value_text, value_num FROM document_fields WHERE file_path = ?",
@@ -3830,8 +4146,14 @@ mod tests {
         let (db, _db_dir) = backfill_test_db().await;
         let queue = vec![("gone.md".to_string(), PathBuf::from("/nonexistent/gone.md"))];
 
-        let filled =
-            backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas()).await;
+        let filled = backfill_document_metadata(
+            &queue,
+            &db,
+            &HashMap::new(),
+            &empty_schemas(),
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(filled, 0);
         assert_eq!(db.document_count().await.unwrap(), 0);
@@ -3848,10 +4170,46 @@ mod tests {
         std::fs::write(&path, "---\ntype: reference\n---\n\nBody.").unwrap();
 
         let queue = vec![("sparse.md".to_string(), path)];
-        let filled =
-            backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas()).await;
+        let filled = backfill_document_metadata(
+            &queue,
+            &db,
+            &HashMap::new(),
+            &empty_schemas(),
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(filled, 1, "metadata must not depend on passing validation");
+    }
+
+    /// #164: `backfill_document_metadata` writes `documents.mtime`, the field
+    /// `search`/the web UI actually read for recency — when `git_mtimes` has an
+    /// entry for the path, that value must win over a fresh filesystem stat.
+    #[tokio::test]
+    async fn backfill_document_metadata_prefers_the_git_mtime_when_present() {
+        let (db, _db_dir) = backfill_test_db().await;
+        let kb = TempDir::new().unwrap();
+        let path = kb.path().join("recipe.md");
+        std::fs::write(&path, "---\ntitle: Test\n---\n\nBody.").unwrap();
+
+        let queue = vec![("recipe.md".to_string(), path)];
+        let mut git_mtimes = HashMap::new();
+        git_mtimes.insert("recipe.md".to_string(), 1_650_000_000);
+
+        let filled =
+            backfill_document_metadata(&queue, &db, &HashMap::new(), &empty_schemas(), &git_mtimes)
+                .await;
+        assert_eq!(filled, 1);
+
+        let summaries = db.all_document_summaries().await.unwrap();
+        let doc = summaries
+            .iter()
+            .find(|d| d.file_path == "recipe.md")
+            .expect("recipe.md must have a documents row after backfill");
+        assert_eq!(
+            doc.mtime, 1_650_000_000,
+            "documents.mtime must be the git-derived value from git_mtimes, not a fresh fs stat"
+        );
     }
 
     #[tokio::test]
@@ -3882,6 +4240,7 @@ mod tests {
             &config,
             &test_schema(),
             "",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -3915,6 +4274,7 @@ mod tests {
             &config,
             &test_schema(),
             "",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -3956,6 +4316,7 @@ mod tests {
             &config,
             &test_schema(),
             "",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -3982,11 +4343,90 @@ mod tests {
             &config,
             &test_schema(),
             "",
+            &HashMap::new(),
         )
         .await
         .unwrap();
         match outcome {
             FileOutcome::Ready(pf) => assert_eq!(pf.old_chunk_count, 0),
+            other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    /// #164: when `git_mtimes` has an entry for this path, `display_mtime` (the
+    /// user/search-facing value) must come from it — and `mtime` (the fs-stat
+    /// pre-filter baseline) must stay independent, not overwritten by it.
+    #[tokio::test]
+    async fn process_file_display_mtime_comes_from_git_mtimes_when_present() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "# Hello\nBody text.";
+        std::fs::write(&path, content).unwrap();
+
+        let mut git_mtimes = HashMap::new();
+        git_mtimes.insert("doc.md".to_string(), 1_600_000_000);
+
+        let config = config_no_validation();
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &test_schema(),
+            "",
+            &git_mtimes,
+        )
+        .await
+        .unwrap();
+        match outcome {
+            FileOutcome::Ready(pf) => {
+                assert_eq!(
+                    pf.display_mtime, 1_600_000_000,
+                    "display_mtime must come from the git_mtimes map when the path is in it"
+                );
+                assert_ne!(
+                    pf.mtime, pf.display_mtime,
+                    "mtime (the fs-stat pre-filter baseline) must never be overwritten by \
+                     the git-derived display_mtime — see PendingFile::mtime's doc comment"
+                );
+                assert!(pf.mtime > 0, "mtime should still be a real fs stat value");
+            }
+            other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    /// #164: with no entry for the path in `git_mtimes` (git integration disabled, or
+    /// the path has no git history yet), `display_mtime` must fall back to the exact
+    /// same fs-stat value as `mtime` — this is the pre-#164 behavior, preserved as the
+    /// degrade path.
+    #[tokio::test]
+    async fn process_file_display_mtime_falls_back_to_fs_mtime_without_a_git_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doc.md");
+        let content = "# Hello\nBody text.";
+        std::fs::write(&path, content).unwrap();
+
+        let config = config_no_validation();
+        let outcome = process_file(
+            &path,
+            "doc.md",
+            content,
+            false,
+            None,
+            &config,
+            &test_schema(),
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        match outcome {
+            FileOutcome::Ready(pf) => assert_eq!(
+                pf.display_mtime, pf.mtime,
+                "with no git_mtimes entry, display_mtime must equal the fs-stat mtime"
+            ),
             other => panic!("Expected Ready, got {:?}", outcome_name(&other)),
         }
     }
@@ -4008,6 +4448,7 @@ mod tests {
             &config,
             &test_schema(),
             "",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -4040,6 +4481,7 @@ mod tests {
             &config,
             &test_schema(),
             "",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -4077,6 +4519,7 @@ mod tests {
             &config,
             &ResolvedSchema::from_config(&config.frontmatter),
             "",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -4120,6 +4563,7 @@ mod tests {
             &config,
             &ResolvedSchema::from_config(&config.frontmatter),
             "",
+            &HashMap::new(),
         )
         .await
         .expect("a strict-mode rejection must be Ok(Rejected), never Err");
@@ -4177,6 +4621,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             "abc",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -4212,6 +4657,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             "new-fingerprint",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -4253,6 +4699,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             &test_schema().fingerprint(),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -4293,6 +4740,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             &test_schema().fingerprint(),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -4316,6 +4764,7 @@ mod tests {
             &config_no_validation(),
             &test_schema(),
             "fingerprint-xyz",
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -4445,6 +4894,10 @@ mod tests {
         }
     }
 
+    // #155: none of `MockVectorStore`'s existing tests exercise the point-count
+    // escalation, so a fixed 0 is fine here — it just has to satisfy the trait.
+    // `FixedPointCountStore` below is what actually drives #155's tests.
+
     impl VectorStore for MockVectorStore {
         async fn upsert_points(
             &self,
@@ -4490,6 +4943,10 @@ mod tests {
             _enable_phrase: bool,
         ) -> Result<()> {
             Ok(())
+        }
+
+        async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
+            Ok(0)
         }
     }
 
@@ -4566,6 +5023,54 @@ mod tests {
             *self.ensure_collection_calls.lock().unwrap() += 1;
             Ok(())
         }
+
+        async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Drives #155's `detect_qdrant_wipe` tests: a `VectorStore` fake whose only
+    /// meaningful method is `collection_point_count`, returning a fixed value set at
+    /// construction. The other trait methods are never called by those tests — they
+    /// exercise `detect_qdrant_wipe` directly, not the full `index_paths_generic`
+    /// pipeline — so they `unreachable!()` rather than silently succeeding, which
+    /// would hide a test accidentally exercising more than it means to.
+    struct FixedPointCountStore(u64);
+
+    impl VectorStore for FixedPointCountStore {
+        async fn upsert_points(
+            &self,
+            _collection: &str,
+            _points: Vec<crate::qdrant::QdrantPoint>,
+        ) -> Result<()> {
+            unreachable!("FixedPointCountStore is only for collection_point_count")
+        }
+
+        async fn delete_by_files(&self, _collection: &str, _file_paths: &[&str]) -> Result<()> {
+            unreachable!("FixedPointCountStore is only for collection_point_count")
+        }
+
+        async fn delete_points_by_ids(&self, _collection: &str, _ids: Vec<String>) -> Result<()> {
+            unreachable!("FixedPointCountStore is only for collection_point_count")
+        }
+
+        async fn drop_collection(&self, _collection: &str) -> Result<()> {
+            unreachable!("FixedPointCountStore is only for collection_point_count")
+        }
+
+        async fn ensure_collection(
+            &self,
+            _collection: &str,
+            _vector_size: u64,
+            _indexed_fields: &[crate::qdrant::IndexedField],
+            _enable_phrase: bool,
+        ) -> Result<()> {
+            unreachable!("FixedPointCountStore is only for collection_point_count")
+        }
+
+        async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
+            Ok(self.0)
+        }
     }
 
     // `index_paths_generic` requires `Q: VectorStore + NeighborStore` since
@@ -4608,6 +5113,7 @@ mod tests {
             old_chunk_count,
             mtime: 1_700_000_000,
             size: 123,
+            display_mtime: 1_700_000_000,
         }
     }
 
@@ -4794,6 +5300,61 @@ mod tests {
                 "file_path payload must be the relative key"
             );
         }
+    }
+
+    /// #164: `upsert_pending` must route `mtime` and `display_mtime` to DIFFERENT
+    /// destinations — `indexed_files.mtime` (the fs-stat pre-filter baseline) gets
+    /// `mtime`; the Qdrant payload and `documents.mtime` (both user/search-facing)
+    /// get `display_mtime`. Uses deliberately distinct values for the two fields so a
+    /// regression that collapses them back to one is caught instead of passing by
+    /// coincidence.
+    #[tokio::test]
+    async fn upsert_pending_routes_mtime_and_display_mtime_to_different_columns() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        let mut pf = make_pending("data/test.md", 1, 0);
+        pf.mtime = 1_000_000_000;
+        pf.display_mtime = 2_000_000_000;
+        let pending = vec![pf];
+
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3]]);
+        let store = MockVectorStore::all_ok();
+
+        upsert_pending(&pending, &embedder, &store, &state, "test-col")
+            .await
+            .unwrap();
+
+        let mtime_val = {
+            let points = store.upserted_points.lock().unwrap();
+            points[0]
+                .payload
+                .get("mtime")
+                .and_then(|v| v.as_i64())
+                .unwrap()
+        };
+        assert_eq!(
+            mtime_val, 2_000_000_000,
+            "Qdrant's 'mtime' payload must be display_mtime, never the fs-stat baseline"
+        );
+
+        let entry = state.get("data/test.md").await.unwrap().unwrap();
+        assert_eq!(
+            entry.mtime, 1_000_000_000,
+            "indexed_files.mtime must stay the fs-stat pre-filter baseline (mtime), \
+             never display_mtime — a git-derived value here would permanently disagree \
+             with scan_for_dirty's live fs stat and defeat the pre-filter forever"
+        );
+
+        let summaries = state.all_document_summaries().await.unwrap();
+        let doc = summaries
+            .iter()
+            .find(|d| d.file_path == "data/test.md")
+            .unwrap();
+        assert_eq!(
+            doc.mtime, 2_000_000_000,
+            "documents.mtime must be display_mtime — the value search/the web UI read"
+        );
     }
 
     #[tokio::test]
