@@ -451,7 +451,7 @@ volumes:
   kb_data:
 ```
 
-On first start with an empty volume, the server automatically shallow-clones the repo and runs a full index. Subsequent updates come through the webhook (`git fetch` + `git merge --ff-only` + incremental reindex).
+On first start with an empty volume, the server automatically clones the repo (a full clone, not shallow — a later `commit_and_sync` from the write tools needs history to fetch/rebase/push) and runs a full index. Subsequent updates come through the webhook (`git fetch` + `git merge --ff-only` + incremental reindex).
 
 **Why this is preferred:**
 
