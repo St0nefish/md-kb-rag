@@ -511,6 +511,20 @@ hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 }
 #detail-body a.internal { color: var(--accent); cursor: pointer; }
 #detail-body a.external { color: var(--accent); }
+/* Wiki-style [[target]] links (registerWikiLinkExtension / rewriteWikiLinks
+ * in viz.js) whose target doesn't resolve to a document currently in the
+ * graph — renamed, removed, or just unresolvable (see resolveWikiLink).
+ * Distinct from both a.internal (a live, clickable link — a RESOLVED wiki
+ * link gets that class too, not this one) and a.external (a real outbound
+ * URL): this is neither, so it gets neither's affordance. A dashed
+ * underline and muted color signal "this link exists in the text but has
+ * no live target" without dressing it up as something followable — see
+ * #170. Not `cursor: pointer` — there is nothing to click. */
+#detail-body a.wiki-link-missing {
+  color: var(--text-muted);
+  text-decoration: underline dashed;
+  cursor: default;
+}
 
 #detail-backlinks { margin-top: 18px; }
 #detail-backlinks h2 { font-size: 13px; color: var(--text-muted); margin-bottom: 6px; }
