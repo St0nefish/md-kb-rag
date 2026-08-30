@@ -20,6 +20,7 @@
 //! counts (documents, points) live in SQLite and Qdrant where they belong.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -557,6 +558,257 @@ impl IndexStatus {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Retrieval-side operational metrics (#168)
+// ---------------------------------------------------------------------------
+//
+// `/status`/`/metrics` are rich about indexing (everything above this point in the
+// file) and had nothing at all about queries — the actual product, since this is a
+// RAG server. This section is the recording surface for that: a query count, a
+// zero-result count, rerank attempt/failure counts, and a per-stage latency
+// histogram for embed/Qdrant/rerank. `render_prometheus` (server.rs, which owns the
+// Prometheus encoder) is the consumer.
+//
+// This is deliberately NOT shaped like `IndexStatus` above, despite the issue
+// asking for an "INDEX_STATUS-style" global: `record_payload_index` and friends
+// run at most a few dozen times per process lifetime (once per field, inside
+// `ensure_collection`), so a `RwLock<Inner>` write-lock per call is free. A query
+// happens on EVERY search request — this is the genuine hot path retrieval.rs's
+// `search` sits on — so recording a query outcome must never contend a lock
+// against a concurrent request, and must not depend on (or block behind) anything
+// `/status`'s 5s cache or single-flight collection does. Every field below is a
+// bare atomic instead: `record_query` never blocks, and a reader takes a
+// wait-free snapshot by loading each atomic once.
+//
+// NOTE for the agent wiring this into `retrieval.rs` (out of scope for this
+// change — see the issue): `search` already computes `embed_ms` and `search_ms`
+// (the Qdrant round trip, dense or hybrid) and logs them at `debug` right before
+// its final `Ok(SearchOutcome { .. })` return. That is the one call site to hook
+// for the common path: call `QUERY_METRICS.record_query(embed_ms as u64, search_ms
+// as u64, rerank, results.len())` right there, where `rerank` is `None` if
+// `deps.reranker` was `None` for this call, or `Some((rerank_ms, success))` if a
+// reranker was actually attempted — `success` is `false` on the `Err(e)` arm that
+// currently just logs `warn!("Reranker unavailable, ...")` and falls back to
+// fused order (rerank_ms would need its own `Instant::now()` wrapped around the
+// `reranker.rerank(query, &docs).await` call, since `search` does not currently
+// time that stage at all). There is a SECOND return point to cover: the
+// `if docs.is_empty()` early return a few lines above the `match reranker.rerank`
+// call also produces zero results and currently skips the timing `debug!`
+// entirely — that path needs the same `record_query` call (with `rerank: None`,
+// since no rerank was attempted) or it will systematically undercount
+// zero-result queries whenever reranking is enabled. `search_grouped` has no
+// existing timing instrumentation and no reranker at all; wiring it through
+// `record_query` (with `rerank: None` always) is straightforward but lower
+// priority since the issue's sketch centers on `search`.
+
+/// Upper bounds (inclusive), in milliseconds, for the buckets in every
+/// [`LatencyHistogram`] below. This is exactly Prometheus's own client-library
+/// default bucket set (`.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10` seconds)
+/// scaled by 1000 so the hot-path recording side can stay in integer
+/// milliseconds — `render_prometheus` converts back to seconds (the Prometheus
+/// convention for a time unit) when it prints the `le` labels. Reusing the
+/// well-known default, rather than hand-tuning per stage, is what makes these
+/// three histograms directly comparable on one dashboard panel without a reader
+/// having to first go look up what each one's buckets mean.
+const LATENCY_BUCKETS_MS: [u64; 11] = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+
+/// A point-in-time read of a [`LatencyHistogram`], shaped exactly as
+/// `render_prometheus` needs it: `bucket_counts[i]` is the CUMULATIVE count of
+/// samples at-or-below `bucket_bounds_ms[i]` (Prometheus's `_bucket{le=".."}`
+/// convention), and `bucket_counts` has one more entry than `bucket_bounds_ms` —
+/// the trailing entry is the "+Inf" bucket, which always equals `count`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LatencyHistogramSnapshot {
+    pub bucket_bounds_ms: Vec<u64>,
+    pub bucket_counts: Vec<u64>,
+    pub count: u64,
+    pub sum_ms: u64,
+}
+
+/// A lock-free, Prometheus-shaped latency histogram: fixed buckets, atomic
+/// counters, no registry. `record` touches exactly one bucket counter (the
+/// smallest bound the sample fits under, or an implicit overflow bucket for
+/// anything past the largest bound) plus `count`/`sum_ms` — three atomic
+/// increments total, none of them a lock. The cumulative per-bound counts a
+/// Prometheus histogram needs are computed in [`Self::snapshot`], at scrape
+/// time, by prefix-summing the per-bucket counters — not maintained
+/// incrementally, since that would mean every `record` touching every bucket
+/// instead of just its own.
+#[derive(Debug)]
+struct LatencyHistogram {
+    /// One counter per bound in [`LATENCY_BUCKETS_MS`], plus a trailing overflow
+    /// ("+Inf") counter for samples past the largest bound. Non-cumulative: each
+    /// slot counts only samples that landed in exactly that bucket.
+    buckets: [AtomicU64; LATENCY_BUCKETS_MS.len() + 1],
+    count: AtomicU64,
+    sum_ms: AtomicU64,
+}
+
+impl LatencyHistogram {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            sum_ms: AtomicU64::new(0),
+        }
+    }
+
+    // Only called (today) from `RetrievalMetrics::record_query` below and from
+    // this module's own tests — see that method's `#[allow(dead_code)]` comment
+    // for why a real, non-test caller does not exist in THIS crate yet.
+    #[allow(dead_code)]
+    fn record(&self, ms: u64) {
+        let idx = LATENCY_BUCKETS_MS
+            .iter()
+            .position(|&bound| ms <= bound)
+            .unwrap_or(LATENCY_BUCKETS_MS.len());
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LatencyHistogramSnapshot {
+        let mut bucket_counts = Vec::with_capacity(LATENCY_BUCKETS_MS.len() + 1);
+        let mut running = 0u64;
+        for slot in self.buckets.iter().take(LATENCY_BUCKETS_MS.len()) {
+            running += slot.load(Ordering::Relaxed);
+            bucket_counts.push(running);
+        }
+        // The overflow slot folds into the final "+Inf" entry, which is why this
+        // total is expected to equal `count` below.
+        running += self.buckets[LATENCY_BUCKETS_MS.len()].load(Ordering::Relaxed);
+        bucket_counts.push(running);
+
+        LatencyHistogramSnapshot {
+            bucket_bounds_ms: LATENCY_BUCKETS_MS.to_vec(),
+            bucket_counts,
+            count: self.count.load(Ordering::Relaxed),
+            sum_ms: self.sum_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time read of [`RetrievalMetrics`]. See that type's doc comment for
+/// what each counter means and why a rate (e.g. "zero-result rate") is reported
+/// as two raw counters rather than a pre-divided fraction — same convention
+/// `IndexStatus` already uses for `runs_total`/`runs_failed`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RetrievalMetricsSnapshot {
+    pub queries_total: u64,
+    pub zero_result_total: u64,
+    pub rerank_attempted_total: u64,
+    pub rerank_failed_total: u64,
+    pub embed_latency_ms: LatencyHistogramSnapshot,
+    pub qdrant_latency_ms: LatencyHistogramSnapshot,
+    pub rerank_latency_ms: LatencyHistogramSnapshot,
+}
+
+/// Process-global retrieval (query-side) operational counters — the counterpart
+/// to [`IndexStatus`] for the other half of this service. See this module's
+/// "Retrieval-side operational metrics" section doc comment above for the full
+/// rationale, including why this is built on bare atomics rather than
+/// `IndexStatus`'s `RwLock<Inner>` shape.
+#[derive(Debug)]
+pub struct RetrievalMetrics {
+    queries_total: AtomicU64,
+    /// Count of queries in `record_query` calls where `result_count == 0` — the
+    /// single best signal that retrieval is failing users, per #168.
+    zero_result_total: AtomicU64,
+    /// Queries where a reranker was actually invoked (`rerank: Some(..)` passed
+    /// to `record_query`), regardless of outcome. Reranking is optional and off
+    /// by default in the query path whenever `reranking:` is absent from
+    /// `config.yaml` or a caller sends no candidates to rerank — those calls
+    /// never touch this counter, so it only ever counts genuine attempts.
+    rerank_attempted_total: AtomicU64,
+    /// Subset of `rerank_attempted_total` where the reranker call failed and
+    /// `retrieval::search` fell back to fused order. Reranking degrades silently
+    /// by design (a warn! log and a fallback, never a request failure), so
+    /// without this counter a reranker that has been down for a week produces no
+    /// operator-visible signal at all.
+    rerank_failed_total: AtomicU64,
+    embed_latency_ms: LatencyHistogram,
+    qdrant_latency_ms: LatencyHistogram,
+    rerank_latency_ms: LatencyHistogram,
+}
+
+impl Default for RetrievalMetrics {
+    fn default() -> Self {
+        Self {
+            queries_total: AtomicU64::new(0),
+            zero_result_total: AtomicU64::new(0),
+            rerank_attempted_total: AtomicU64::new(0),
+            rerank_failed_total: AtomicU64::new(0),
+            embed_latency_ms: LatencyHistogram::new(),
+            qdrant_latency_ms: LatencyHistogram::new(),
+            rerank_latency_ms: LatencyHistogram::new(),
+        }
+    }
+}
+
+impl RetrievalMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one completed retrieval call. Never blocks — see the module
+    /// section doc comment on why that matters on this specific call path.
+    ///
+    /// `rerank` is `None` when no reranker was attempted for this call (no
+    /// `RerankClient` configured, or the call returned zero candidates before a
+    /// rerank was ever attempted) and `Some((rerank_ms, success))` whenever a
+    /// rerank genuinely was attempted — pass `success: false` on a reranker
+    /// error, not a skipped call, since that is the silent-degradation case this
+    /// counter exists to surface.
+    ///
+    /// `#[allow(dead_code)]`: this is the recording half of #168's API — the
+    /// call site belongs in `retrieval::search`, which is off-limits for this
+    /// change (owned by another agent this wave; see the module section doc
+    /// comment above for the exact hand-off: what to pass for `rerank`, and the
+    /// two return points in `search` that both need a call here). Nothing in
+    /// THIS crate calls it yet outside tests, which is expected until that
+    /// follow-up lands — `QUERY_METRICS.snapshot()` (called from
+    /// `server.rs`) already has a real, live, non-test caller, so it does not
+    /// need the same suppression.
+    #[allow(dead_code)]
+    pub fn record_query(
+        &self,
+        embed_ms: u64,
+        qdrant_ms: u64,
+        rerank: Option<(u64, bool)>,
+        result_count: usize,
+    ) {
+        self.queries_total.fetch_add(1, Ordering::Relaxed);
+        if result_count == 0 {
+            self.zero_result_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.embed_latency_ms.record(embed_ms);
+        self.qdrant_latency_ms.record(qdrant_ms);
+        if let Some((rerank_ms, success)) = rerank {
+            self.rerank_attempted_total.fetch_add(1, Ordering::Relaxed);
+            if !success {
+                self.rerank_failed_total.fetch_add(1, Ordering::Relaxed);
+            }
+            self.rerank_latency_ms.record(rerank_ms);
+        }
+    }
+
+    pub fn snapshot(&self) -> RetrievalMetricsSnapshot {
+        RetrievalMetricsSnapshot {
+            queries_total: self.queries_total.load(Ordering::Relaxed),
+            zero_result_total: self.zero_result_total.load(Ordering::Relaxed),
+            rerank_attempted_total: self.rerank_attempted_total.load(Ordering::Relaxed),
+            rerank_failed_total: self.rerank_failed_total.load(Ordering::Relaxed),
+            embed_latency_ms: self.embed_latency_ms.snapshot(),
+            qdrant_latency_ms: self.qdrant_latency_ms.snapshot(),
+            rerank_latency_ms: self.rerank_latency_ms.snapshot(),
+        }
+    }
+}
+
+/// Process-wide retrieval (query-side) metrics. See the section doc comment
+/// above for why this is global and why it is safe to update from a hot path.
+pub static QUERY_METRICS: LazyLock<RetrievalMetrics> = LazyLock::new(RetrievalMetrics::new);
 
 /// Query-string keys whose values are scrubbed by [`redact_error`].
 const SECRET_QUERY_KEYS: [&str; 6] = ["api-key", "api_key", "apikey", "key", "token", "password"];
@@ -1180,5 +1432,194 @@ mod tests {
     fn format_unix_renders_rfc3339() {
         assert_eq!(format_unix(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_unix(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    // --- retrieval metrics (#168) ---------------------------------------------
+
+    #[test]
+    fn a_fresh_retrieval_metrics_reports_all_zeros() {
+        let m = RetrievalMetrics::new();
+        let snap = m.snapshot();
+        assert_eq!(snap.queries_total, 0);
+        assert_eq!(snap.zero_result_total, 0);
+        assert_eq!(snap.rerank_attempted_total, 0);
+        assert_eq!(snap.rerank_failed_total, 0);
+        assert_eq!(snap.embed_latency_ms.count, 0);
+        assert_eq!(snap.qdrant_latency_ms.count, 0);
+        assert_eq!(snap.rerank_latency_ms.count, 0);
+        // The "+Inf" trailing bucket is always present, even with zero samples.
+        assert_eq!(
+            snap.embed_latency_ms.bucket_counts.len(),
+            snap.embed_latency_ms.bucket_bounds_ms.len() + 1
+        );
+    }
+
+    #[test]
+    fn record_query_counts_a_query_and_its_latencies() {
+        let m = RetrievalMetrics::new();
+        m.record_query(12, 8, None, 5);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.queries_total, 1);
+        assert_eq!(snap.zero_result_total, 0, "5 results is not zero-result");
+        assert_eq!(snap.rerank_attempted_total, 0, "no reranker was passed");
+        assert_eq!(snap.embed_latency_ms.count, 1);
+        assert_eq!(snap.embed_latency_ms.sum_ms, 12);
+        assert_eq!(snap.qdrant_latency_ms.count, 1);
+        assert_eq!(snap.qdrant_latency_ms.sum_ms, 8);
+        assert_eq!(
+            snap.rerank_latency_ms.count, 0,
+            "no rerank attempted, so its histogram must stay empty"
+        );
+    }
+
+    #[test]
+    fn record_query_with_zero_results_increments_the_zero_result_counter() {
+        let m = RetrievalMetrics::new();
+        m.record_query(10, 10, None, 0);
+        assert_eq!(m.snapshot().zero_result_total, 1);
+
+        // A later query with results must not retroactively "fix" the count —
+        // it is a running total of how many queries came back empty, not a
+        // current-state flag.
+        m.record_query(10, 10, None, 3);
+        let snap = m.snapshot();
+        assert_eq!(snap.queries_total, 2);
+        assert_eq!(snap.zero_result_total, 1);
+    }
+
+    #[test]
+    fn record_query_tracks_a_successful_rerank_attempt() {
+        let m = RetrievalMetrics::new();
+        m.record_query(5, 5, Some((40, true)), 10);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.rerank_attempted_total, 1);
+        assert_eq!(
+            snap.rerank_failed_total, 0,
+            "a successful rerank must not count as a failure"
+        );
+        assert_eq!(snap.rerank_latency_ms.count, 1);
+        assert_eq!(snap.rerank_latency_ms.sum_ms, 40);
+    }
+
+    #[test]
+    fn record_query_tracks_a_failed_rerank_attempt() {
+        // Models `retrieval::search`'s `Err(e)` arm on `reranker.rerank(..)`: it
+        // still degrades to fused order rather than failing the request, which is
+        // exactly the silent-failure mode #168 exists to surface — a failed
+        // attempt still counts as an ATTEMPT (and still contributes a latency
+        // sample: the reranker was reached and took time before it failed).
+        let m = RetrievalMetrics::new();
+        m.record_query(5, 5, Some((200, false)), 10);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.rerank_attempted_total, 1);
+        assert_eq!(snap.rerank_failed_total, 1);
+        assert_eq!(snap.rerank_latency_ms.count, 1);
+    }
+
+    #[test]
+    fn retrieval_metrics_snapshot_is_a_running_total_across_many_queries() {
+        let m = RetrievalMetrics::new();
+        for _ in 0..3 {
+            m.record_query(10, 10, None, 1);
+        }
+        m.record_query(10, 10, Some((30, false)), 0);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.queries_total, 4);
+        assert_eq!(snap.zero_result_total, 1);
+        assert_eq!(snap.rerank_attempted_total, 1);
+        assert_eq!(snap.rerank_failed_total, 1);
+        assert_eq!(snap.embed_latency_ms.count, 4);
+    }
+
+    #[test]
+    fn latency_histogram_buckets_a_sample_into_the_smallest_fitting_bound() {
+        let m = RetrievalMetrics::new();
+        // Exactly on a bound: Prometheus buckets are `le` (inclusive), so a
+        // 25ms sample belongs in the "25" bucket and every bucket above it, not
+        // the next one up.
+        m.record_query(25, 0, None, 1);
+        let snap = m.snapshot();
+
+        let idx_25 = snap
+            .embed_latency_ms
+            .bucket_bounds_ms
+            .iter()
+            .position(|&b| b == 25)
+            .unwrap();
+        let idx_10 = snap
+            .embed_latency_ms
+            .bucket_bounds_ms
+            .iter()
+            .position(|&b| b == 10)
+            .unwrap();
+        assert_eq!(
+            snap.embed_latency_ms.bucket_counts[idx_25], 1,
+            "a 25ms sample must land in the le=25 bucket"
+        );
+        assert_eq!(
+            snap.embed_latency_ms.bucket_counts[idx_10], 0,
+            "a 25ms sample must not count toward le=10"
+        );
+    }
+
+    #[test]
+    fn latency_histogram_buckets_are_cumulative() {
+        let m = RetrievalMetrics::new();
+        m.record_query(3, 0, None, 1); // falls in the first (le=5) bucket
+        m.record_query(8, 0, None, 1); // falls in the le=10 bucket
+        let snap = m.snapshot();
+
+        // le=5 sees only the 3ms sample; le=10 and everything above must also
+        // include it (cumulative), plus the 8ms sample.
+        let at = |bound: u64| {
+            let idx = snap
+                .embed_latency_ms
+                .bucket_bounds_ms
+                .iter()
+                .position(|&b| b == bound)
+                .unwrap();
+            snap.embed_latency_ms.bucket_counts[idx]
+        };
+        assert_eq!(at(5), 1);
+        assert_eq!(at(10), 2);
+        assert_eq!(at(10000), 2);
+    }
+
+    #[test]
+    fn latency_histogram_overflow_bucket_catches_samples_past_the_largest_bound() {
+        let m = RetrievalMetrics::new();
+        m.record_query(999_999, 0, None, 1);
+        let snap = m.snapshot();
+
+        // Every explicit bound must show 0 — the sample is larger than all of
+        // them — while the trailing "+Inf" entry (one past the last bound) must
+        // still catch it, matching Prometheus's own overflow-bucket contract.
+        for &count in
+            &snap.embed_latency_ms.bucket_counts[..snap.embed_latency_ms.bucket_counts.len() - 1]
+        {
+            assert_eq!(count, 0);
+        }
+        assert_eq!(
+            *snap.embed_latency_ms.bucket_counts.last().unwrap(),
+            1,
+            "an over-bound sample must still land in the +Inf bucket"
+        );
+        assert_eq!(snap.embed_latency_ms.count, 1);
+    }
+
+    #[test]
+    fn the_process_global_query_metrics_starts_at_zero() {
+        // A smoke test on the actual static, distinct from the `RetrievalMetrics::new()`
+        // instances every other test above uses — those are deliberately private so
+        // tests never observe another test's recordings through a shared global.
+        // This only asserts the type is reachable and constructs cleanly; it does
+        // NOT assert exact counts, since `cargo test` runs many tests in one process
+        // and nothing else in this module writes to `QUERY_METRICS`, but a future
+        // test that does would otherwise make this one order-dependent.
+        let _ = QUERY_METRICS.snapshot();
     }
 }
