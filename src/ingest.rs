@@ -255,23 +255,161 @@ async fn file_mtime_nanos(path: &Path, label: &str) -> i64 {
         })
 }
 
-/// #164: one batched `git log` for every path in `rel_keys`, mapping each to the
-/// commit time of its most recent touch — the source of truth `process_file`/
-/// `backfill_document_metadata` fall back away from (to `file_mtime` above) only when
-/// a path has no entry here.
+/// Process-global memo of git-log-derived mtimes, keyed to the exact `(data_path,
+/// HEAD sha)` generation they were computed against — the #236 fix for
+/// `build_git_mtimes` holding `git::GIT_LOCK` for a full `git log` history walk on
+/// EVERY `index_paths_generic` call, scoped or full.
 ///
-/// Deliberately NOT one `git log -1` per file: across a large corpus that is a
-/// subprocess spawn per document, which is the exact cost this batches away into a
-/// single invocation covering the whole set at once (`git::git_log_mtimes`).
+/// ## Why caching, and not one of the other options #236 lists
+///
+/// `git log -- <pathspec>`'s cost is dominated by how far back it has to walk commit
+/// history looking for matches, not by how many paths are in the pathspec — a
+/// narrowly-scoped query over a long-history repo still walks the same history a
+/// broad one does, it just prints less of it. So "scope the query to the paths being
+/// indexed" (already true here — `rel_keys` was never the whole corpus for a scoped
+/// run) does not actually bound the walk cost the issue is about; the pathspec was
+/// always narrow, and the walk was expensive anyway.
+///
+/// "Only run it on full reindexes" — the option this module would otherwise reach
+/// for first, since it is by far the simplest — is unsound here specifically because
+/// of how this project's queue collapses trigger provenance: `reindex::run_worker`
+/// hands every scoped unit to `ingest::index_paths` tagged `Trigger::Worker`
+/// regardless of whether the underlying event was a `write_document` call (whose
+/// file WAS just written locally by this process — filesystem mtime is trustworthy)
+/// or a webhook-driven fetch+merge (whose files were just checked out by `git merge`,
+/// which sets filesystem mtime to the MERGE time, not preserving each commit's
+/// original time — exactly the collapse #164 exists to fix). There is no signal left
+/// by the time a path reaches `build_git_mtimes` that distinguishes those two cases,
+/// so gating this to full-only would silently reintroduce #164's bug for every
+/// webhook-driven update — likely the dominant path for a KB whose canonical copy
+/// lives on a separate Git host, per this project's own architecture. Weakening
+/// mtime accuracy to solve a lock-contention problem is the wrong trade.
+///
+/// Caching instead makes the EXPENSIVE case (a real history walk) run only once per
+/// commit landing — "document mtimes only change when commits land," per the issue
+/// — rather than once per write/webhook, with no accuracy cost at all: every call
+/// still gets a live, HEAD-correct answer, just served from memory once this
+/// process has already resolved it for the current HEAD.
+///
+/// ## Shape
+///
+/// `key` is `None` before the very first lookup and after every successful
+/// `resolve()` call against a DIFFERENT `(data_path, head)` pair, at which point
+/// `entries` is wiped — see `resolve`'s doc comment. Keyed on `data_path` as well as
+/// `head`, not `head` alone, so a hypothetical multi-repo process (this crate's own
+/// test suite spins up many independent temp repos in one binary) can never
+/// cross-contaminate one repo's entries into another's, even in the astronomically
+/// unlikely event two unrelated repos' HEAD commits happen to collide.
+///
+/// `entries` maps a path to `Some(mtime)` (a resolved git-derived mtime) or `None`
+/// (a CONFIRMED negative result: git has no history for this path at this HEAD) —
+/// caching the negative is what stops a path with no git history (never committed,
+/// only ever written to disk) from being re-queried by every subsequent call at the
+/// same HEAD, forever.
+///
+/// Not persisted anywhere: cold on every process start/restart. That is always SAFE
+/// (a cold cache just means the next call does a real, uncached lookup — exactly
+/// what every call did before this existed) and never WRONG (there is no on-disk
+/// cache file that could survive a restart to contradict a live git repo).
+struct GitMtimeCache {
+    key: Option<(String, String)>,
+    entries: HashMap<String, Option<i64>>,
+}
+
+impl GitMtimeCache {
+    fn empty() -> Self {
+        Self {
+            key: None,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Wipe `entries` if they belong to a different `(data_path, head)` generation
+    /// than the one being requested, then adopt the requested generation as current.
+    /// A no-op (keeps every already-resolved entry) when the generation matches.
+    ///
+    /// Pure state transition, no I/O or locking of its own beyond whatever the
+    /// caller already holds — deliberately factored out of `build_git_mtimes` so the
+    /// actual invalidate-vs-reuse decision, the one thing a caching layer can get
+    /// subtly wrong (silently serving a stale value after HEAD moved), can be
+    /// exercised directly in tests without a real git repo or subprocess.
+    fn resolve(&mut self, data_path: &str, head: &str) {
+        let want = (data_path.to_string(), head.to_string());
+        if self.key.as_ref() != Some(&want) {
+            self.entries.clear();
+            self.key = Some(want);
+        }
+    }
+
+    /// Split `rel_keys` into (already-cached answers, still-missing keys) against
+    /// the CURRENT generation — call `resolve` first if the generation might have
+    /// changed. A key with a cached `None` (confirmed no git history) counts as
+    /// resolved, not missing — see the struct doc comment.
+    fn split(&self, rel_keys: &[String]) -> (HashMap<String, i64>, Vec<String>) {
+        let mut found = HashMap::new();
+        let mut missing = Vec::new();
+        for key in rel_keys {
+            match self.entries.get(key) {
+                Some(Some(ts)) => {
+                    found.insert(key.clone(), *ts);
+                }
+                Some(None) => {}
+                None => missing.push(key.clone()),
+            }
+        }
+        (found, missing)
+    }
+
+    /// Merge a fresh, just-computed lookup for `missing` into the cache — but ONLY
+    /// if the cache is still at the exact `(data_path, head)` generation `fresh` was
+    /// computed against.
+    ///
+    /// This guard matters for a real race: between the `split()` call that produced
+    /// `missing` and this call, another concurrent caller could have observed a
+    /// NEWER HEAD and already invalidated the cache into a new generation via its
+    /// own `resolve()`. Merging `fresh` (computed against the OLD generation)
+    /// into that newer generation would silently resurrect stale, superseded values
+    /// under a key that is supposed to mean "current as of the new HEAD." Dropping
+    /// `fresh` on the floor in that rare case is strictly safer: the next caller
+    /// that needs these paths just repeats the (cheap, #237-chunked) lookup.
+    fn merge(
+        &mut self,
+        data_path: &str,
+        head: &str,
+        missing: &[String],
+        fresh: &HashMap<String, i64>,
+    ) {
+        if self.key.as_ref() != Some(&(data_path.to_string(), head.to_string())) {
+            return;
+        }
+        for key in missing {
+            self.entries.insert(key.clone(), fresh.get(key).copied());
+        }
+    }
+}
+
+static GIT_MTIME_CACHE: std::sync::LazyLock<tokio::sync::Mutex<GitMtimeCache>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(GitMtimeCache::empty()));
+
+/// #164: git-log-derived "true" last-modified time for every path in `rel_keys` that
+/// git has history for — the source of truth `process_file`/`backfill_document_metadata`
+/// fall back away from (to `file_mtime`) only when a path has no entry here.
+///
+/// #236: backed by [`GIT_MTIME_CACHE`], a process-global memo invalidated on HEAD
+/// change rather than a fresh `git log` walk on every call — see that struct's doc
+/// comment for the full rationale (and why the simpler "full reindexes only" or
+/// "narrow the pathspec" alternatives don't actually fix this). The `GIT_LOCK`
+/// acquisition below still covers the WHOLE sequence (HEAD resolution plus, on a
+/// cache miss, the chunked `git log` walk) as one logical operation, per this
+/// project's git-locking discipline — it is just usually a much shorter hold than
+/// before, because `rev_parse_head` does not walk history and a warm cache needs no
+/// subprocess at all.
 ///
 /// Gated on git integration actually being configured (`source.git_url`) and the
 /// data path actually being a git clone (`.git` present) — a config without git
 /// integration, or a data path that predates the first clone, has no git history to
 /// ask about, so this returns an empty map immediately rather than spawning a git
-/// process that can only fail. Any OTHER failure (git errors, times out) also
-/// degrades to an empty map rather than failing the calling indexing run — a stale or
-/// missing recency signal is a metadata nicety, not a reason to abort embedding and
-/// upserting content that otherwise indexed successfully.
+/// process that can only fail.
 async fn build_git_mtimes(config: &ResolvedConfig, rel_keys: &[String]) -> HashMap<String, i64> {
     if config.source.git_url.is_none() {
         return HashMap::new();
@@ -282,17 +420,37 @@ async fn build_git_mtimes(config: &ResolvedConfig, rel_keys: &[String]) -> HashM
     }
 
     let lock = crate::git::lock_git().await;
-    match crate::git::git_log_mtimes(&lock, data_path, rel_keys).await {
-        Ok(map) => map,
+
+    // Cheap — no history walk — so a run at a HEAD this process has already fully
+    // resolved skips the expensive part entirely. Any failure here (repo mid-op,
+    // unreadable, etc.) falls back to one uncached, #237-chunked lookup for exactly
+    // this run rather than either serving a possibly-wrong-generation cache or
+    // failing the calling indexing run over a metadata nicety.
+    let head = match crate::git::rev_parse_head(&lock, data_path).await {
+        Ok(h) => h,
         Err(e) => {
             warn!(
-                "Failed to compute git-log mtimes for this run — every file in it falls \
-                 back to filesystem mtime instead (see #164): {:#}",
+                "Failed to resolve HEAD for git-log-mtime caching — falling back to an \
+                 uncached lookup for this run only (see #236): {:#}",
                 e
             );
-            HashMap::new()
+            return crate::git::git_log_mtimes(&lock, data_path, rel_keys).await;
         }
+    };
+
+    let missing = {
+        let mut cache = GIT_MTIME_CACHE.lock().await;
+        cache.resolve(data_path, &head);
+        cache.split(rel_keys).1
+    };
+
+    if !missing.is_empty() {
+        let fresh = crate::git::git_log_mtimes(&lock, data_path, &missing).await;
+        let mut cache = GIT_MTIME_CACHE.lock().await;
+        cache.merge(data_path, &head, &missing, &fresh);
     }
+
+    GIT_MTIME_CACHE.lock().await.split(rel_keys).0
 }
 
 #[cfg(test)]
@@ -920,6 +1078,171 @@ async fn update_semantic_edges<N: NeighborStore>(
             );
         }
     }
+}
+
+/// Files accumulated in `index_paths_generic`'s `pending: Vec<PendingFile>` before a
+/// mid-scan flush through [`flush_pending_batch`] (#160).
+///
+/// Each `PendingFile` carries a full parsed document body, its chunk text
+/// (duplicated out of the body — see `PendingFile::body`'s doc comment), and, once
+/// `upsert_pending` runs, a full embedding vector per chunk plus the `QdrantPoint`
+/// built from it. Left unbounded, that is the entire changed-file delta of a run —
+/// up to the whole corpus on a `--full` reindex or a fresh bootstrap clone — held
+/// resident at once before a single byte reaches Qdrant or `indexed_files`. This
+/// constant bounds that to a fixed-size window instead: peak resident memory for the
+/// pending batch becomes a function of this number, not of corpus size, and (see
+/// [`flush_pending_batch`]'s doc comment) a mid-run crash only ever loses the batch
+/// currently in flight rather than the whole run's progress.
+///
+/// Not derived from `embedding.batch_size` (`config.rs`, default 32): that knob
+/// counts CHUNK TEXTS per HTTP embedding call, a different unit from files — one
+/// document can produce anywhere from one chunk to dozens, so a files-denominated
+/// threshold and a chunks-denominated one don't convert into each other without
+/// knowing the corpus's chunk-per-file distribution up front, which this module has
+/// no cheap way to know before it has already chunked (and therefore already paid
+/// most of the memory cost of) the batch in question. `config.rs` is out of scope
+/// for this change, so this stays a hardcoded constant rather than a new knob; if an
+/// operator ever needs to tune it, the field to add is `indexing.index_batch_size`
+/// (`usize`, default 200) next to `reconcile_interval_secs` in `IndexingConfig`.
+///
+/// 200 is chosen to keep a single flush's `PendingFile` batch (bodies + chunk text +,
+/// once embedded, vectors) in the low tens of MB for a typical markdown KB document,
+/// while still being large enough that a big corpus's per-batch overhead (one
+/// `embed_texts` HTTP round trip, one Qdrant `upsert_points` call, one state-DB
+/// transaction per file) stays a small fraction of total run time rather than
+/// dominating it with per-batch fixed costs.
+const PENDING_FLUSH_BATCH_SIZE: usize = 200;
+
+/// Flush `pending` through `upsert_pending` (embed + Qdrant upsert + state-DB write)
+/// and `update_semantic_edges`, then empty it — the sub-batching fix for #160.
+///
+/// Called twice from `index_paths_generic`'s per-path loop: mid-scan, whenever
+/// `pending.len()` reaches [`PENDING_FLUSH_BATCH_SIZE`], and once more after the loop
+/// for whatever remainder (`< PENDING_FLUSH_BATCH_SIZE` files) never hit that
+/// threshold. Both call sites hand this the SAME `pending` `Vec` and drive it through
+/// the same `upsert_pending` — the one and only function permitted to mutate
+/// Qdrant/state.db — so sub-batching adds no second mutator; it only changes how many
+/// times the existing one is called and how much of `pending` it sees per call.
+///
+/// ## Partial-progress semantics (mid-run crash)
+///
+/// This is the property #160 exists to fix, so it is worth stating exactly what a
+/// crash leaves behind. Say a run has 10 batches of work; the process dies during
+/// (or between) batch 3's flush:
+///
+///   - Batches 1 and 2 already completed a full `upsert_pending` call each: their
+///     files' points are in Qdrant AND their `indexed_files`/`documents` rows are
+///     written. That work survives the crash intact — nothing about it depended on
+///     the run finishing.
+///   - Batch 3, whichever step it died on, is exactly as safe as a *whole-corpus*
+///     `upsert_pending` call dying at that same step always was — `upsert_pending`'s
+///     own doc comment already covers this (points are written before state, so a
+///     crash between the two leaves a harmless SURPLUS: Qdrant points with no
+///     matching state row yet, self-healing on retry, never a deficit). Sub-batching
+///     does not change that internal ordering at all; it only shrinks how much of
+///     the corpus can be "batch 3" at once.
+///   - Batches 4 through 10 were never reached: the scan loop simply never got to
+///     those paths, so their `indexed_files` rows are untouched — whatever they were
+///     before this run started (stale, or absent for a new file). Because nothing
+///     about their state changed, the NEXT run's `scan_for_dirty` re-detects them as
+///     dirty exactly as if this run had never touched them, and they are retried
+///     from scratch. Nothing here needs a resume checkpoint or a "where did we leave
+///     off" marker: dirty detection already IS that mechanism, for free.
+///
+/// Net effect: a mid-run death loses at most one batch's worth of in-flight work (at
+/// most `PENDING_FLUSH_BATCH_SIZE` files' embeddings, recomputed on retry) instead of
+/// the WHOLE run's worth — the whole point, since before this change every file in
+/// `pending` was one un-recoverable unit spanning the entire corpus delta.
+///
+/// ## Orphan removal and tail-trim stay correct
+///
+/// `remove_orphans` is deliberately NOT called from here or from anywhere inside the
+/// scan loop — it still runs exactly once, in `index_paths_generic`, after the loop
+/// (and therefore after every `flush_pending_batch` call, this trailing one
+/// included) has finished. `remove_orphans` acts on `missing` — paths absent from
+/// disk — which is entirely disjoint from `pending` — paths present and (re)indexed.
+/// Sub-batching `pending` cannot make `remove_orphans` run early against a path a
+/// later batch hasn't written yet, because `remove_orphans` never reads `pending` at
+/// all; the two lists don't interact. Calling it per-flush here would be the bug
+/// this doc comment is warning the next reader away from — DON'T.
+///
+/// Tail-trim (stale high-index point cleanup for a file that shrank) is unaffected
+/// for a different reason: it is already per-file, driven off `PendingFile::
+/// old_chunk_count`, which comes from `state_map` — loaded ONCE, for the whole
+/// worklist, before the scan loop even starts. It was never a whole-`pending`-view
+/// operation to begin with, so chopping `pending` into smaller calls changes nothing
+/// about its correctness.
+///
+/// ## #155's Qdrant-wipe deficit-detector window
+///
+/// `detect_qdrant_wipe` flags a DEFICIT: state.db believes more chunks exist than
+/// Qdrant actually has. `upsert_pending` writes Qdrant points before it writes the
+/// matching state rows (see its own doc comment), so mid-batch it can only ever
+/// produce a SURPLUS (Qdrant ahead of state), which the detector already treats as
+/// legitimate. Sub-batching does not change that per-batch ordering — it only means
+/// there are now several smaller such windows across a run instead of one huge one
+/// spanning the whole corpus. If anything this NARROWS the aggregate surplus window
+/// versus the pre-#160 code, which mid-run held the ENTIRE pending batch's points
+/// written and NONE of its state rows written until the single terminal call's
+/// per-file state loop finished — a bigger, not smaller, surplus window than any one
+/// sub-batch here produces. The one deficit-producing sequence in this module
+/// (`index_paths_generic`'s `force` block: `state.clear()` before
+/// `drop_collection()`) runs entirely BEFORE the scan loop / any flush, so it is
+/// untouched by this change; `acquire_reindex_lock`'s cross-process exclusivity is
+/// what actually closes that race, not batch sizing.
+async fn flush_pending_batch<E: EmbedStore, Q: VectorStore + NeighborStore>(
+    pending: &mut Vec<PendingFile>,
+    embedder: &E,
+    store: &Q,
+    state: &StateDb,
+    collection: &str,
+    semantic_edges: &SemanticEdgesConfig,
+) -> Result<usize> {
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    // `mem::take` rather than `drain(..)`: hands `upsert_pending`/`update_semantic_edges`
+    // an owned `Vec` (both want `&[PendingFile]`, satisfied either way) while leaving
+    // `pending` valid and empty for the scan loop to keep pushing into. The batch's
+    // allocation — bodies, chunk text, and (after `upsert_pending` embeds them)
+    // vectors, the actual memory #160 is about — drops with `batch` when this function
+    // returns, which is what makes peak resident memory bounded by batch size rather
+    // than growing for the rest of the run.
+    let batch = std::mem::take(pending);
+    let count = batch.len();
+
+    INDEX_STATUS.set_phase(Phase::Embedding);
+    info!("Embedding chunks for {} changed file(s)…", count);
+    upsert_pending(&batch, embedder, store, state, collection).await?;
+
+    // Precompute semantic (kNN) edges for the web UI graph view, same as the
+    // pre-#160 single terminal call — no-ops when `semantic_edges.enabled` is false.
+    update_semantic_edges(&batch, store, state, collection, semantic_edges).await;
+
+    // Hand status back to "Scanning": if more paths remain, the loop resumes
+    // immediately after this call, and `/status` should reflect that rather than
+    // continuing to claim "Embedding" for whatever's left of the scan. If this was
+    // the FINAL flush instead, the next phase this run sets (Backfilling,
+    // RemovingOrphans, or nothing at all) overwrites this before it's ever visible,
+    // so there is no cost to setting it unconditionally here.
+    //
+    // One observability regression worth naming rather than hiding: `upsert_pending`
+    // calls `INDEX_STATUS.set_chunks_total`, which resets `chunks_embedded` to 0
+    // every time it is called (see `status.rs`). Pre-#160, that fired once per run
+    // against the WHOLE pending set, so `/status`'s chunks progress bar swept
+    // 0→100% once per run. Post-#160 it fires once per flush against just that
+    // batch, so the same bar now resets and re-sweeps once per batch instead — a
+    // choppier, less informative progress signal for a run with many batches.
+    // `files_done`/`files_total` (set for every path in the scan loop, not just on a
+    // flush) still gives an accurate whole-run progress read throughout, so this is
+    // a real but secondary regression in one of two progress signals, not a loss of
+    // progress visibility altogether — and fixing it properly would mean threading a
+    // whole-run chunk-count total into `status.rs`, out of scope for a change
+    // touching only `ingest.rs`/`git.rs`.
+    INDEX_STATUS.set_phase(Phase::Scanning);
+
+    Ok(count)
 }
 
 /// Remove orphaned files (deleted from disk but still in the index).
@@ -2439,6 +2762,10 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     let mut read_errors = 0usize;
     let mut frozen = 0usize;
     let mut rejected = 0usize;
+    // #160: running total across every `flush_pending_batch` call (mid-loop and the
+    // trailing one), since `pending.len()` after the loop is no longer a meaningful
+    // count of files indexed this run — every mid-loop flush resets it to 0.
+    let mut indexed_count = 0usize;
 
     INDEX_STATUS.set_phase(Phase::Scanning);
     let mut scanned = 0usize;
@@ -2547,28 +2874,45 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
                 // to this file's validity, and is retried at the run level regardless.
                 INDEX_STATUS.record_strict_rejection(rel_key, None);
                 pending.push(pf);
+
+                // #160: flush as soon as `pending` reaches the bounded batch size,
+                // rather than letting it grow for the rest of the scan loop. This is
+                // what keeps peak resident memory a function of
+                // `PENDING_FLUSH_BATCH_SIZE` instead of the run's total changed-file
+                // count — see `flush_pending_batch`'s doc comment for the full
+                // partial-progress/orphan-removal/#155 analysis. `scanned` (not
+                // `pending.len()` after this call, which is always 0 right after a
+                // flush) is what `INDEX_STATUS.set_files_done` above already tracks,
+                // so a mid-loop flush changes nothing about the scan progress signal.
+                if pending.len() >= PENDING_FLUSH_BATCH_SIZE {
+                    indexed_count += flush_pending_batch(
+                        &mut pending,
+                        embedder,
+                        store,
+                        &state,
+                        collection,
+                        &config.ui.semantic_edges,
+                    )
+                    .await?;
+                }
             }
         }
     }
 
-    // ── Batch embedding & upsert ────────────────────────────────────────────
-    let pending_count = pending.len();
-    if !pending.is_empty() {
-        INDEX_STATUS.set_phase(Phase::Embedding);
-        info!("Embedding chunks for {} changed file(s)…", pending_count);
-        upsert_pending(&pending, embedder, store, &state, collection).await?;
-
-        // Precompute semantic (kNN) edges for the web UI graph view. No-ops when
-        // `ui.semantic_edges` is disabled (the default) — see `update_semantic_edges`.
-        update_semantic_edges(
-            &pending,
-            store,
-            &state,
-            collection,
-            &config.ui.semantic_edges,
-        )
-        .await;
-    }
+    // ── Final flush ───────────────────────────────────────────────────────────
+    //
+    // Whatever never reached `PENDING_FLUSH_BATCH_SIZE` inside the loop above — for
+    // a run smaller than one batch, this is the ONLY flush, identical in effect to
+    // the pre-#160 single terminal call.
+    indexed_count += flush_pending_batch(
+        &mut pending,
+        embedder,
+        store,
+        &state,
+        collection,
+        &config.ui.semantic_edges,
+    )
+    .await?;
 
     // ── Backfill metadata for unchanged files ────────────────────────────────
     let backfilled = if backfill_queue.is_empty() {
@@ -2595,7 +2939,7 @@ async fn index_paths_generic<E: EmbedStore, Q: VectorStore + NeighborStore>(
     // filesystem walk count, which is now `scan_for_dirty`'s concern entirely.
     let counters = crate::status::RunCounters {
         discovered: paths.len() as u64,
-        indexed: pending_count as u64,
+        indexed: indexed_count as u64,
         skipped: skipped as u64,
         invalid: invalid as u64,
         empty: empty as u64,
@@ -4242,6 +4586,224 @@ mod tests {
         );
     }
 
+    // -- GitMtimeCache (#236) ----------------------------------------------------
+
+    #[test]
+    fn git_mtime_cache_resolve_wipes_entries_on_a_different_head() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        cache.entries.insert("a.md".to_string(), Some(1_000));
+        assert_eq!(
+            cache.split(&["a.md".to_string()]).0.get("a.md"),
+            Some(&1_000)
+        );
+
+        // A DIFFERENT head must wipe the entry, not silently keep serving it — this
+        // is the exact bug a naive "just check the key on write, never on read"
+        // cache implementation could get wrong: a stale value surviving under a key
+        // that no longer means what it used to.
+        cache.resolve("/repo", "head-b");
+        let (found, missing) = cache.split(&["a.md".to_string()]);
+        assert!(
+            found.is_empty(),
+            "the old generation's entry must not survive a HEAD change"
+        );
+        assert_eq!(missing, vec!["a.md".to_string()]);
+    }
+
+    #[test]
+    fn git_mtime_cache_resolve_is_a_noop_when_the_generation_is_unchanged() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        cache.entries.insert("a.md".to_string(), Some(1_000));
+
+        // Same (data_path, head) again — the already-resolved entry must survive.
+        cache.resolve("/repo", "head-a");
+        assert_eq!(
+            cache.split(&["a.md".to_string()]).0.get("a.md"),
+            Some(&1_000)
+        );
+    }
+
+    #[test]
+    fn git_mtime_cache_split_reports_only_true_misses() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        cache.entries.insert("cached.md".to_string(), Some(1_000));
+
+        let (found, missing) = cache.split(&["cached.md".to_string(), "new.md".to_string()]);
+        assert_eq!(found.get("cached.md"), Some(&1_000));
+        assert_eq!(missing, vec!["new.md".to_string()]);
+    }
+
+    #[test]
+    fn git_mtime_cache_split_treats_a_confirmed_negative_result_as_not_missing() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        // `None` means "confirmed: git has no history for this path at this HEAD" —
+        // a resolved answer, not an open question that should be re-queried.
+        cache.entries.insert("untracked.md".to_string(), None);
+
+        let (found, missing) = cache.split(&["untracked.md".to_string()]);
+        assert!(
+            found.is_empty(),
+            "a confirmed-negative path has no timestamp to return"
+        );
+        assert!(
+            missing.is_empty(),
+            "a confirmed-negative path must not be reported as missing — that would \
+             make it get re-queried by every future call at this HEAD, forever"
+        );
+    }
+
+    #[test]
+    fn git_mtime_cache_merge_records_positive_and_negative_results() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+        let mut fresh = HashMap::new();
+        fresh.insert("found.md".to_string(), 1_000_i64);
+        // "absent.md" is deliberately NOT in `fresh` — simulates git having no
+        // history for it, which `merge` must still record as a confirmed negative.
+        cache.merge(
+            "/repo",
+            "head-a",
+            &["found.md".to_string(), "absent.md".to_string()],
+            &fresh,
+        );
+
+        let (found, missing) = cache.split(&["found.md".to_string(), "absent.md".to_string()]);
+        assert_eq!(found.get("found.md"), Some(&1_000));
+        assert!(
+            missing.is_empty(),
+            "both keys are now resolved, one way or the other"
+        );
+        assert_eq!(cache.entries.get("absent.md"), Some(&None));
+    }
+
+    /// The race `merge`'s doc comment describes: between the `split()` that produced
+    /// `missing` and the `merge()` call, another concurrent caller observed a NEWER
+    /// HEAD and already invalidated the cache into a different generation. Merging
+    /// results computed against the OLD generation into that newer one would
+    /// resurrect stale data under a key that is supposed to mean "current as of the
+    /// new HEAD" — `merge` must refuse instead.
+    #[test]
+    fn git_mtime_cache_merge_is_a_noop_after_a_racing_invalidation() {
+        let mut cache = GitMtimeCache::empty();
+        cache.resolve("/repo", "head-a");
+
+        // Simulate a concurrent caller moving the cache to a newer generation
+        // between this test's own `split()` (not shown — `missing` is constructed
+        // directly) and its `merge()` call below.
+        cache.resolve("/repo", "head-b");
+
+        let mut fresh = HashMap::new();
+        fresh.insert("a.md".to_string(), 1_000_i64);
+        // Merging against the OLD (data_path, "head-a") pair while the cache is now
+        // at "head-b" must be rejected.
+        cache.merge("/repo", "head-a", &["a.md".to_string()], &fresh);
+
+        let (found, missing) = cache.split(&["a.md".to_string()]);
+        assert!(
+            found.is_empty(),
+            "stale-generation results must never be merged into a newer generation"
+        );
+        assert_eq!(missing, vec!["a.md".to_string()]);
+    }
+
+    fn git_commit_dated(work: &TempDir, rel_path: &str, message: &str, unix_secs: i64) {
+        std::process::Command::new("git")
+            .args(["add", "--", rel_path])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                message,
+            ])
+            .current_dir(work.path())
+            // `@<unix-seconds> <tz-offset>` is git's own unambiguous date format —
+            // see `git.rs`'s `git_log_mtimes` tests for why this, not an ISO string.
+            .env("GIT_AUTHOR_DATE", format!("@{unix_secs} +0000"))
+            .env("GIT_COMMITTER_DATE", format!("@{unix_secs} +0000"))
+            .output()
+            .unwrap();
+    }
+
+    /// End-to-end proof that #236's cache stays correct across a real HEAD change —
+    /// the property that actually matters, since a caching bug that forgot to
+    /// invalidate would silently serve a stale mtime forever rather than failing
+    /// loudly. First call resolves `a.md` at the FIRST commit's timestamp; a second
+    /// commit updates `a.md` and moves HEAD; a second call must return the NEW
+    /// timestamp, not the cached old one.
+    #[tokio::test]
+    async fn build_git_mtimes_invalidates_its_cache_when_head_moves() {
+        let bare = crate::git::tests::create_bare_repo("main");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "main");
+
+        let mut config = scan_test_config(&work);
+        config.source.git_url = Some("https://example.com/repo.git".to_string());
+
+        std::fs::write(work.path().join("a.md"), "v1").unwrap();
+        git_commit_dated(&work, "a.md", "add a.md", 1_600_000_000);
+
+        let map = build_git_mtimes(&config, &["a.md".to_string()]).await;
+        assert_eq!(
+            map.get("a.md"),
+            Some(&1_600_000_000),
+            "first call must reflect the first commit"
+        );
+
+        std::fs::write(work.path().join("a.md"), "v2").unwrap();
+        git_commit_dated(&work, "a.md", "update a.md", 1_700_000_000);
+
+        let map = build_git_mtimes(&config, &["a.md".to_string()]).await;
+        assert_eq!(
+            map.get("a.md"),
+            Some(&1_700_000_000),
+            "second call must reflect the NEW HEAD, not a stale cached value from \
+             before this process ever saw the second commit"
+        );
+    }
+
+    /// A second call at the SAME HEAD for a path the first call never asked about
+    /// must still get a correct answer — the cache's incremental top-up
+    /// (`GitMtimeCache::split`'s `missing` half) has to actually fetch it, not treat
+    /// "not yet in the cache" as "confirmed absent."
+    #[tokio::test]
+    async fn build_git_mtimes_resolves_a_path_not_covered_by_an_earlier_call_at_the_same_head() {
+        let bare = crate::git::tests::create_bare_repo("main");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "main");
+
+        let mut config = scan_test_config(&work);
+        config.source.git_url = Some("https://example.com/repo.git".to_string());
+
+        std::fs::write(work.path().join("a.md"), "content").unwrap();
+        git_commit_dated(&work, "a.md", "add a.md", 1_600_000_000);
+        std::fs::write(work.path().join("b.md"), "content").unwrap();
+        git_commit_dated(&work, "b.md", "add b.md", 1_650_000_000);
+
+        // First call only ever asks about a.md.
+        let map = build_git_mtimes(&config, &["a.md".to_string()]).await;
+        assert_eq!(map.get("a.md"), Some(&1_600_000_000));
+
+        // Second call, same HEAD, now also asks about b.md — never previously
+        // queried by this process at this generation.
+        let map = build_git_mtimes(&config, &["a.md".to_string(), "b.md".to_string()]).await;
+        assert_eq!(map.get("a.md"), Some(&1_600_000_000));
+        assert_eq!(
+            map.get("b.md"),
+            Some(&1_650_000_000),
+            "a path outside the first call's scope must still resolve correctly on \
+             a later call at the same HEAD"
+        );
+    }
+
     // -- domain derivation ---------------------------------------------------
 
     #[test]
@@ -5441,6 +6003,290 @@ mod tests {
         ) -> Result<Vec<SearchResult>> {
             Ok(vec![])
         }
+    }
+
+    /// Echoes back one stub embedding vector per input text, unlike `MockEmbedClient`
+    /// (which returns a fixed-length `Vec` regardless of how many texts it was given).
+    /// `upsert_pending`'s embedding-count mismatch check (`all_embeddings.len() !=
+    /// all_texts.len()`) means a fixed-length fake only works when every call happens
+    /// to receive exactly that many texts — true for a single terminal upsert, but
+    /// not for #160's sub-batched flushes, where consecutive `upsert_pending` calls
+    /// can (and, for the last, partial batch, deliberately do) receive different
+    /// text counts. This is what the #160 sub-batching tests below need instead.
+    struct EchoEmbedClient;
+
+    impl EmbedStore for EchoEmbedClient {
+        async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0_f32]).collect())
+        }
+    }
+
+    /// Records the SIZE of every `upsert_points` call (not just the accumulated
+    /// total, which `TrackingMockVectorStore` already gives — the #160 sub-batching
+    /// tests need to see the call BOUNDARIES to prove multiple bounded flushes
+    /// happened instead of one giant one) and, optionally, fails a specific
+    /// 1-indexed call to prove a mid-run failure leaves earlier, already-flushed
+    /// batches intact while never recording points for the failing batch itself —
+    /// mirroring how a real Qdrant upsert failure leaves no partial points behind for
+    /// that specific call.
+    struct BatchTrackingVectorStore {
+        /// Point count of each `upsert_points` call, in call order.
+        upsert_call_sizes: Mutex<Vec<usize>>,
+        /// Every point actually recorded as upserted — excludes any call selected by
+        /// `fail_at_call` below.
+        upserted_points: Mutex<Vec<crate::qdrant::QdrantPoint>>,
+        /// 1-indexed call number to fail (e.g. `Some(2)` fails the SECOND
+        /// `upsert_points` call and every one after it never happens, since
+        /// `index_paths_generic` propagates the error via `?` and stops scanning).
+        /// `None` means every call succeeds.
+        fail_at_call: Option<usize>,
+    }
+
+    impl BatchTrackingVectorStore {
+        fn new(fail_at_call: Option<usize>) -> Self {
+            Self {
+                upsert_call_sizes: Mutex::new(Vec::new()),
+                upserted_points: Mutex::new(Vec::new()),
+                fail_at_call,
+            }
+        }
+    }
+
+    impl VectorStore for BatchTrackingVectorStore {
+        async fn upsert_points(
+            &self,
+            _collection: &str,
+            points: Vec<crate::qdrant::QdrantPoint>,
+        ) -> Result<()> {
+            let call_number = {
+                let mut sizes = self.upsert_call_sizes.lock().unwrap();
+                sizes.push(points.len());
+                sizes.len()
+            };
+            if self.fail_at_call == Some(call_number) {
+                anyhow::bail!(
+                    "simulated upsert failure on call {} (test-injected)",
+                    call_number
+                );
+            }
+            self.upserted_points.lock().unwrap().extend(points);
+            Ok(())
+        }
+
+        async fn delete_by_files(&self, _collection: &str, _file_paths: &[&str]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_points_by_ids(&self, _collection: &str, _ids: Vec<String>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn drop_collection(&self, _collection: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_collection(
+            &self,
+            _collection: &str,
+            _vector_size: u64,
+            _indexed_fields: &[crate::qdrant::IndexedField],
+            _enable_phrase: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    // `ui.semantic_edges.enabled` defaults to `false` (see `config_no_validation`'s
+    // base config), so none of the #160 tests below ever actually call this — a
+    // trivial empty-Ok stub, same posture as `TrackingMockVectorStore`'s own.
+    impl NeighborStore for BatchTrackingVectorStore {
+        async fn recommend_by_point_id(
+            &self,
+            _collection: &str,
+            _point_id: &str,
+            _limit: u64,
+            _filter: Option<Filter>,
+        ) -> Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+    }
+
+    /// #160: before the fix, `index_paths_generic` accumulated every changed file
+    /// into one `pending: Vec<PendingFile>` across the whole scan loop and called
+    /// `upsert_pending` exactly ONCE, at the very end, no matter how many files were
+    /// in scope. This test writes `PENDING_FLUSH_BATCH_SIZE + 50` distinct files (250
+    /// with the current constant) — enough to force at least one mid-scan flush —
+    /// and asserts the vector store saw MORE than one `upsert_points` call, each no
+    /// larger than the batch size.
+    ///
+    /// Before #160: fails — exactly one call, sized `PENDING_FLUSH_BATCH_SIZE + 50`.
+    /// After #160: passes — two calls, sized `PENDING_FLUSH_BATCH_SIZE` and `50`.
+    #[tokio::test]
+    async fn index_paths_generic_flushes_pending_in_bounded_sub_batches() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let extra = 50;
+        let total = PENDING_FLUSH_BATCH_SIZE + extra;
+        let mut paths = Vec::with_capacity(total);
+        for i in 0..total {
+            let name = format!("doc-{i:04}.md");
+            std::fs::write(dir.path().join(&name), format!("# Doc {i}\n\nBody {i}.")).unwrap();
+            paths.push(PathBuf::from(name));
+        }
+
+        let embedder = EchoEmbedClient;
+        let store = BatchTrackingVectorStore::new(None);
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let call_sizes = store.upsert_call_sizes.lock().unwrap().clone();
+        assert_eq!(
+            call_sizes,
+            vec![PENDING_FLUSH_BATCH_SIZE, extra],
+            "expected one bounded flush at the batch size threshold plus one trailing \
+             flush for the remainder, not a single call covering everything"
+        );
+        assert_eq!(
+            store.upserted_points.lock().unwrap().len(),
+            total,
+            "every file must still end up indexed, just across multiple flushes"
+        );
+
+        let state = StateDb::new(Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.count().await.unwrap(),
+            total as i64,
+            "every file's state row must be written regardless of which flush it landed in"
+        );
+    }
+
+    /// #160's partial-progress guarantee: a mid-run failure must leave Qdrant and
+    /// `indexed_files` mutually coherent, not just for the batch that failed but for
+    /// every batch around it.
+    ///
+    /// This writes `2 * PENDING_FLUSH_BATCH_SIZE + 10` files (410 with the current
+    /// constant) and fails the SECOND `upsert_points` call — i.e. the second
+    /// mid-scan flush, covering files 201-400. Expected shape after the run:
+    ///
+    ///   - Batch 1 (files 1-200): flushed successfully BEFORE the failure. Its
+    ///     points are in the store and its state rows are written — this is the
+    ///     "already-committed work survives the crash" half of the guarantee.
+    ///   - Batch 2 (files 201-400): its `upsert_points` call fails. No points are
+    ///     recorded for it (mirroring a real failed Qdrant upsert) and, because
+    ///     `upsert_pending` writes points before state rows, no state rows either —
+    ///     so this batch is cleanly retryable, not half-written.
+    ///   - Batch 3 (files 401-410): the scan loop never reaches them at all — the
+    ///     `?` on batch 2's failed flush returns out of `index_paths_generic`
+    ///     immediately. Their `indexed_files` rows (there are none, same as before
+    ///     this run started) are exactly as untouched as if this run had never
+    ///     happened, which is what lets the next `scan_for_dirty` sweep re-detect
+    ///     and retry files 201-410 as a normal dirty set.
+    ///
+    /// Before #160 there was no batch boundary to fail mid-run at all — a single
+    /// `upsert_pending` call either indexed everything or (on failure) left NOTHING
+    /// indexed, so this specific "some committed, some cleanly retryable, some never
+    /// touched" three-way split could not previously occur. This test's assertions
+    /// (state count == exactly one batch's worth, not 0 and not everything) are what
+    /// would fail against that old, coarser failure granularity.
+    #[tokio::test]
+    async fn index_paths_generic_mid_run_failure_leaves_coherent_partial_progress() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_no_validation();
+        config.source.data_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let batch = PENDING_FLUSH_BATCH_SIZE;
+        let tail = 10;
+        let total = 2 * batch + tail;
+        let mut paths = Vec::with_capacity(total);
+        for i in 0..total {
+            let name = format!("doc-{i:04}.md");
+            std::fs::write(dir.path().join(&name), format!("# Doc {i}\n\nBody {i}.")).unwrap();
+            paths.push(PathBuf::from(name));
+        }
+
+        let embedder = EchoEmbedClient;
+        let store = BatchTrackingVectorStore::new(Some(2));
+
+        let result = index_paths_generic(
+            &config,
+            &paths,
+            false,
+            std::time::Instant::now(),
+            &embedder,
+            &store,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the second flush's injected upsert failure must propagate out of the run"
+        );
+
+        // Exactly two calls were attempted: the first (successful, batch-sized) and
+        // the second (failed). A third, for the never-scanned tail, must never
+        // happen — proof the run stopped rather than plowing on past the failure.
+        assert_eq!(
+            store.upsert_call_sizes.lock().unwrap().clone(),
+            vec![batch, batch],
+            "batch 1 succeeds at the full batch size; batch 2 is attempted (and then \
+             fails) at the full batch size too; batch 3 (the tail) is never attempted"
+        );
+        assert_eq!(
+            store.upserted_points.lock().unwrap().len(),
+            batch,
+            "only the first, successful batch's points were actually recorded"
+        );
+
+        let state = StateDb::new(Path::new(&config.state_db_path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.count().await.unwrap(),
+            batch as i64,
+            "state.db must hold rows for exactly the first batch — the second \
+             batch's failed flush wrote no state rows (Qdrant-before-state ordering \
+             inside upsert_pending), and the tail was never scanned at all"
+        );
+
+        // Spot-check specific files rather than only the aggregate count: batch 1's
+        // first file must be tracked, batch 2's first file must not be, and the
+        // never-reached tail's first file must not be either.
+        assert!(
+            state.get("doc-0000.md").await.unwrap().is_some(),
+            "batch 1's files must be tracked"
+        );
+        assert!(
+            state
+                .get(&format!("doc-{batch:04}.md"))
+                .await
+                .unwrap()
+                .is_none(),
+            "batch 2's files must NOT be tracked — cleanly retryable, not half-written"
+        );
+        assert!(
+            state
+                .get(&format!("doc-{:04}.md", 2 * batch))
+                .await
+                .unwrap()
+                .is_none(),
+            "the tail batch was never scanned, so it must be untouched"
+        );
     }
 
     async fn test_state_db(dir: &TempDir) -> StateDb {
