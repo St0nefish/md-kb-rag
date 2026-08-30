@@ -44,3 +44,36 @@ documents whose links into a moved document were rewritten). It also carries `di
 whether it was cut and how large the real diff is; the text content always has the
 diff in full, uncapped. `sync_failure_cause` appears only when `outcome` is
 `committed_pending_sync`.
+
+## Batch writes
+
+`documents` writes several documents as ONE commit instead of one commit per
+document — the right choice when restructuring several related pages, or making
+the same kind of change (e.g. a status flip) across a set of documents. Pass
+ONLY `documents` (and, optionally, `message` for the whole batch's commit
+subject) — `path` and every other field above belong to the single-document
+call shape and are rejected if set alongside `documents`.
+
+Each entry in `documents` is `{path, content?, old_string?, new_string?,
+frontmatter_patch?, append?, expected_hash?, force_new?}` — the same content-edit
+vocabulary as a single-document call (create via `content`, or edit via
+`content` / `old_string`+`new_string` / `frontmatter_patch`+`append`), with the
+same mutual-exclusivity rules, applied per entry. There is no `new_path` inside
+a batch entry — a batch write can create or fully replace a document, not move
+one; use a plain (non-batch) `write_document` call, or `path` naming a
+directory, for a move. Every `path` in `documents` must be unique. Capped at 25
+documents per call.
+
+A batch is atomic: every document lands in the one commit, or (if git itself
+fails before committing) none of them do and everything already written in
+this call is rolled back — there is no partial-success result. Frontmatter
+validation (and the create-path dedup gate, for any entries that are creates)
+runs for every document before anything is written, so a batch that is going
+to fail does so having touched nothing; a failure lists every offending
+document at once via `data.failures`, not just the first one found.
+
+`structured_content` for a successful batch write carries `outcome`, `sha`,
+`rebased_paths`, and `sync_failure_cause` exactly like a single-document write
+(one commit, so one of each), plus `documents`: an array of `{path, is_create,
+diff, diff_truncated, diff_total_bytes}`, one entry per document written. The
+text summary includes every document's diff in full.

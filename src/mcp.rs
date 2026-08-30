@@ -1080,8 +1080,10 @@ pub struct SearchParams {
 /// Parameters for `write_document`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct WriteDocumentParams {
-    /// Document or directory path, relative to the KB root.
-    pub path: String,
+    /// Document or directory path, relative to the KB root. Required unless
+    /// `documents` is set for a batch write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// Whole file content, including frontmatter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -1109,6 +1111,54 @@ pub struct WriteDocumentParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hash: Option<String>,
     /// Skip the near-duplicate check when creating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_new: Option<bool>,
+    /// Batch write (#180): a list of documents to write together as ONE git
+    /// commit instead of one commit per document. Mutually exclusive with
+    /// `path` and every other field above — a batch call supplies ONLY this
+    /// field (plus, optionally, `message` for the whole batch's commit
+    /// subject). Each entry supports the same content-edit modes as a
+    /// single-document call (`content` / `old_string`+`new_string` /
+    /// `frontmatter_patch` / `append`) but NOT `new_path` — a batch entry
+    /// can create or fully replace a document, not move one; see
+    /// `write::BatchWriteRequest`'s doc comment for why moves are excluded.
+    /// Capped at `write::MAX_BATCH_DOCUMENTS` documents per call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<BatchDocumentInput>>,
+}
+
+/// One document within a `write_document` batch call (`WriteDocumentParams::documents`).
+/// Field-for-field the same content-edit vocabulary as a single-document
+/// `write_document` call, minus `new_path` (no per-entry moves — see
+/// `WriteDocumentParams::documents`'s doc comment) and minus `message` (the
+/// batch has ONE commit message, supplied once at the top level, not one per
+/// entry).
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct BatchDocumentInput {
+    /// Document path, relative to the KB root. Must be unique within the batch.
+    pub path: String,
+    /// Whole file content, including frontmatter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Surgical edit: exact text to replace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_string: Option<String>,
+    /// Surgical edit: its replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_string: Option<String>,
+    /// Structured frontmatter edits; combines with `append`, not with
+    /// `content` or `old_string`/`new_string`. See `write::FrontmatterEdit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontmatter_patch: Option<Vec<FrontmatterPatchOp>>,
+    /// Append this text to the end of the document body; combines with
+    /// `frontmatter_patch`, not with `content` or `old_string`/`new_string`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append: Option<String>,
+    /// Stale-read guard: content_hash from a prior get_document, checked
+    /// against this document specifically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<String>,
+    /// Skip the near-duplicate check when creating this document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_new: Option<bool>,
 }
@@ -1367,6 +1417,30 @@ pub fn parse_edit_mode(params: &WriteDocumentParams) -> Result<Option<EditMode>,
              body), or new_path (move) — at least one is required"
                 .to_string(),
         )
+    }
+}
+
+/// Adapt one `BatchDocumentInput` into the shape [`parse_edit_mode`] expects,
+/// so a batch entry's content-edit mode is parsed by the EXACT SAME function
+/// (and therefore the exact same rules/error text) a single-document
+/// `write_document` call uses — no second copy of that logic to drift out of
+/// sync with the first. `path`/`new_path`/`message` are irrelevant to
+/// `parse_edit_mode` (it only reads the content-edit fields plus
+/// `new_path.is_some()`, and a batch entry never has one), so they are
+/// filled with harmless placeholders rather than threaded through.
+fn batch_input_as_write_params(input: &BatchDocumentInput) -> WriteDocumentParams {
+    WriteDocumentParams {
+        path: Some(input.path.clone()),
+        content: input.content.clone(),
+        old_string: input.old_string.clone(),
+        new_string: input.new_string.clone(),
+        frontmatter_patch: input.frontmatter_patch.clone(),
+        append: input.append.clone(),
+        new_path: None,
+        message: None,
+        expected_hash: input.expected_hash.clone(),
+        force_new: input.force_new,
+        documents: None,
     }
 }
 
@@ -1636,6 +1710,200 @@ fn with_outcome_and_referencing(
 /// (`ErrorData::data`), not just on success.
 fn outcome_data(outcome: WriteOutcome) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "outcome": outcome.as_str() }))
+}
+
+/// Map a successful `write::write_documents_batch` result (#180) onto this
+/// tool surface's `CallToolResult`. Mirrors `create_edit_success_to_result`'s
+/// shape (`outcome`/`sha`/`rebased_paths`/`sync_failure_cause`), but a batch
+/// has no single `rel_path` or single `diff` — every per-document detail
+/// (path, whether it was a create, its own diff) lives in a `documents`
+/// array instead of at the top level, since the ONE commit covers several
+/// otherwise-unrelated documents at once.
+fn batch_write_success_to_result(success: write::BatchWriteSuccess) -> CallToolResult {
+    let verb_list: String = success
+        .documents
+        .iter()
+        .map(|d| {
+            format!(
+                "- {} {}",
+                if d.is_create { "create" } else { "update" },
+                d.rel_path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let (summary, outcome) = match success.outcome {
+        CoreWriteOutcome::Synced => (
+            format!(
+                "Batch write: {} document(s) synced (commit {}). Indexing has been queued \
+                 and will complete shortly.\n{}",
+                success.documents.len(),
+                success.sha,
+                verb_list
+            ),
+            WriteOutcome::Synced,
+        ),
+        CoreWriteOutcome::CommittedPendingSync => {
+            let cause = success
+                .sync_failure_cause
+                .as_deref()
+                .unwrap_or("unknown error");
+            (
+                format!(
+                    "Batch write: {} document(s) committed locally (commit {}), but the push \
+                     to the remote failed: {}. It will sync on the next successful write or \
+                     manual intervention. Indexing has been queued from the local copy.\n{}",
+                    success.documents.len(),
+                    success.sha,
+                    cause,
+                    verb_list
+                ),
+                WriteOutcome::CommittedPendingSync,
+            )
+        }
+    };
+
+    // Every document's diff, in full — same "text channel is never truncated"
+    // contract `create_edit_success_to_result` upholds for a single write;
+    // `structured_content` below carries the per-document CAPPED copies.
+    let mut text = summary;
+    for doc in &success.documents {
+        if !doc.diff.is_empty() {
+            text = format!("{text}\n\n{}", doc.diff);
+        }
+    }
+
+    let documents_json: Vec<serde_json::Value> = success
+        .documents
+        .iter()
+        .map(|d| {
+            let (diff, diff_truncated, diff_total_bytes) = capped_diff(&d.diff);
+            serde_json::json!({
+                "path": d.rel_path,
+                "is_create": d.is_create,
+                "diff": diff,
+                "diff_truncated": diff_truncated,
+                "diff_total_bytes": diff_total_bytes,
+            })
+        })
+        .collect();
+
+    let mut fields = serde_json::Map::new();
+    fields.insert("outcome".to_string(), serde_json::json!(outcome.as_str()));
+    fields.insert("sha".to_string(), serde_json::json!(success.sha));
+    fields.insert(
+        "rebased_paths".to_string(),
+        serde_json::json!(rebased_paths_json(&success.rebased_paths)),
+    );
+    fields.insert("documents".to_string(), serde_json::json!(documents_json));
+    if let Some(cause) = &success.sync_failure_cause {
+        fields.insert("sync_failure_cause".to_string(), serde_json::json!(cause));
+    }
+
+    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    result.structured_content = Some(serde_json::Value::Object(fields));
+    result
+}
+
+/// Short, human-readable text for one document's `WriteError` inside a batch
+/// failure report (#180) — a compact cousin of `create_edit_error_to_mcp_error`'s
+/// per-variant messages (full sentences addressed to a single-document
+/// caller); this one is designed to read well joined with several siblings
+/// in one list. Exhaustive over `WriteError` deliberately, same as
+/// `create_edit_error_to_mcp_error`/`write_error_response` — a new
+/// `WriteError` variant must be given a line here too, not silently folded
+/// into a generic fallback.
+fn batch_write_document_error_text(err: &WriteError) -> String {
+    match err {
+        WriteError::Frozen { reason } => format!("schema is invalid: {reason}"),
+        WriteError::Validation { result } => result.errors.join("; "),
+        WriteError::DedupHit {
+            duplicate_of,
+            similarity,
+            threshold,
+        } => format!(
+            "a similar document already exists: '{duplicate_of}' (similarity {similarity:.2} \
+             >= threshold {threshold:.2})"
+        ),
+        WriteError::InvalidCommitMessage { reason } => reason.clone(),
+        WriteError::UnsafePath { msg } => msg.clone(),
+        WriteError::Internal { msg } => msg.clone(),
+        WriteError::AlreadyExists => "document already exists".to_string(),
+        WriteError::NotFound => "document does not exist".to_string(),
+        WriteError::StaleHash { expected, actual } => format!(
+            "content has changed since it was read (expected content_hash '{expected}', \
+             actual is '{actual}')"
+        ),
+        WriteError::PreCommitFailed { msg, .. } => msg.clone(),
+        WriteError::Io { msg } => msg.clone(),
+    }
+}
+
+/// Map a `write::write_documents_batch` failure (#180) onto this tool
+/// surface's `McpError`.
+fn batch_write_error_to_mcp_error(err: write::BatchWriteError) -> McpError {
+    match err {
+        write::BatchWriteError::Empty => {
+            McpError::invalid_params("documents must not be empty".to_string(), None)
+        }
+        write::BatchWriteError::TooMany { count, max } => McpError::invalid_params(
+            format!("documents has {count} entries; maximum is {max}"),
+            None,
+        ),
+        write::BatchWriteError::DuplicatePath { rel_path } => McpError::invalid_params(
+            format!("documents contains '{rel_path}' more than once"),
+            None,
+        ),
+        write::BatchWriteError::InvalidCommitMessage { reason } => {
+            McpError::invalid_params(reason, None)
+        }
+        write::BatchWriteError::Documents { failures } => {
+            let detail: Vec<serde_json::Value> = failures
+                .iter()
+                .map(|(path, err)| {
+                    serde_json::json!({
+                        "path": path,
+                        "error": batch_write_document_error_text(err),
+                    })
+                })
+                .collect();
+            let summary = failures
+                .iter()
+                .map(|(path, err)| format!("'{path}': {}", batch_write_document_error_text(err)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            McpError::invalid_params(
+                format!(
+                    "batch write failed: {} document(s) had a problem — {summary}",
+                    failures.len(),
+                ),
+                Some(serde_json::json!({ "failures": detail })),
+            )
+        }
+        write::BatchWriteError::PreCommitFailed {
+            rolled_back: true,
+            msg,
+        } => McpError::internal_error(
+            format!(
+                "batch write failed: git commit failed and every document has been rolled \
+                 back — nothing changed, safe to retry. Cause: {msg}"
+            ),
+            outcome_data(WriteOutcome::FailedNoChange),
+        ),
+        write::BatchWriteError::PreCommitFailed {
+            rolled_back: false,
+            msg,
+        } => McpError::internal_error(
+            format!(
+                "batch write is in an INCONSISTENT state: git commit failed AND the \
+                 rollback attempt itself failed for at least one document. The working \
+                 tree may not match git history — do not assume this operation did or did \
+                 not take effect. Manual inspection is required. {msg}"
+            ),
+            outcome_data(WriteOutcome::FailedInconsistentState),
+        ),
+    }
 }
 
 /// Map a successful `write::write_document` result (create or edit) onto this
@@ -3996,15 +4264,311 @@ impl KbSearchServer {
         .await
     }
 
+    /// `write_document`'s batch dispatch (#180): `documents` was supplied.
+    ///
+    /// Rejects every single-document field (`path`, `content`,
+    /// `old_string`/`new_string`, `frontmatter_patch`, `append`, `new_path`,
+    /// `expected_hash`, `force_new`) if set alongside `documents` at the top
+    /// level — a batch entry carries its own copies of the content-edit
+    /// fields inside `documents` instead, and mixing the two shapes in one
+    /// call has no well-defined meaning worth guessing at.
+    ///
+    /// Resolves each entry's create-vs-edit status and computes its
+    /// `new_content` up front (reusing `parse_edit_mode` via
+    /// `batch_input_as_write_params`, so a batch entry's content-edit rules
+    /// are byte-for-byte the same as a single-document call's — see that
+    /// adapter's doc comment), collecting EVERY entry's problem rather than
+    /// stopping at the first one — this is pure request-shape parsing
+    /// (bad field combinations, a missing `content` on a create, a path
+    /// that resolves outside the KB), done entirely before
+    /// `write::write_documents_batch` is ever called, so it cannot itself
+    /// leave any repo state behind to roll back. `write_documents_batch`
+    /// then owns the atomic, single-commit part: its own further validation
+    /// (schema, frontmatter, dedup) and the filesystem/git work — see that
+    /// function's doc comment for the full phase breakdown and rollback
+    /// contract.
+    async fn write_document_batch(
+        &self,
+        params: WriteDocumentParams,
+    ) -> Result<CallToolResult, McpError> {
+        for (field, is_set) in [
+            ("path", params.path.is_some()),
+            ("content", params.content.is_some()),
+            ("old_string", params.old_string.is_some()),
+            ("new_string", params.new_string.is_some()),
+            ("frontmatter_patch", params.frontmatter_patch.is_some()),
+            ("append", params.append.is_some()),
+            ("new_path", params.new_path.is_some()),
+            ("expected_hash", params.expected_hash.is_some()),
+            ("force_new", params.force_new.is_some()),
+        ] {
+            if is_set {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "{field} is not valid alongside documents: a batch write supplies \
+                         ONLY documents (and, optionally, message for the whole batch's \
+                         commit subject) — each document's own path/content/edit fields \
+                         belong inside its entry in documents"
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        let documents = params
+            .documents
+            .expect("write_document_batch is only called when params.documents.is_some()");
+
+        if documents.is_empty() {
+            return Err(McpError::invalid_params(
+                "documents must not be empty".to_string(),
+                None,
+            ));
+        }
+        if documents.len() > write::MAX_BATCH_DOCUMENTS {
+            return Err(McpError::invalid_params(
+                format!(
+                    "documents has {} entries; maximum is {}",
+                    documents.len(),
+                    write::MAX_BATCH_DOCUMENTS
+                ),
+                None,
+            ));
+        }
+
+        let mut parse_errors: Vec<String> = Vec::new();
+        let mut rel_paths: Vec<String> = Vec::with_capacity(documents.len());
+        let mut old_contents: Vec<String> = Vec::with_capacity(documents.len());
+        let mut new_contents: Vec<String> = Vec::with_capacity(documents.len());
+        let mut is_creates: Vec<bool> = Vec::with_capacity(documents.len());
+
+        for entry in &documents {
+            let raw = entry.path.trim().to_string();
+            if raw.is_empty() {
+                parse_errors.push("documents: an entry's path is empty".to_string());
+                continue;
+            }
+            if raw.len() > MAX_PATH_LEN {
+                parse_errors.push(format!(
+                    "documents: '{raw}' exceeds the maximum path length of {MAX_PATH_LEN} \
+                     characters"
+                ));
+                continue;
+            }
+            if let Some(content) = entry.content.as_deref()
+                && content.len() > MAX_CONTENT_LEN
+            {
+                parse_errors.push(format!(
+                    "documents: '{}' content is too large ({} bytes); maximum is {} bytes",
+                    raw,
+                    content.len(),
+                    MAX_CONTENT_LEN
+                ));
+                continue;
+            }
+
+            match retrieval::resolve_within_data(
+                &raw,
+                &self.canonical_data_path,
+                &self.include_patterns,
+            ) {
+                Ok(canonical) => {
+                    let fake_params = batch_input_as_write_params(entry);
+                    let mode = match parse_edit_mode(&fake_params) {
+                        Ok(Some(m)) => m,
+                        Ok(None) => {
+                            // `parse_edit_mode` only returns `None` for a pure move
+                            // (`new_path.is_some()` with no edit mode) — a batch
+                            // entry never has `new_path`, so this is unreachable in
+                            // practice; treated as "no edit mode" defensively rather
+                            // than with `unreachable!()`, since it costs nothing to
+                            // fail soft here instead of panicking on a future
+                            // `parse_edit_mode` change this call site fails to track.
+                            parse_errors.push(format!(
+                                "documents: '{raw}' provides no edit mode (content, \
+                                 old_string+new_string, frontmatter_patch, or append)"
+                            ));
+                            continue;
+                        }
+                        Err(e) => {
+                            parse_errors.push(format!("documents: '{raw}': {e}"));
+                            continue;
+                        }
+                    };
+
+                    let rel_path = canonical
+                        .strip_prefix(&self.canonical_data_path)
+                        .unwrap_or(&canonical)
+                        .to_string_lossy()
+                        .into_owned();
+                    let old_content = match tokio::fs::read_to_string(&canonical).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            parse_errors.push(format!(
+                                "documents: failed to read existing file '{rel_path}': {e}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let new_content = match mode {
+                        EditMode::Full { content } => content,
+                        EditMode::Surgical { old, new } => {
+                            match apply_surgical(&old_content, &old, &new, &rel_path) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    parse_errors.push(format!("documents: '{rel_path}': {e}"));
+                                    continue;
+                                }
+                            }
+                        }
+                        EditMode::Patch { edits } => {
+                            match write::apply_frontmatter_patch(&old_content, &edits) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    parse_errors.push(format!("documents: '{rel_path}': {e}"));
+                                    continue;
+                                }
+                            }
+                        }
+                        EditMode::Append { text } => write::apply_append(&old_content, &text),
+                        EditMode::PatchAppend { edits, text } => {
+                            match write::apply_frontmatter_patch(&old_content, &edits) {
+                                Ok(patched) => write::apply_append(&patched, &text),
+                                Err(e) => {
+                                    parse_errors.push(format!("documents: '{rel_path}': {e}"));
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+
+                    rel_paths.push(rel_path);
+                    old_contents.push(old_content);
+                    new_contents.push(new_content);
+                    is_creates.push(false);
+                }
+                Err(retrieval::ResolveErr::NotFound) | Err(retrieval::ResolveErr::NotPermitted) => {
+                    // Create path — mirrors `write_document_create`'s own field
+                    // guards: none of the edit-only fields make sense against a
+                    // document that does not exist yet.
+                    if entry.old_string.is_some() || entry.new_string.is_some() {
+                        parse_errors.push(format!(
+                            "documents: '{raw}' cannot be surgically edited — it does not \
+                             exist yet"
+                        ));
+                        continue;
+                    }
+                    if entry.frontmatter_patch.is_some() {
+                        parse_errors.push(format!(
+                            "documents: '{raw}' cannot be frontmatter-patched — it does not \
+                             exist yet; use content to create it"
+                        ));
+                        continue;
+                    }
+                    if entry.append.is_some() {
+                        parse_errors.push(format!(
+                            "documents: '{raw}' cannot be appended to — it does not exist \
+                             yet; use content to create it"
+                        ));
+                        continue;
+                    }
+                    let Some(content) = entry.content.clone() else {
+                        parse_errors.push(format!(
+                            "documents: '{raw}' does not exist yet — content is required to \
+                             create it"
+                        ));
+                        continue;
+                    };
+                    if let Err(e) =
+                        write::check_include_pattern_against(&self.include_patterns, &raw)
+                    {
+                        parse_errors.push(format!(
+                            "documents: '{raw}': {}",
+                            batch_write_document_error_text(&e)
+                        ));
+                        continue;
+                    }
+                    rel_paths.push(raw);
+                    old_contents.push(String::new());
+                    new_contents.push(content);
+                    is_creates.push(true);
+                }
+                Err(retrieval::ResolveErr::Outside) => {
+                    parse_errors.push(format!("documents: '{raw}' is outside the data directory"));
+                }
+                Err(retrieval::ResolveErr::Other(msg)) => {
+                    parse_errors.push(format!("documents: '{raw}': {msg}"));
+                }
+            }
+        }
+
+        if !parse_errors.is_empty() {
+            return Err(McpError::invalid_params(parse_errors.join("; "), None));
+        }
+
+        let config = self.config();
+        let token = std::env::var(&config.source.git_token_env)
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let deps = WriteDeps {
+            retrieval: self.deps(),
+            canonical_data_path: &self.canonical_data_path,
+            schema_cache: &self.schema_cache,
+            validation: &config.validation,
+            prepend_description: config.chunking.prepend_description,
+            dedup_enabled: config.write.dedup_enabled,
+            dedup_threshold: config.write.dedup_threshold,
+            git_url: config.source.git_url.as_deref(),
+            branch: &config.source.branch,
+            token: token.as_deref(),
+            commit_author_name: &config.write.commit_author_name,
+            commit_author_email: &config.write.commit_author_email,
+            queue: &self.reindex_queue,
+            // Batch writes never move a document or delete one, so nothing in
+            // `write::write_documents_batch` ever reads `WriteDeps::state` —
+            // unlike a single-document move, `None` here skips no real
+            // behavior (see that field's own doc comment), so there is no
+            // reason to pay for opening `state.db` on a call that will never
+            // touch it.
+            state: None,
+        };
+
+        let requests: Vec<write::BatchWriteRequest<'_>> = (0..documents.len())
+            .map(|i| write::BatchWriteRequest {
+                rel_path: &rel_paths[i],
+                old_content: &old_contents[i],
+                new_content: &new_contents[i],
+                is_create: is_creates[i],
+                force_new: documents[i].force_new,
+                expected_hash: documents[i].expected_hash.as_deref(),
+            })
+            .collect();
+
+        match write::write_documents_batch(&deps, &requests, params.message.as_deref()).await {
+            Ok(success) => Ok(batch_write_success_to_result(success)),
+            Err(err) => Err(batch_write_error_to_mcp_error(err)),
+        }
+    }
+
     #[tool]
     async fn write_document(
         &self,
         Parameters(params): Parameters<WriteDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
-        let raw = params.path.trim().to_string();
+        // Branch 0: a batch write. Checked first and exclusively — every
+        // single-document field is rejected if set alongside `documents`
+        // (enforced inside `write_document_batch`), so there is no ambiguity
+        // about which of the two shapes a call with both would mean.
+        if params.documents.is_some() {
+            return self.write_document_batch(params).await;
+        }
+
+        let raw = params.path.as_deref().unwrap_or("").trim().to_string();
         if raw.is_empty() {
             return Err(McpError::invalid_params(
-                "path parameter is empty".to_string(),
+                "path parameter is empty (or, for a batch write, documents is required)"
+                    .to_string(),
                 None,
             ));
         }
@@ -7591,7 +8155,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let params = WriteDocumentParams {
-            path: "docs/nonexistent.md".to_string(),
+            path: Some("docs/nonexistent.md".to_string()),
             old_string: None,
             new_string: None,
             content: Some("---\ntitle: Test\n---\n# Body".to_string()),
@@ -7601,6 +8165,7 @@ mod tests {
             force_new: Some(true),
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7629,7 +8194,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let params = WriteDocumentParams {
-            path: "docs/existing.md".to_string(),
+            path: Some("docs/existing.md".to_string()),
             content: Some(
                 "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n"
                     .to_string(),
@@ -7642,6 +8207,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -7672,7 +8238,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let params = WriteDocumentParams {
-            path: "docs/log.md".to_string(),
+            path: Some("docs/log.md".to_string()),
             content: None,
             old_string: None,
             new_string: None,
@@ -7687,6 +8253,7 @@ mod tests {
                 values: None,
             }]),
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
         let result = result.expect("frontmatter_patch must succeed against an existing document");
@@ -7716,7 +8283,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let params = WriteDocumentParams {
-            path: "docs/log.md".to_string(),
+            path: Some("docs/log.md".to_string()),
             content: None,
             old_string: None,
             new_string: None,
@@ -7726,6 +8293,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: Some("- entry two".to_string()),
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
         result.expect("append must succeed against an existing document");
@@ -7750,7 +8318,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let params = WriteDocumentParams {
-            path: "docs/log.md".to_string(),
+            path: Some("docs/log.md".to_string()),
             content: None,
             old_string: None,
             new_string: None,
@@ -7765,6 +8333,7 @@ mod tests {
                 values: None,
             }]),
             append: Some("- entry two".to_string()),
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
         result.expect("frontmatter_patch + append must succeed together");
@@ -7796,7 +8365,7 @@ mod tests {
 
         // The patch removes the very field the schema requires.
         let params = WriteDocumentParams {
-            path: "notes.md".to_string(),
+            path: Some("notes.md".to_string()),
             content: None,
             old_string: None,
             new_string: None,
@@ -7811,6 +8380,7 @@ mod tests {
                 values: None,
             }]),
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
         let err = result.expect_err("a schema-violating patch must fail validation");
@@ -7829,7 +8399,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let params = WriteDocumentParams {
-            path: "does-not-exist.md".to_string(),
+            path: Some("does-not-exist.md".to_string()),
             content: None,
             old_string: None,
             new_string: None,
@@ -7844,6 +8414,7 @@ mod tests {
                 values: None,
             }]),
             append: None,
+            documents: None,
         };
         let err = server
             .write_document(Parameters(params))
@@ -7863,7 +8434,7 @@ mod tests {
         let (server, _config) = make_git_backed_server(&work);
 
         let params = WriteDocumentParams {
-            path: "does-not-exist.md".to_string(),
+            path: Some("does-not-exist.md".to_string()),
             content: None,
             old_string: None,
             new_string: None,
@@ -7873,6 +8444,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: Some("text".to_string()),
+            documents: None,
         };
         let err = server
             .write_document(Parameters(params))
@@ -7903,7 +8475,7 @@ mod tests {
         let server = make_write_test_server(&tmp, &["**/*.txt".to_string()], config);
 
         let params = WriteDocumentParams {
-            path: "docs/existing.md".to_string(),
+            path: Some("docs/existing.md".to_string()),
             content: Some("---\ntitle: Test\n---\n# New content".to_string()),
             old_string: None,
             new_string: None,
@@ -7913,6 +8485,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8004,7 +8577,7 @@ mod tests {
 
         // Try to write a .txt file (not matched by **/*.md)
         let params = WriteDocumentParams {
-            path: "notes.txt".to_string(),
+            path: Some("notes.txt".to_string()),
             content: Some("Some plain text".to_string()),
             old_string: None,
             new_string: None,
@@ -8014,6 +8587,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8037,7 +8611,7 @@ mod tests {
 
         // Absolute path should be caught by a guard before any write happens.
         let params = WriteDocumentParams {
-            path: "/etc/passwd".to_string(),
+            path: Some("/etc/passwd".to_string()),
             content: Some("# Evil".to_string()),
             old_string: None,
             new_string: None,
@@ -8047,6 +8621,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8091,7 +8666,7 @@ mod tests {
         std::fs::write(&outside_file, "# Not part of the KB").unwrap();
 
         let params = WriteDocumentParams {
-            path: outside_file.to_str().unwrap().to_string(),
+            path: Some(outside_file.to_str().unwrap().to_string()),
             content: Some("# Evil overwrite".to_string()),
             old_string: None,
             new_string: None,
@@ -8101,6 +8676,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8184,7 +8760,7 @@ mod tests {
 
         // Content intentionally missing the "title" frontmatter field
         let params = WriteDocumentParams {
-            path: "guide/missing-title.md".to_string(),
+            path: Some("guide/missing-title.md".to_string()),
             content: Some("---\ntype: guide\n---\n# No title in frontmatter".to_string()),
             old_string: None,
             new_string: None,
@@ -8194,6 +8770,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8441,7 +9018,7 @@ mod tests {
         // When dedup is disabled we should NOT get a dedup refusal.
         // The write will fail at git/reindex (no live services) — that's fine.
         let params = WriteDocumentParams {
-            path: "docs/new.md".to_string(),
+            path: Some("docs/new.md".to_string()),
             content: Some("---\ntitle: Test Doc\n---\n# Content".to_string()),
             old_string: None,
             new_string: None,
@@ -8451,6 +9028,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8480,7 +9058,7 @@ mod tests {
         // enabled.  The embed/qdrant will fail-open (no live services), so we will
         // reach git/reindex and fail there — but NOT with a dedup message.
         let params = WriteDocumentParams {
-            path: "docs/forced.md".to_string(),
+            path: Some("docs/forced.md".to_string()),
             content: Some("---\ntitle: Forced Doc\n---\n# Content".to_string()),
             old_string: None,
             new_string: None,
@@ -8490,6 +9068,7 @@ mod tests {
             force_new: Some(true),
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8520,7 +9099,7 @@ mod tests {
         // Edit path should never trigger the dedup gate.
         // It will fail at git/reindex — but NOT with a dedup message.
         let params = WriteDocumentParams {
-            path: "docs/edit-me.md".to_string(),
+            path: Some("docs/edit-me.md".to_string()),
             old_string: None,
             new_string: None,
             content: Some("---\ntitle: Edited Doc\n---\n# New content".to_string()),
@@ -8530,6 +9109,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
         let result = server.write_document(Parameters(params)).await;
 
@@ -8706,7 +9286,7 @@ mod tests {
         new_path: Option<&str>,
     ) -> WriteDocumentParams {
         WriteDocumentParams {
-            path: "docs/test.md".to_string(),
+            path: Some("docs/test.md".to_string()),
             content: content.map(|s| s.to_string()),
             old_string: old_string.map(|s| s.to_string()),
             new_string: new_string.map(|s| s.to_string()),
@@ -8716,6 +9296,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         }
     }
 
@@ -9310,7 +9891,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/queued.md".to_string(),
+                path: Some("docs/queued.md".to_string()),
                 content: Some(
                     "---\ntitle: Queued\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
                         .to_string(),
@@ -9323,6 +9904,7 @@ mod tests {
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -9371,7 +9953,7 @@ mod tests {
         // second half of this test would not be proving anything.
         let rejected = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "notes/before.md".to_string(),
+                path: Some("notes/before.md".to_string()),
                 content: Some("---\ntitle: Before\nstatus: beta\n---\n\n# Body\n".to_string()),
                 old_string: None,
                 new_string: None,
@@ -9381,6 +9963,7 @@ mod tests {
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
         assert!(
@@ -9407,7 +9990,7 @@ mod tests {
         // Same server, same cached schema handle, next call: must see the new rule.
         let accepted = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "notes/after.md".to_string(),
+                path: Some("notes/after.md".to_string()),
                 content: Some("---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string()),
                 old_string: None,
                 new_string: None,
@@ -9417,6 +10000,7 @@ mod tests {
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
         assert!(
@@ -9575,7 +10159,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/new.md".to_string(),
+                path: Some("docs/new.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: Some("---\ntitle: Test\n---\n# Body".to_string()),
@@ -9585,6 +10169,7 @@ mod tests {
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await
             .unwrap();
@@ -9653,7 +10238,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/big.md".to_string(),
+                path: Some("docs/big.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: Some(content),
@@ -9663,6 +10248,7 @@ mod tests {
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await
             .unwrap();
@@ -9741,7 +10327,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "old-project7".to_string(),
+                path: Some("old-project7".to_string()),
                 content: None,
                 old_string: None,
                 new_string: None,
@@ -9751,6 +10337,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await
             .unwrap();
@@ -10009,7 +10596,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/new.md".to_string(),
+                path: Some("docs/new.md".to_string()),
                 content: Some(
                     "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n"
                         .to_string(),
@@ -10022,6 +10609,7 @@ mod tests {
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10066,7 +10654,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "edit-me.md".to_string(),
+                path: Some("edit-me.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: Some(
@@ -10079,6 +10667,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10128,7 +10717,7 @@ mod tests {
             "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "edit-me.md".to_string(),
+                path: Some("edit-me.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: Some(new_content.to_string()),
@@ -10138,6 +10727,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10227,7 +10817,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/edit-me.md".to_string(),
+                path: Some("docs/edit-me.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: Some("---\ntitle: New\ntype: guide\n---\n# New body\n".to_string()),
@@ -10237,6 +10827,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10276,7 +10867,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "edit-me.md".to_string(),
+                path: Some("edit-me.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: Some(new_content.to_string()),
@@ -10286,6 +10877,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10354,7 +10946,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "edit-me.md".to_string(),
+                path: Some("edit-me.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: Some(new_content.to_string()),
@@ -10364,6 +10956,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10410,7 +11003,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/old-home.md".to_string(),
+                path: Some("docs/old-home.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: None,
@@ -10420,6 +11013,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10457,7 +11051,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "edit-me.md".to_string(),
+                path: Some("edit-me.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: Some(new_content.to_string()),
@@ -10467,6 +11061,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10506,7 +11101,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "source.md".to_string(),
+                path: Some("source.md".to_string()),
                 old_string: None,
                 new_string: None,
                 content: None,
@@ -10516,6 +11111,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10568,7 +11164,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "old-project".to_string(),
+                path: Some("old-project".to_string()),
                 content: None,
                 old_string: None,
                 new_string: None,
@@ -10578,6 +11174,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10606,7 +11203,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "some-dir".to_string(),
+                path: Some("some-dir".to_string()),
                 content: None,
                 old_string: None,
                 new_string: None,
@@ -10616,6 +11213,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10637,7 +11235,7 @@ mod tests {
         let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
 
         let base = || WriteDocumentParams {
-            path: "some-dir".to_string(),
+            path: Some("some-dir".to_string()),
             content: None,
             old_string: None,
             new_string: None,
@@ -10647,6 +11245,7 @@ mod tests {
             force_new: None,
             frontmatter_patch: None,
             append: None,
+            documents: None,
         };
 
         let cases: Vec<(&str, WriteDocumentParams)> = vec![
@@ -10720,6 +11319,259 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // write_document: batch dispatch (#180)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_document_batch_rejects_single_document_fields_alongside_documents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let one_doc = || {
+            Some(vec![BatchDocumentInput {
+                path: "docs/x.md".to_string(),
+                content: Some("---\ntitle: X\n---\n\n# X\n".to_string()),
+                old_string: None,
+                new_string: None,
+                frontmatter_patch: None,
+                append: None,
+                expected_hash: None,
+                force_new: None,
+            }])
+        };
+        let base = || WriteDocumentParams {
+            path: None,
+            content: None,
+            old_string: None,
+            new_string: None,
+            new_path: None,
+            message: None,
+            expected_hash: None,
+            force_new: None,
+            frontmatter_patch: None,
+            append: None,
+            documents: one_doc(),
+        };
+
+        let cases: Vec<(&str, WriteDocumentParams)> = vec![
+            (
+                "path",
+                WriteDocumentParams {
+                    path: Some("docs/y.md".to_string()),
+                    ..base()
+                },
+            ),
+            (
+                "content",
+                WriteDocumentParams {
+                    content: Some("x".to_string()),
+                    ..base()
+                },
+            ),
+            (
+                "new_path",
+                WriteDocumentParams {
+                    new_path: Some("docs/z.md".to_string()),
+                    ..base()
+                },
+            ),
+        ];
+
+        for (field, params) in cases {
+            let result = server.write_document(Parameters(params)).await;
+            let err =
+                result.expect_err(&format!("{field} set alongside documents must be rejected"));
+            assert!(
+                err.message.contains(field),
+                "error should name '{field}' as the rejected field, got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_document_batch_rejects_more_than_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let documents: Vec<BatchDocumentInput> = (0..(write::MAX_BATCH_DOCUMENTS + 1))
+            .map(|i| BatchDocumentInput {
+                path: format!("docs/over-cap-{i}.md"),
+                content: Some(format!("---\ntitle: {i}\n---\n\n# {i}\n")),
+                old_string: None,
+                new_string: None,
+                frontmatter_patch: None,
+                append: None,
+                expected_hash: None,
+                force_new: None,
+            })
+            .collect();
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: None,
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: None,
+                message: None,
+                expected_hash: None,
+                force_new: None,
+                frontmatter_patch: None,
+                append: None,
+                documents: Some(documents),
+            }))
+            .await;
+        let err = result.expect_err("a batch over the size cap must be rejected");
+        assert!(
+            err.message
+                .contains(&write::MAX_BATCH_DOCUMENTS.to_string()),
+            "error should report the cap: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_batch_happy_path_lands_every_document_in_one_commit() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let documents = vec![
+            BatchDocumentInput {
+                path: "docs/batch-a.md".to_string(),
+                content: Some(
+                    "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# A\n"
+                        .to_string(),
+                ),
+                old_string: None,
+                new_string: None,
+                frontmatter_patch: None,
+                append: None,
+                expected_hash: None,
+                force_new: Some(true),
+            },
+            BatchDocumentInput {
+                path: "docs/batch-b.md".to_string(),
+                content: Some(
+                    "---\ntitle: B\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# B\n"
+                        .to_string(),
+                ),
+                old_string: None,
+                new_string: None,
+                frontmatter_patch: None,
+                append: None,
+                expected_hash: None,
+                force_new: Some(true),
+            },
+        ];
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: None,
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: None,
+                message: None,
+                expected_hash: None,
+                force_new: None,
+                frontmatter_patch: None,
+                append: None,
+                documents: Some(documents),
+            }))
+            .await
+            .expect("batch write should succeed");
+
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("2 document(s) synced"), "got: {text}");
+        assert!(text.contains("docs/batch-a.md"), "got: {text}");
+        assert!(text.contains("docs/batch-b.md"), "got: {text}");
+
+        let structured = result
+            .structured_content
+            .expect("batch write must carry structured_content");
+        assert_eq!(structured["outcome"], "synced");
+        assert!(!structured["sha"].as_str().unwrap().is_empty());
+        let docs = structured["documents"].as_array().unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["path"], "docs/batch-a.md");
+        assert_eq!(docs[0]["is_create"], true);
+        assert_eq!(docs[1]["path"], "docs/batch-b.md");
+
+        crate::reindex::test_support::assert_marked_dirty(
+            &server.reindex_queue,
+            &["docs/batch-a.md", "docs/batch-b.md"],
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_batch_reports_every_failing_document_at_once() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let documents = vec![
+            BatchDocumentInput {
+                path: "docs/ok.md".to_string(),
+                content: Some(
+                    "---\ntitle: Ok\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Ok\n"
+                        .to_string(),
+                ),
+                old_string: None,
+                new_string: None,
+                frontmatter_patch: None,
+                append: None,
+                expected_hash: None,
+                force_new: Some(true),
+            },
+            // Neither content, old_string/new_string, frontmatter_patch, nor
+            // append — parse_edit_mode must reject this the same way it
+            // rejects a single-document call with no edit mode at all.
+            BatchDocumentInput {
+                path: "docs/no-edit-mode.md".to_string(),
+                content: None,
+                old_string: None,
+                new_string: None,
+                frontmatter_patch: None,
+                append: None,
+                expected_hash: None,
+                force_new: None,
+            },
+        ];
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: None,
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: None,
+                message: None,
+                expected_hash: None,
+                force_new: None,
+                frontmatter_patch: None,
+                append: None,
+                documents: Some(documents),
+            }))
+            .await;
+        let err = result.expect_err("a batch entry with no edit mode must be rejected");
+        assert!(
+            err.message.contains("docs/no-edit-mode.md"),
+            "error should name the offending entry: {}",
+            err.message
+        );
+
+        // Nothing should have been written for the OTHER (valid) document either
+        // — this is a pre-flight parse failure in mcp.rs, before
+        // `write::write_documents_batch` is ever called.
+        assert!(!work.path().join("docs/ok.md").exists());
+        assert!(!work.path().join("docs/no-edit-mode.md").exists());
+    }
+
+    // -----------------------------------------------------------------------
     // write_document: create-path guards (surgical/content on a nonexistent path)
     // -----------------------------------------------------------------------
 
@@ -10731,7 +11583,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/nonexistent.md".to_string(),
+                path: Some("docs/nonexistent.md".to_string()),
                 content: None,
                 old_string: Some("old".to_string()),
                 new_string: Some("new".to_string()),
@@ -10741,6 +11593,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10764,7 +11617,7 @@ mod tests {
 
         let err = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "a".repeat(MAX_PATH_LEN + 1),
+                path: Some("a".repeat(MAX_PATH_LEN + 1)),
                 content: Some("---\ntitle: Test\n---\n# Body".to_string()),
                 old_string: None,
                 new_string: None,
@@ -10774,6 +11627,7 @@ mod tests {
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await
             .expect_err("overlong path should return Err");
@@ -10799,7 +11653,7 @@ mod tests {
 
         let err = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "existing.md".to_string(),
+                path: Some("existing.md".to_string()),
                 content: None,
                 old_string: None,
                 new_string: None,
@@ -10809,6 +11663,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await
             .expect_err("overlong new_path should return Err");
@@ -10827,7 +11682,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/nonexistent.md".to_string(),
+                path: Some("docs/nonexistent.md".to_string()),
                 content: None,
                 old_string: None,
                 new_string: None,
@@ -10837,6 +11692,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -10862,7 +11718,7 @@ mod tests {
 
         let result = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "docs/nonexistent.md".to_string(),
+                path: Some("docs/nonexistent.md".to_string()),
                 content: Some("---\ntitle: Test\n---\n# Body".to_string()),
                 old_string: None,
                 new_string: None,
@@ -10872,6 +11728,7 @@ mod tests {
                 force_new: None,
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
 
@@ -11097,7 +11954,7 @@ mod tests {
         // next call would wrongly reject "beta" against the stale pre-change schema.
         let accepted = server
             .write_document(Parameters(WriteDocumentParams {
-                path: "notes/after.md".to_string(),
+                path: Some("notes/after.md".to_string()),
                 content: Some("---\ntitle: After\nstatus: beta\n---\n\n# Body\n".to_string()),
                 old_string: None,
                 new_string: None,
@@ -11107,6 +11964,7 @@ mod tests {
                 force_new: Some(true),
                 frontmatter_patch: None,
                 append: None,
+                documents: None,
             }))
             .await;
         assert!(
