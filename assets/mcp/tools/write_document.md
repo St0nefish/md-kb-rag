@@ -35,3 +35,12 @@ Frontmatter is validated against the *destination* directory's schema — call
 a stale read — it still guards the whole file, even for a `frontmatter_patch`
 that only touches a few fields, since the body is carried through from the same
 read the hash was checked against.
+
+`structured_content` mirrors what the text summary already says, so you don't have
+to parse prose to act on it: `outcome`, `sha` (the commit), `rebased_paths` (paths a
+concurrent push pulled in during the pre-push rebase), and `rewritten_paths` (other
+documents whose links into a moved document were rewritten). It also carries `diff`
+(the unified diff), capped for size — `diff_truncated`/`diff_total_bytes` tell you
+whether it was cut and how large the real diff is; the text content always has the
+diff in full, uncapped. `sync_failure_cause` appears only when `outcome` is
+`committed_pending_sync`.
