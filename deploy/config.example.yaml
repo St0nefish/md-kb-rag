@@ -536,6 +536,36 @@ reranking:
   # unchanged. See deploy/TROUBLESHOOTING.md for the bytes-vs-tokens caveat.
 
 
+# ----------------------------------------------------------------------------
+# ui — knowledge-base web UI tuning
+# ----------------------------------------------------------------------------
+# Pure YAML tuning knobs for the web UI served by this same binary (see
+# README.md's "Web UI" section). No secrets, no bootstrap wiring — everything
+# here is live-reloadable via POST /admin/reload.
+ui:
+
+  # Precomputed semantic (kNN) graph edges shown alongside markdown-link edges
+  # in the web UI's graph view, in addition to the links already discovered
+  # from `[[wiki-links]]` and markdown links between documents.
+  semantic_edges:
+
+    # Off by default: computing these costs one Qdrant `recommend` query per
+    # indexed document, on every run that touches the graph — real query
+    # volume proportional to corpus size, not a one-time cost. Enable only if
+    # the semantic-neighbor overlay is worth that cost for your deployment.
+    enabled: false
+
+    # Number of nearest-neighbor edges to keep per document, highest
+    # cosine-similarity score first, after dedup and the min_score filter
+    # below.
+    k: 5
+
+    # Minimum cosine similarity for a neighbor to be kept as an edge. Results
+    # scoring below this are discarded rather than shown as a weak/misleading
+    # connection.
+    min_score: 0.6
+
+
 # ============================================================================
 # ENV-only settings — cannot be set here; setting any of these under the
 # matching YAML section above is a schema error (unknown field)
