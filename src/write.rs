@@ -4132,6 +4132,43 @@ mod tests {
         assert_eq!(success.outcome, WriteOutcome::CommittedPendingSync);
         assert!(success.sync_failure_cause.is_some());
         assert!(!work.path().join("doomed.md").exists());
+
+        // #150: this is the ONLY trigger for the reindex worker to purge the
+        // deleted document's Qdrant points and state rows (see
+        // `ingest::index_paths`'s missing-file branch) — a regression that
+        // dropped this call would leave the document searchable forever,
+        // with every other assertion above still green.
+        crate::reindex::test_support::assert_marked_dirty(&harness.reindex_queue, &["doomed.md"]);
+    }
+
+    /// #150: `delete_document`'s OTHER success path — commit AND push both
+    /// succeed — was, per the issue, never exercised by any test at all
+    /// (only the `CommittedPendingSync` branch above was reached, and even
+    /// that omitted this assertion). Mirrors `create_synced_write_marks_the_path_dirty_and_returns_a_diff`'s
+    /// pattern for the create path.
+    #[tokio::test]
+    async fn delete_synced_write_marks_the_path_dirty() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("doomed-synced.md"),
+            "---\ntitle: D\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "doomed-synced.md", "add doomed-synced.md");
+
+        let harness = git_backed_harness(&work);
+
+        let success = delete_document(&harness.deps(), "doomed-synced.md", None)
+            .await
+            .unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+        assert!(!work.path().join("doomed-synced.md").exists());
+
+        crate::reindex::test_support::assert_marked_dirty(
+            &harness.reindex_queue,
+            &["doomed-synced.md"],
+        );
     }
 
     // -----------------------------------------------------------------------
