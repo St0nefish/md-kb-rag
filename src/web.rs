@@ -12,7 +12,7 @@
 //! `retrieval::get_document`), reused rather than duplicated, just wired to axum
 //! instead of rmcp.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -64,6 +64,22 @@ const MAX_SCHEMA_VALUES: usize = 200;
 /// a computed sizing scheme (e.g. by backlink count) can be added later without
 /// changing the wire shape.
 const NODE_SIZE: u32 = 30;
+
+/// Hard cap on how many document nodes `/api/graph`'s full-KB response returns
+/// (see #174). Below this, the response is byte-for-byte what an uncapped one
+/// would have been — chosen high enough that a normal KB (a few hundred documents
+/// spread across this project's ~14 top-level domains) never touches it, while
+/// still bounding the pathological "several thousand documents" case: both the
+/// server's response size AND the client's fcose force-layout cost scale with
+/// node count, and only truncating server-side actually caps the former — a
+/// client-side slice would still have paid to transfer and parse the whole thing.
+/// The per-document neighbourhood view (`#/graph/<path>`) is unaffected — it is
+/// already bounded by hop depth, not by this constant.
+///
+/// No `config.rs` knob yet — that file has a concurrent owner during this PR. The
+/// natural follow-up is a `ui.graph_node_limit: usize` field (default matching
+/// this constant) alongside the existing `ui.semantic_edges` block.
+const DEFAULT_GRAPH_NODE_LIMIT: usize = 1500;
 /// Fallback node color for a document with no `type` frontmatter.
 const DEFAULT_NODE_COLOR: &str = "#94a3b8";
 
@@ -366,6 +382,14 @@ struct GraphResponse {
     edges: Vec<GraphEdge>,
     types: Vec<String>,
     palette: BTreeMap<String, String>,
+    /// How many documents exist in total, independent of `nodes.len()` — lets a
+    /// caller render "showing N of M" instead of silently treating `nodes.len()`
+    /// as the whole KB. Mirrors `search`'s `total`/`has_more` convention: a
+    /// truncated response says so rather than leaving the caller to infer it.
+    total_nodes: usize,
+    /// True when `nodes.len() < total_nodes`, i.e. the `DEFAULT_GRAPH_NODE_LIMIT`
+    /// cap actually dropped nodes from this response.
+    nodes_truncated: bool,
 }
 
 /// Deterministic FNV-1a hash. NOT `std::collections`'s default hasher (SipHash with
@@ -414,14 +438,49 @@ fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
 /// Build the `/api/graph` response from raw rows. Pure and separate from the
 /// handler so it is unit-testable without a database.
 ///
-/// Edges are dropped when either endpoint is not among `summaries`' paths — the
-/// contract only requires dropping a dangling *target* (a renamed/removed file
-/// whose link row hasn't been cleaned up yet), but a dangling *source* would be
-/// just as broken to hand to Cytoscape, so both ends are checked.
+/// `limit` caps how many document nodes make it into the response (see #174 and
+/// `DEFAULT_GRAPH_NODE_LIMIT`). When `summaries.len() <= limit` nothing is
+/// dropped and the response is exactly what an uncapped build would have
+/// produced. Otherwise, nodes are ranked by degree — the number of link
+/// endpoints (either direction, any kind) touching that document across the
+/// FULL `links` list, computed before any truncation so a node's rank never
+/// depends on which other nodes already got cut — and only the top `limit`
+/// survive. Ties (most commonly degree-0 documents with no links at all) break
+/// on `file_path` so the selection, and therefore the whole response, is
+/// deterministic across requests rather than depending on incidental DB row
+/// order. Dropping arbitrary nodes would misrepresent the graph's shape; degree
+/// is a cheap proxy for "which nodes actually matter to the picture."
+///
+/// Edges are dropped when either endpoint is not among the SURVIVING nodes'
+/// paths — the contract only requires dropping a dangling *target* (a
+/// renamed/removed file whose link row hasn't been cleaned up yet), but a
+/// dangling *source*, or an endpoint this response's cap simply excluded, would
+/// be just as broken to hand to Cytoscape, so both ends are checked.
 fn build_graph_response(
     summaries: &[DocumentSummary],
     links: &[(String, String, String, Option<f64>)],
+    limit: usize,
 ) -> GraphResponse {
+    let total_nodes = summaries.len();
+
+    let mut degree: HashMap<&str, usize> = HashMap::new();
+    for (source, target, _, _) in links {
+        *degree.entry(source.as_str()).or_insert(0) += 1;
+        *degree.entry(target.as_str()).or_insert(0) += 1;
+    }
+
+    let mut ranked: Vec<&DocumentSummary> = summaries.iter().collect();
+    ranked.sort_by(|a, b| {
+        let degree_a = degree.get(a.file_path.as_str()).copied().unwrap_or(0);
+        let degree_b = degree.get(b.file_path.as_str()).copied().unwrap_or(0);
+        degree_b
+            .cmp(&degree_a)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
+    let nodes_truncated = ranked.len() > limit;
+    ranked.truncate(limit);
+    let summaries = ranked;
+
     let node_ids: HashSet<&str> = summaries.iter().map(|s| s.file_path.as_str()).collect();
 
     let mut types: BTreeSet<String> = BTreeSet::new();
@@ -510,6 +569,8 @@ fn build_graph_response(
         edges,
         types: types.into_iter().collect(),
         palette,
+        total_nodes,
+        nodes_truncated,
     }
 }
 
@@ -549,7 +610,12 @@ async fn graph_handler(State(state): State<UiState>) -> Response {
         }
     };
 
-    Json(build_graph_response(&summaries, &links)).into_response()
+    Json(build_graph_response(
+        &summaries,
+        &links,
+        DEFAULT_GRAPH_NODE_LIMIT,
+    ))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1623,11 +1689,13 @@ mod tests {
 
     #[test]
     fn build_graph_response_empty_input_yields_empty_arrays() {
-        let resp = build_graph_response(&[], &[]);
+        let resp = build_graph_response(&[], &[], DEFAULT_GRAPH_NODE_LIMIT);
         assert!(resp.nodes.is_empty());
         assert!(resp.edges.is_empty());
         assert!(resp.types.is_empty());
         assert!(resp.palette.is_empty());
+        assert_eq!(resp.total_nodes, 0);
+        assert!(!resp.nodes_truncated);
     }
 
     #[test]
@@ -1665,8 +1733,10 @@ mod tests {
             ),
         ];
 
-        let resp = build_graph_response(&summaries, &links);
+        let resp = build_graph_response(&summaries, &links, DEFAULT_GRAPH_NODE_LIMIT);
         assert_eq!(resp.nodes.len(), 2);
+        assert_eq!(resp.total_nodes, 2);
+        assert!(!resp.nodes_truncated);
         assert_eq!(
             resp.edges.len(),
             1,
@@ -1685,6 +1755,109 @@ mod tests {
 
         assert_eq!(resp.types, vec!["guide".to_string()]);
         assert!(resp.palette.contains_key("guide"));
+    }
+
+    #[test]
+    fn build_graph_response_caps_nodes_and_keeps_the_highest_degree_ones() {
+        // Four documents: hub has two incident links (degree 2), leaf_a and
+        // leaf_b each have one (degree 1), and lonely has none (degree 0). A
+        // limit of 2 must keep exactly {hub, and whichever of leaf_a/leaf_b
+        // sorts first by path — a.md before b.md}, dropping lonely and the
+        // other leaf regardless of their position in `summaries`.
+        let summaries = vec![
+            DocumentSummary {
+                file_path: "z_lonely.md".into(),
+                title: None,
+                description: None,
+                mtime: 0,
+                indexed_at: "now".into(),
+                frontmatter: serde_json::json!({}),
+            },
+            DocumentSummary {
+                file_path: "leaf_b.md".into(),
+                title: None,
+                description: None,
+                mtime: 0,
+                indexed_at: "now".into(),
+                frontmatter: serde_json::json!({}),
+            },
+            DocumentSummary {
+                file_path: "hub.md".into(),
+                title: None,
+                description: None,
+                mtime: 0,
+                indexed_at: "now".into(),
+                frontmatter: serde_json::json!({}),
+            },
+            DocumentSummary {
+                file_path: "leaf_a.md".into(),
+                title: None,
+                description: None,
+                mtime: 0,
+                indexed_at: "now".into(),
+                frontmatter: serde_json::json!({}),
+            },
+        ];
+        let links = vec![
+            (
+                "hub.md".to_string(),
+                "leaf_a.md".to_string(),
+                "markdown".to_string(),
+                None,
+            ),
+            (
+                "hub.md".to_string(),
+                "leaf_b.md".to_string(),
+                "markdown".to_string(),
+                None,
+            ),
+        ];
+
+        let resp = build_graph_response(&summaries, &links, 2);
+        assert_eq!(resp.total_nodes, 4, "total_nodes reports the real count");
+        assert!(resp.nodes_truncated);
+        assert_eq!(resp.nodes.len(), 2);
+
+        let ids: std::collections::HashSet<&str> =
+            resp.nodes.iter().map(|n| n.data.id.as_str()).collect();
+        assert!(
+            ids.contains("hub.md"),
+            "the highest-degree node must survive"
+        );
+        assert!(
+            ids.contains("leaf_a.md"),
+            "leaf_a.md (degree 1) beats leaf_b.md (also degree 1) on the path tiebreak: {ids:?}"
+        );
+        assert!(
+            !ids.contains("z_lonely.md"),
+            "degree-0 node must be dropped first"
+        );
+        assert!(
+            !ids.contains("leaf_b.md"),
+            "losing tiebreak node must be dropped"
+        );
+
+        // The edge to the dropped leaf_b.md must not survive either — an edge
+        // naming a node outside the capped set is exactly as broken as one
+        // naming a node that was never indexed.
+        assert_eq!(resp.edges.len(), 1);
+        assert_eq!(resp.edges[0].data.target, "leaf_a.md");
+    }
+
+    #[test]
+    fn build_graph_response_under_the_limit_is_untruncated() {
+        let summaries = vec![DocumentSummary {
+            file_path: "only.md".into(),
+            title: None,
+            description: None,
+            mtime: 0,
+            indexed_at: "now".into(),
+            frontmatter: serde_json::json!({}),
+        }];
+        let resp = build_graph_response(&summaries, &[], 100);
+        assert_eq!(resp.nodes.len(), 1);
+        assert_eq!(resp.total_nodes, 1);
+        assert!(!resp.nodes_truncated);
     }
 
     #[test]
@@ -1726,7 +1899,7 @@ mod tests {
             ),
         ];
 
-        let resp = build_graph_response(&summaries, &links);
+        let resp = build_graph_response(&summaries, &links, DEFAULT_GRAPH_NODE_LIMIT);
         assert_eq!(resp.edges.len(), 2);
         let ids: std::collections::HashSet<&str> =
             resp.edges.iter().map(|e| e.data.id.as_str()).collect();
@@ -1745,7 +1918,7 @@ mod tests {
             indexed_at: "now".into(),
             frontmatter: serde_json::Value::Null,
         }];
-        let resp = build_graph_response(&summaries, &[]);
+        let resp = build_graph_response(&summaries, &[], DEFAULT_GRAPH_NODE_LIMIT);
         assert_eq!(resp.nodes.len(), 1);
         assert_eq!(resp.nodes[0].data.r#type, None);
         assert_eq!(resp.nodes[0].data.tags, Vec::<String>::new());
@@ -1958,6 +2131,8 @@ mod tests {
         assert_eq!(json["edges"], serde_json::json!([]));
         assert_eq!(json["types"], serde_json::json!([]));
         assert_eq!(json["palette"], serde_json::json!({}));
+        assert_eq!(json["total_nodes"], serde_json::json!(0));
+        assert_eq!(json["nodes_truncated"], serde_json::json!(false));
     }
 
     #[tokio::test]
@@ -2001,6 +2176,8 @@ mod tests {
         let json = body_json(resp).await;
 
         assert_eq!(json["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(json["total_nodes"], serde_json::json!(2));
+        assert_eq!(json["nodes_truncated"], serde_json::json!(false));
         let edges = json["edges"].as_array().unwrap();
         assert_eq!(
             edges.len(),

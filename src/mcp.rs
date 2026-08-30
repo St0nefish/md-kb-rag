@@ -225,6 +225,131 @@ fn json_value_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// `search`'s `filters` parameter as delivered by an MCP client.
+///
+/// Same fix as [`FieldDefinitionInput`], applied to the same shape of bug: the old
+/// type here, `Option<serde_json::Map<String, serde_json::Value>>`, advertises no
+/// schema constraint at all (schemars emits `{}` for a bare `serde_json::Map`), so a
+/// calling model has no way to learn from the tool schema that a scalar means
+/// equality, an array means any-of, or that an object accepts
+/// `any_of`/`all_of`/`gte`/`lte`/`gt`/`lt`. It has to learn that from prose alone —
+/// and, per the same failure mode `FieldDefinitionInput` exists to cover, at least
+/// one client class responds to an under-specified object parameter by sending it
+/// JSON-encoded as a string instead, which the old `Option<Map<...>>` field rejected
+/// with a raw deserialize error rather than a caller-actionable one.
+///
+/// Unlike `FieldDefinitionInput`, there is no existing typed Rust struct to delegate
+/// to for the advertised schema — `filters` is a map keyed by arbitrary caller-chosen
+/// field names, each valued by one of several shapes — so [`json_schema`] below
+/// builds that schema by hand instead of deriving it. Actual per-condition parsing
+/// still happens in `parse_field_filter`, unchanged: this type only fixes what the
+/// tool schema advertises and adds the same string-tolerance fallback, it does not
+/// duplicate that function's shape checking or its field-named error messages.
+///
+/// [`json_schema`]: schemars::JsonSchema::json_schema
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchFiltersInput(pub serde_json::Map<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for SearchFiltersInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_search_filters_input(value)
+            .map(SearchFiltersInput)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parse `search`'s `filters` argument from JSON: an object directly, or (see
+/// [`SearchFiltersInput`]) a string containing one. Mirrors
+/// [`parse_field_definition`]'s two-shape acceptance and error style.
+fn parse_search_filters_input(
+    value: serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    use serde_json::Value;
+
+    match value {
+        Value::Object(map) => Ok(map),
+        Value::String(s) => match serde_json::from_str::<Value>(&s) {
+            Ok(Value::Object(map)) => Ok(map),
+            Ok(other) => Err(filters_shape_error(&other)),
+            Err(e) => Err(format!(
+                "filters must be a JSON object mapping frontmatter field names to \
+                 conditions. A JSON string containing that object is also accepted, \
+                 but this string is not valid JSON: {e}"
+            )),
+        },
+        other => Err(filters_shape_error(&other)),
+    }
+}
+
+/// Build the "wrong shape entirely" error for [`parse_search_filters_input`], naming
+/// what was actually received without echoing its (possibly large) content.
+fn filters_shape_error(value: &serde_json::Value) -> String {
+    format!(
+        "filters must be a JSON object mapping frontmatter field names to conditions, \
+         got {}",
+        json_value_kind(value)
+    )
+}
+
+impl schemars::JsonSchema for SearchFiltersInput {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SearchFilters".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(concat!(module_path!(), "::SearchFiltersInput"))
+    }
+
+    // Hand-built rather than derived (see this type's doc comment): describes an
+    // object whose values ("filter conditions") are, per field, a scalar
+    // (equality), an array of scalars (any-of), or an object carrying
+    // `any_of`/`all_of`/`gte`/`lte`/`gt`/`lt` — exactly the shapes
+    // `parse_field_filter` accepts. Kept tight and caller-facing (see #126): no
+    // implementation rationale leaks into the emitted schema, only the shape a
+    // caller needs to construct a valid `filters` value.
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "description": "Frontmatter criteria by field (dot-path keys). Each \
+                value is either a scalar (equality), an array of scalars (any-of), \
+                or an object with any_of/all_of (explicit set match) or \
+                gte/lte/gt/lt (numeric range).",
+            "additionalProperties": {
+                "description": "One field's filter condition.",
+                "anyOf": [
+                    { "type": ["string", "number", "boolean"] },
+                    {
+                        "type": "array",
+                        "items": { "type": ["string", "number", "boolean"] }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "any_of": {
+                                "type": "array",
+                                "items": { "type": ["string", "number", "boolean"] }
+                            },
+                            "all_of": {
+                                "type": "array",
+                                "items": { "type": ["string", "number", "boolean"] }
+                            },
+                            "gte": { "type": "number" },
+                            "lte": { "type": "number" },
+                            "gt": { "type": "number" },
+                            "lt": { "type": "number" }
+                        }
+                    }
+                ]
+            }
+        })
+    }
+}
+
 /// Turn tool parameters into a typed schema edit.
 fn build_schema_edit(params: &UpdateSchemaParams) -> Result<crate::schema::SchemaEdit, McpError> {
     use crate::schema::SchemaEdit;
@@ -396,6 +521,28 @@ fn render_casualties(casualties: &[serde_json::Value]) -> String {
     out
 }
 
+/// Cap a casualty list for `structured_content`, mirroring the cap
+/// [`render_casualties`] already applies to the text half.
+///
+/// `documents_broken_by` deliberately returns the *complete* casualty list — the
+/// force/refuse decision needs completeness, so that query stays unbounded — but
+/// embedding the full `Vec` verbatim into `structured_content` let a schema
+/// tightening that broke thousands of documents emit a multi-megabyte tool result
+/// while the text channel silently stayed capped at [`MAX_REPORTED_CASUALTIES`].
+/// Returns the capped list alongside the true total and whether it was truncated,
+/// the same `total`/`has_more` shape `search` uses elsewhere in this file, so a
+/// client that only reads `structured_content` can still tell "empty" from
+/// "truncated" rather than only ever seeing the first page.
+fn capped_casualties(casualties: &[serde_json::Value]) -> (Vec<serde_json::Value>, usize, bool) {
+    let total = casualties.len();
+    let capped = casualties
+        .iter()
+        .take(MAX_REPORTED_CASUALTIES)
+        .cloned()
+        .collect();
+    (capped, total, total > MAX_REPORTED_CASUALTIES)
+}
+
 /// Default page size for `list_documents` — well above `search`'s cap, since
 /// enumeration is the point.
 const DEFAULT_LIST_LIMIT: u64 = 100;
@@ -540,12 +687,13 @@ fn parse_field_filter(field: &str, raw: &serde_json::Value) -> Result<FieldFilte
 /// both backends: SQLite (`state::StateDb::push_where`, enumeration mode) and Qdrant
 /// (`qdrant::lower_field_filters`, query mode).
 fn parse_filters(
-    raw_filters: &Option<serde_json::Map<String, serde_json::Value>>,
+    raw_filters: &Option<SearchFiltersInput>,
 ) -> Result<Vec<(String, FieldFilter)>, McpError> {
     let invalid = |msg: String| McpError::invalid_params(msg, None);
 
     let mut filters = Vec::new();
     if let Some(raw_filters) = raw_filters {
+        let raw_filters = &raw_filters.0;
         if raw_filters.len() > MAX_LIST_FILTERS {
             return Err(invalid(format!(
                 "too many filters: {} (max {})",
@@ -815,7 +963,7 @@ pub struct SearchParams {
 
     /// Frontmatter criteria by field (dot-paths).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filters: Option<serde_json::Map<String, serde_json::Value>>,
+    pub filters: Option<SearchFiltersInput>,
 
     /// Restrict to paths starting with this prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2710,6 +2858,8 @@ impl KbSearchServer {
         let force = params.force.unwrap_or(false);
 
         if !casualties.is_empty() && !force && !dry_run {
+            let (would_invalidate, casualties_total, casualties_truncated) =
+                capped_casualties(&casualties);
             return Err(McpError::invalid_params(
                 format!(
                     "Refusing to apply: {} existing document(s) would fail the new rules. \
@@ -2717,7 +2867,11 @@ impl KbSearchServer {
                     casualties.len(),
                     render_casualties(&casualties)
                 ),
-                Some(serde_json::json!({ "would_invalidate": casualties })),
+                Some(serde_json::json!({
+                    "would_invalidate": would_invalidate,
+                    "casualties_total": casualties_total,
+                    "casualties_truncated": casualties_truncated,
+                })),
             ));
         }
 
@@ -2734,11 +2888,15 @@ impl KbSearchServer {
                 crate::schema::SCHEMA_FILE_NAME,
                 yaml
             );
+            let (would_invalidate, casualties_total, casualties_truncated) =
+                capped_casualties(&casualties);
             let mut result = CallToolResult::success(vec![Content::text(text)]);
             result.structured_content = Some(serde_json::json!({
                 "dry_run": true,
                 "summary": summary,
-                "would_invalidate": casualties,
+                "would_invalidate": would_invalidate,
+                "casualties_total": casualties_total,
+                "casualties_truncated": casualties_truncated,
                 "yaml": yaml,
             }));
             return Ok(result);
@@ -2827,13 +2985,16 @@ impl KbSearchServer {
             ));
         }
 
+        let (invalidated, casualties_total, casualties_truncated) = capped_casualties(&casualties);
         let mut result = CallToolResult::success(vec![Content::text(text)]);
         result.structured_content = Some(serde_json::json!({
             "outcome": outcome.as_str(),
             "dry_run": false,
             "summary": summary,
             "path": rel_file_str,
-            "invalidated": casualties,
+            "invalidated": invalidated,
+            "casualties_total": casualties_total,
+            "casualties_truncated": casualties_truncated,
         }));
         Ok(result)
     }
@@ -3338,6 +3499,24 @@ impl KbSearchServer {
                 None,
             ));
         }
+        // Mirrors `get_document`'s length guard (see its comment): rejecting an
+        // oversized path here avoids paying for `resolve_safe_write_path`, an
+        // include-pattern check, and git staging on an input that was never going
+        // to resolve to anything.
+        if raw.len() > MAX_PATH_LEN {
+            return Err(McpError::invalid_params(
+                format!("path exceeds maximum length of {MAX_PATH_LEN} characters"),
+                None,
+            ));
+        }
+        if let Some(new_path) = params.new_path.as_deref()
+            && new_path.len() > MAX_PATH_LEN
+        {
+            return Err(McpError::invalid_params(
+                format!("new_path exceeds maximum length of {MAX_PATH_LEN} characters"),
+                None,
+            ));
+        }
 
         // Branch 1: a directory move. Detected via the literal (non-fuzzy)
         // resolver — a directory can never satisfy `resolve_within_data`'s
@@ -3400,6 +3579,15 @@ impl KbSearchServer {
         if raw.is_empty() {
             return Err(McpError::invalid_params(
                 "path parameter is empty".to_string(),
+                None,
+            ));
+        }
+        // Mirrors `get_document`'s length guard (see its comment) and
+        // `write_document`'s identical check: reject before the fuzzy resolver, the
+        // metadata index, or git ever see an input that was never going to resolve.
+        if raw.len() > MAX_PATH_LEN {
+            return Err(McpError::invalid_params(
+                format!("path exceeds maximum length of {MAX_PATH_LEN} characters"),
                 None,
             ));
         }
@@ -3857,7 +4045,7 @@ mod tests {
 
     fn filters_from(json: serde_json::Value) -> SearchParams {
         SearchParams {
-            filters: Some(json.as_object().unwrap().clone()),
+            filters: Some(SearchFiltersInput(json.as_object().unwrap().clone())),
             ..Default::default()
         }
     }
@@ -4033,11 +4221,140 @@ mod tests {
             map.insert(format!("field{i}"), serde_json::json!("x"));
         }
         let err = build_document_query(&SearchParams {
-            filters: Some(map),
+            filters: Some(SearchFiltersInput(map)),
             ..Default::default()
         })
         .unwrap_err();
         assert!(format!("{:?}", err).contains("too many filters"));
+    }
+
+    #[test]
+    fn search_filters_advertises_as_a_typed_object() {
+        // Regression test for #151: `filters` used to be typed
+        // `Option<serde_json::Map<String, serde_json::Value>>`, which schemars turns
+        // into an unconstrained `{"type": "object"}` with no `additionalProperties`
+        // constraint at all — no signal to a calling client about what a field's
+        // condition may look like, and (per `SearchFiltersInput`'s doc comment) the
+        // same under-specification that drove at least one real client to send a
+        // nested-object parameter JSON-encoded as a string instead of an object.
+        let schema = schemars::schema_for!(SearchParams);
+        let root = schema.as_value();
+
+        let filters_schema = &root["properties"]["filters"];
+        // `Option<SearchFiltersInput>` becomes `anyOf: [<real schema>, {"type":
+        // "null"}]`; find the non-null branch.
+        let object_schema = filters_schema["anyOf"]
+            .as_array()
+            .expect("filters must offer a typed alternative, not a bare {}")
+            .iter()
+            .find(|branch| branch["type"] != serde_json::json!("null"))
+            .expect("filters must have a non-null branch");
+
+        // schemars refs a named type's schema into `$defs` rather than inlining it;
+        // resolve it so the assertions below see the real shape (mirrors
+        // `update_schema_definition_advertises_as_a_typed_object`'s resolution).
+        let resolved = match object_schema["$ref"].as_str() {
+            Some(reference) => &root["$defs"][reference.rsplit('/').next().unwrap()],
+            None => object_schema,
+        };
+
+        assert_eq!(
+            resolved["type"],
+            serde_json::json!("object"),
+            "filters must advertise as an object, got: {resolved}"
+        );
+        let condition_schema = &resolved["additionalProperties"];
+        assert_ne!(
+            *condition_schema,
+            serde_json::json!(true),
+            "a bare `additionalProperties: true` (schemars' rendering of an \
+             unconstrained serde_json::Map) tells a client nothing about a \
+             condition's shape — this is the exact bug being fixed, got: {resolved}"
+        );
+
+        let branches = condition_schema["anyOf"]
+            .as_array()
+            .expect("a filter condition must advertise its scalar/array/object forms");
+
+        // Scalar branch: equality against a string, number, or boolean.
+        assert!(
+            branches
+                .iter()
+                .any(|b| b["type"].as_array().is_some_and(|types| {
+                    let types: Vec<&str> = types.iter().filter_map(|t| t.as_str()).collect();
+                    types.contains(&"string")
+                        && types.contains(&"number")
+                        && types.contains(&"boolean")
+                })),
+            "missing the scalar-equality branch, got: {condition_schema}"
+        );
+
+        // Array branch: any-of against a list of scalars.
+        assert!(
+            branches
+                .iter()
+                .any(|b| b["type"] == serde_json::json!("array") && !b["items"].is_null()),
+            "missing the any-of-array branch, got: {condition_schema}"
+        );
+
+        // Object branch: named any_of/all_of/gte/lte/gt/lt properties.
+        let object_branch = branches
+            .iter()
+            .find(|b| b["type"] == serde_json::json!("object"))
+            .expect("missing the any_of/all_of/range object branch");
+        for key in ["any_of", "all_of", "gte", "lte", "gt", "lt"] {
+            assert!(
+                !object_branch["properties"][key].is_null(),
+                "condition object schema is missing documented key '{key}': \
+                 {object_branch}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_filters_accepts_a_json_encoded_string_as_a_fallback() {
+        // At least one real MCP client sends nested-object tool arguments as a
+        // JSON-encoded string rather than an object, regardless of what the tool
+        // schema advertises (same failure mode `FieldDefinitionInput` exists to
+        // cover — see #151). `SearchFiltersInput` must tolerate that as a fallback,
+        // and the parsed result must behave identically to the equivalent object.
+        let params: SearchParams = serde_json::from_value(serde_json::json!({
+            "filters": r#"{"type":"guide"}"#,
+        }))
+        .expect("a JSON-encoded filters string must deserialize");
+        let query = build_document_query(&params).unwrap();
+        assert_eq!(
+            query.filters,
+            vec![("type".to_string(), FieldFilter::AnyOf(vec!["guide".into()]))]
+        );
+    }
+
+    #[test]
+    fn search_filters_rejects_a_string_that_is_not_valid_json() {
+        let err = serde_json::from_value::<SearchFiltersInput>(serde_json::Value::String(
+            "not json at all".to_string(),
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not valid JSON"),
+            "expected a message explaining the string wasn't parseable JSON, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn search_filters_rejects_a_json_array_naming_the_expected_shape() {
+        let err = serde_json::from_value::<SearchFiltersInput>(serde_json::json!(["type", "x"]))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("JSON object"),
+            "expected the error to name the expected shape, got: {msg}"
+        );
+        assert!(
+            !msg.contains("SearchFiltersInput"),
+            "a Rust type name is meaningless to an MCP client, got: {msg}"
+        );
     }
 
     #[test]
@@ -4141,7 +4458,7 @@ mod tests {
         // attributable to routing, not to the filter being universally invalid.
         let enumerate_result = server
             .search(Parameters(SearchParams {
-                filters: Some(filters.clone()),
+                filters: Some(SearchFiltersInput(filters.clone())),
                 ..Default::default()
             }))
             .await
@@ -4159,7 +4476,7 @@ mod tests {
             .search(Parameters(SearchParams {
                 query: Some("test".to_string()),
                 granularity: Some("document".to_string()),
-                filters: Some(filters),
+                filters: Some(SearchFiltersInput(filters)),
                 ..Default::default()
             }))
             .await
@@ -4240,7 +4557,7 @@ mod tests {
 
     fn filters_param(json: serde_json::Value) -> SearchParams {
         SearchParams {
-            filters: Some(json.as_object().unwrap().clone()),
+            filters: Some(SearchFiltersInput(json.as_object().unwrap().clone())),
             ..Default::default()
         }
     }
@@ -5043,6 +5360,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_schema_caps_structured_casualties_like_it_caps_the_text() {
+        // #148: `documents_broken_by` deliberately returns every casualty — the
+        // force/refuse decision needs completeness — but before this fix that full
+        // list went straight into `structured_content` while the text half was
+        // already capped at MAX_REPORTED_CASUALTIES via `render_casualties`. Seed
+        // enough documents to blow past the cap and assert the structured half is
+        // bounded too, with a total/truncated flag so a client reading only
+        // `structured_content` can still tell it was cut off.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        let seeded = MAX_REPORTED_CASUALTIES + 5;
+        for i in 0..seeded {
+            seed_document(
+                &server,
+                &format!("notes/doc{i}.md"),
+                serde_json::json!({ "title": format!("Doc {i}") }),
+            )
+            .await;
+        }
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: None,
+                definition: Some(definition(serde_json::json!({ "required": true }))),
+                dry_run: Some(true),
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(
+            structured["would_invalidate"].as_array().unwrap().len(),
+            MAX_REPORTED_CASUALTIES,
+            "structured_content must cap the casualty list the same way the text \
+             rendering does, not embed all {seeded} verbatim"
+        );
+        assert_eq!(
+            structured["casualties_total"],
+            serde_json::json!(seeded),
+            "the true count must still be reported even though the list is capped"
+        );
+        assert_eq!(
+            structured["casualties_truncated"],
+            serde_json::json!(true),
+            "truncation must never be silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schema_reports_untruncated_casualties_below_the_cap() {
+        // Companion to the truncation test above: when the casualty count is at or
+        // under the cap, `casualties_truncated` must read false and
+        // `casualties_total` must match the (uncapped) list length exactly, so a
+        // client cannot mistake "small" for "truncated."
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(&server, "notes/a.md", serde_json::json!({ "title": "A" })).await;
+
+        let result = server
+            .update_schema(Parameters(UpdateSchemaParams {
+                path: Some("notes".into()),
+                operation: "set_field".into(),
+                field: "status".into(),
+                values: None,
+                definition: Some(definition(serde_json::json!({ "required": true }))),
+                dry_run: Some(true),
+                force: None,
+                acknowledge_root_change: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["would_invalidate"].as_array().unwrap().len(), 1);
+        assert_eq!(structured["casualties_total"], serde_json::json!(1));
+        assert_eq!(structured["casualties_truncated"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
     async fn update_schema_refuses_a_breaking_change_without_force() {
         let tmp = tempfile::tempdir().unwrap();
         let server = schema_tool_server(&tmp);
@@ -5502,7 +5903,7 @@ mod tests {
         filters.insert("prep".into(), serde_json::json!({ "lt": 30 }));
         let result = server
             .search(Parameters(SearchParams {
-                filters: Some(filters),
+                filters: Some(SearchFiltersInput(filters)),
                 ..Default::default()
             }))
             .await
@@ -7309,6 +7710,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_document_overlong_path_rejected() {
+        // Mirrors `get_document`'s overlong-path test (see that test's comment on
+        // MAX_PATH_LEN): `delete_document` must reject the same class of input
+        // before the fuzzy resolver ever runs, not fall through to a resolver-level
+        // "not found" error.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let params = DeleteDocumentParams {
+            path: "a".repeat(MAX_PATH_LEN + 1),
+            message: None,
+        };
+        let err = server
+            .delete_document(Parameters(params))
+            .await
+            .expect_err("overlong path should return Err");
+        assert!(
+            err.message.contains("exceeds maximum length"),
+            "error should name the length problem, got: {}",
+            err.message
+        );
+    }
+
     // `delete_document_existing_file_proceeds_to_git_step` used to live here: create
     // a file in a plain tempdir with no git repo, delete it, and check the failure
     // wasn't a path-resolution error. `delete_document_with_no_git_repo_reports_
@@ -8762,6 +9188,68 @@ mod tests {
             err.message
                 .contains("cannot surgically edit a document that does not exist"),
             "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_overlong_path_rejected() {
+        // Mirrors `get_document`'s overlong-path test: `write_document` must reject
+        // the same class of input before `resolve_safe_write_path`, the
+        // include-pattern check, or git staging ever see it — see #153.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+
+        let err = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "a".repeat(MAX_PATH_LEN + 1),
+                content: Some("---\ntitle: Test\n---\n# Body".to_string()),
+                old_string: None,
+                new_string: None,
+                new_path: None,
+                message: None,
+                expected_hash: None,
+                force_new: Some(true),
+            }))
+            .await
+            .expect_err("overlong path should return Err");
+        assert!(
+            err.message.contains("exceeds maximum length"),
+            "error should name the length problem, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_overlong_new_path_rejected() {
+        // Same guard, applied to `new_path` (used for moves) rather than `path` —
+        // see #153.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_test_resolved_config(tmp.path());
+        let server = make_write_test_server(&tmp, &["**/*.md".to_string()], config);
+        std::fs::write(
+            tmp.path().join("existing.md"),
+            "---\ntitle: Old\n---\n# Old\n",
+        )
+        .unwrap();
+
+        let err = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "existing.md".to_string(),
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: Some("a".repeat(MAX_PATH_LEN + 1)),
+                message: None,
+                expected_hash: None,
+                force_new: None,
+            }))
+            .await
+            .expect_err("overlong new_path should return Err");
+        assert!(
+            err.message.contains("exceeds maximum length"),
+            "error should name the length problem, got: {}",
             err.message
         );
     }
