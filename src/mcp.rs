@@ -93,6 +93,15 @@ const MAX_SCHEMA_DEFINITION_LEN: usize = 8 * 1024;
 const MAX_REPORTED_VALUES: usize = 200;
 /// Cap on fields echoed back per scope by `get_schema`.
 const MAX_REPORTED_FIELDS: usize = 500;
+/// Cap on the unified diff embedded in a write/delete tool's `structured_content`
+/// (fix #129). Mirrors `MAX_SCHEMA_DEFINITION_LEN`'s convention for bounding a
+/// single text blob: `WriteSuccess::diff` is unbounded by design (a full replace
+/// of a large document produces a large diff, and the text channel already
+/// carries it whole), but embedding it verbatim into `structured_content` too
+/// would let one write emit a multi-megabyte tool result. See
+/// [`capped_diff`] for the same unbounded-source/bounded-payload split
+/// [`capped_casualties`] already applies to `update_schema`'s casualty list.
+const MAX_STRUCTURED_DIFF_BYTES: usize = 8 * 1024;
 
 /// Normalize a caller-supplied scope path into a safe KB-relative directory.
 ///
@@ -554,6 +563,41 @@ fn capped_casualties(casualties: &[serde_json::Value]) -> (Vec<serde_json::Value
         .cloned()
         .collect();
     (capped, total, total > MAX_REPORTED_CASUALTIES)
+}
+
+/// Cap `diff` (a `WriteSuccess`/`DirectoryMoveSuccess` unified diff) for
+/// `structured_content` — see [`MAX_STRUCTURED_DIFF_BYTES`]'s doc comment.
+/// Returns `(capped_diff, diff_truncated, diff_total_bytes)`, the same
+/// capped-value/truncated-flag/true-total shape [`capped_casualties`] returns,
+/// so a client reading only `structured_content` can tell "the whole diff" from
+/// "cut off, and by how much" rather than only ever seeing the first slice.
+///
+/// Cuts at a `char_boundary` at or before the byte cap — `diff` is arbitrary
+/// document text, so a naive byte-index cut could otherwise land inside a
+/// multi-byte UTF-8 character and produce an invalid `&str` slice.
+fn capped_diff(diff: &str) -> (String, bool, usize) {
+    let total = diff.len();
+    if total <= MAX_STRUCTURED_DIFF_BYTES {
+        return (diff.to_string(), false, total);
+    }
+    let mut end = MAX_STRUCTURED_DIFF_BYTES;
+    while end > 0 && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    (diff[..end].to_string(), true, total)
+}
+
+/// Render `WriteSuccess::rebased_paths`/`DirectoryMoveSuccess::rebased_paths`
+/// (a `Vec<PathBuf>`) as `Vec<String>` for `structured_content` — mirrors
+/// `web.rs`'s `write_success_response` doing the identical `to_string_lossy`
+/// conversion for its own fixed HTTP contract, rather than letting `json!`
+/// serialize `PathBuf` directly (which errors on a non-UTF-8 path instead of
+/// degrading gracefully).
+fn rebased_paths_json(rebased_paths: &[PathBuf]) -> Vec<String> {
+    rebased_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Default page size for `list_documents` — well above `search`'s cap, since
@@ -1497,10 +1541,52 @@ impl WriteOutcome {
     }
 }
 
+/// Build the fields every write/delete `structured_content` payload shares
+/// (fix #129): `sha` and `diff` (capped — see [`capped_diff`] — with
+/// `diff_truncated`/`diff_total_bytes` alongside it) and `rebased_paths`, plus
+/// `sync_failure_cause` when the write landed as `committed_pending_sync`.
+/// Before this, `structured_content` carried only `{"outcome", ...}` — a
+/// client that prefers structured content over prose (Claude Code does) had
+/// no programmatic way to learn the commit SHA or see the diff at all, the
+/// same class of bug as #124 (`search`'s `structured_content` once regressed
+/// to a bare `{"path_prefix_truncated": ...}`).
+///
+/// Returns a `serde_json::Map` rather than a full `Value` so
+/// [`with_outcome_and_rewrites`]/[`with_outcome_and_referencing`] can merge in
+/// their own move/delete-specific field on top.
+fn write_success_structured_fields(
+    outcome: WriteOutcome,
+    success: &WriteSuccess,
+) -> serde_json::Map<String, serde_json::Value> {
+    let (diff, diff_truncated, diff_total_bytes) = capped_diff(&success.diff);
+    let mut fields = serde_json::Map::new();
+    fields.insert("outcome".to_string(), serde_json::json!(outcome.as_str()));
+    fields.insert("sha".to_string(), serde_json::json!(success.sha));
+    fields.insert("diff".to_string(), serde_json::json!(diff));
+    fields.insert(
+        "diff_truncated".to_string(),
+        serde_json::json!(diff_truncated),
+    );
+    fields.insert(
+        "diff_total_bytes".to_string(),
+        serde_json::json!(diff_total_bytes),
+    );
+    fields.insert(
+        "rebased_paths".to_string(),
+        serde_json::json!(rebased_paths_json(&success.rebased_paths)),
+    );
+    if let Some(cause) = &success.sync_failure_cause {
+        fields.insert("sync_failure_cause".to_string(), serde_json::json!(cause));
+    }
+    fields
+}
+
 /// Attach a machine-readable `{"outcome": ...}` discriminant to a successful
 /// `CallToolResult`, alongside its human-readable text content — for
-/// `write_document`'s create/edit path specifically: also attaches
-/// `rewritten_paths`, the repo-relative paths of OTHER documents a MOVE
+/// `write_document`'s create/edit path specifically: also attaches `sha`,
+/// `diff`/`diff_truncated`/`diff_total_bytes`, `rebased_paths`, and
+/// `sync_failure_cause` (see [`write_success_structured_fields`], fix #129),
+/// plus `rewritten_paths`, the repo-relative paths of OTHER documents a MOVE
 /// rewrote incoming links in (always `[]` for a non-move write, or a move
 /// with nothing to rewrite). A move that silently edits other documents
 /// without surfacing which ones is not acceptable, so this rides in
@@ -1509,12 +1595,14 @@ impl WriteOutcome {
 fn with_outcome_and_rewrites(
     mut result: CallToolResult,
     outcome: WriteOutcome,
-    rewritten_paths: &[String],
+    success: &WriteSuccess,
 ) -> CallToolResult {
-    result.structured_content = Some(serde_json::json!({
-        "outcome": outcome.as_str(),
-        "rewritten_paths": rewritten_paths,
-    }));
+    let mut fields = write_success_structured_fields(outcome, success);
+    fields.insert(
+        "rewritten_paths".to_string(),
+        serde_json::json!(success.rewritten_paths),
+    );
+    result.structured_content = Some(serde_json::Value::Object(fields));
     result
 }
 
@@ -1522,19 +1610,24 @@ fn with_outcome_and_rewrites(
 /// specifically: attaches `referencing_paths`, the repo-relative paths of
 /// OTHER documents that still link to the just-deleted document (always `[]`
 /// when none exist, or when no `StateDb` was available to check — see
-/// `write::WriteSuccess::referencing_paths`'s doc comment). This is the
-/// caller-visible half of the reverse-link check #181 already logs
-/// server-side — an agent has no access to that log, so the same information
-/// must reach it through the tool result too.
+/// `write::WriteSuccess::referencing_paths`'s doc comment), alongside the same
+/// `sha`/`diff`/`rebased_paths`/`sync_failure_cause` fields
+/// [`write_success_structured_fields`] attaches for create/edit (fix #129).
+/// The `referencing_paths` half is the caller-visible counterpart of the
+/// reverse-link check #181 already logs server-side — an agent has no access
+/// to that log, so the same information must reach it through the tool result
+/// too.
 fn with_outcome_and_referencing(
     mut result: CallToolResult,
     outcome: WriteOutcome,
-    referencing_paths: &[String],
+    success: &WriteSuccess,
 ) -> CallToolResult {
-    result.structured_content = Some(serde_json::json!({
-        "outcome": outcome.as_str(),
-        "referencing_paths": referencing_paths,
-    }));
+    let mut fields = write_success_structured_fields(outcome, success);
+    fields.insert(
+        "referencing_paths".to_string(),
+        serde_json::json!(success.referencing_paths),
+    );
+    result.structured_content = Some(serde_json::Value::Object(fields));
     result
 }
 
@@ -1580,7 +1673,7 @@ fn create_edit_success_to_result(
             with_outcome_and_rewrites(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::Synced,
-                &success.rewritten_paths,
+                &success,
             )
         }
         CoreWriteOutcome::CommittedPendingSync => {
@@ -1601,7 +1694,7 @@ fn create_edit_success_to_result(
             with_outcome_and_rewrites(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::CommittedPendingSync,
-                &success.rewritten_paths,
+                &success,
             )
         }
     }
@@ -1797,7 +1890,7 @@ fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolRe
             with_outcome_and_referencing(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::Synced,
-                &success.referencing_paths,
+                &success,
             )
         }
         CoreWriteOutcome::CommittedPendingSync => {
@@ -1818,7 +1911,7 @@ fn delete_success_to_result(success: WriteSuccess, rel_path: &str) -> CallToolRe
             with_outcome_and_referencing(
                 CallToolResult::success(vec![Content::text(result_text)]),
                 WriteOutcome::CommittedPendingSync,
-                &success.referencing_paths,
+                &success,
             )
         }
     }
@@ -1941,11 +2034,29 @@ fn move_directory_success_to_result(
     };
 
     let mut result = CallToolResult::success(vec![Content::text(summary)]);
-    result.structured_content = Some(serde_json::json!({
-        "outcome": outcome.as_str(),
-        "moved": moved_json,
-        "rewritten_paths": success.rewritten_paths,
-    }));
+    // (fix #129) Same sha/rebased_paths/sync_failure_cause parity
+    // `write_success_structured_fields` gives the single-document create/edit/delete
+    // path — this tool surface is still `write_document`, just dispatched to a
+    // directory move, so a caller reading only `structured_content` deserves the
+    // same commit-identifying fields here too. No `diff`: `DirectoryMoveSuccess`
+    // carries no unified diff (a directory move's text summary has none either —
+    // see `moved_lines`/`moved_json` above for its equivalent).
+    let mut structured = serde_json::Map::new();
+    structured.insert("outcome".to_string(), serde_json::json!(outcome.as_str()));
+    structured.insert("sha".to_string(), serde_json::json!(success.sha));
+    structured.insert(
+        "rebased_paths".to_string(),
+        serde_json::json!(rebased_paths_json(&success.rebased_paths)),
+    );
+    structured.insert("moved".to_string(), serde_json::json!(moved_json));
+    structured.insert(
+        "rewritten_paths".to_string(),
+        serde_json::json!(success.rewritten_paths),
+    );
+    if let Some(cause) = &success.sync_failure_cause {
+        structured.insert("sync_failure_cause".to_string(), serde_json::json!(cause));
+    }
+    result.structured_content = Some(serde_json::Value::Object(structured));
     result
 }
 
@@ -9445,6 +9556,212 @@ mod tests {
 
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["referencing_paths"], serde_json::json!([]));
+    }
+
+    // -----------------------------------------------------------------------
+    // structured_content parity with the text summary (sha/diff/rebased_paths) —
+    // fix #129
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_document_structured_content_carries_sha_and_diff() {
+        // Before the fix, `structured_content` for a create/edit carried only
+        // `{"outcome", "rewritten_paths"}` — a client reading only structured
+        // content (Claude Code does) had no programmatic way to learn the commit
+        // SHA or see the diff, even though both are in the text summary.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "docs/new.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some("---\ntitle: Test\n---\n# Body".to_string()),
+                message: None,
+                expected_hash: None,
+                new_path: None,
+                force_new: Some(true),
+                frontmatter_patch: None,
+                append: None,
+            }))
+            .await
+            .unwrap();
+
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected a text content block, got {other:?}"),
+        };
+        let structured = result
+            .structured_content
+            .expect("write_document must attach structured_content");
+
+        let sha = structured["sha"]
+            .as_str()
+            .expect("structured_content must carry the commit sha as a string");
+        assert_eq!(
+            sha,
+            head_sha(&work),
+            "structured sha must match the commit the text summary names"
+        );
+        assert!(
+            text.contains(sha),
+            "sanity: the text summary must name the same sha, got: {text}"
+        );
+
+        let diff = structured["diff"]
+            .as_str()
+            .expect("structured_content must carry the diff as a string");
+        assert!(
+            !diff.is_empty(),
+            "a real create must produce a non-empty diff"
+        );
+        assert!(
+            text.contains(diff),
+            "the structured diff must match what the text channel already carries, got \
+             text: {text} structured diff: {diff}"
+        );
+        assert_eq!(structured["diff_truncated"], serde_json::json!(false));
+        assert_eq!(
+            structured["diff_total_bytes"],
+            serde_json::json!(diff.len())
+        );
+        assert_eq!(structured["rebased_paths"], serde_json::json!([]));
+        assert!(
+            structured.get("sync_failure_cause").is_none(),
+            "a fully synced write must not carry sync_failure_cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_document_structured_diff_is_capped_for_a_large_write() {
+        // The diff can be large (a full replace of a big document) — this
+        // codebase never truncates a structured payload silently (`search`'s
+        // `has_more`, `update_schema`'s `casualties_truncated`), so a large diff
+        // must be capped WITH a flag saying so, the same convention.
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let (server, _config) = make_git_backed_server(&work);
+
+        // Comfortably over MAX_STRUCTURED_DIFF_BYTES (8 KiB) so the added-lines
+        // diff itself, not just the raw content, exceeds the cap.
+        let big_body: String = (0..2000)
+            .map(|i| format!("line {i} of filler body text\n"))
+            .collect();
+        let content = format!("---\ntitle: Big\n---\n# Body\n{big_body}");
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "docs/big.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some(content),
+                message: None,
+                expected_hash: None,
+                new_path: None,
+                force_new: Some(true),
+                frontmatter_patch: None,
+                append: None,
+            }))
+            .await
+            .unwrap();
+
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected a text content block, got {other:?}"),
+        };
+        let structured = result.structured_content.unwrap();
+
+        let diff = structured["diff"].as_str().unwrap();
+        assert!(
+            diff.len() <= MAX_STRUCTURED_DIFF_BYTES,
+            "capped diff must not exceed the byte cap, got {} bytes",
+            diff.len()
+        );
+        assert_eq!(structured["diff_truncated"], serde_json::json!(true));
+        let diff_total_bytes = structured["diff_total_bytes"].as_u64().unwrap() as usize;
+        assert!(
+            diff_total_bytes > MAX_STRUCTURED_DIFF_BYTES,
+            "diff_total_bytes must report the TRUE, uncapped length"
+        );
+        assert!(
+            text.contains(diff),
+            "the capped structured diff must still be a prefix of the full text diff"
+        );
+        assert!(
+            text.len() > diff.len(),
+            "the TEXT channel must never be truncated by this cap — only structured_content"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_structured_content_carries_sha_and_diff() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::write(
+            work.path().join("gone.md"),
+            "---\ntitle: Gone\n---\n\n# Body\n",
+        )
+        .unwrap();
+        git_commit_all(&work, "gone.md", "add gone.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .delete_document(Parameters(DeleteDocumentParams {
+                path: "gone.md".to_string(),
+                message: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(
+            structured["sha"].as_str().unwrap(),
+            head_sha(&work),
+            "delete_document's structured_content must carry the commit sha too"
+        );
+        let diff = structured["diff"].as_str().unwrap();
+        assert!(
+            !diff.is_empty(),
+            "a delete must produce a non-empty (all-removals) diff"
+        );
+        assert_eq!(structured["rebased_paths"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn write_document_directory_move_structured_content_carries_sha_and_rebased_paths() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old-project7")).unwrap();
+        let doc_content = "---\ntitle: A\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old-project7/a.md"), doc_content).unwrap();
+        git_commit_all(&work, "old-project7/a.md", "add old-project7/a.md");
+        let (server, _config) = make_git_backed_server(&work);
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "old-project7".to_string(),
+                content: None,
+                old_string: None,
+                new_string: None,
+                new_path: Some("archive/new-project7".to_string()),
+                message: None,
+                expected_hash: None,
+                force_new: None,
+                frontmatter_patch: None,
+                append: None,
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(
+            structured["sha"].as_str().unwrap(),
+            head_sha(&work),
+            "a directory move's structured_content must carry the commit sha too"
+        );
+        assert_eq!(structured["rebased_paths"], serde_json::json!([]));
     }
 
     // -----------------------------------------------------------------------
