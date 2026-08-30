@@ -581,26 +581,17 @@ impl IndexStatus {
 // bare atomic instead: `record_query` never blocks, and a reader takes a
 // wait-free snapshot by loading each atomic once.
 //
-// NOTE for the agent wiring this into `retrieval.rs` (out of scope for this
-// change — see the issue): `search` already computes `embed_ms` and `search_ms`
-// (the Qdrant round trip, dense or hybrid) and logs them at `debug` right before
-// its final `Ok(SearchOutcome { .. })` return. That is the one call site to hook
-// for the common path: call `QUERY_METRICS.record_query(embed_ms as u64, search_ms
-// as u64, rerank, results.len())` right there, where `rerank` is `None` if
-// `deps.reranker` was `None` for this call, or `Some((rerank_ms, success))` if a
-// reranker was actually attempted — `success` is `false` on the `Err(e)` arm that
-// currently just logs `warn!("Reranker unavailable, ...")` and falls back to
-// fused order (rerank_ms would need its own `Instant::now()` wrapped around the
-// `reranker.rerank(query, &docs).await` call, since `search` does not currently
-// time that stage at all). There is a SECOND return point to cover: the
-// `if docs.is_empty()` early return a few lines above the `match reranker.rerank`
-// call also produces zero results and currently skips the timing `debug!`
-// entirely — that path needs the same `record_query` call (with `rerank: None`,
-// since no rerank was attempted) or it will systematically undercount
-// zero-result queries whenever reranking is enabled. `search_grouped` has no
-// existing timing instrumentation and no reranker at all; wiring it through
-// `record_query` (with `rerank: None` always) is straightforward but lower
-// priority since the issue's sketch centers on `search`.
+// #245 wired this into `retrieval.rs`: `search_paged` (which `search` wraps) calls
+// `QUERY_METRICS.record_query(embed_ms as u64, search_ms as u64, rerank,
+// results.len())` at every point it can produce a completed `Ok(SearchOutcome)` —
+// not just the common path's final `debug!("search timing")` line, but also the
+// `docs.is_empty()` early return (before a rerank is even attempted) and the
+// reranker's own "response was entirely unusable, falling back to fused order"
+// branch (an attempted-but-unusable rerank, recorded the same as the `Err(e)`
+// arm: `rerank: Some((rerank_ms, false))`). Missing either of the latter two would
+// undercount zero/low-result queries specifically whenever reranking is enabled —
+// see that function's doc comment for the full accounting of its return points.
+// `search_grouped` has no reranker at all, so it always passes `rerank: None`.
 
 /// Upper bounds (inclusive), in milliseconds, for the buckets in every
 /// [`LatencyHistogram`] below. This is exactly Prometheus's own client-library
@@ -654,10 +645,9 @@ impl LatencyHistogram {
         }
     }
 
-    // Only called (today) from `RetrievalMetrics::record_query` below and from
-    // this module's own tests — see that method's `#[allow(dead_code)]` comment
-    // for why a real, non-test caller does not exist in THIS crate yet.
-    #[allow(dead_code)]
+    // Called from `RetrievalMetrics::record_query` below, which `retrieval::search`
+    // (and `search_grouped`) call on every completed query (#245) — plus this
+    // module's own tests.
     fn record(&self, ms: u64) {
         let idx = LATENCY_BUCKETS_MS
             .iter()
@@ -761,16 +751,15 @@ impl RetrievalMetrics {
     /// error, not a skipped call, since that is the silent-degradation case this
     /// counter exists to surface.
     ///
-    /// `#[allow(dead_code)]`: this is the recording half of #168's API — the
-    /// call site belongs in `retrieval::search`, which is off-limits for this
-    /// change (owned by another agent this wave; see the module section doc
-    /// comment above for the exact hand-off: what to pass for `rerank`, and the
-    /// two return points in `search` that both need a call here). Nothing in
-    /// THIS crate calls it yet outside tests, which is expected until that
-    /// follow-up lands — `QUERY_METRICS.snapshot()` (called from
-    /// `server.rs`) already has a real, live, non-test caller, so it does not
-    /// need the same suppression.
-    #[allow(dead_code)]
+    /// This is the recording half of #168's API. #245 wired it in:
+    /// `retrieval::search_paged` (which `search` is a thin wrapper over) calls
+    /// this at every point it can produce a completed `Ok(SearchOutcome)` —
+    /// the common path at the bottom of the function, the `docs.is_empty()`
+    /// early return, and the reranker's own "response was entirely unusable"
+    /// fallback — so a query is counted exactly once regardless of which path
+    /// it takes, including the zero-result paths that bypass the timing
+    /// `debug!` this call sits next to. `search_grouped` calls it too, always
+    /// with `rerank: None` (that path has no reranker).
     pub fn record_query(
         &self,
         embed_ms: u64,
