@@ -1795,9 +1795,22 @@ mod tests {
     }
 
     /// Integration test: `ensure_collection(enable_phrase: true)` creates a working
-    /// phrase-matching text index, and a phrase-filtered hybrid query only returns
-    /// the chunk containing the exact phrase — not one that merely contains the
-    /// same words in a different order.
+    /// phrase-matching text index, and a phrase-filtered hybrid query ranks the chunk
+    /// containing the exact phrase above one that merely contains the same words in a
+    /// different order.
+    ///
+    /// #212: this test originally asserted the phrase-matching chunk was the ONLY
+    /// result (`results.len() == 1`) — i.e. that the phrase condition acts as a hard
+    /// filter. Against a real server (this test could not previously run at all — see
+    /// below) that assertion fails: both chunks come back, `/data/exact.md` first with
+    /// `/data/reordered.md` second. That is not a bug; it is exactly what
+    /// `build_fusion_arms`'s doc comment documents as deliberate — the phrase
+    /// condition only ever applies within ONE of the fused RRF arms (`dense` always
+    /// runs unfiltered too), so a document absent from the phrase arm can still
+    /// surface via the dense arm, just ranked lower because it only accumulates
+    /// reciprocal rank from one arm instead of two. Phrase matching is a ranking
+    /// signal, not an exclusion filter — the assertions below were rewritten to match
+    /// that actual, intended contract instead of loosening it to "don't crash".
     ///
     /// Stays live-only — this exercises Qdrant's own phrase-matching text index
     /// end to end (index creation, then a real `Condition::matches_phrase` filter
@@ -1841,13 +1854,15 @@ mod tests {
 
         let points = vec![
             make_point(
-                "00000000-0000-0000-0000-000000000p01",
+                // #212: was "...000p01" — 'p' is not a hex digit, so this was never a
+                // valid UUID and the point was rejected; the test had never actually run.
+                "00000000-0000-0000-0000-000000000a01",
                 "/data/exact.md",
                 "deploy notes for node:ares rocm",
                 vec![1.0, 0.0, 0.0, 0.0],
             ),
             make_point(
-                "00000000-0000-0000-0000-000000000p02",
+                "00000000-0000-0000-0000-000000000a02",
                 "/data/reordered.md",
                 "rocm notes for node:ares deploy",
                 vec![1.0, 0.0, 0.0, 0.0],
@@ -1861,6 +1876,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let phrases = vec!["node:ares rocm".to_string()];
+        // `explain: true` so `phrase_score` is populated — its presence (not value) is
+        // what proves the phrase arm actually matched, which is a much more precise
+        // check than inferring it from ranking order alone.
         let results = store
             .hybrid_search(
                 &config.collection,
@@ -1871,19 +1889,37 @@ mod tests {
                 Vec::new(),
                 10,
                 50,
-                false,
+                true,
             )
             .await
             .unwrap();
 
         assert_eq!(
             results.len(),
-            1,
-            "the phrase filter must exclude the chunk with the same words reordered"
+            2,
+            "both chunks are retrievable — the dense arm runs unfiltered alongside the \
+             phrase arm, so phrase matching is a ranking signal, not an exclusion filter"
         );
         assert_eq!(
             results[0].payload.get("file_path").and_then(|v| v.as_str()),
             Some("/data/exact.md"),
+            "the exact-phrase chunk accumulates reciprocal rank from both the dense and \
+             phrase arms, so it must rank first"
+        );
+        assert!(
+            results[0].phrase_score.is_some(),
+            "the top result's phrase_score must be Some — it matched the phrase arm"
+        );
+        assert_eq!(
+            results[1].payload.get("file_path").and_then(|v| v.as_str()),
+            Some("/data/reordered.md"),
+            "the reordered chunk still surfaces via the unfiltered dense arm, just ranked \
+             second since it only accumulates rank from one arm instead of two"
+        );
+        assert!(
+            results[1].phrase_score.is_none(),
+            "the reordered chunk never matched the phrase arm, so its phrase_score must \
+             be None — this is the actual signal the phrase-matching text index provides"
         );
 
         store
@@ -2385,14 +2421,27 @@ mod tests {
 
     /// Integration test: upsert several documents' first-chunk points, then confirm
     /// `recommend_by_point_id` returns the nearest neighbor by the named `dense`
-    /// vector and that an excluding filter removes the source document itself.
+    /// vector and that an excluding filter removes a specific document.
+    ///
+    /// #212: this test originally asserted that an UNFILTERED query for point A's
+    /// nearest neighbor returned A itself (i.e. that querying by a point's own ID
+    /// includes that point in its own results). Against a real server that assertion
+    /// fails — B comes back instead. This is not a bug: Qdrant's `VectorInput::new_id`
+    /// query mechanism resolves the point's stored vector and searches with it, but
+    /// deliberately EXCLUDES the query point itself from the results (the same way
+    /// "recommend similar items" never recommends the item back to itself) — that
+    /// exclusion happens server-side regardless of whether the caller also supplies a
+    /// filter. So `recommend_by_point_id(a, limit=1, None)` was never going to return
+    /// A; it returns A's actual nearest DIFFERENT neighbor, B — exactly what the
+    /// second half of this test (with an explicit `must_not` filter) already expected.
+    /// The assertion below was corrected to match that real, documented behavior.
     ///
     /// Stays live-only — what this proves is that Qdrant's server-side point-id
     /// resolution (`VectorInput::new_id`, i.e. "look up this point's own vector and
-    /// use it as the query") actually works end to end, plus that a `must_not`
-    /// filter is honored by the Query API for this query shape. Neither is
-    /// something a fake can stand in for: it's Qdrant's own vector-lookup-by-id
-    /// behavior under test, not code in this crate.
+    /// use it as the query, excluding the point itself") actually works end to end,
+    /// plus that a `must_not` filter is honored by the Query API for this query
+    /// shape. Neither is something a fake can stand in for: it's Qdrant's own
+    /// vector-lookup-by-id behavior under test, not code in this crate.
     ///
     /// Requires a running Qdrant instance at localhost:6334.
     /// Run with: cargo test recommend_by_point_id_finds_nearest_neighbor -- --ignored
@@ -2446,7 +2495,9 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // Unfiltered: a's own point is the nearest match to itself.
+        // Unfiltered: Qdrant's ID-based query excludes the query point itself from
+        // its own results (server-side, unconditionally — see this test's doc
+        // comment), so a's nearest neighbor here is b, not a itself.
         let results = store
             .recommend_by_point_id(&config.collection, point_a, 1, None)
             .await
@@ -2454,7 +2505,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].payload.get("file_path").and_then(|v| v.as_str()),
-            Some("/data/a.md"),
+            Some("/data/b.md"),
+            "querying by point a's own ID excludes a itself, so its nearest neighbor is b"
         );
 
         // Excluding a's own file, the nearest neighbor is b, not c.
