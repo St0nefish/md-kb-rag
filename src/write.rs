@@ -74,6 +74,22 @@ pub fn dedup_verdict(top: Option<(String, f32)>, threshold: f32) -> Option<Dupli
 /// `chunking.prepend_description` is set, so a dedup query built without that
 /// prefix would be compared against a different textual basis than the
 /// candidates it is scored against.
+///
+/// It deliberately does NOT reproduce `chunking.prepend_heading_path`'s
+/// breadcrumb, and that is safe for a non-obvious structural reason worth
+/// stating: `chunk::annotate_heading_paths` walks sections with an ancestor
+/// stack that starts empty for every document, and a chunk's heading path is
+/// fixed from whichever section started it. A document's FIRST chunk is always
+/// seeded from its first section, whose ancestor path is therefore always
+/// empty — so chunk 0 never carries a breadcrumb, whatever the document's
+/// heading structure. Since a create-path dedup query is doc-start text scored
+/// against the corpus, matching chunk 0's basis is what matters.
+///
+/// If a future chunking change breaks that invariant — anything that can give
+/// a document's first chunk a prefix this function does not build — the dedup
+/// gate silently starts comparing unlike text and lets near-duplicates through
+/// with no error. `mcp::tests::build_dedup_query_matches_chunk_prepend_format`
+/// is the pin; keep it honest rather than adjusting it to match a regression.
 pub(crate) fn build_dedup_query(
     body: &str,
     description: Option<&str>,

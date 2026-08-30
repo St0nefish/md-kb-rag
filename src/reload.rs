@@ -314,9 +314,10 @@ pub fn diff(old: &ResolvedConfig, new: &ResolvedConfig) -> ReloadReport {
             d(&new.chunking.prepend_heading_path),
             "changes the text every future chunk embeds — a chunk's heading-ancestry \
              breadcrumb is prepended before embedding, so existing chunks were embedded \
-             without it (or with it). Same basis-change as prepend_description above, \
-             including the dedup query text. Run `md-kb-rag index --full` for a \
-             consistent corpus.",
+             on the other basis. Unlike prepend_description this does NOT affect the \
+             create_document dedup query (a document's first chunk never carries a \
+             breadcrumb — see write.rs build_dedup_query). Run `md-kb-rag index --full` \
+             for a consistent corpus.",
         );
     }
 
