@@ -31,7 +31,7 @@ use crate::embed::QueryEmbedder;
 use crate::git;
 use crate::qdrant::RetrievalStore;
 use crate::retrieval::{RetrievalDeps, SearchFilters};
-use crate::schema::SharedSchemaCache;
+use crate::schema::{self, SharedSchemaCache};
 use crate::state::StateDb;
 use crate::validate::{self, ValidationResult};
 
@@ -595,6 +595,287 @@ fn check_include_pattern<E: QueryEmbedder, Q: RetrievalStore>(
     rel_path: &str,
 ) -> Result<(), WriteError> {
     check_include_pattern_against(deps.retrieval.include_patterns, rel_path)
+}
+
+// ---------------------------------------------------------------------------
+// (#179) Content-mode helpers: frontmatter patch / append
+//
+// Both compute a full `new_content` string the same way `mcp.rs`'s
+// `apply_surgical` already does for old_string/new_string — a pure function
+// the caller (currently only `mcp.rs`'s `write_document_edit`) invokes BEFORE
+// building a `WriteRequest`, not a new field on `WriteRequest` itself. That
+// keeps `write_document`'s core pipeline (schema validation, the dedup gate,
+// the commit, the pre-commit rollback) completely unaware that a patch or an
+// append happened at all: by the time it sees `new_content`, a patch/append
+// write looks exactly like a full-replace write of that same content, so it
+// participates in schema validation, `expected_hash`, and rollback for free,
+// with no special-casing anywhere in the pipeline below this point.
+// ---------------------------------------------------------------------------
+
+/// A single structured edit to a document's OWN frontmatter, applied by
+/// [`apply_frontmatter_patch`].
+///
+/// Mirrors `schema::SchemaEdit`'s vocabulary
+/// (`set_field`/`remove_field`/`add_values`/`remove_values`) — this
+/// codebase's established idiom for "a structured edit instead of a
+/// free-text patch" (see `update_schema`) — applied here to a document's own
+/// frontmatter VALUES rather than a schema's field DECLARATIONS. `field` is a
+/// dot-path, same convention `schema::get_by_dotpath`/`set_by_dotpath` and
+/// `GetSchemaParams::fields`/`SearchFiltersInput` already use throughout this
+/// codebase.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrontmatterEdit {
+    /// Set (or create) a field to an exact value, replacing whatever was
+    /// there. Always succeeds — mirrors `SchemaEdit::SetField`'s unconditional
+    /// insert-or-replace.
+    SetField {
+        field: String,
+        value: serde_json::Value,
+    },
+    /// Remove a field declaration. Errors if the field is not currently set —
+    /// mirrors `SchemaEdit::RemoveField`'s identical refusal, so a caller
+    /// cannot mistake "nothing to remove" for a silent no-op.
+    RemoveField { field: String },
+    /// Append values to a list field, creating it (as a new list) if absent,
+    /// de-duplicated against what is already there. Errors if the field
+    /// exists and is not a list.
+    AddValues {
+        field: String,
+        values: Vec<serde_json::Value>,
+    },
+    /// Remove values from a list field. Errors if the field is absent or is
+    /// not a list — mirrors `SchemaEdit::RemoveValues`'s identical refusal.
+    RemoveValues {
+        field: String,
+        values: Vec<serde_json::Value>,
+    },
+}
+
+/// Split `content` into `(frontmatter_block, body)` at the byte level,
+/// preserving BOTH halves EXACTLY as they appear in `content` — every byte of
+/// `content` is accounted for in exactly one of the two halves, concatenating
+/// them losslessly reconstructs `content`.
+///
+/// This is deliberately NOT `validate::parse_frontmatter_raw` (the
+/// `gray_matter`-backed parser used everywhere else in this codebase): that
+/// function trims trailing whitespace from the body it returns, so its output
+/// is not always a byte-exact suffix of the original content — fine for
+/// validation (which only cares about the parsed VALUES), fatal here, where
+/// [`apply_append`] depends on exactness to guarantee it can never write into
+/// the frontmatter block at all, structurally, rather than by carefully
+/// avoiding it.
+///
+/// Delimiter convention: `content` must begin with a `---` line (`\n`- or
+/// `\r\n`-terminated); the block ends at the next line that is exactly `---`
+/// (optionally `\r`-terminated), found by scanning line-by-line so a literal
+/// `---` inside a YAML value (e.g. a horizontal-rule in a `description`
+/// string) can never be mistaken for the closing delimiter. Returns `None`
+/// when `content` has no opening delimiter, or an opening delimiter with no
+/// matching close — both read as "no frontmatter block", the same as
+/// `gray_matter` treats them.
+fn split_frontmatter_bytes(content: &str) -> Option<(&str, &str)> {
+    let after_open = content
+        .strip_prefix("---\r\n")
+        .or_else(|| content.strip_prefix("---\n"))?;
+
+    let mut offset = 0usize;
+    for line in after_open.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+        if trimmed == "---" {
+            let close_end = offset + line.len();
+            let fm_len = (content.len() - after_open.len()) + close_end;
+            return Some((&content[..fm_len], &content[fm_len..]));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Remove the value at a dot-path, mirroring `schema::get_by_dotpath`'s own
+/// traversal. Not in `schema.rs` alongside its `get`/`set` siblings because
+/// this module's remit is deliberately kept to `write.rs`/`mcp.rs`/`web.rs`
+/// (see this crate's write-pipeline module boundaries) — the two sibling
+/// functions are schema-declaration helpers `schema.rs` owns for its own
+/// `apply_defaults`; this one is document-frontmatter-only. Returns whether
+/// anything was actually removed.
+fn remove_by_dotpath(frontmatter: &mut HashMap<String, serde_json::Value>, path: &str) -> bool {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.len() == 1 {
+        return frontmatter.remove(segments[0]).is_some();
+    }
+    let Some(mut cursor) = frontmatter
+        .get_mut(segments[0])
+        .and_then(|v| v.as_object_mut())
+    else {
+        return false;
+    };
+    for segment in &segments[1..segments.len() - 1] {
+        let Some(next) = cursor.get_mut(*segment).and_then(|v| v.as_object_mut()) else {
+            return false;
+        };
+        cursor = next;
+    }
+    cursor.remove(segments[segments.len() - 1]).is_some()
+}
+
+/// Render a frontmatter map back to a `---`-delimited YAML block (including
+/// both delimiters and the trailing newline after the closing one).
+///
+/// Keys are sorted (`BTreeMap`) before serializing — the exact same reasoning
+/// as `SchemaFile::to_yaml`'s identical `BTreeMap` conversion: `HashMap`
+/// iteration order is unspecified (and randomized per-process), so
+/// serializing straight from it would reorder every field on every patch, for
+/// no reason connected to what actually changed. Sorting trades that for a
+/// deterministic, minimal diff — at the cost of NOT preserving whatever key
+/// order (or comments) the document's own frontmatter happened to have,
+/// exactly the same trade-off this codebase already made for
+/// `.kb-schema.yaml` when `update_schema` rewrites one.
+fn render_frontmatter_block(
+    frontmatter: &HashMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    let ordered: BTreeMap<&String, &serde_json::Value> = frontmatter.iter().collect();
+    let yaml = serde_yaml_ng::to_string(&ordered)
+        .map_err(|e| format!("failed to serialize frontmatter: {e}"))?;
+    Ok(format!("---\n{yaml}---\n"))
+}
+
+/// Apply a structured frontmatter patch to `old_content`, returning the full
+/// new document content (frontmatter block + body, byte-identical body).
+///
+/// Parses the existing frontmatter via `validate::parse_frontmatter_raw` (the
+/// same basis `write_document`'s own validation step re-parses immediately
+/// afterward — see the doc comment on this module's content-mode-helpers
+/// section for why that duplication is fine: this function's OUTPUT is just
+/// ordinary `new_content`, re-validated from scratch like any other write),
+/// applies each edit in order, then re-serializes and reattaches the ORIGINAL
+/// body untouched — this function never reads, modifies, or even fully
+/// re-parses the body, so it cannot corrupt it, structurally, not just by
+/// convention.
+///
+/// Handles a document with no existing frontmatter block by creating one
+/// (mirrors `SchemaEdit::AddValues`'s "creating the field if absent"): the
+/// whole original `old_content` becomes the body, separated from the new
+/// frontmatter block by a blank line (unless the body is empty, in which case
+/// no trailing blank line is added either).
+///
+/// `expected_hash` (checked by the caller, both before this runs and again
+/// under `GIT_LOCK` immediately before the write — see `write_document`'s
+/// step 1 and its re-check) still guards the WHOLE file, unchanged, and that
+/// is deliberate even though a patch only ever touches frontmatter: the body
+/// reattached here is whatever `old_content` happened to contain, so a stale
+/// read of the BODY must still be caught, or a patch computed against a
+/// stale `old_content` could silently commit a stale body over a concurrent
+/// body edit that landed in between. Since this function always derives the
+/// body from the exact `old_content` the hash was checked against, the
+/// existing whole-file guard already provides that protection for free — no
+/// patch-specific handling is needed here or in `write_document`.
+pub fn apply_frontmatter_patch(
+    old_content: &str,
+    edits: &[FrontmatterEdit],
+) -> Result<String, String> {
+    let (fm_block, body) = split_frontmatter_bytes(old_content).unwrap_or(("", old_content));
+    let had_frontmatter = !fm_block.is_empty();
+
+    let (mut frontmatter, _) = validate::parse_frontmatter_raw(old_content);
+
+    for edit in edits {
+        match edit {
+            FrontmatterEdit::SetField { field, value } => {
+                schema::set_by_dotpath(&mut frontmatter, field, value.clone());
+            }
+            FrontmatterEdit::RemoveField { field } => {
+                if !remove_by_dotpath(&mut frontmatter, field) {
+                    return Err(format!(
+                        "field '{field}' is not set in this document's frontmatter"
+                    ));
+                }
+            }
+            FrontmatterEdit::AddValues { field, values } => {
+                let mut existing: Vec<serde_json::Value> =
+                    match schema::get_by_dotpath(&frontmatter, field) {
+                        Some(serde_json::Value::Array(arr)) => arr.clone(),
+                        Some(_) => {
+                            return Err(format!(
+                                "field '{field}' is not a list in this document's frontmatter"
+                            ));
+                        }
+                        None => Vec::new(),
+                    };
+                for v in values {
+                    if !existing.contains(v) {
+                        existing.push(v.clone());
+                    }
+                }
+                schema::set_by_dotpath(&mut frontmatter, field, serde_json::Value::Array(existing));
+            }
+            FrontmatterEdit::RemoveValues { field, values } => {
+                let existing = match schema::get_by_dotpath(&frontmatter, field) {
+                    Some(serde_json::Value::Array(arr)) => arr.clone(),
+                    Some(_) => {
+                        return Err(format!(
+                            "field '{field}' is not a list in this document's frontmatter"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "field '{field}' has no value list in this document's frontmatter"
+                        ));
+                    }
+                };
+                let filtered: Vec<serde_json::Value> = existing
+                    .into_iter()
+                    .filter(|v| !values.contains(v))
+                    .collect();
+                schema::set_by_dotpath(&mut frontmatter, field, serde_json::Value::Array(filtered));
+            }
+        }
+    }
+
+    let new_fm_block = render_frontmatter_block(&frontmatter)?;
+
+    if had_frontmatter {
+        Ok(format!("{new_fm_block}{body}"))
+    } else if body.is_empty() {
+        Ok(new_fm_block)
+    } else {
+        Ok(format!("{new_fm_block}\n{body}"))
+    }
+}
+
+/// Append `text` to the end of `old_content`'s BODY — never past the
+/// frontmatter block, structurally guaranteed by reusing
+/// [`split_frontmatter_bytes`] rather than a substring/offset computed by
+/// hand: whatever that function calls the frontmatter block is copied through
+/// completely untouched, and `text` only ever lands inside whatever it calls
+/// the body.
+///
+/// Exactly one newline separates existing body content from `text` — this
+/// function does not fabricate blank-line spacing beyond that (a caller that
+/// wants a blank line before its entry includes the leading newline in
+/// `text` itself; see `write_document.md`), except for the one case where
+/// there is no separator to reuse at all: a frontmatter block with an empty
+/// body gets a single blank line before `text`, so the appended content does
+/// not land glued to the closing `---`.
+///
+/// Handles a document with no frontmatter block (appends to the whole
+/// content), an empty file (the result is just `text`), and a body with no
+/// trailing newline (one is inserted before appending) — see this function's
+/// tests for each case.
+pub fn apply_append(old_content: &str, text: &str) -> String {
+    let (fm_block, body) = split_frontmatter_bytes(old_content).unwrap_or(("", old_content));
+
+    let mut new_body = body.to_string();
+    if !new_body.is_empty() && !new_body.ends_with('\n') {
+        new_body.push('\n');
+    }
+    if !fm_block.is_empty() && new_body.is_empty() {
+        new_body.push('\n');
+    }
+    new_body.push_str(text.trim_end_matches('\n'));
+    new_body.push('\n');
+
+    format!("{fm_block}{new_body}")
 }
 
 // ---------------------------------------------------------------------------
@@ -3333,6 +3614,318 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // (#179) split_frontmatter_bytes / apply_frontmatter_patch / apply_append —
+    // pure unit tests. These are the exact edge cases #179 calls out by name:
+    // no frontmatter, an empty file, and no trailing newline.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_frontmatter_bytes_normal_document() {
+        let content = "---\ntitle: X\n---\n\n# Body\ntext\n";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "---\ntitle: X\n---\n");
+        assert_eq!(body, "\n# Body\ntext\n");
+        assert_eq!(format!("{fm}{body}"), content, "split must be lossless");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_no_trailing_newline_on_body() {
+        let content = "---\ntitle: X\n---\n\n# Body\ntext";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "---\ntitle: X\n---\n");
+        assert_eq!(body, "\n# Body\ntext");
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_no_frontmatter_returns_none() {
+        assert!(split_frontmatter_bytes("# Just a doc\nbody text\n").is_none());
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_empty_content_returns_none() {
+        assert!(split_frontmatter_bytes("").is_none());
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_unterminated_delimiter_returns_none() {
+        // Opens with `---` but never closes — must not be mistaken for a
+        // (frontmatter, "") split.
+        assert!(split_frontmatter_bytes("---\ntitle: X\nno closing delimiter\n").is_none());
+    }
+
+    #[test]
+    fn split_frontmatter_bytes_dashes_inside_a_value_are_not_the_closing_delimiter() {
+        let content = "---\ndescription: a---b\n---\n\nBody\n";
+        let (fm, body) = split_frontmatter_bytes(content).unwrap();
+        assert_eq!(fm, "---\ndescription: a---b\n---\n");
+        assert_eq!(body, "\nBody\n");
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_set_field_on_existing_document() {
+        let old = "---\ntitle: X\nstatus: draft\n---\n\n# Body\n";
+        let new = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::SetField {
+                field: "status".into(),
+                value: serde_json::json!("active"),
+            }],
+        )
+        .unwrap();
+        let (fm, body) = validate::parse_frontmatter_raw(&new);
+        assert_eq!(fm.get("status").unwrap(), "active");
+        assert_eq!(fm.get("title").unwrap(), "X");
+        assert_eq!(body.trim(), "# Body");
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_never_touches_the_body() {
+        let old = "---\ntitle: X\n---\n\n# Body\nwith --- a dash-line\nand text\n";
+        let new = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::SetField {
+                field: "title".into(),
+                value: serde_json::json!("Y"),
+            }],
+        )
+        .unwrap();
+        assert!(new.ends_with("# Body\nwith --- a dash-line\nand text\n"));
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_creates_frontmatter_when_absent() {
+        let old = "# Just a doc\nno frontmatter here\n";
+        let new = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::SetField {
+                field: "title".into(),
+                value: serde_json::json!("New Title"),
+            }],
+        )
+        .unwrap();
+        let (fm, body) = validate::parse_frontmatter_raw(&new);
+        assert_eq!(fm.get("title").unwrap(), "New Title");
+        assert_eq!(body.trim(), "# Just a doc\nno frontmatter here");
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_on_empty_file_creates_frontmatter_only() {
+        let new = apply_frontmatter_patch(
+            "",
+            &[FrontmatterEdit::SetField {
+                field: "title".into(),
+                value: serde_json::json!("T"),
+            }],
+        )
+        .unwrap();
+        assert!(new.starts_with("---\n"));
+        assert!(new.trim_end().ends_with("---"));
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_remove_field_errors_when_absent() {
+        let old = "---\ntitle: X\n---\n\nBody\n";
+        let err = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::RemoveField {
+                field: "nonexistent".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("nonexistent"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_remove_field_removes_when_present() {
+        let old = "---\ntitle: X\nstatus: draft\n---\n\nBody\n";
+        let new = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::RemoveField {
+                field: "status".into(),
+            }],
+        )
+        .unwrap();
+        let (fm, _) = validate::parse_frontmatter_raw(&new);
+        assert!(!fm.contains_key("status"));
+        assert!(fm.contains_key("title"));
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_add_values_creates_and_dedupes() {
+        let old = "---\ntitle: X\ntags: [a]\n---\n\nBody\n";
+        let new = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::AddValues {
+                field: "tags".into(),
+                values: vec![serde_json::json!("a"), serde_json::json!("b")],
+            }],
+        )
+        .unwrap();
+        let (fm, _) = validate::parse_frontmatter_raw(&new);
+        let tags: Vec<String> = fm
+            .get("tags")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(tags, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_add_values_creates_field_when_absent() {
+        let old = "---\ntitle: X\n---\n\nBody\n";
+        let new = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::AddValues {
+                field: "tags".into(),
+                values: vec![serde_json::json!("new")],
+            }],
+        )
+        .unwrap();
+        let (fm, _) = validate::parse_frontmatter_raw(&new);
+        assert_eq!(
+            fm.get("tags").unwrap().as_array().unwrap(),
+            &vec![serde_json::json!("new")]
+        );
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_add_values_errors_on_non_list_field() {
+        let old = "---\ntitle: X\n---\n\nBody\n";
+        let err = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::AddValues {
+                field: "title".into(),
+                values: vec![serde_json::json!("x")],
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("title"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_remove_values_filters_the_list() {
+        let old = "---\ntitle: X\ntags: [a, b, c]\n---\n\nBody\n";
+        let new = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::RemoveValues {
+                field: "tags".into(),
+                values: vec![serde_json::json!("b")],
+            }],
+        )
+        .unwrap();
+        let (fm, _) = validate::parse_frontmatter_raw(&new);
+        let tags: Vec<String> = fm
+            .get("tags")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(tags, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_remove_values_errors_when_field_absent() {
+        let old = "---\ntitle: X\n---\n\nBody\n";
+        let err = apply_frontmatter_patch(
+            old,
+            &[FrontmatterEdit::RemoveValues {
+                field: "tags".into(),
+                values: vec![serde_json::json!("a")],
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("tags"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_frontmatter_patch_multiple_edits_apply_in_order() {
+        let old = "---\ntitle: X\nstatus: draft\ntags: [a]\n---\n\nBody\n";
+        let new = apply_frontmatter_patch(
+            old,
+            &[
+                FrontmatterEdit::SetField {
+                    field: "status".into(),
+                    value: serde_json::json!("active"),
+                },
+                FrontmatterEdit::AddValues {
+                    field: "tags".into(),
+                    values: vec![serde_json::json!("b")],
+                },
+                FrontmatterEdit::RemoveField {
+                    field: "title".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let (fm, _) = validate::parse_frontmatter_raw(&new);
+        assert_eq!(fm.get("status").unwrap(), "active");
+        assert!(!fm.contains_key("title"));
+        assert_eq!(
+            fm.get("tags").unwrap().as_array().unwrap().len(),
+            2,
+            "got: {:?}",
+            fm.get("tags")
+        );
+    }
+
+    #[test]
+    fn apply_append_no_frontmatter() {
+        let result = apply_append("existing line\n", "new entry");
+        assert_eq!(result, "existing line\nnew entry\n");
+    }
+
+    #[test]
+    fn apply_append_no_trailing_newline_on_existing_content() {
+        let result = apply_append("existing line", "new entry");
+        assert_eq!(result, "existing line\nnew entry\n");
+    }
+
+    #[test]
+    fn apply_append_empty_file() {
+        let result = apply_append("", "first entry");
+        assert_eq!(result, "first entry\n");
+    }
+
+    #[test]
+    fn apply_append_with_frontmatter_and_body() {
+        let old = "---\ntitle: X\n---\n\n# Log\n- entry one\n";
+        let result = apply_append(old, "- entry two");
+        assert_eq!(
+            result,
+            "---\ntitle: X\n---\n\n# Log\n- entry one\n- entry two\n"
+        );
+    }
+
+    #[test]
+    fn apply_append_with_frontmatter_and_no_body_inserts_a_separator() {
+        let old = "---\ntitle: X\n---\n";
+        let result = apply_append(old, "first body line");
+        assert_eq!(result, "---\ntitle: X\n---\n\nfirst body line\n");
+    }
+
+    #[test]
+    fn apply_append_never_touches_the_frontmatter_block() {
+        let old = "---\ntitle: X\ndescription: a---b\n---\n\nBody\n";
+        let result = apply_append(old, "more");
+        assert!(result.starts_with("---\ntitle: X\ndescription: a---b\n---\n"));
+    }
+
+    #[test]
+    fn apply_append_strips_a_trailing_newline_the_caller_included() {
+        // Whether the caller's `text` ends in `\n` or not, the result always
+        // has exactly one trailing newline — never two.
+        let a = apply_append("body\n", "entry\n");
+        let b = apply_append("body\n", "entry");
+        assert_eq!(a, b);
+        assert!(a.ends_with("entry\n") && !a.ends_with("entry\n\n"));
+    }
+
+    // -----------------------------------------------------------------------
     // Test harness: a WriteDeps backed by a temp dir and (unreachable) real
     // EmbedClient/QdrantStore — matching the pattern `mcp.rs`'s own write tests
     // use, since dedup is disabled by default in `make_test_resolved_config`.
@@ -3845,6 +4438,174 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
             original
+        );
+        assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status(&work), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // (#179) frontmatter_patch / append end-to-end through `write_document`.
+    // These prove the design decision in this module's content-mode-helpers
+    // section: `apply_frontmatter_patch`/`apply_append` only ever COMPUTE
+    // `new_content` — by the time it reaches `write_document`, a patch/append
+    // write is indistinguishable from an ordinary full-replace write of that
+    // same content, so schema validation and the pre-commit rollback apply to
+    // it with no special-casing.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn frontmatter_patch_synced_write_updates_only_frontmatter_end_to_end() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "---\ntitle: Log\nstatus: draft\n---\n\n# Body\nunchanged\n";
+        std::fs::write(work.path().join("log.md"), original).unwrap();
+        git_commit_all(&work, "log.md", "add log.md");
+
+        let harness = git_backed_harness(&work);
+        let new_content = apply_frontmatter_patch(
+            original,
+            &[FrontmatterEdit::SetField {
+                field: "status".into(),
+                value: serde_json::json!("active"),
+            }],
+        )
+        .unwrap();
+
+        let mut req = make_req("log.md", &new_content, false);
+        req.old_content = original;
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        let on_disk = std::fs::read_to_string(work.path().join("log.md")).unwrap();
+        let (fm, body) = validate::parse_frontmatter_raw(&on_disk);
+        assert_eq!(fm.get("status").unwrap(), "active");
+        assert_eq!(fm.get("title").unwrap(), "Log");
+        assert_eq!(body.trim(), "# Body\nunchanged");
+
+        crate::reindex::test_support::assert_marked_dirty(&harness.reindex_queue, &["log.md"]);
+    }
+
+    #[tokio::test]
+    async fn frontmatter_patch_validation_failure_leaves_the_file_untouched() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "---\ntitle: Log\nstatus: draft\n---\n\n# Body\n";
+        std::fs::write(work.path().join("log.md"), original).unwrap();
+        git_commit_all(&work, "log.md", "add log.md");
+
+        let mut config = crate::mcp::make_test_resolved_config(work.path());
+        Arc::get_mut(&mut config).unwrap().frontmatter.required = vec!["title".into()];
+        let harness = Harness::new(&work, config);
+
+        // Patch removes the very field the schema requires — this must fail
+        // schema validation exactly like any other write, not silently commit.
+        let new_content = apply_frontmatter_patch(
+            original,
+            &[FrontmatterEdit::RemoveField {
+                field: "title".into(),
+            }],
+        )
+        .unwrap();
+
+        let mut req = make_req("log.md", &new_content, false);
+        req.old_content = original;
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::Validation { result } => {
+                assert!(result.field_errors.iter().any(|e| e.field == "title"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("log.md")).unwrap(),
+            original,
+            "a rejected patch must never touch the file on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontmatter_patch_precommit_failure_rolls_back_to_the_original_content() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "---\ntitle: Log\nstatus: draft\n---\n\n# Body\n";
+        std::fs::write(work.path().join("log.md"), original).unwrap();
+        git_commit_all(&work, "log.md", "add log.md");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let harness = git_backed_harness(&work);
+
+        let new_content = apply_frontmatter_patch(
+            original,
+            &[FrontmatterEdit::SetField {
+                field: "status".into(),
+                value: serde_json::json!("active"),
+            }],
+        )
+        .unwrap();
+
+        let mut req = make_req("log.md", &new_content, false);
+        req.old_content = original;
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
+            other => panic!("expected PreCommitFailed, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("log.md")).unwrap(),
+            original,
+            "a patch write's rollback must participate exactly like any other edit's"
+        );
+        assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status(&work), "");
+    }
+
+    #[tokio::test]
+    async fn append_synced_write_adds_to_the_end_of_the_body_end_to_end() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "---\ntitle: Log\n---\n\n# Log\n- entry one\n";
+        std::fs::write(work.path().join("log.md"), original).unwrap();
+        git_commit_all(&work, "log.md", "add log.md");
+
+        let harness = git_backed_harness(&work);
+        let new_content = apply_append(original, "- entry two");
+
+        let mut req = make_req("log.md", &new_content, false);
+        req.old_content = original;
+        let success = write_document(&harness.deps(), req).await.unwrap();
+        assert_eq!(success.outcome, WriteOutcome::Synced);
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("log.md")).unwrap(),
+            "---\ntitle: Log\n---\n\n# Log\n- entry one\n- entry two\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_precommit_failure_rolls_back_to_the_original_content() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original = "---\ntitle: Log\n---\n\n# Log\n- entry one\n";
+        std::fs::write(work.path().join("log.md"), original).unwrap();
+        git_commit_all(&work, "log.md", "add log.md");
+        let head_before = head_sha(&work);
+
+        force_git_commit_to_fail(&work);
+        let harness = git_backed_harness(&work);
+        let new_content = apply_append(original, "- entry two");
+
+        let mut req = make_req("log.md", &new_content, false);
+        req.old_content = original;
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        match err {
+            WriteError::PreCommitFailed { rolled_back, .. } => assert!(rolled_back),
+            other => panic!("expected PreCommitFailed, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("log.md")).unwrap(),
+            original,
+            "an append write's rollback must participate exactly like any other edit's"
         );
         assert_eq!(head_before, head_sha(&work));
         assert_eq!(git_status(&work), "");
