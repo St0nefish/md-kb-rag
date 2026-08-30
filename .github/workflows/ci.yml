@@ -166,13 +166,21 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: self-hosted
-    # TEMPORARY (this commit only): still non-blocking while the networking
-    # fix in `Start Qdrant` below is proven on the real runner. This job has
-    # never once succeeded — 0 successes in 52 attempts — so it does not get
-    # promoted to blocking on the strength of local runs alone. Flipped in the
-    # follow-up commit once a run is observed green.
-    continue-on-error: true
-
+    # Blocking as of #133. Three separate things had to be true first, and all
+    # three now are:
+    #  1. Two pre-existing bugs in the tests themselves — an invalid literal
+    #     point-ID UUID in phrase_index_enables_exact_phrase_matching's fixture
+    #     (fixed by #212) and a genuine assertion mismatch in
+    #     recommend_by_point_id_finds_nearest_neighbor (fixed by #231, which
+    #     also made the suite safe under cargo's default multi-threaded
+    #     harness rather than --test-threads=1). Both closed.
+    #  2. The job could never reach qdrant at all: it published ports onto the
+    #     host's loopback from a runner that is itself a container. Fixed in
+    #     `Start Qdrant` below — see that step's comment.
+    #  3. An actual green run. This job had 0 successes in 52 attempts before
+    #     that fix; run 33342483836 is the first, with `Run live-Qdrant tests`
+    #     reporting "7 passed; 0 failed". It is required from that point on,
+    #     not on the strength of local runs.
     steps:
       - uses: actions/checkout@v5
         with:
@@ -279,19 +287,29 @@ jobs:
         run: docker rm -f ci-qdrant 2>/dev/null || true
 
   # Gate job for branch protection — set "ci-pass" as the required status check.
-  # Passes when test succeeds or was skipped (doc-only changes).
-  # qdrant-integration is temporarily still out of this list — see its own
-  # comment; it is added back once its networking fix is observed green.
+  # Passes when both test and qdrant-integration succeed or were skipped
+  # (doc-only changes skip both identically, via the same `changes` gate).
+  # #133: qdrant-integration used to be deliberately left out of this list —
+  # see its own job comment for why that's no longer the case.
   ci-pass:
     if: always()
-    needs: [test]
+    needs: [test, qdrant-integration]
     runs-on: ubuntu-latest
     steps:
       - name: Check result
         run: |
-          if [[ "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
-            echo "CI passed (test: ${{ needs.test.result }})"
+          ok=true
+          if [[ ! "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "test: ${{ needs.test.result }}"
+            ok=false
+          fi
+          if [[ ! "${{ needs.qdrant-integration.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "qdrant-integration: ${{ needs.qdrant-integration.result }}"
+            ok=false
+          fi
+          if [[ "$ok" == "true" ]]; then
+            echo "CI passed (test: ${{ needs.test.result }}, qdrant-integration: ${{ needs.qdrant-integration.result }})"
           else
-            echo "CI failed (test: ${{ needs.test.result }})"
+            echo "CI failed"
             exit 1
           fi
