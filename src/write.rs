@@ -5187,6 +5187,110 @@ mod tests {
         assert_eq!(git_status(&work), "");
     }
 
+    /// Covers write.rs's step-10.5 self-contained rollback (fires when a
+    /// `tokio::fs::write` into a referencing document fails DURING the
+    /// rewrite loop, before git is touched at all) — a distinct code path
+    /// from `move_precommit_failure_with_rewrites_restores_the_referencing_document_too`
+    /// above, which exercises the LATER rollback triggered by `git commit`
+    /// itself failing (#145).
+    ///
+    /// Two referencing documents point at the source. `StateDb::links_targeting`
+    /// returns sources `ORDER BY source_path`, so `ref-a.md` is rewritten
+    /// FIRST and lands on disk successfully, then `ref-b.md`'s write is forced
+    /// to fail (its permission bits stripped to read-only) — standing in for
+    /// a permission race or a full disk hitting the SECOND of several
+    /// referencing documents mid-loop, which is exactly the scenario the
+    /// issue's "duplicated at both old and new locations, or another
+    /// document's content corrupted" failure mode depends on. The rollback
+    /// must undo THREE things, not just the failing write: the
+    /// already-rewritten `ref-a.md`, the source removal, and the destination
+    /// write — proving the loop's own by-hand unwind (not the later
+    /// git-commit-triggered one) is correct.
+    #[tokio::test]
+    async fn move_link_rewrite_write_failure_rolls_back_the_move_and_every_already_rewritten_document()
+     {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        std::fs::create_dir_all(work.path().join("old")).unwrap();
+        let source_original =
+            "---\ntitle: Move Me\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Body\n";
+        std::fs::write(work.path().join("old/loc.md"), source_original).unwrap();
+        git_commit_all(&work, "old/loc.md", "add old/loc.md");
+
+        let ref_a_original = "---\ntitle: Ref A\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [the moved doc](old/loc.md) for more.\n";
+        let ref_b_original = "---\ntitle: Ref B\ndescription: d\ntype: guide\ntags: [t]\n\
+             ---\n\nSee [the moved doc](old/loc.md) too.\n";
+        std::fs::write(work.path().join("ref-a.md"), ref_a_original).unwrap();
+        std::fs::write(work.path().join("ref-b.md"), ref_b_original).unwrap();
+        git_commit_paths(&work, &["ref-a.md", "ref-b.md"], "add referencing docs");
+        let head_before = head_sha(&work);
+
+        let harness = git_backed_harness_with_state_db(&work).await;
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links("ref-a.md", "markdown", &[("old/loc.md".to_string(), None)])
+            .await
+            .unwrap();
+        harness
+            .state_db
+            .as_ref()
+            .unwrap()
+            .replace_links("ref-b.md", "markdown", &[("old/loc.md".to_string(), None)])
+            .await
+            .unwrap();
+
+        // Read-only: `read_to_string` (earlier in the same loop iteration)
+        // still succeeds, so the code genuinely reaches — and fails at — the
+        // write this test targets, rather than taking the earlier "stale
+        // row, skip" branch on a read failure.
+        let ref_b_path = work.path().join("ref-b.md");
+        let mut perms = std::fs::metadata(&ref_b_path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&ref_b_path, perms).unwrap();
+
+        let req = make_move_req("old/loc.md", "new/loc.md", source_original, source_original);
+        let err = write_document(&harness.deps(), req).await.unwrap_err();
+        assert!(
+            matches!(err, WriteError::Io { .. }),
+            "expected Io (the write-failure branch, not a git failure), got {err:?}"
+        );
+
+        // Restore permissions before the assertions below (and the tempdir's
+        // own cleanup) touch the file again.
+        let mut perms = std::fs::metadata(&ref_b_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&ref_b_path, perms).unwrap();
+
+        assert!(
+            !work.path().join("new/loc.md").exists(),
+            "destination must be removed by the rollback"
+        );
+        assert!(
+            work.path().join("old/loc.md").exists(),
+            "source must be restored by the rollback"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("old/loc.md")).unwrap(),
+            source_original
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("ref-a.md")).unwrap(),
+            ref_a_original,
+            "the first (already-rewritten) referencing document must be restored too, not \
+             just the move itself"
+        );
+
+        // This rollback runs entirely before git is touched — no `git add`
+        // ever ran, so there is nothing to unstage and HEAD never moved.
+        assert_eq!(head_before, head_sha(&work));
+        assert_eq!(git_status(&work), "");
+    }
+
     #[tokio::test]
     async fn move_with_no_state_db_does_not_rewrite_a_genuinely_referencing_document() {
         let bare = crate::git::tests::create_bare_repo("master");
