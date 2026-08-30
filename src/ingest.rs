@@ -848,6 +848,16 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
 
     // Tail trim: for files that shrank, delete stale high-index point IDs.
     // Non-fatal: warn and continue; stale tail points will be cleaned on next --full.
+    //
+    // fix #251: this runs BEFORE the per-file state loop below writes this same
+    // file's new (lower) chunk_count, which opens a narrow, bounded DEFICIT window
+    // for #155's `detect_qdrant_wipe` — state.db still claims `pf.old_chunk_count`
+    // while Qdrant has already dropped to the trimmed, lower count. See
+    // `flush_pending_batch`'s "## #155's Qdrant-wipe deficit-detector window" doc
+    // comment for the full accounting of why this window is safe to leave in
+    // place rather than reordered, and `upsert_pending_tail_trim_runs_before_this_
+    // files_state_write` (this module's test module) for the regression test that
+    // pins the ordering this comment depends on.
     for (pf, (_start, new_count)) in pending.iter().zip(file_boundaries.iter()) {
         if pf.old_chunk_count > *new_count {
             let stale_ids: Vec<String> = (*new_count..pf.old_chunk_count)
@@ -870,6 +880,10 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     // file must not abandon the rest of the batch — that would leave later files with
     // vectors but no state row, and they would be needlessly re-embedded next run.
     // Record and continue; every failure mode here self-heals on the following run.
+    //
+    // For a shrunk file, THIS `state.upsert` call is also what closes the tail-trim
+    // deficit window opened above (fix #251) — the moment it commits, state.db's
+    // claim for this file matches (or is behind) what Qdrant actually holds again.
     let mut bookkeeping_failures = 0usize;
     for (pf, (_start, count)) in pending.iter().zip(file_boundaries.iter()) {
         if let Err(e) = state
@@ -1135,12 +1149,15 @@ const PENDING_FLUSH_BATCH_SIZE: usize = 200;
 ///     written. That work survives the crash intact — nothing about it depended on
 ///     the run finishing.
 ///   - Batch 3, whichever step it died on, is exactly as safe as a *whole-corpus*
-///     `upsert_pending` call dying at that same step always was — `upsert_pending`'s
-///     own doc comment already covers this (points are written before state, so a
-///     crash between the two leaves a harmless SURPLUS: Qdrant points with no
-///     matching state row yet, self-healing on retry, never a deficit). Sub-batching
-///     does not change that internal ordering at all; it only shrinks how much of
-///     the corpus can be "batch 3" at once.
+///     `upsert_pending` call dying at that same step always was: new points are
+///     written before matching state rows, so a crash in THAT window leaves a
+///     harmless SURPLUS (Qdrant points with no matching state row yet, self-healing
+///     on retry) — with one narrow, bounded exception for a file that SHRANK, whose
+///     tail-trim delete also runs before that file's own state write; see "## #155's
+///     Qdrant-wipe deficit-detector window" below for why that exception stays
+///     accurate as a bounded DEFICIT rather than the SURPLUS the general case
+///     produces. Sub-batching does not change any of that internal ordering at all;
+///     it only shrinks how much of the corpus can be "batch 3" at once.
 ///   - Batches 4 through 10 were never reached: the scan loop simply never got to
 ///     those paths, so their `indexed_files` rows are untouched — whatever they were
 ///     before this run started (stale, or absent for a new file). Because nothing
@@ -1176,16 +1193,60 @@ const PENDING_FLUSH_BATCH_SIZE: usize = 200;
 /// ## #155's Qdrant-wipe deficit-detector window
 ///
 /// `detect_qdrant_wipe` flags a DEFICIT: state.db believes more chunks exist than
-/// Qdrant actually has. `upsert_pending` writes Qdrant points before it writes the
-/// matching state rows (see its own doc comment), so mid-batch it can only ever
-/// produce a SURPLUS (Qdrant ahead of state), which the detector already treats as
-/// legitimate. Sub-batching does not change that per-batch ordering — it only means
-/// there are now several smaller such windows across a run instead of one huge one
-/// spanning the whole corpus. If anything this NARROWS the aggregate surplus window
-/// versus the pre-#160 code, which mid-run held the ENTIRE pending batch's points
-/// written and NONE of its state rows written until the single terminal call's
-/// per-file state loop finished — a bigger, not smaller, surplus window than any one
-/// sub-batch here produces. The one deficit-producing sequence in this module
+/// Qdrant actually has. `upsert_pending`'s batch-wide `upsert_points` call writes
+/// EVERY new/changed point before any state row in this batch is written, so THAT
+/// part of the call is surplus-only, exactly as the previous version of this
+/// comment claimed — but that is not the whole story, and the previous wording
+/// (fix #251) overstated it into an absolute "can only ever produce a SURPLUS",
+/// which is surplus-DOMINANT but not surplus-ONLY:
+///
+/// `upsert_pending` also tail-trims stale high-index points for a file that
+/// SHRANK, and — see the tail-trim loop's own comment in `upsert_pending` — that
+/// delete runs BEFORE the per-file state loop reaches that same file's
+/// `state.upsert`. For the window between one shrunk file's tail-trim delete and
+/// its own state write, state.db still claims that file's OLD (higher) chunk
+/// count while Qdrant has already dropped to the NEW (lower) one: a genuine
+/// DEFICIT, not a surplus, for that file specifically. It is bounded, not merely
+/// "small enough to hand-wave": the deficit for any one file is capped at
+/// `old_chunk_count - new_chunk_count` (the trim never deletes more than that),
+/// and because the ENTIRE tail-trim loop runs before the state loop starts on ANY
+/// file in this batch, the aggregate deficit at its absolute worst — the instant
+/// the state loop is about to begin — is the sum of that per-file delta across
+/// every file that shrank in this one flush, itself capped at
+/// `PENDING_FLUSH_BATCH_SIZE` (200) files. `QDRANT_WIPE_DEFICIT_SLACK` (50) is
+/// sized for ordinary mid-write noise, not "every file in a 200-file batch shrank
+/// substantially" — a pathological corpus edit could in principle push one
+/// batch's aggregate past slack — but the window closes the moment the state loop
+/// reaches each shrunk file (a single SQLite upsert per file, not the embed/upsert
+/// round trip that dominates a flush's wall time), so its real-world exposure is
+/// brief. `upsert_pending_tail_trim_runs_before_this_files_state_write` (this
+/// module's test module) pins the ordering this whole section depends on.
+///
+/// This was deliberately NOT fixed by reordering `upsert_pending` to write state
+/// before tail-trimming (which WOULD close the window and make the surplus-only
+/// claim literally true) — that trade was considered and rejected. Reordering
+/// means a crash between the state write and the tail-trim delete leaves state.db
+/// already correct (claiming the NEW, lower count) while Qdrant still holds the
+/// stale high-index points, now with NOTHING left to ever detect and clean them:
+/// the file's content hash already matches, so the next reconcile sweep's dirty
+/// detection will not re-select it, and #155's deficit detector is one-sided
+/// (surplus is never a fault — see `detect_qdrant_wipe`'s own doc comment) and so
+/// would never flag it either. That is the exact "worse regression" this module's
+/// `remove_orphans` doc comment (on `acquire_reindex_lock`) already declined for
+/// the analogous ordering in orphan deletion — permanently orphaned points beat no
+/// detection mechanism, but a self-healing bounded deficit beats both. Leaving
+/// `upsert_pending`'s current order in place is what keeps a failed/incomplete
+/// tail-trim (for ANY reason — a crash, or the delete call itself failing, which
+/// the tail-trim loop already treats as non-fatal) always self-healing via the
+/// SAME state-hash-mismatch retry path the rest of this module relies on: a state
+/// row that has NOT yet advanced to the new count is what makes the file dirty
+/// again on the next scan.
+///
+/// Sub-batching does not create this window — it existed identically in the
+/// pre-#160 single terminal call, just capable of spanning the WHOLE corpus's
+/// shrunk files in one pass instead of one batch's worth; if anything sub-batching
+/// narrows its typical aggregate size the same way it narrows the surplus window
+/// above. The one deficit-producing sequence in this module
 /// (`index_paths_generic`'s `force` block: `state.clear()` before
 /// `drop_collection()`) runs entirely BEFORE the scan loop / any flush, so it is
 /// untouched by this change; `acquire_reindex_lock`'s cross-process exclusivity is
@@ -6043,6 +6104,63 @@ mod tests {
         }
     }
 
+    /// Witnesses `upsert_pending`'s internal call order for fix #251: at the exact
+    /// moment tail-trim's `delete_points_by_ids` fires for a shrinking file, this
+    /// reads `state.total_chunk_count()` back through the SAME `StateDb` handle
+    /// `upsert_pending` is about to update, and records it. If `upsert_pending` had
+    /// already written that file's new (shrunk) chunk count to state.db before
+    /// tail-trimming it, the recorded sum would already reflect the new, lower
+    /// total; recording the OLD (pre-shrink) total instead proves the state write
+    /// has not happened yet at that point — precisely the ordering the corrected
+    /// #251 doc comment on `flush_pending_batch` depends on. See
+    /// `upsert_pending_tail_trim_runs_before_this_files_state_write` below.
+    struct DeficitWitnessStore<'a> {
+        state: &'a StateDb,
+        chunk_sum_at_trim: Mutex<Option<i64>>,
+    }
+
+    impl VectorStore for DeficitWitnessStore<'_> {
+        async fn upsert_points(
+            &self,
+            _collection: &str,
+            _points: Vec<crate::qdrant::QdrantPoint>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_by_files(&self, _collection: &str, _file_paths: &[&str]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_points_by_ids(&self, _collection: &str, _ids: Vec<String>) -> Result<()> {
+            let sum = self
+                .state
+                .total_chunk_count()
+                .await
+                .expect("total_chunk_count must succeed against the test DB");
+            *self.chunk_sum_at_trim.lock().unwrap() = Some(sum);
+            Ok(())
+        }
+
+        async fn drop_collection(&self, _collection: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_collection(
+            &self,
+            _collection: &str,
+            _vector_size: u64,
+            _indexed_fields: &[crate::qdrant::IndexedField],
+            _enable_phrase: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn collection_point_count(&self, _collection: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
     // `index_paths_generic` requires `Q: VectorStore + NeighborStore` since
     // `update_semantic_edges` runs in the same call path. None of the
     // `index_paths_generic` tests above enable `ui.semantic_edges`, so this is
@@ -6698,6 +6816,55 @@ mod tests {
 
         let deleted_ids = store.deleted_ids.lock().unwrap().clone();
         assert!(deleted_ids.is_empty(), "no tail trim when file grew");
+    }
+
+    /// fix #251 — proves the ordering claim the corrected `flush_pending_batch` doc
+    /// comment makes: for a file that shrank, tail-trim's `delete_points_by_ids`
+    /// runs BEFORE that file's own `state.upsert`, so there is a real (if narrow and
+    /// bounded) window where state.db still claims the file's OLD chunk count while
+    /// Qdrant has already been trimmed down to the NEW one — a deficit, not a
+    /// surplus, contradicting the pre-fix comment's absolute "can only ever produce
+    /// a SURPLUS" claim. Uses `DeficitWitnessStore` to read `state.total_chunk_count()`
+    /// from inside `delete_points_by_ids` itself, capturing exactly what a
+    /// concurrent `detect_qdrant_wipe` read could observe at that instant.
+    #[tokio::test]
+    async fn upsert_pending_tail_trim_runs_before_this_files_state_write() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        state
+            .upsert("data/shrink251.md", "old-hash", 5, "", 0, 0)
+            .await
+            .unwrap();
+
+        let pf = make_pending("data/shrink251.md", 2, 5);
+        let pending = vec![pf];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
+        let store = DeficitWitnessStore {
+            state: &state,
+            chunk_sum_at_trim: Mutex::new(None),
+        };
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        assert!(result.is_ok());
+
+        let observed = store
+            .chunk_sum_at_trim
+            .lock()
+            .unwrap()
+            .expect("tail-trim must have fired for a file that shrank");
+        assert_eq!(
+            observed, 5,
+            "state.db must still report the file's OLD chunk count (5) at the moment \
+             tail-trim deletes its stale Qdrant points — if this were the file's NEW \
+             count (2) instead, state.upsert would have already run and the deficit \
+             window this test exists to characterize would not exist"
+        );
+
+        // The window closes by the time the whole call returns: state has caught up
+        // to Qdrant's already-trimmed count.
+        let entry = state.get("data/shrink251.md").await.unwrap().unwrap();
+        assert_eq!(entry.chunk_count, 2);
     }
 
     /// Every upserted point's ID must be keyed off its OWN file and chunk index —
