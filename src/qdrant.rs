@@ -230,6 +230,21 @@ pub fn all_indexed_fields(
 /// so that class of drift can't happen again.
 pub const CHUNK_TEXT_KEY: &str = "text";
 
+/// The Qdrant payload key under which a document's ancestor-directory keyword
+/// array is stored (#130) — for `sysadmin/nodes/ares/boot/efi.md`:
+/// `["sysadmin", "sysadmin/nodes", "sysadmin/nodes/ares", "sysadmin/nodes/ares/boot",
+/// "sysadmin/nodes/ares/boot/efi.md"]` (every ancestor directory, deepest last,
+/// plus the document's own full relative path as the terminal entry — see
+/// `ingest::derive_path_ancestors`'s doc comment for why the file's own path is
+/// included even though the issue's example stops at the parent directory).
+///
+/// There is exactly one writer — `ingest::index_paths` — and it must be the only
+/// place that ever inserts this key, same discipline as [`CHUNK_TEXT_KEY`] and for
+/// the same reason (the #61 regression). Every place that turns a `path_prefix`
+/// into a Qdrant condition (currently `retrieval::path_prefix_condition`) must go
+/// through this constant instead of a string literal.
+pub const PATH_ANCESTORS_KEY: &str = "path_ancestors";
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub score: f32,
@@ -868,6 +883,40 @@ impl QdrantStore {
                 );
                 crate::status::INDEX_STATUS.record_payload_index(
                     "mtime",
+                    Some(crate::status::redact_error(&format!("{e:#}"))),
+                );
+            }
+        }
+
+        // Keyword index on `path_ancestors` (#130), unconditional and non-fatal for
+        // the same reasons as the `mtime` index just above: it is a derived field
+        // every point carries going forward (not a schema-declared one, so it isn't
+        // in `indexed_fields`), and Qdrant filters correctly without the index —
+        // just by an unindexed scan — so a creation failure degrades performance,
+        // not correctness, and must not fail startup.
+        //
+        // A keyword index on an array-valued field indexes every element, which is
+        // exactly what `path_prefix_condition`'s `Condition::matches` (single-value
+        // "does the array contain this element") needs to run as an index lookup
+        // rather than a full collection scan.
+        match self
+            .client
+            .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                collection,
+                PATH_ANCESTORS_KEY,
+                FieldType::Keyword,
+            ))
+            .await
+        {
+            Ok(_) => crate::status::INDEX_STATUS.record_payload_index(PATH_ANCESTORS_KEY, None),
+            Err(e) => {
+                error!(
+                    "Could not ensure the keyword index on '{}' in collection '{}': {:#}. \
+                     path_prefix filtering may be slow until this is resolved.",
+                    PATH_ANCESTORS_KEY, collection, e
+                );
+                crate::status::INDEX_STATUS.record_payload_index(
+                    PATH_ANCESTORS_KEY,
                     Some(crate::status::redact_error(&format!("{e:#}"))),
                 );
             }

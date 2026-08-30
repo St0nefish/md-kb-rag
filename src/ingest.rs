@@ -12,7 +12,9 @@ use crate::{
     chunk,
     config::{IndexingConfig, ResolvedConfig, SemanticEdgesConfig},
     embed::{EmbedClient, EmbedStore},
-    qdrant::{CHUNK_TEXT_KEY, QdrantPoint, QdrantStore, SearchResult, VectorStore},
+    qdrant::{
+        CHUNK_TEXT_KEY, PATH_ANCESTORS_KEY, QdrantPoint, QdrantStore, SearchResult, VectorStore,
+    },
     schema::{ResolvedSchema, SchemaCache},
     state::{IndexedFile, StateDb},
     status::{INDEX_STATUS, Phase, RunMode, Trigger},
@@ -798,7 +800,18 @@ async fn upsert_pending<E: EmbedStore, Q: VectorStore>(
     for (pf, (start, count)) in pending.iter().zip(file_boundaries.iter()) {
         let embeddings = &all_embeddings[*start..*start + *count];
 
-        let base_payload = with_derived_domain(&pf.frontmatter, &pf.file_path);
+        let mut base_payload = with_derived_domain(&pf.frontmatter, &pf.file_path);
+        // #130: every point for this file carries the same ancestor-path array —
+        // computed once per file, not per chunk, same as `base_payload` itself.
+        base_payload.insert(
+            PATH_ANCESTORS_KEY.to_string(),
+            serde_json::Value::Array(
+                derive_path_ancestors(&pf.file_path)
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
 
         for (chunk, vector) in pf.chunks.iter().zip(embeddings.iter()) {
             let mut payload: HashMap<String, serde_json::Value> = base_payload.clone();
@@ -1413,6 +1426,62 @@ pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
         std::path::Component::Normal(name) => name.to_str().map(str::to_string),
         _ => None,
     }
+}
+
+/// Derive the ancestor-path keyword array (#130) stored under
+/// [`crate::qdrant::PATH_ANCESTORS_KEY`], which is what turns `path_prefix` from a
+/// post-fetch retain (`retrieval::apply_path_prefix`) into a native, exact Qdrant
+/// payload filter (`retrieval::path_prefix_condition`).
+///
+/// For `sysadmin/nodes/ares/boot/efi.md` this returns, in order:
+/// `["sysadmin", "sysadmin/nodes", "sysadmin/nodes/ares",
+/// "sysadmin/nodes/ares/boot", "sysadmin/nodes/ares/boot/efi.md"]` — every proper
+/// ancestor directory, shallowest first, deepest last, **plus the document's own
+/// full relative path as the final entry**.
+///
+/// That last entry is a deliberate superset of the issue's own example (which
+/// stops at the parent directory): today's post-fetch `path_prefix` retain matches
+/// against the *whole* relative path string, so a caller can already pass a
+/// prefix that is (or extends into) a filename — most usefully the full path of one
+/// specific document, to scope a query to just that file. Stopping the ancestor
+/// array at the parent directory would silently break that call shape once a
+/// document is reindexed under this field: an exact `path_ancestors` match could
+/// never succeed against a prefix Qdrant never saw recorded anywhere. Appending the
+/// full path costs one extra keyword per document and closes the gap exactly.
+///
+/// What this does NOT preserve: a prefix that is a genuine partial filename (e.g.
+/// `sysadmin/nodes/ares/boot/ef` to fuzzy-match `efi.md`) can no longer match once
+/// a document is reindexed — an exact keyword-array membership test has no notion
+/// of "starts with" below the segment/full-path granularity this array records.
+/// That narrowing is intentional and, in practice, rarely relied on: every
+/// documented and tested use of `path_prefix` (this KB's top-level areas, a single
+/// document's exact path) is one of the two granularities this array does capture.
+/// A caller who genuinely needs arbitrary substring-prefix matching still has it in
+/// enumeration mode (`search` with no `query`, which compiles `path_prefix` to SQL
+/// `LIKE prefix%` in `state.rs` — untouched by this change).
+///
+/// Returns an empty vector for a document at the knowledge-base root (mirroring
+/// `derive_domain`'s "no area" case) plus, still, its own full path as the sole
+/// entry — a root-level document is a legitimate `path_prefix` target too.
+pub(crate) fn derive_path_ancestors(rel_path: &str) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    let mut built = String::new();
+    for component in Path::new(rel_path).components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let Some(name) = name.to_str() else { continue };
+        if !built.is_empty() {
+            built.push('/');
+        }
+        built.push_str(name);
+        ancestors.push(built.clone());
+    }
+    // The loop above already pushed the full path as its last iteration (there is
+    // no separate "stop at the parent" step to undo) — every prefix ending at a
+    // directory boundary AND the terminal full-path entry both fall out of the
+    // same accumulation.
+    ancestors
 }
 
 // ---------------------------------------------------------------------------
@@ -4939,6 +5008,41 @@ mod tests {
         assert_eq!(derive_domain(""), None);
     }
 
+    // -- path-ancestor derivation (#130) --------------------------------------
+
+    #[test]
+    fn path_ancestors_are_every_proper_directory_plus_the_full_path() {
+        assert_eq!(
+            derive_path_ancestors("sysadmin/nodes/ares/boot/efi.md"),
+            vec![
+                "sysadmin".to_string(),
+                "sysadmin/nodes".to_string(),
+                "sysadmin/nodes/ares".to_string(),
+                "sysadmin/nodes/ares/boot".to_string(),
+                "sysadmin/nodes/ares/boot/efi.md".to_string(),
+            ],
+            "matches issue #130's own worked example, plus the terminal full-path entry"
+        );
+    }
+
+    #[test]
+    fn path_ancestors_for_a_root_level_document_is_just_its_own_path() {
+        // No parent directory to record, but the document's own path is still a
+        // legitimate `path_prefix` target (e.g. `path_prefix: "README.md"`).
+        assert_eq!(
+            derive_path_ancestors("README.md"),
+            vec!["README.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_ancestors_for_a_single_level_directory() {
+        assert_eq!(
+            derive_path_ancestors("food/chili.md"),
+            vec!["food".to_string(), "food/chili.md".to_string()]
+        );
+    }
+
     #[test]
     fn derived_domain_overrides_whatever_frontmatter_claimed() {
         // Location is the single source of truth; a stale `domain:` key must not win.
@@ -6670,6 +6774,52 @@ mod tests {
                 point.payload.get("file_path").and_then(|v| v.as_str()),
                 Some("data/test.md"),
                 "file_path payload must be the relative key"
+            );
+        }
+    }
+
+    /// #130: pins the actual Qdrant-payload write, not just `derive_path_ancestors`
+    /// in isolation — the two tests above prove the pure function is right, this
+    /// one proves `upsert_pending` actually calls it and stores the result under
+    /// `qdrant::PATH_ANCESTORS_KEY` for every chunk of the file.
+    #[tokio::test]
+    async fn upsert_pending_writes_path_ancestors_payload() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state_db(&dir).await;
+
+        let pending = vec![make_pending("sysadmin/nodes/ares/boot/efi.md", 2, 0)];
+        let embedder = MockEmbedClient::ok(vec![vec![1.0; 3], vec![2.0; 3]]);
+        let store = MockVectorStore::all_ok();
+
+        let result = upsert_pending(&pending, &embedder, &store, &state, "test-col").await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let points = store.upserted_points.lock().unwrap();
+        assert_eq!(points.len(), 2, "one point per chunk");
+        for point in points.iter() {
+            let ancestors: Vec<String> = point
+                .payload
+                .get(PATH_ANCESTORS_KEY)
+                .unwrap_or_else(|| panic!("point payload must contain '{PATH_ANCESTORS_KEY}'"))
+                .as_array()
+                .expect("path_ancestors must be an array")
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .expect("every element must be a string")
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                ancestors,
+                vec![
+                    "sysadmin".to_string(),
+                    "sysadmin/nodes".to_string(),
+                    "sysadmin/nodes/ares".to_string(),
+                    "sysadmin/nodes/ares/boot".to_string(),
+                    "sysadmin/nodes/ares/boot/efi.md".to_string(),
+                ],
+                "every chunk of the same file must carry the same ancestor array"
             );
         }
     }

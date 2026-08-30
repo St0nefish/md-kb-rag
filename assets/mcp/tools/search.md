@@ -9,7 +9,13 @@ without.
 Narrow with `filters`, keyed by frontmatter field — a scalar means equals
 (`{"type": "guide"}`), an array means any-of, an object means all-of or a numeric
 range (`{"planning.prep_minutes": {"lt": 30}}`). Nested fields use dot-paths.
-`path_prefix` restricts to a folder.
+`path_prefix` restricts to a folder — an exact match, same as enumeration mode.
+`sysadmin/` and `sysadmin` behave identically. A document indexed before this
+exactness was added still falls back to a slower approximate check until it is
+next reindexed; if that ever under-returns against a very selective prefix,
+the response carries `path_prefix_truncated: true` rather than silently
+handing back fewer matches than actually exist — it settles to always `false`
+once every document has been reindexed at least once.
 
 `offset` pages results. Enumeration (no query) is exhaustive — page as deep as
 you like. With a query, paging reaches only as far as this search's own ranked
