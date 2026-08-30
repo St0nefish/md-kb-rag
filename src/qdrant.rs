@@ -1579,6 +1579,87 @@ impl QdrantStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
+
+    // --- live-Qdrant (`#[ignore]`d) test helpers -- see #231 ---
+    //
+    // The `#[ignore]`d tests below all talk to a real Qdrant server
+    // (`docker compose up -d qdrant`; run with `cargo test -- --ignored`).
+    // CI's `qdrant-integration` job runs that suite under cargo's default
+    // multi-threaded runner, so several of these tests hit the same shared
+    // server concurrently. Two helpers below exist specifically to make that
+    // safe:
+
+    /// Deterministic, per-test collection name. Must be called with the
+    /// test's own function name, not a hand-picked string -- a name tied 1:1
+    /// to the test that owns it can never collide with another test's
+    /// collection (now or as tests are added later) without anyone having to
+    /// remember to pick a fresh name by hand. Deterministic rather than
+    /// random so a failure is reproducible: `cargo test <fn_name> --
+    /// --ignored` always talks to the exact same collection a CI failure did.
+    fn live_test_collection(test_name: &str) -> String {
+        format!("md-kb-rag-test-{test_name}")
+    }
+
+    /// Run a live-Qdrant test body, dropping its collection afterward
+    /// whether the body panics or not. Without this, a failed assertion
+    /// mid-test skips the trailing `delete_collection` call and orphans the
+    /// collection on the server — harmless for a single run, but the orphans
+    /// accumulate across every subsequent run and the server ends up
+    /// carrying stale collections from every test that ever failed once.
+    async fn with_collection_cleanup<F, Fut>(store: &QdrantStore, collection: &str, body: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let result = std::panic::AssertUnwindSafe(body()).catch_unwind().await;
+        let _ = store.client.delete_collection(collection).await;
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// Retry `probe` (typically a live-Qdrant read taken shortly after a
+    /// write) until `ready` accepts its result or `attempts` are exhausted,
+    /// sleeping `interval` between tries.
+    ///
+    /// A prior fixed `tokio::time::sleep(500ms)` before reading back an
+    /// upsert was the actual source of #231's reported flakiness: these
+    /// tests already had unique collection names (nothing here was ever
+    /// dropping a collection out from under another test), but a single
+    /// fixed delay assumes indexing latency is constant, and it isn't --
+    /// under the default multi-threaded `--ignored` runner, several tests
+    /// hit the same shared server at once, so how long a given write takes
+    /// to become visible to a subsequent read varies with how loaded the
+    /// server happens to be right then. That surfaced as exactly the
+    /// "unrelated assertion mismatch" #231 describes (an empty result set,
+    /// or a "no point with id" error, where a fixed-length sleep had usually
+    /// been enough). Confirmed serially (`--test-threads=1`) these tests
+    /// passed every time; only concurrent runs were ever flaky, which is
+    /// what pointed at write-visibility timing rather than a genuine
+    /// collection collision. Polling with a generous ceiling removes the
+    /// dependency on server load while still failing fast if something is
+    /// genuinely wrong.
+    async fn retry_until<T, F, Fut>(
+        attempts: u32,
+        interval: std::time::Duration,
+        mut probe: F,
+        mut ready: impl FnMut(&T) -> bool,
+    ) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let mut last = probe().await;
+        for _ in 1..attempts {
+            if ready(&last) {
+                return last;
+            }
+            tokio::time::sleep(interval).await;
+            last = probe().await;
+        }
+        last
+    }
 
     #[test]
     fn qdrant_value_roundtrip() {
@@ -1643,7 +1724,7 @@ mod tests {
     async fn qdrant_search_returns_payload() {
         let config = ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
-            collection: "test-search-payload".into(),
+            collection: live_test_collection("qdrant_search_returns_payload"),
         };
         let store = QdrantStore::new(&config).unwrap();
 
@@ -1656,58 +1737,61 @@ mod tests {
             .await
             .unwrap();
 
-        let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
-        payload.insert("title".into(), serde_json::json!("Test Document"));
-        payload.insert("file_path".into(), serde_json::json!("/data/test.md"));
-        payload.insert("text".into(), serde_json::json!("Hello world chunk"));
+        with_collection_cleanup(&store, &config.collection, || async {
+            let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
+            payload.insert("title".into(), serde_json::json!("Test Document"));
+            payload.insert("file_path".into(), serde_json::json!("/data/test.md"));
+            payload.insert("text".into(), serde_json::json!("Hello world chunk"));
 
-        let point = QdrantPoint {
-            id: "00000000-0000-0000-0000-000000000001".into(),
-            vector: vec![1.0, 0.0, 0.0, 0.0],
-            sparse: None,
-            payload,
-        };
-        store
-            .upsert_points(&config.collection, vec![point])
-            .await
-            .unwrap();
+            let point = QdrantPoint {
+                id: "00000000-0000-0000-0000-000000000001".into(),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                sparse: None,
+                payload,
+            };
+            store
+                .upsert_points(&config.collection, vec![point])
+                .await
+                .unwrap();
 
-        // Small delay for indexing
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let results = store
-            .search(
-                &config.collection,
-                vec![1.0, 0.0, 0.0, 0.0],
-                HashMap::new(),
-                Vec::new(),
-                1,
+            // Poll instead of a single fixed sleep -- see retry_until's doc
+            // comment for why (#231).
+            let results = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .search(
+                            &config.collection,
+                            vec![1.0, 0.0, 0.0, 0.0],
+                            HashMap::new(),
+                            Vec::new(),
+                            1,
+                        )
+                        .await
+                        .unwrap()
+                },
+                |results| !results.is_empty(),
             )
-            .await
-            .unwrap();
+            .await;
 
-        assert_eq!(results.len(), 1);
-        let result = &results[0];
-        assert_eq!(
-            result.payload.get("title").and_then(|v| v.as_str()),
-            Some("Test Document"),
-            "search results must include payload fields"
-        );
-        assert_eq!(
-            result.payload.get("file_path").and_then(|v| v.as_str()),
-            Some("/data/test.md"),
-        );
-        assert_eq!(
-            result.payload.get("text").and_then(|v| v.as_str()),
-            Some("Hello world chunk"),
-        );
-
-        // Clean up
-        store
-            .client
-            .delete_collection(&config.collection)
-            .await
-            .unwrap();
+            assert_eq!(results.len(), 1);
+            let result = &results[0];
+            assert_eq!(
+                result.payload.get("title").and_then(|v| v.as_str()),
+                Some("Test Document"),
+                "search results must include payload fields"
+            );
+            assert_eq!(
+                result.payload.get("file_path").and_then(|v| v.as_str()),
+                Some("/data/test.md"),
+            );
+            assert_eq!(
+                result.payload.get("text").and_then(|v| v.as_str()),
+                Some("Hello world chunk"),
+            );
+        })
+        .await;
     }
 
     /// #159: `ensure_collection` against an EXISTING collection must reject a
@@ -1739,59 +1823,55 @@ mod tests {
     async fn ensure_collection_rejects_a_dimension_mismatch() {
         let config = ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
-            collection: "test-dimension-mismatch".into(),
+            collection: live_test_collection("ensure_collection_rejects_a_dimension_mismatch"),
         };
         let store = QdrantStore::new(&config).unwrap();
 
         let _ = store.client.delete_collection(&config.collection).await;
 
-        // Create the collection at dimension 4 — as if indexed by an older embedding
-        // model.
-        store
-            .ensure_collection(&config.collection, 4, &[], false)
-            .await
-            .unwrap();
+        with_collection_cleanup(&store, &config.collection, || async {
+            // Create the collection at dimension 4 — as if indexed by an older embedding
+            // model.
+            store
+                .ensure_collection(&config.collection, 4, &[], false)
+                .await
+                .unwrap();
 
-        // A plain restart with a reconfigured (or swapped) embedding model now produces
-        // a different dimension, with no `drop_collection` in between — exactly what
-        // `index --full` would do, and a plain `serve` restart never does.
-        let result = store
-            .ensure_collection(&config.collection, 8, &[], false)
-            .await;
+            // A plain restart with a reconfigured (or swapped) embedding model now produces
+            // a different dimension, with no `drop_collection` in between — exactly what
+            // `index --full` would do, and a plain `serve` restart never does.
+            let result = store
+                .ensure_collection(&config.collection, 8, &[], false)
+                .await;
 
-        assert!(
-            result.is_err(),
-            "a dimension mismatch against an existing collection must be rejected"
-        );
-        let msg = format!("{:#}", result.unwrap_err());
-        assert!(
-            msg.contains('4'),
-            "error should name the existing dimension: {msg}"
-        );
-        assert!(
-            msg.contains('8'),
-            "error should name the configured dimension: {msg}"
-        );
-        assert!(
-            msg.contains("index --full"),
-            "error should point at the fix: {msg}"
-        );
+            assert!(
+                result.is_err(),
+                "a dimension mismatch against an existing collection must be rejected"
+            );
+            let msg = format!("{:#}", result.unwrap_err());
+            assert!(
+                msg.contains('4'),
+                "error should name the existing dimension: {msg}"
+            );
+            assert!(
+                msg.contains('8'),
+                "error should name the configured dimension: {msg}"
+            );
+            assert!(
+                msg.contains("index --full"),
+                "error should point at the fix: {msg}"
+            );
 
-        // A matching call (same dimension as what the collection already holds) must
-        // still be a no-op success — this is the overwhelmingly common case (every
-        // ordinary scoped indexing run calls `ensure_collection` again) and must not
-        // regress.
-        store
-            .ensure_collection(&config.collection, 4, &[], false)
-            .await
-            .expect("a matching dimension must not be rejected");
-
-        // Clean up
-        store
-            .client
-            .delete_collection(&config.collection)
-            .await
-            .unwrap();
+            // A matching call (same dimension as what the collection already holds) must
+            // still be a no-op success — this is the overwhelmingly common case (every
+            // ordinary scoped indexing run calls `ensure_collection` again) and must not
+            // regress.
+            store
+                .ensure_collection(&config.collection, 4, &[], false)
+                .await
+                .expect("a matching dimension must not be rejected");
+        })
+        .await;
     }
 
     /// Integration test: `ensure_collection(enable_phrase: true)` creates a working
@@ -1828,7 +1908,7 @@ mod tests {
     async fn phrase_index_enables_exact_phrase_matching() {
         let config = ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
-            collection: "test-phrase-matching".into(),
+            collection: live_test_collection("phrase_index_enables_exact_phrase_matching"),
         };
         let store = QdrantStore::new(&config).unwrap();
 
@@ -1840,93 +1920,99 @@ mod tests {
             .await
             .unwrap();
 
-        let make_point = |id: &str, file: &str, text: &str, vec: Vec<f32>| {
-            let mut payload = HashMap::new();
-            payload.insert("file_path".into(), serde_json::json!(file));
-            payload.insert("text".into(), serde_json::json!(text));
-            QdrantPoint {
-                id: id.into(),
-                vector: vec,
-                sparse: None,
-                payload,
-            }
-        };
+        with_collection_cleanup(&store, &config.collection, || async {
+            let make_point = |id: &str, file: &str, text: &str, vec: Vec<f32>| {
+                let mut payload = HashMap::new();
+                payload.insert("file_path".into(), serde_json::json!(file));
+                payload.insert("text".into(), serde_json::json!(text));
+                QdrantPoint {
+                    id: id.into(),
+                    vector: vec,
+                    sparse: None,
+                    payload,
+                }
+            };
 
-        let points = vec![
-            make_point(
-                // #212: was "...000p01" — 'p' is not a hex digit, so this was never a
-                // valid UUID and the point was rejected; the test had never actually run.
-                "00000000-0000-0000-0000-000000000a01",
-                "/data/exact.md",
-                "deploy notes for node:ares rocm",
-                vec![1.0, 0.0, 0.0, 0.0],
-            ),
-            make_point(
-                "00000000-0000-0000-0000-000000000a02",
-                "/data/reordered.md",
-                "rocm notes for node:ares deploy",
-                vec![1.0, 0.0, 0.0, 0.0],
-            ),
-        ];
-        store
-            .upsert_points(&config.collection, points)
-            .await
-            .unwrap();
+            let points = vec![
+                make_point(
+                    // #212: was "...000p01" — 'p' is not a hex digit, so this was never a
+                    // valid UUID and the point was rejected; the test had never actually run.
+                    "00000000-0000-0000-0000-000000000a01",
+                    "/data/exact.md",
+                    "deploy notes for node:ares rocm",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-000000000a02",
+                    "/data/reordered.md",
+                    "rocm notes for node:ares deploy",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ),
+            ];
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let phrases = vec!["node:ares rocm".to_string()];
-        // `explain: true` so `phrase_score` is populated — its presence (not value) is
-        // what proves the phrase arm actually matched, which is a much more precise
-        // check than inferring it from ranking order alone.
-        let results = store
-            .hybrid_search(
-                &config.collection,
-                vec![1.0, 0.0, 0.0, 0.0],
-                None,
-                &phrases,
-                HashMap::new(),
-                Vec::new(),
-                10,
-                50,
-                true,
+            let phrases = vec!["node:ares rocm".to_string()];
+            // `explain: true` so `phrase_score` is populated — its presence (not value) is
+            // what proves the phrase arm actually matched, which is a much more precise
+            // check than inferring it from ranking order alone.
+            //
+            // Poll instead of a single fixed sleep -- see retry_until's doc
+            // comment for why (#231).
+            let results = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .hybrid_search(
+                            &config.collection,
+                            vec![1.0, 0.0, 0.0, 0.0],
+                            None,
+                            &phrases,
+                            HashMap::new(),
+                            Vec::new(),
+                            10,
+                            50,
+                            true,
+                        )
+                        .await
+                        .unwrap()
+                },
+                |results| results.len() >= 2,
             )
-            .await
-            .unwrap();
+            .await;
 
-        assert_eq!(
-            results.len(),
-            2,
-            "both chunks are retrievable — the dense arm runs unfiltered alongside the \
-             phrase arm, so phrase matching is a ranking signal, not an exclusion filter"
-        );
-        assert_eq!(
-            results[0].payload.get("file_path").and_then(|v| v.as_str()),
-            Some("/data/exact.md"),
-            "the exact-phrase chunk accumulates reciprocal rank from both the dense and \
-             phrase arms, so it must rank first"
-        );
-        assert!(
-            results[0].phrase_score.is_some(),
-            "the top result's phrase_score must be Some — it matched the phrase arm"
-        );
-        assert_eq!(
-            results[1].payload.get("file_path").and_then(|v| v.as_str()),
-            Some("/data/reordered.md"),
-            "the reordered chunk still surfaces via the unfiltered dense arm, just ranked \
-             second since it only accumulates rank from one arm instead of two"
-        );
-        assert!(
-            results[1].phrase_score.is_none(),
-            "the reordered chunk never matched the phrase arm, so its phrase_score must \
-             be None — this is the actual signal the phrase-matching text index provides"
-        );
-
-        store
-            .client
-            .delete_collection(&config.collection)
-            .await
-            .unwrap();
+            assert_eq!(
+                results.len(),
+                2,
+                "both chunks are retrievable — the dense arm runs unfiltered alongside the \
+                 phrase arm, so phrase matching is a ranking signal, not an exclusion filter"
+            );
+            assert_eq!(
+                results[0].payload.get("file_path").and_then(|v| v.as_str()),
+                Some("/data/exact.md"),
+                "the exact-phrase chunk accumulates reciprocal rank from both the dense and \
+                 phrase arms, so it must rank first"
+            );
+            assert!(
+                results[0].phrase_score.is_some(),
+                "the top result's phrase_score must be Some — it matched the phrase arm"
+            );
+            assert_eq!(
+                results[1].payload.get("file_path").and_then(|v| v.as_str()),
+                Some("/data/reordered.md"),
+                "the reordered chunk still surfaces via the unfiltered dense arm, just ranked \
+                 second since it only accumulates rank from one arm instead of two"
+            );
+            assert!(
+                results[1].phrase_score.is_none(),
+                "the reordered chunk never matched the phrase arm, so its phrase_score must \
+                 be None — this is the actual signal the phrase-matching text index provides"
+            );
+        })
+        .await;
     }
 
     /// Integration test: upsert points for multiple files, batch-delete by file paths,
@@ -1946,7 +2032,7 @@ mod tests {
     async fn delete_by_files_removes_matching() {
         let config = ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
-            collection: "test-delete-by-files".into(),
+            collection: live_test_collection("delete_by_files_removes_matching"),
         };
         let store = QdrantStore::new(&config).unwrap();
 
@@ -1963,89 +2049,120 @@ mod tests {
             .await
             .unwrap();
 
-        // Insert points for 3 different files
-        let make_point = |id: &str, file: &str, vec: Vec<f32>| {
-            let mut payload = HashMap::new();
-            payload.insert("file_path".into(), serde_json::json!(file));
-            QdrantPoint {
-                id: id.into(),
-                vector: vec,
-                sparse: None,
-                payload,
-            }
-        };
+        with_collection_cleanup(&store, &config.collection, || async {
+            // Insert points for 3 different files
+            let make_point = |id: &str, file: &str, vec: Vec<f32>| {
+                let mut payload = HashMap::new();
+                payload.insert("file_path".into(), serde_json::json!(file));
+                QdrantPoint {
+                    id: id.into(),
+                    vector: vec,
+                    sparse: None,
+                    payload,
+                }
+            };
 
-        let points = vec![
-            make_point(
-                "00000000-0000-0000-0000-000000000001",
-                "/data/a.md",
-                vec![1.0, 0.0, 0.0, 0.0],
-            ),
-            make_point(
-                "00000000-0000-0000-0000-000000000002",
-                "/data/b.md",
-                vec![0.0, 1.0, 0.0, 0.0],
-            ),
-            make_point(
-                "00000000-0000-0000-0000-000000000003",
-                "/data/c.md",
-                vec![0.0, 0.0, 1.0, 0.0],
-            ),
-        ];
-        store
-            .upsert_points(&config.collection, points)
-            .await
-            .unwrap();
+            let points = vec![
+                make_point(
+                    "00000000-0000-0000-0000-000000000001",
+                    "/data/a.md",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-000000000002",
+                    "/data/b.md",
+                    vec![0.0, 1.0, 0.0, 0.0],
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-000000000003",
+                    "/data/c.md",
+                    vec![0.0, 0.0, 1.0, 0.0],
+                ),
+            ];
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Delete points for files a.md and b.md in one call
-        store
-            .delete_by_files(&config.collection, &["/data/a.md", "/data/b.md"])
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // c.md point should still be searchable
-        let results = store
-            .search(
-                &config.collection,
-                vec![0.0, 0.0, 1.0, 0.0],
-                HashMap::new(),
-                Vec::new(),
-                10,
-            )
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            results[0].payload.get("file_path").and_then(|v| v.as_str()),
-            Some("/data/c.md"),
-        );
-
-        // a.md and b.md should return no results
-        let results_a = store
-            .search(
-                &config.collection,
-                vec![1.0, 0.0, 0.0, 0.0],
-                {
-                    let mut f = HashMap::new();
-                    f.insert("file_path".into(), serde_json::json!("/data/a.md"));
-                    f
+            // Poll instead of a single fixed sleep -- see retry_until's doc
+            // comment for why (#231). Wait for all 3 points to actually be
+            // visible before deleting 2 of them, or the delete's own filter
+            // match could race the upsert becoming visible.
+            let count_before_delete = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .collection_point_count(&config.collection)
+                        .await
+                        .unwrap()
                 },
-                Vec::new(),
-                10,
+                |count| *count == 3,
             )
-            .await
-            .unwrap();
-        assert!(results_a.is_empty(), "a.md points should be deleted");
+            .await;
+            assert_eq!(
+                count_before_delete, 3,
+                "all 3 upserted points must be visible before delete_by_files runs"
+            );
 
-        store
-            .client
-            .delete_collection(&config.collection)
-            .await
-            .unwrap();
+            // Delete points for files a.md and b.md in one call
+            store
+                .delete_by_files(&config.collection, &["/data/a.md", "/data/b.md"])
+                .await
+                .unwrap();
+
+            let count_after_delete = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .collection_point_count(&config.collection)
+                        .await
+                        .unwrap()
+                },
+                |count| *count == 1,
+            )
+            .await;
+            assert_eq!(
+                count_after_delete, 1,
+                "exactly 2 of the 3 points should have been deleted"
+            );
+
+            // c.md point should still be searchable
+            let results = store
+                .search(
+                    &config.collection,
+                    vec![0.0, 0.0, 1.0, 0.0],
+                    HashMap::new(),
+                    Vec::new(),
+                    10,
+                )
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].payload.get("file_path").and_then(|v| v.as_str()),
+                Some("/data/c.md"),
+            );
+
+            // a.md and b.md should return no results
+            let results_a = store
+                .search(
+                    &config.collection,
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    {
+                        let mut f = HashMap::new();
+                        f.insert("file_path".into(), serde_json::json!("/data/a.md"));
+                        f
+                    },
+                    Vec::new(),
+                    10,
+                )
+                .await
+                .unwrap();
+            assert!(results_a.is_empty(), "a.md points should be deleted");
+        })
+        .await;
     }
 
     /// `upsert_points`, `delete_by_files`, and `delete_points_by_ids` each guard
@@ -2186,7 +2303,7 @@ mod tests {
     async fn facet_values_returns_distinct_strings() {
         let config = ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
-            collection: "test-facet-values".into(),
+            collection: live_test_collection("facet_values_returns_distinct_strings"),
         };
         let store = QdrantStore::new(&config).unwrap();
 
@@ -2202,55 +2319,60 @@ mod tests {
             .await
             .unwrap();
 
-        let make_point = |id: &str, domain: &str, vec: Vec<f32>| {
-            let mut payload = HashMap::new();
-            payload.insert("domain".into(), serde_json::json!(domain));
-            QdrantPoint {
-                id: id.into(),
-                vector: vec,
-                sparse: None,
-                payload,
-            }
-        };
+        with_collection_cleanup(&store, &config.collection, || async {
+            let make_point = |id: &str, domain: &str, vec: Vec<f32>| {
+                let mut payload = HashMap::new();
+                payload.insert("domain".into(), serde_json::json!(domain));
+                QdrantPoint {
+                    id: id.into(),
+                    vector: vec,
+                    sparse: None,
+                    payload,
+                }
+            };
 
-        let points = vec![
-            make_point(
-                "00000000-0000-0000-0000-000000000001",
-                "networking",
-                vec![1.0, 0.0, 0.0, 0.0],
-            ),
-            make_point(
-                "00000000-0000-0000-0000-000000000002",
-                "docker",
-                vec![0.0, 1.0, 0.0, 0.0],
-            ),
-            make_point(
-                "00000000-0000-0000-0000-000000000003",
-                "networking",
-                vec![0.0, 0.0, 1.0, 0.0],
-            ),
-        ];
-        store
-            .upsert_points(&config.collection, points)
-            .await
-            .unwrap();
+            let points = vec![
+                make_point(
+                    "00000000-0000-0000-0000-000000000001",
+                    "networking",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-000000000002",
+                    "docker",
+                    vec![0.0, 1.0, 0.0, 0.0],
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-000000000003",
+                    "networking",
+                    vec![0.0, 0.0, 1.0, 0.0],
+                ),
+            ];
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Poll instead of a single fixed sleep -- see retry_until's doc
+            // comment for why (#231).
+            let values = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .fetch_facet_values(&config.collection, "domain", 10)
+                        .await
+                        .unwrap()
+                },
+                |values| values.len() >= 2,
+            )
+            .await;
 
-        let values = store
-            .fetch_facet_values(&config.collection, "domain", 10)
-            .await
-            .unwrap();
-
-        assert_eq!(values.len(), 2, "should have 2 distinct domains");
-        assert!(values.contains(&"networking".to_string()));
-        assert!(values.contains(&"docker".to_string()));
-
-        store
-            .client
-            .delete_collection(&config.collection)
-            .await
-            .unwrap();
+            assert_eq!(values.len(), 2, "should have 2 distinct domains");
+            assert!(values.contains(&"networking".to_string()));
+            assert!(values.contains(&"docker".to_string()));
+        })
+        .await;
     }
 
     /// `fetch_facet_values` treats ANY facet-query failure as "no values" rather
@@ -2450,7 +2572,7 @@ mod tests {
     async fn recommend_by_point_id_finds_nearest_neighbor() {
         let config = ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
-            collection: "test-recommend-by-point-id".into(),
+            collection: live_test_collection("recommend_by_point_id_finds_nearest_neighbor"),
         };
         let store = QdrantStore::new(&config).unwrap();
 
@@ -2467,67 +2589,76 @@ mod tests {
             .await
             .unwrap();
 
-        let make_point = |id: &str, file: &str, vec: Vec<f32>| {
-            let mut payload = HashMap::new();
-            payload.insert("file_path".into(), serde_json::json!(file));
-            QdrantPoint {
-                id: id.into(),
-                vector: vec,
-                sparse: None,
-                payload,
-            }
-        };
+        with_collection_cleanup(&store, &config.collection, || async {
+            let make_point = |id: &str, file: &str, vec: Vec<f32>| {
+                let mut payload = HashMap::new();
+                payload.insert("file_path".into(), serde_json::json!(file));
+                QdrantPoint {
+                    id: id.into(),
+                    vector: vec,
+                    sparse: None,
+                    payload,
+                }
+            };
 
-        // "a" and "b" are near-identical vectors (should recommend each other);
-        // "c" is orthogonal and should not show up as a's nearest neighbor.
-        let point_a = "00000000-0000-0000-0000-0000000000a1";
-        let point_b = "00000000-0000-0000-0000-0000000000b1";
-        let point_c = "00000000-0000-0000-0000-0000000000c1";
-        let points = vec![
-            make_point(point_a, "/data/a.md", vec![1.0, 0.0, 0.0, 0.0]),
-            make_point(point_b, "/data/b.md", vec![0.99, 0.01, 0.0, 0.0]),
-            make_point(point_c, "/data/c.md", vec![0.0, 0.0, 1.0, 0.0]),
-        ];
-        store
-            .upsert_points(&config.collection, points)
+            // "a" and "b" are near-identical vectors (should recommend each other);
+            // "c" is orthogonal and should not show up as a's nearest neighbor.
+            let point_a = "00000000-0000-0000-0000-0000000000a1";
+            let point_b = "00000000-0000-0000-0000-0000000000b1";
+            let point_c = "00000000-0000-0000-0000-0000000000c1";
+            let points = vec![
+                make_point(point_a, "/data/a.md", vec![1.0, 0.0, 0.0, 0.0]),
+                make_point(point_b, "/data/b.md", vec![0.99, 0.01, 0.0, 0.0]),
+                make_point(point_c, "/data/c.md", vec![0.0, 0.0, 1.0, 0.0]),
+            ];
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
+
+            // Poll instead of a single fixed sleep -- see retry_until's doc
+            // comment for why (#231). `recommend_by_point_id` looks up point
+            // a's own stored vector server-side; before it's visible this
+            // returns a hard "no point with id" error rather than an empty
+            // result, so the retry predicate checks `is_ok()`.
+            //
+            // Unfiltered: Qdrant's ID-based query excludes the query point itself from
+            // its own results (server-side, unconditionally — see this test's doc
+            // comment), so a's nearest neighbor here is b, not a itself.
+            let results = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .recommend_by_point_id(&config.collection, point_a, 1, None)
+                        .await
+                },
+                |result| result.is_ok(),
+            )
             .await
             .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].payload.get("file_path").and_then(|v| v.as_str()),
+                Some("/data/b.md"),
+                "querying by point a's own ID excludes a itself, so its nearest neighbor is b"
+            );
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Unfiltered: Qdrant's ID-based query excludes the query point itself from
-        // its own results (server-side, unconditionally — see this test's doc
-        // comment), so a's nearest neighbor here is b, not a itself.
-        let results = store
-            .recommend_by_point_id(&config.collection, point_a, 1, None)
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            results[0].payload.get("file_path").and_then(|v| v.as_str()),
-            Some("/data/b.md"),
-            "querying by point a's own ID excludes a itself, so its nearest neighbor is b"
-        );
-
-        // Excluding a's own file, the nearest neighbor is b, not c.
-        let exclude_self =
-            Filter::must_not([Condition::matches("file_path", "/data/a.md".to_string())]);
-        let results = store
-            .recommend_by_point_id(&config.collection, point_a, 1, Some(exclude_self))
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            results[0].payload.get("file_path").and_then(|v| v.as_str()),
-            Some("/data/b.md"),
-            "nearest neighbor excluding self should be b, not the orthogonal c"
-        );
-
-        store
-            .client
-            .delete_collection(&config.collection)
-            .await
-            .unwrap();
+            // Excluding a's own file, the nearest neighbor is b, not c.
+            let exclude_self =
+                Filter::must_not([Condition::matches("file_path", "/data/a.md".to_string())]);
+            let results = store
+                .recommend_by_point_id(&config.collection, point_a, 1, Some(exclude_self))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].payload.get("file_path").and_then(|v| v.as_str()),
+                Some("/data/b.md"),
+                "nearest neighbor excluding self should be b, not the orthogonal c"
+            );
+        })
+        .await;
     }
 
     // ------------------------------------------------------------------
@@ -2669,7 +2800,7 @@ mod tests {
     async fn qdrant_filters_agree_with_the_offline_prediction() {
         let config = ResolvedQdrantConfig {
             url: "http://localhost:6334".into(),
-            collection: "test-filter-equivalence".into(),
+            collection: live_test_collection("qdrant_filters_agree_with_the_offline_prediction"),
         };
         let store = QdrantStore::new(&config).unwrap();
         let _ = store.client.delete_collection(&config.collection).await;
@@ -2680,71 +2811,79 @@ mod tests {
             .await
             .unwrap();
 
-        let make_point = |id: &str, file_path: &str, tags: &[&str]| {
-            let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
-            payload.insert("file_path".into(), serde_json::json!(file_path));
-            payload.insert("tags".into(), serde_json::json!(tags));
-            QdrantPoint {
-                id: id.into(),
-                vector: vec![1.0, 0.0, 0.0, 0.0],
-                sparse: None,
-                payload,
-            }
-        };
-        let points = vec![
-            make_point(
-                "00000000-0000-0000-0000-000000000001",
-                "a.md",
-                &["recipe", "dinner"],
-            ),
-            make_point(
-                "00000000-0000-0000-0000-000000000002",
-                "b.md",
-                &["recipe", "breakfast"],
-            ),
-            make_point("00000000-0000-0000-0000-000000000003", "d.md", &["zfs"]),
-        ];
-        store
-            .upsert_points(&config.collection, points)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        with_collection_cleanup(&store, &config.collection, || async {
+            let make_point = |id: &str, file_path: &str, tags: &[&str]| {
+                let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
+                payload.insert("file_path".into(), serde_json::json!(file_path));
+                payload.insert("tags".into(), serde_json::json!(tags));
+                QdrantPoint {
+                    id: id.into(),
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                    sparse: None,
+                    payload,
+                }
+            };
+            let points = vec![
+                make_point(
+                    "00000000-0000-0000-0000-000000000001",
+                    "a.md",
+                    &["recipe", "dinner"],
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-000000000002",
+                    "b.md",
+                    &["recipe", "breakfast"],
+                ),
+                make_point("00000000-0000-0000-0000-000000000003", "d.md", &["zfs"]),
+            ];
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
 
-        let filters = vec![(
-            "tags".to_string(),
-            FieldFilter::AnyOf(vec!["breakfast".into(), "zfs".into()]),
-        )];
-        let indexed = HashMap::from([("tags".to_string(), IndexKind::Keyword)]);
-        let conditions = lower_field_filters(&filters, &indexed).unwrap();
+            let filters = vec![(
+                "tags".to_string(),
+                FieldFilter::AnyOf(vec!["breakfast".into(), "zfs".into()]),
+            )];
+            let indexed = HashMap::from([("tags".to_string(), IndexKind::Keyword)]);
 
-        let results = store
-            .search(
-                &config.collection,
-                vec![1.0, 0.0, 0.0, 0.0],
-                HashMap::new(),
-                conditions,
-                10,
+            // Poll instead of a single fixed sleep -- see retry_until's doc
+            // comment for why (#231). `lower_field_filters` is cheap and pure,
+            // so it's simplest to just rebuild the conditions fresh on each
+            // attempt rather than cloning them out of the closure.
+            let results = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    let conditions = lower_field_filters(&filters, &indexed).unwrap();
+                    store
+                        .search(
+                            &config.collection,
+                            vec![1.0, 0.0, 0.0, 0.0],
+                            HashMap::new(),
+                            conditions,
+                            10,
+                        )
+                        .await
+                        .unwrap()
+                },
+                |results| results.len() >= 2,
             )
-            .await
-            .unwrap();
-        let mut paths: Vec<&str> = results
-            .iter()
-            .filter_map(|r| r.payload.get("file_path").and_then(|v| v.as_str()))
-            .collect();
-        paths.sort();
+            .await;
+            let mut paths: Vec<&str> = results
+                .iter()
+                .filter_map(|r| r.payload.get("file_path").and_then(|v| v.as_str()))
+                .collect();
+            paths.sort();
 
-        assert_eq!(
-            paths,
-            vec!["b.md", "d.md"],
-            "a live Qdrant server must honor lower_field_filters's any_of the same way \
-             the offline equivalence tests in state.rs predict"
-        );
-
-        store
-            .client
-            .delete_collection(&config.collection)
-            .await
-            .unwrap();
+            assert_eq!(
+                paths,
+                vec!["b.md", "d.md"],
+                "a live Qdrant server must honor lower_field_filters's any_of the same way \
+                 the offline equivalence tests in state.rs predict"
+            );
+        })
+        .await;
     }
 
     // ------------------------------------------------------------------
