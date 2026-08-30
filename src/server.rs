@@ -609,13 +609,57 @@ async fn cached_status(state: &StatusState) -> StatusResponse {
     fresh
 }
 
-async fn status_handler(State(state): State<StatusState>) -> Json<StatusResponse> {
-    Json(cached_status(&state).await)
+/// Wire shape for `GET /status`: every field of [`StatusResponse`] flattened
+/// alongside the retrieval (query-side) fields that live outside it.
+///
+/// `retrieval`/`phrase_matching_available` are deliberately NOT fields on
+/// [`StatusResponse`] itself: that struct is constructed by literal in more than
+/// one place this change must not touch (`md-kb-rag status`'s own JSON/text
+/// rendering builds and consumes it directly, in `main.rs`, which is out of
+/// scope for #168 — see the module docs on why `RetrievalMetrics` lives in
+/// `status.rs` rather than being threaded through `collect_status`). Adding a
+/// field to `StatusResponse` would be a breaking change to every one of those
+/// call sites. Flattening a second struct alongside it at the JSON boundary gets
+/// the same wire shape (retrieval fields appear as ordinary top-level `/status`
+/// keys) without touching `StatusResponse`'s definition or its other
+/// constructors at all. `md-kb-rag status --json` (main.rs) therefore does not
+/// gain these fields — acceptable, since that command runs in its own
+/// short-lived process that never serves a query, so they would only ever read
+/// as zero there anyway (the same caveat `StatusResponse::queue`/`indexing`
+/// already document for the CLI).
+#[derive(serde::Serialize)]
+struct StatusHttpResponse {
+    #[serde(flatten)]
+    status: StatusResponse,
+    retrieval: crate::status::RetrievalMetricsSnapshot,
+    /// Mirrors `status::INDEX_STATUS.phrase_matching_available()` — whether the
+    /// Qdrant `text` payload index that phrase-matched (double-quoted) queries
+    /// depend on is confirmed present. This degrades silently against an older
+    /// Qdrant server (`ensure_collection` logs and tolerates the failure so a
+    /// bad index cannot stop the process from booting — see `qdrant.rs`), so
+    /// without this field an operator has no way to tell "phrase search is
+    /// configured on but quietly inert" apart from "working" short of reading
+    /// logs from the moment the server started.
+    phrase_matching_available: bool,
+}
+
+async fn status_handler(State(state): State<StatusState>) -> Json<StatusHttpResponse> {
+    // `cached_status` hands back its own owned clone (see its doc comment), so
+    // this can just move it into the wrapper below — no borrow, no lifetime to
+    // thread through the response type.
+    let status = cached_status(&state).await;
+    Json(StatusHttpResponse {
+        retrieval: crate::status::QUERY_METRICS.snapshot(),
+        phrase_matching_available: crate::status::INDEX_STATUS.phrase_matching_available(),
+        status,
+    })
 }
 
 async fn metrics_handler(State(state): State<StatusState>) -> Response {
     let status = cached_status(&state).await;
-    let body = render_prometheus(&status);
+    let retrieval = crate::status::QUERY_METRICS.snapshot();
+    let phrase_matching_available = crate::status::INDEX_STATUS.phrase_matching_available();
+    let body = render_prometheus(&status, &retrieval, phrase_matching_available);
 
     axum::response::IntoResponse::into_response((
         StatusCode::OK,
@@ -665,7 +709,21 @@ fn escape_label(value: &str) -> String {
 /// Hand-rolled rather than pulling in a metrics crate: every value here is read from
 /// SQLite/Qdrant at scrape time or from an in-memory snapshot, so there is no registry
 /// to maintain and nothing to keep in sync.
-pub fn render_prometheus(status: &StatusResponse) -> String {
+///
+/// `retrieval`/`phrase_matching_available` are passed in explicitly rather than read
+/// from `crate::status::QUERY_METRICS`/`INDEX_STATUS` inside this function, even
+/// though both are reachable as process globals from here. Reading them directly
+/// would make this function's tests observe whatever every OTHER test in this binary
+/// happened to record into the same global before it ran — `cargo test` runs the
+/// whole crate's tests in one multi-threaded process, so that would make assertions
+/// on exact counts flaky by test execution order. Taking snapshots as parameters
+/// keeps this function pure and its tests deterministic; `metrics_handler` is the
+/// one real caller that reads the globals.
+pub fn render_prometheus(
+    status: &StatusResponse,
+    retrieval: &crate::status::RetrievalMetricsSnapshot,
+    phrase_matching_available: bool,
+) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(4096);
 
@@ -960,6 +1018,100 @@ pub fn render_prometheus(status: &StatusResponse) -> String {
             &lines,
         );
     }
+
+    // ── retrieval (query-side) metrics (#168) ────────────────────────────────
+    // Everything above this point answers "is indexing healthy"; this section is
+    // the first thing that answers the same question about queries — the actual
+    // product, for a RAG server. See `status.rs`'s "Retrieval-side operational
+    // metrics" section doc comment for the recording side and why it never blocks
+    // the hot query path.
+
+    metric(
+        "kb_query_total",
+        "Retrieval calls (retrieval::search) completed since process start.",
+        "counter",
+        &plain(retrieval.queries_total as f64),
+    );
+    metric(
+        "kb_query_zero_result_total",
+        "Retrieval calls that returned zero results. The single best signal that \
+         retrieval is failing users — compare its rate against kb_query_total \
+         rather than alerting on the raw count.",
+        "counter",
+        &plain(retrieval.zero_result_total as f64),
+    );
+    metric(
+        "kb_query_rerank_attempted_total",
+        "Retrieval calls where a reranker was actually invoked. Always 0 when \
+         reranking is not configured (`reranking:` absent from config.yaml).",
+        "counter",
+        &plain(retrieval.rerank_attempted_total as f64),
+    );
+    metric(
+        "kb_query_rerank_failed_total",
+        "Subset of kb_query_rerank_attempted_total where the reranker call \
+         failed and the query fell back to fused order. Reranking degrades \
+         silently by design (a fallback, never a request failure), so this is \
+         the only signal that a rerank service has been down for a while — \
+         compare its rate against kb_query_rerank_attempted_total.",
+        "counter",
+        &plain(retrieval.rerank_failed_total as f64),
+    );
+    metric(
+        "kb_phrase_matching_available",
+        "1 if the Qdrant payload index phrase-matched (double-quoted) queries \
+         depend on is confirmed present, 0 otherwise — degrades silently \
+         against an older Qdrant server that rejects phrase_matching text \
+         indexes (see kb_payload_index_ok{field=\"text\"}, which this mirrors).",
+        "gauge",
+        &plain(if phrase_matching_available { 1.0 } else { 0.0 }),
+    );
+
+    // `metric` is not called again past this point, so its capture of `s` ends
+    // here (NLL) — that is what lets `histogram` below take its own `&mut s` and
+    // what lets `s` be returned by value at the end of this function without
+    // either borrow outliving its last use.
+    //
+    // Prometheus-standard histogram exposition: one `_bucket{le=".."}` line per
+    // cumulative bound (already computed by `LatencyHistogramSnapshot`, see its
+    // doc comment), a trailing `_bucket{le="+Inf"}` equal to the total sample
+    // count, then `_sum`/`_count`. Bucket bounds are recorded in milliseconds
+    // (see `status::LATENCY_BUCKETS_MS`) but rendered in seconds — the
+    // Prometheus base-unit convention this file already follows for every other
+    // time metric (`kb_index_last_run_duration_seconds` and friends).
+    let mut histogram = |name: &str, help: &str, snap: &crate::status::LatencyHistogramSnapshot| {
+        let _ = writeln!(s, "# HELP {name} {help}");
+        let _ = writeln!(s, "# TYPE {name} histogram");
+        for (bound_ms, count) in snap.bucket_bounds_ms.iter().zip(&snap.bucket_counts) {
+            let _ = writeln!(
+                s,
+                "{name}_bucket{{le=\"{}\"}} {count}",
+                *bound_ms as f64 / 1000.0
+            );
+        }
+        let inf_count = snap.bucket_counts.last().copied().unwrap_or(0);
+        let _ = writeln!(s, "{name}_bucket{{le=\"+Inf\"}} {inf_count}");
+        let _ = writeln!(s, "{name}_sum {}", snap.sum_ms as f64 / 1000.0);
+        let _ = writeln!(s, "{name}_count {}", snap.count);
+    };
+
+    histogram(
+        "kb_query_embed_latency_seconds",
+        "Time spent embedding the query text, per retrieval call.",
+        &retrieval.embed_latency_ms,
+    );
+    histogram(
+        "kb_query_qdrant_latency_seconds",
+        "Time spent in the Qdrant round trip (dense or hybrid search), per \
+         retrieval call.",
+        &retrieval.qdrant_latency_ms,
+    );
+    histogram(
+        "kb_query_rerank_latency_seconds",
+        "Time spent in the reranker call, per retrieval call where one was \
+         attempted. Empty (zero samples) when reranking is not configured.",
+        &retrieval.rerank_latency_ms,
+    );
 
     s
 }
@@ -2272,9 +2424,28 @@ mod tests {
         }
     }
 
+    /// A retrieval-metrics snapshot with a few queries recorded, including a
+    /// zero-result one and a failed rerank attempt — exercises every counter and
+    /// histogram `render_prometheus` emits for #168, the same way `sample_status`
+    /// exercises the indexing side.
+    fn sample_retrieval() -> crate::status::RetrievalMetricsSnapshot {
+        let m = crate::status::RetrievalMetrics::new();
+        m.record_query(12, 8, Some((40, true)), 5);
+        m.record_query(9, 6, None, 0); // zero-result, no reranker attempted
+        m.record_query(15, 11, Some((210, false)), 3); // failed rerank
+        m.snapshot()
+    }
+
+    /// A `RetrievalMetricsSnapshot` with no queries recorded, for tests that only
+    /// care about the indexing-side output and would otherwise have to build a
+    /// throwaway fixture just to satisfy `render_prometheus`'s signature.
+    fn empty_retrieval() -> crate::status::RetrievalMetricsSnapshot {
+        crate::status::RetrievalMetrics::new().snapshot()
+    }
+
     #[test]
     fn prometheus_output_covers_indexing_store_and_breakdown() {
-        let out = render_prometheus(&sample_status());
+        let out = render_prometheus(&sample_status(), &empty_retrieval(), false);
 
         // Build-info gauge (#183): version carried as a label, value always 1.
         assert!(
@@ -2315,25 +2486,119 @@ mod tests {
         // Metadata breakdown.
         assert!(out.contains(r#"kb_documents_by_field{field="type",value="reference"} 120"#));
 
-        // Every metric must be declared before use, or Prometheus rejects the scrape.
+        assert_every_metric_is_declared(&out);
+    }
+
+    /// Every metric line must be declared by a `# TYPE` header, or Prometheus rejects
+    /// the scrape. A histogram's `_bucket`/`_sum`/`_count` lines are declared once,
+    /// under their shared base name (`# TYPE kb_query_embed_latency_seconds
+    /// histogram`, not a separate header per suffix — the Prometheus histogram
+    /// convention `render_prometheus`'s `histogram` closure follows), so those three
+    /// suffixes are stripped before matching against a `# TYPE` line. Shared by every
+    /// test that checks this invariant, rather than duplicated per test, so a future
+    /// histogram/summary addition only needs to update this one place.
+    fn assert_every_metric_is_declared(out: &str) {
         for line in out.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
             let name = line
                 .split(['{', ' '])
                 .next()
                 .expect("metric name")
                 .to_string();
+            let base = name
+                .strip_suffix("_bucket")
+                .or_else(|| name.strip_suffix("_sum"))
+                .or_else(|| name.strip_suffix("_count"))
+                .unwrap_or(name.as_str());
             assert!(
-                out.contains(&format!("# TYPE {name} ")),
+                out.contains(&format!("# TYPE {base} ")),
                 "metric {name} emitted without a TYPE declaration"
             );
         }
     }
 
     #[test]
+    fn prometheus_output_covers_retrieval_query_metrics() {
+        // #168: before this change there was no query-side telemetry at all —
+        // this fails against the pre-change `render_prometheus(&StatusResponse)`
+        // signature outright (it takes no retrieval snapshot to assert on), and
+        // would fail post-change too if any of the lines below were missing.
+        let out = render_prometheus(&sample_status(), &sample_retrieval(), true);
+
+        // Query volume and the zero-result signal — sample_retrieval() records
+        // 3 queries, one of which returned zero results.
+        assert!(out.contains("kb_query_total 3"), "{out}");
+        assert!(out.contains("kb_query_zero_result_total 1"), "{out}");
+
+        // Rerank attempt/failure counters — one success, one failure recorded.
+        assert!(out.contains("kb_query_rerank_attempted_total 2"), "{out}");
+        assert!(out.contains("kb_query_rerank_failed_total 1"), "{out}");
+
+        // Phrase-arm availability, mirroring kb_payload_index_ok{field="text"}.
+        assert!(out.contains("kb_phrase_matching_available 1"), "{out}");
+
+        // Histograms: TYPE line, correctly cumulative buckets, a +Inf bucket
+        // equal to the total count, and _sum/_count trailers. Bucket bounds are
+        // rendered in seconds (the Prometheus base-unit convention). sample_retrieval()
+        // records embed samples of 9ms, 12ms and 15ms: the 9ms sample alone fits
+        // under the "0.01" (10ms) bound, but ALL THREE fit under "0.025" (25ms) —
+        // cumulative buckets count everything at-or-below the bound, not just
+        // what landed exactly in that bucket.
+        assert!(
+            out.contains("# TYPE kb_query_embed_latency_seconds histogram"),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"kb_query_embed_latency_seconds_bucket{le="0.01"} 1"#),
+            "only the 9ms sample fits at-or-below le=0.01s (10ms): {out}"
+        );
+        assert!(
+            out.contains(r#"kb_query_embed_latency_seconds_bucket{le="0.025"} 3"#),
+            "all three samples (9ms, 12ms, 15ms) fit at-or-below le=0.025s (25ms): {out}"
+        );
+        assert!(
+            out.contains(r#"kb_query_embed_latency_seconds_bucket{le="+Inf"} 3"#),
+            "the +Inf bucket must equal the total sample count: {out}"
+        );
+        assert!(
+            out.contains("kb_query_embed_latency_seconds_count 3"),
+            "{out}"
+        );
+        assert!(
+            out.contains("kb_query_rerank_latency_seconds_count 2"),
+            "only the 2 attempted reranks should contribute rerank latency samples: {out}"
+        );
+
+        // Same invariant `prometheus_output_covers_indexing_store_and_breakdown`
+        // checks, re-run here since this test adds lines that one does not exercise.
+        assert_every_metric_is_declared(&out);
+    }
+
+    #[test]
+    fn prometheus_retrieval_histograms_are_empty_but_present_with_no_queries() {
+        // A freshly started process (or one that has only ever indexed, never
+        // served a query) must still emit valid, well-formed histogram/counter
+        // output — zero samples, not absent series, so a dashboard panel does
+        // not show a gap that reads as "broken" rather than "idle".
+        let out = render_prometheus(&sample_status(), &empty_retrieval(), false);
+
+        assert!(out.contains("kb_query_total 0"), "{out}");
+        assert!(out.contains("kb_query_zero_result_total 0"), "{out}");
+        assert!(out.contains("kb_phrase_matching_available 0"), "{out}");
+        assert!(
+            out.contains(r#"kb_query_embed_latency_seconds_bucket{le="+Inf"} 0"#),
+            "{out}"
+        );
+        assert!(
+            out.contains("kb_query_embed_latency_seconds_count 0"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn prometheus_omits_run_metrics_before_anything_has_run() {
         let mut status = sample_status();
         status.indexing = crate::status::IndexStatus::new().snapshot();
-        let out = render_prometheus(&status);
+        let out = render_prometheus(&status, &empty_retrieval(), false);
 
         assert!(out.contains("kb_indexing_in_progress 0"));
         // No fabricated zero timestamp: absent is different from "succeeded in 1970",
@@ -2345,7 +2610,7 @@ mod tests {
 
     #[test]
     fn state_set_metrics_emit_a_zero_for_inactive_values() {
-        let out = render_prometheus(&sample_status());
+        let out = render_prometheus(&sample_status(), &empty_retrieval(), false);
 
         // Every phase present every scrape, so a Grafana state timeline shows an
         // explicit 0 rather than a gap for the phases that are not running.
@@ -2397,7 +2662,7 @@ mod tests {
     fn breakdown_values_with_quotes_stay_parseable() {
         let mut status = sample_status();
         status.breakdown[0].values[0].value = "he said \"hi\"\nand left".into();
-        let out = render_prometheus(&status);
+        let out = render_prometheus(&status, &empty_retrieval(), false);
 
         // Tag and type values come from knowledge-base frontmatter, so they are not
         // guaranteed to be label-safe; an unescaped quote would corrupt the scrape.
@@ -2495,7 +2760,7 @@ mod tests {
         assert!(status.breakdown.iter().any(|b| b.field == "area"));
 
         // And it still renders as valid exposition output.
-        let out = render_prometheus(&status);
+        let out = render_prometheus(&status, &empty_retrieval(), false);
         assert!(out.contains("kb_indexed_files 1"));
         assert!(!out.contains("kb_qdrant_points"));
         assert!(out.contains("kb_status_errors 1"));
@@ -2527,7 +2792,10 @@ mod tests {
         assert_eq!(status.store.indexed_files, Some(3));
         assert_eq!(status.store.documents_with_metadata, Some(0));
         assert_eq!(status.store.documents_missing_metadata, Some(3));
-        assert!(render_prometheus(&status).contains("kb_documents_missing_metadata 3"));
+        assert!(
+            render_prometheus(&status, &empty_retrieval(), false)
+                .contains("kb_documents_missing_metadata 3")
+        );
     }
 
     // --- #155 (passive half): qdrant_points vs. chunk_count_total ---
@@ -2662,7 +2930,7 @@ mod tests {
             status.store.errors
         );
         // And it still renders as valid exposition output.
-        assert!(render_prometheus(&status).contains("kb_status_errors"));
+        assert!(render_prometheus(&status, &empty_retrieval(), false).contains("kb_status_errors"));
     }
 
     #[tokio::test]
