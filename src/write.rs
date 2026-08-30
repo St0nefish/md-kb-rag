@@ -733,11 +733,38 @@ fn remove_by_dotpath(frontmatter: &mut HashMap<String, serde_json::Value>, path:
 /// `.kb-schema.yaml` when `update_schema` rewrites one.
 fn render_frontmatter_block(
     frontmatter: &HashMap<String, serde_json::Value>,
+    newline: &str,
 ) -> Result<String, String> {
     let ordered: BTreeMap<&String, &serde_json::Value> = frontmatter.iter().collect();
     let yaml = serde_yaml_ng::to_string(&ordered)
         .map_err(|e| format!("failed to serialize frontmatter: {e}"))?;
-    Ok(format!("---\n{yaml}---\n"))
+    if newline == "\n" {
+        return Ok(format!("---\n{yaml}---\n"));
+    }
+    // serde_yaml_ng always emits LF. Re-terminate every line with the
+    // document's own ending so a patch does not silently convert a CRLF file
+    // into a mixed-ending one — the bytes would all still be there, but every
+    // subsequent diff of that document would show the whole frontmatter block
+    // as changed.
+    let converted: String = yaml
+        .split_inclusive('\n')
+        .map(|line| format!("{}{newline}", line.trim_end_matches('\n')))
+        .collect();
+    Ok(format!("---{newline}{converted}---{newline}"))
+}
+
+/// The line ending `content` uses, for round-tripping a rewrite through it.
+///
+/// Decided by the first ending actually present, not by a majority vote: a
+/// document with mixed endings is already inconsistent, and picking its first
+/// one at least keeps a rewrite from making the inconsistency worse. Content
+/// with no newline at all gets LF, matching what this project writes by
+/// default everywhere else.
+fn detect_newline(content: &str) -> &'static str {
+    match content.find('\n') {
+        Some(i) if i > 0 && content.as_bytes()[i - 1] == b'\r' => "\r\n",
+        _ => "\n",
+    }
 }
 
 /// Apply a structured frontmatter patch to `old_content`, returning the full
@@ -832,7 +859,7 @@ pub fn apply_frontmatter_patch(
         }
     }
 
-    let new_fm_block = render_frontmatter_block(&frontmatter)?;
+    let new_fm_block = render_frontmatter_block(&frontmatter, detect_newline(old_content))?;
 
     if had_frontmatter {
         Ok(format!("{new_fm_block}{body}"))
@@ -864,16 +891,35 @@ pub fn apply_frontmatter_patch(
 /// tests for each case.
 pub fn apply_append(old_content: &str, text: &str) -> String {
     let (fm_block, body) = split_frontmatter_bytes(old_content).unwrap_or(("", old_content));
+    // Match the document's own line ending rather than always emitting LF —
+    // otherwise the first append to a CRLF document glues an LF-terminated
+    // block onto it and leaves the file with mixed endings.
+    let nl = detect_newline(old_content);
 
     let mut new_body = body.to_string();
     if !new_body.is_empty() && !new_body.ends_with('\n') {
-        new_body.push('\n');
+        new_body.push_str(nl);
     }
     if !fm_block.is_empty() && new_body.is_empty() {
-        new_body.push('\n');
+        new_body.push_str(nl);
     }
-    new_body.push_str(text.trim_end_matches('\n'));
-    new_body.push('\n');
+    // Normalize the caller's text to the document's ending too: an agent
+    // composing an append has no idea what the file on disk uses.
+    let appended: String = text
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .split_inclusive('\n')
+        .map(|line| {
+            let stripped = line.trim_end_matches('\n').trim_end_matches('\r');
+            if line.ends_with('\n') {
+                format!("{stripped}{nl}")
+            } else {
+                stripped.to_string()
+            }
+        })
+        .collect();
+    new_body.push_str(&appended);
+    new_body.push_str(nl);
 
     format!("{fm_block}{new_body}")
 }
@@ -3877,6 +3923,61 @@ mod tests {
     fn apply_append_no_frontmatter() {
         let result = apply_append("existing line\n", "new entry");
         assert_eq!(result, "existing line\nnew entry\n");
+    }
+
+    /// A CRLF document must stay entirely CRLF after an append.
+    ///
+    /// Both halves matter: the separator this function inserts, and the
+    /// caller's own text, which arrives LF-terminated because an agent
+    /// composing an append has no idea what the file on disk uses. Getting
+    /// either wrong leaves a file with mixed endings — no bytes lost, but
+    /// every later diff of that document shows lines nobody edited.
+    #[test]
+    fn apply_append_preserves_crlf_line_endings() {
+        let result = apply_append("# Body\r\nold line\r\n", "new entry");
+        assert_eq!(result, "# Body\r\nold line\r\nnew entry\r\n");
+
+        let multi = apply_append("# Body\r\n", "first\nsecond");
+        assert_eq!(multi, "# Body\r\nfirst\r\nsecond\r\n");
+
+        let no_trailing = apply_append("# Body\r\nold line", "new entry");
+        assert_eq!(no_trailing, "# Body\r\nold line\r\nnew entry\r\n");
+    }
+
+    /// An LF document must not acquire CRLF from CRLF-terminated input text.
+    #[test]
+    fn apply_append_normalizes_crlf_input_into_an_lf_document() {
+        let result = apply_append("# Body\nold line\n", "first\r\nsecond");
+        assert_eq!(result, "# Body\nold line\nfirst\nsecond\n");
+    }
+
+    /// A frontmatter patch re-serializes the whole block, so it is the other
+    /// place a CRLF document can silently become mixed — `serde_yaml_ng`
+    /// always emits LF.
+    #[test]
+    fn apply_frontmatter_patch_preserves_crlf_line_endings() {
+        let doc = "---\r\ntitle: X\r\nstatus: draft\r\n---\r\n\r\n# Body\r\ntext\r\n";
+        let result = apply_frontmatter_patch(
+            doc,
+            &[FrontmatterEdit::SetField {
+                field: "status".into(),
+                value: serde_json::json!("active"),
+            }],
+        )
+        .unwrap();
+        // Deliberately not asserting the absence of "\n\r": two adjacent CRLF
+        // endings contain that sequence at their boundary, so it says nothing.
+        // The per-line check below is the real invariant.
+        for line in result.split_inclusive('\n') {
+            assert!(
+                !line.ends_with('\n') || line.ends_with("\r\n"),
+                "every terminated line must keep CRLF, got {line:?}"
+            );
+        }
+        assert!(
+            result.contains("# Body\r\ntext\r\n"),
+            "body must survive byte-exact: {result:?}"
+        );
     }
 
     #[test]
