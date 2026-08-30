@@ -3460,6 +3460,13 @@ impl KbSearchServer {
     ///   the source, this is the destination. `None` (the default for a plain
     ///   create, and for an edit call with no `new_path`) is the existing
     ///   create/edit behavior. See `write::WriteRequest::dest_path`.
+    /// * `expected_hash` – the caller's `content_hash` from a prior read, threaded
+    ///   straight into `WriteRequest::expected_hash`. See that field's doc comment
+    ///   for why this is not redundant with `write_document_edit`'s own up-front
+    ///   check: this one is `write::write_document`'s live-disk re-check,
+    ///   immediately before the overwrite under `GIT_LOCK`, which catches a
+    ///   modification that landed during this call's own awaits (e.g. a slow
+    ///   `validation.lint_command`) — a window the up-front check cannot see.
     #[allow(clippy::too_many_arguments)]
     async fn run_document_write(
         &self,
@@ -3472,6 +3479,7 @@ impl KbSearchServer {
         force_new: Option<bool>,
         operation: &str,
         dest_path: Option<&str>,
+        expected_hash: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
         // One snapshot for the whole call, so a concurrent `POST /admin/reload`
         // cannot mix old and new values across this method's several config reads.
@@ -3532,14 +3540,18 @@ impl KbSearchServer {
             default_verb,
             force_new,
             operation,
-            // The edit path already enforces the stale-read guard itself, ahead
-            // of applying a surgical old_string/new_string replacement — so a
-            // stale read surfaces as an explicit "changed since you read it"
-            // error rather than a confusing old_string-not-found one. Passing
-            // `None` here avoids redundantly re-hashing the same in-memory
-            // `old_content` a second time; it can never disagree with the first
-            // check since both compare against the identical string.
-            expected_hash: None,
+            // Threaded straight from this method's own `expected_hash` parameter.
+            // `write_document_edit`'s up-front check (above) and this one check
+            // different things: the up-front check compares against the
+            // in-memory `old_content` this call already read, catching a stale
+            // caller read; this one is `write::write_document`'s live-disk
+            // re-check immediately before the overwrite under `GIT_LOCK`, which
+            // catches a concurrent modification that lands *during* this call —
+            // e.g. while awaiting `validate::validate_content`, which can exec an
+            // arbitrarily slow `validation.lint_command`. Passing `None` here
+            // would leave that second window unguarded, silently dropping #142's
+            // protection for every MCP write (see #243).
+            expected_hash,
             // Threaded straight from this method's own `dest_path` parameter —
             // `Some` turns this call into a move. See
             // `write::WriteRequest::dest_path`.
@@ -3730,6 +3742,7 @@ impl KbSearchServer {
             params.force_new,
             "write_document",
             None, // a create never moves a document
+            params.expected_hash.as_deref(),
         )
         .await
     }
@@ -3861,6 +3874,7 @@ impl KbSearchServer {
             None, // no dedup gate for edit
             operation,
             dest_path,
+            params.expected_hash.as_deref(),
         )
         .await
     }
@@ -9920,6 +9934,97 @@ mod tests {
             std::fs::read_to_string(work.path().join("edit-me.md")).unwrap(),
             new_content
         );
+    }
+
+    /// #243 regression, at the MCP layer specifically — `write.rs`'s own
+    /// `stale_hash_re_check_catches_a_change_made_after_the_first_check`
+    /// already covers the re-check itself, but that test (and every
+    /// `expected_hash` test above this one) constructs the concurrent change
+    /// BEFORE the call, which `write_document_edit`'s own up-front check
+    /// (comparing against the `old_content` it freshly reads from disk right
+    /// then) catches on its own regardless of whether `run_document_write`
+    /// threads `expected_hash` into `WriteRequest` at all — so none of those
+    /// would have failed before the fix. This test instead makes the change
+    /// land DURING the call, in the `validate::validate_content` await, via a
+    /// `lint_command` that overwrites the file mid-flight — the exact failure
+    /// scenario #243 describes (a webhook merge landing while an arbitrarily
+    /// slow lint command runs). Before the fix, `run_document_write` passed
+    /// `expected_hash: None` into `WriteRequest` no matter what the caller
+    /// sent, so `write::write_document`'s live-disk re-check was skipped
+    /// entirely and the write proceeded, silently clobbering the concurrent
+    /// change. After the fix, the re-check catches it and the write is
+    /// rejected before ever reaching the filesystem overwrite.
+    #[tokio::test]
+    async fn write_document_tool_re_checks_expected_hash_against_a_change_made_during_the_call() {
+        let bare = crate::git::tests::create_bare_repo("master");
+        let work = crate::git::tests::clone_bare_repo(bare.path(), "master");
+        let original =
+            "---\ntitle: Old\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# Old body\n";
+        std::fs::write(work.path().join("edit-me.md"), original).unwrap();
+        git_commit_all(&work, "edit-me.md", "add edit-me.md");
+        let head_before = head_sha(&work);
+
+        // Simulates a concurrent change (a webhook merge, in production)
+        // landing between `write_document_edit`'s own read of the file and the
+        // actual overwrite inside `write::write_document` — modeled here as a
+        // `lint_command` that overwrites the file mid-flight, during the
+        // `validate::validate_content` await that runs before the re-check.
+        let concurrent = "---\ntitle: Concurrent\ndescription: d\ntype: guide\ntags: \
+                           [t]\n---\n\n# Concurrent body\n";
+        let abs_path = work.path().join("edit-me.md");
+
+        let mut config = make_test_resolved_config(work.path());
+        Arc::get_mut(&mut config).unwrap().validation.lint_command = Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf '%s' '{}' > '{}'", concurrent, abs_path.display()),
+        ]);
+        let server = make_write_test_server(&work, &["**/*.md".to_string()], config);
+
+        let expected_hash = crate::ingest::compute_hash_from_bytes(original.as_bytes());
+        let concurrent_hash = crate::ingest::compute_hash_from_bytes(concurrent.as_bytes());
+        let new_content =
+            "---\ntitle: New\ndescription: d\ntype: guide\ntags: [t]\n---\n\n# New body\n";
+
+        let result = server
+            .write_document(Parameters(WriteDocumentParams {
+                path: "edit-me.md".to_string(),
+                old_string: None,
+                new_string: None,
+                content: Some(new_content.to_string()),
+                message: None,
+                expected_hash: Some(expected_hash),
+                new_path: None,
+                force_new: None,
+                frontmatter_patch: None,
+                append: None,
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "a concurrent on-disk change made during the call must be caught by the \
+             live-disk re-check, not silently clobbered",
+        );
+        assert!(
+            err.message.contains("changed since you read it"),
+            "expected the stale-hash message, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(&concurrent_hash),
+            "the rejection must report the LIVE on-disk hash (the lint_command's \
+             concurrent write), not the caller's original — got: {}",
+            err.message
+        );
+
+        // The concurrent write must survive untouched — that is the whole
+        // point of the re-check: it must never be silently clobbered.
+        assert_eq!(
+            std::fs::read_to_string(&abs_path).unwrap(),
+            concurrent,
+            "the concurrent change must survive the rejected write"
+        );
+        assert_eq!(head_before, head_sha(&work), "no commit must be made");
     }
 
     // -----------------------------------------------------------------------
