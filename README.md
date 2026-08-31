@@ -277,7 +277,7 @@ The server exposes exactly six MCP tools. Read tools (`search`, `get_document`, 
 | `query` | string | no | Natural-language search query. Omit to enumerate instead of rank |
 | `granularity` | string | no | `chunk` or `document`. Defaults to `chunk` when `query` is set, `document` when it isn't |
 | `filters` | object | no | Keyed by frontmatter field (dot-paths for nested fields, e.g. `planning.prep_minutes`). A scalar means equality (`{"type": "guide"}`); an array means any-of (`{"tags": ["recipe","dinner"]}`); an object means all-of or a numeric range (`{"tags": {"all_of": ["recipe","dinner"]}}`, `{"planning.prep_minutes": {"lt": 30}}`). Range operators: `gte`, `lte`, `gt`, `lt`. Also `any_of`, `all_of` |
-| `path_prefix` | string | no | Restrict to a folder, e.g. `lifestyle/kitchen/recipes/` |
+| `path_prefix` | string | no | Restrict by location, e.g. `lifestyle/kitchen/recipes/`. Granularity differs by mode — see below |
 | `modified_after` / `modified_before` | string | no | Exclude documents outside this mtime range; works in both modes |
 | `limit` / `offset` | integer | no | Paging. Query mode: default 10, max 50 (`search.default_limit`/`search.max_limit`). Enumeration mode: default 100, max 1000 |
 | `order_by` / `descending` | string / boolean | no | Enumeration only: sort by `path` (default), `title`, `mtime`, `indexed_at` |
@@ -291,7 +291,9 @@ Per field, `filters` operators are **mutually exclusive**: set matching (`any_of
 
 **Phrase search:** a double-quoted span inside `query` matches as an exact phrase, fused as a third RRF arm alongside the dense and sparse ones (`search.phrase`, default `true` — see [Configuration](#configuration) below). This degrades gracefully — logged, not fatal — against a Qdrant server too old for phrase-matching text indexes.
 
-**`path_prefix` in query mode over-fetches** to try to still return a full page after filtering to the prefix, but for a narrow enough prefix it may still under-return; when the response can't prove it returned everything that matched, it sets `path_prefix_truncated: true`. Enumeration mode has no such caveat — it's exhaustive by construction.
+**`path_prefix` matches at a different granularity per mode.** With a `query` it scopes by whole path components — a folder, or one document's full path — resolved by Qdrant against a `path_ancestors` keyword array, so `sysadmin` matches the `sysadmin` folder and `sys` matches nothing. Without a query (enumeration) it is a plain string prefix (SQL `LIKE prefix%`), so a partial final segment matches too: `kitchen/recipes/stir_fr` finds `stir_fry.md`. A trailing slash is optional in both modes.
+
+In query mode, a document indexed before `path_ancestors` existed carries no such field and falls back to the legacy behavior: the query **over-fetches** and filters by string prefix client-side, which for a narrow enough prefix may still under-return. When the response can't prove it returned everything that matched, it sets `path_prefix_truncated: true`. That fallback disappears per document as each is reindexed, and the flag settles to always `false` once the whole corpus has been. Enumeration mode never had the caveat — it's exhaustive by construction.
 
 Returns both plain text and MCP `structured_content`: query mode returns ranked results plus `path_prefix_truncated`; enumeration mode returns `total`, `returned`, `offset`, `has_more`, `documents[]`. Truncation is never silent either way.
 

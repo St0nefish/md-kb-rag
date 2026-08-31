@@ -230,6 +230,21 @@ pub fn all_indexed_fields(
 /// so that class of drift can't happen again.
 pub const CHUNK_TEXT_KEY: &str = "text";
 
+/// The Qdrant payload key under which a document's ancestor-directory keyword
+/// array is stored (#130) — for `sysadmin/nodes/ares/boot/efi.md`:
+/// `["sysadmin", "sysadmin/nodes", "sysadmin/nodes/ares", "sysadmin/nodes/ares/boot",
+/// "sysadmin/nodes/ares/boot/efi.md"]` (every ancestor directory, deepest last,
+/// plus the document's own full relative path as the terminal entry — see
+/// `ingest::derive_path_ancestors`'s doc comment for why the file's own path is
+/// included even though the issue's example stops at the parent directory).
+///
+/// There is exactly one writer — `ingest::index_paths` — and it must be the only
+/// place that ever inserts this key, same discipline as [`CHUNK_TEXT_KEY`] and for
+/// the same reason (the #61 regression). Every place that turns a `path_prefix`
+/// into a Qdrant condition (currently `retrieval::path_prefix_condition`) must go
+/// through this constant instead of a string literal.
+pub const PATH_ANCESTORS_KEY: &str = "path_ancestors";
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub score: f32,
@@ -868,6 +883,40 @@ impl QdrantStore {
                 );
                 crate::status::INDEX_STATUS.record_payload_index(
                     "mtime",
+                    Some(crate::status::redact_error(&format!("{e:#}"))),
+                );
+            }
+        }
+
+        // Keyword index on `path_ancestors` (#130), unconditional and non-fatal for
+        // the same reasons as the `mtime` index just above: it is a derived field
+        // every point carries going forward (not a schema-declared one, so it isn't
+        // in `indexed_fields`), and Qdrant filters correctly without the index —
+        // just by an unindexed scan — so a creation failure degrades performance,
+        // not correctness, and must not fail startup.
+        //
+        // A keyword index on an array-valued field indexes every element, which is
+        // exactly what `path_prefix_condition`'s `Condition::matches` (single-value
+        // "does the array contain this element") needs to run as an index lookup
+        // rather than a full collection scan.
+        match self
+            .client
+            .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                collection,
+                PATH_ANCESTORS_KEY,
+                FieldType::Keyword,
+            ))
+            .await
+        {
+            Ok(_) => crate::status::INDEX_STATUS.record_payload_index(PATH_ANCESTORS_KEY, None),
+            Err(e) => {
+                error!(
+                    "Could not ensure the keyword index on '{}' in collection '{}': {:#}. \
+                     path_prefix filtering may be slow until this is resolved.",
+                    PATH_ANCESTORS_KEY, collection, e
+                );
+                crate::status::INDEX_STATUS.record_payload_index(
+                    PATH_ANCESTORS_KEY,
                     Some(crate::status::redact_error(&format!("{e:#}"))),
                 );
             }
@@ -1875,22 +1924,40 @@ mod tests {
     }
 
     /// Integration test: `ensure_collection(enable_phrase: true)` creates a working
-    /// phrase-matching text index, and a phrase-filtered hybrid query ranks the chunk
-    /// containing the exact phrase above one that merely contains the same words in a
-    /// different order.
+    /// phrase-matching text index, a phrase-filtered *fused* (RRF) query ranks the
+    /// chunk containing the exact phrase above one that merely contains the same
+    /// words in a different order, and — #133 — the identical phrase condition
+    /// applied as a hard `Filter::must` genuinely EXCLUDES the non-matching chunk,
+    /// not just outranks it.
     ///
     /// #212: this test originally asserted the phrase-matching chunk was the ONLY
-    /// result (`results.len() == 1`) — i.e. that the phrase condition acts as a hard
-    /// filter. Against a real server (this test could not previously run at all — see
-    /// below) that assertion fails: both chunks come back, `/data/exact.md` first with
-    /// `/data/reordered.md` second. That is not a bug; it is exactly what
-    /// `build_fusion_arms`'s doc comment documents as deliberate — the phrase
-    /// condition only ever applies within ONE of the fused RRF arms (`dense` always
-    /// runs unfiltered too), so a document absent from the phrase arm can still
-    /// surface via the dense arm, just ranked lower because it only accumulates
-    /// reciprocal rank from one arm instead of two. Phrase matching is a ranking
-    /// signal, not an exclusion filter — the assertions below were rewritten to match
-    /// that actual, intended contract instead of loosening it to "don't crash".
+    /// result of the FUSED query (`results.len() == 1`) — i.e. that the phrase
+    /// condition acts as a hard filter there. Against a real server (this test could
+    /// not previously run at all — see below) that assertion fails: both chunks come
+    /// back, `/data/exact.md` first with `/data/reordered.md` second. That is not a
+    /// bug; it is exactly what `build_fusion_arms`'s doc comment documents as
+    /// deliberate — the phrase condition only ever applies within ONE of the fused
+    /// RRF arms (`dense` always runs unfiltered too), so a document absent from the
+    /// phrase arm can still surface via the dense arm, just ranked lower because it
+    /// only accumulates reciprocal rank from one arm instead of two. Phrase matching
+    /// is a *ranking* signal there, not an exclusion filter — the fused-query
+    /// assertions below were rewritten to match that actual, intended contract
+    /// instead of loosening it to "don't crash".
+    ///
+    /// #133: that rewrite, however, left NOTHING in the default (non-`--ignored`,
+    /// and — pre-#133 — not even CI-run) suite proving Qdrant's phrase filter
+    /// actually excludes anything server-side. Every other phrase test (offline,
+    /// mocked) only proves the *request* is shaped correctly — that the arm exists,
+    /// that `extract_phrases` splits quoted spans, that the filter condition is
+    /// present in what gets sent. None of that would catch the payload index
+    /// silently failing to build (`ensure_collection` tolerates that failure by
+    /// design and only logs), a tokenizer mismatch between indexing and querying, a
+    /// wrong field name in the phrase condition, or a Qdrant version whose phrase
+    /// semantics differ from what's assumed. The block at the end of this test closes
+    /// that gap directly: it applies the same phrase condition through `search`'s
+    /// `extra_conditions` (the plain dense-only path, which — unlike `hybrid_search`'s
+    /// fused arms — always compiles every condition into one real `Filter::must`) and
+    /// asserts the reordered chunk is gone from the result set entirely.
     ///
     /// Stays live-only — this exercises Qdrant's own phrase-matching text index
     /// end to end (index creation, then a real `Condition::matches_phrase` filter
@@ -2010,6 +2077,64 @@ mod tests {
                 results[1].phrase_score.is_none(),
                 "the reordered chunk never matched the phrase arm, so its phrase_score must \
                  be None — this is the actual signal the phrase-matching text index provides"
+            );
+
+            // #133: everything above proves phrase matching is a *ranking* signal
+            // inside the fused RRF query — and, per `build_fusion_arms`'s doc
+            // comment, that arm can never actually EXCLUDE a document, because the
+            // dense arm always runs alongside it unfiltered. That leaves the one
+            // claim the `phrase_matching` payload index actually exists to back —
+            // "Qdrant can filter results down to exactly the literal phrase" —
+            // completely unproven: a silently-failed index build (`ensure_collection`
+            // tolerates that by design and only logs — see its own doc comment), a
+            // tokenizer mismatch between how chunks were indexed and how phrases are
+            // queried, or a wrong field name in the phrase condition would all still
+            // let every assertion above pass, because nothing above ever asks Qdrant
+            // to exclude anything.
+            //
+            // Prove exclusion directly instead: apply the identical phrase condition
+            // as a hard `Filter::must` via `search`'s `extra_conditions` (the plain
+            // dense-only path, not the fused `hybrid_search` prefetch arm) and
+            // confirm the reordered chunk is excluded outright rather than merely
+            // out-ranked. This is what actually distinguishes "the server-side
+            // enforcement works" from "the request was shaped correctly" — the class
+            // of failure #133 was filed over.
+            let filtered = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || async {
+                    store
+                        .search(
+                            &config.collection,
+                            vec![1.0, 0.0, 0.0, 0.0],
+                            HashMap::new(),
+                            vec![Condition::matches_phrase(
+                                "text",
+                                "node:ares rocm".to_string(),
+                            )],
+                            10,
+                        )
+                        .await
+                        .unwrap()
+                },
+                |results| !results.is_empty(),
+            )
+            .await;
+
+            assert_eq!(
+                filtered.len(),
+                1,
+                "a hard phrase filter must exclude the reordered chunk outright, not merely \
+                 rank it lower — this is the server-side enforcement #133 asked to be proven"
+            );
+            assert_eq!(
+                filtered[0]
+                    .payload
+                    .get("file_path")
+                    .and_then(|v| v.as_str()),
+                Some("/data/exact.md"),
+                "the only survivor of a hard phrase filter must be the chunk that actually \
+                 contains the literal phrase"
             );
         })
         .await;
@@ -2656,6 +2781,219 @@ mod tests {
                 results[0].payload.get("file_path").and_then(|v| v.as_str()),
                 Some("/data/b.md"),
                 "nearest neighbor excluding self should be b, not the orthogonal c"
+            );
+        })
+        .await;
+    }
+
+    /// #130: pin the three Qdrant server behaviors `path_prefix` is built on.
+    ///
+    /// `retrieval::path_prefix_condition` compiles `path_prefix` to
+    /// `should[ matches(path_ancestors, prefix), is_empty(path_ancestors) ]`,
+    /// ANDed into each RRF prefetch arm's `must`. That is only correct if three
+    /// non-obvious things are true of the server, none of which this crate
+    /// controls and none of which the qdrant-client crate documents:
+    ///
+    ///   1. `is_empty` matches a point whose key is **missing entirely**, not
+    ///      only one whose value is `[]`. This is the whole
+    ///      backward-compatibility escape: documents indexed before
+    ///      `path_ancestors` existed carry no such key, and if `is_empty`
+    ///      stopped matching them, `path_prefix` would return **zero results
+    ///      for the entire un-reindexed corpus** — silently, with a green
+    ///      mock-only suite.
+    ///   2. A keyword `match` against an **array-valued** field tests element
+    ///      membership, not equality against the whole array. Every ancestor
+    ///      entry past the first depends on this.
+    ///   3. A `should` nested inside a prefetch arm's `must` behaves as an OR
+    ///      *within* that arm, rather than being flattened or dropped.
+    ///
+    /// All three were verified by hand against `qdrant/qdrant:v1.17.0` when this
+    /// was written; this test is what makes a future server changing any of them
+    /// fail loudly here instead of quietly at the top of someone's search
+    /// results. `retrieval.rs`'s own coverage cannot substitute — its
+    /// `MockRetrievalStore` never evaluates the `Filter` it is handed.
+    ///
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test path_prefix_filter_semantics_hold_on_a_live_server -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn path_prefix_filter_semantics_hold_on_a_live_server() {
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: live_test_collection("path_prefix_filter_semantics_hold_on_a_live_server"),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        let vector_size = 4;
+        store
+            .ensure_collection(
+                &config.collection,
+                vector_size,
+                &[IndexedField::keyword("file_path")],
+                false,
+            )
+            .await
+            .unwrap();
+
+        with_collection_cleanup(&store, &config.collection, || async {
+            // `ancestors: None` is the legacy shape under test — the key is not
+            // written at all, exactly as a pre-#130 point carries it.
+            let make_point = |id: &str, file: &str, ancestors: Option<Vec<&str>>| {
+                let mut payload = HashMap::new();
+                payload.insert("file_path".into(), serde_json::json!(file));
+                if let Some(ancestors) = ancestors {
+                    payload.insert(PATH_ANCESTORS_KEY.into(), serde_json::json!(ancestors));
+                }
+                QdrantPoint {
+                    id: id.into(),
+                    // Identical vectors: relevance is irrelevant here, the
+                    // filter is the entire subject.
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                    sparse: None,
+                    payload,
+                }
+            };
+
+            let points = vec![
+                make_point(
+                    "00000000-0000-0000-0000-0000000001a1",
+                    "/data/sysadmin/nodes/ares.md",
+                    Some(vec!["sysadmin", "sysadmin/nodes", "sysadmin/nodes/ares.md"]),
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-0000000001b1",
+                    "/data/food/chili.md",
+                    Some(vec!["food", "food/chili.md"]),
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-0000000001c1",
+                    "/data/legacy.md",
+                    None,
+                ),
+            ];
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
+
+            let search = async |conditions: Vec<Condition>| -> Vec<String> {
+                let mut files: Vec<String> = store
+                    .hybrid_search(
+                        &config.collection,
+                        vec![1.0, 0.0, 0.0, 0.0],
+                        None,
+                        &[],
+                        HashMap::new(),
+                        conditions,
+                        10,
+                        50,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|r| {
+                        r.payload
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                // Sort so assertions pin membership, not RRF tie-break order
+                // between three identical vectors.
+                files.sort();
+                files
+            };
+
+            // Establish write visibility once, unfiltered, before asserting on
+            // any filter -- see retry_until's doc comment (#231).
+            let all = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || search(Vec::new()),
+                |files| files.len() >= 3,
+            )
+            .await;
+            assert_eq!(
+                all,
+                vec![
+                    "/data/food/chili.md",
+                    "/data/legacy.md",
+                    "/data/sysadmin/nodes/ares.md"
+                ],
+                "all three fixture points must be visible before filters are judged"
+            );
+
+            // (1) is_empty matches the point with NO `path_ancestors` key at all
+            //     -- and only that one.
+            assert_eq!(
+                search(vec![Condition::is_empty(PATH_ANCESTORS_KEY)]).await,
+                vec!["/data/legacy.md"],
+                "is_empty must match a MISSING key, not just an empty array — the \
+                 entire legacy-document escape hangs on this"
+            );
+
+            // (2) a keyword match against an array-valued field is element
+            //     membership: "sysadmin" is one of three entries, and matching
+            //     it must not also drag in the point that has no such entry.
+            assert_eq!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    "sysadmin".to_string()
+                )])
+                .await,
+                vec!["/data/sysadmin/nodes/ares.md"],
+                "a keyword match on an array field tests element membership"
+            );
+            // The deep entry matches on the same terms — this is what lets a
+            // caller scope to one specific document by its full path.
+            assert_eq!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    "sysadmin/nodes/ares.md".to_string()
+                )])
+                .await,
+                vec!["/data/sysadmin/nodes/ares.md"],
+            );
+
+            // (3) component-exactness: keyword matching is not "starts with".
+            //     This is the documented narrowing query mode carries versus
+            //     enumeration mode's SQL `LIKE prefix%`.
+            assert!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    "sys".to_string()
+                )])
+                .await
+                .is_empty(),
+                "a partial path component must NOT match — query-mode path_prefix is \
+                 component-exact, unlike enumeration mode's string prefix"
+            );
+            assert!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    "sysadmin/nodes/ares".to_string()
+                )])
+                .await
+                .is_empty(),
+                "a partial final segment must NOT match either"
+            );
+
+            // (4) the actual shipped shape: a `should` nested inside the
+            //     prefetch arm's `must` is an OR — the matching document AND the
+            //     legacy one, and nothing else.
+            assert_eq!(
+                search(vec![Condition::from(Filter::should([
+                    Condition::matches(PATH_ANCESTORS_KEY, "sysadmin".to_string()),
+                    Condition::is_empty(PATH_ANCESTORS_KEY),
+                ]))])
+                .await,
+                vec!["/data/legacy.md", "/data/sysadmin/nodes/ares.md"],
+                "should[match, is_empty] nested in a prefetch arm's must must behave \
+                 as an OR: the prefix match plus the legacy escape, excluding the \
+                 non-matching reindexed document"
             );
         })
         .await;

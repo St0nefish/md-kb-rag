@@ -157,29 +157,32 @@ jobs:
             .
 
   # The mocked VectorStore suite proves nothing about real Qdrant wire
-  # semantics — filters, phrase matching, RRF, recommend. The six tests that
+  # semantics — filters, phrase matching, RRF, recommend. The eight tests that
   # do exercise a live server (src/qdrant.rs) are #[ignore]d, and plain
-  # `cargo test` (above) never passes --ignored, so none of them have ever
-  # run in CI (#186, and its narrower instance #133). Bring up the project's
-  # own qdrant service and run just those.
+  # `cargo test` (above) never passes --ignored, so none of them ran in CI
+  # before this job was added (#186, and its narrower instance #133). Start a
+  # qdrant container (image pin single-sourced from docker-compose.yml, but
+  # NOT the compose service itself — see `Start Qdrant` for why) and run just
+  # those.
   qdrant-integration:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: self-hosted
-    # Deliberately non-blocking for now: running this suite for the first time
-    # (while wiring it up) found phrase_index_enables_exact_phrase_matching
-    # and recommend_by_point_id_finds_nearest_neighbor FAILING against a real
-    # server — an invalid literal point-ID UUID in the phrase test's fixture,
-    # and a genuine assertion mismatch in the recommend test. Both are
-    # pre-existing bugs in the tests themselves (#133 already tracks the
-    # phrase one), not something this CI-wiring change fixes. Making the job
-    # required today would immediately red-flag every PR, including the one
-    # that adds it, over failures nobody here introduced. continue-on-error
-    # keeps the job's own pass/fail visible without letting it block, and it
-    # is deliberately left out of ci-pass's `needs` below for the same
-    # reason. Flip both once the underlying test bugs are fixed.
-    continue-on-error: true
-
+    # Blocking as of #133. Three separate things had to be true first, and all
+    # three now are:
+    #  1. Two pre-existing bugs in the tests themselves — an invalid literal
+    #     point-ID UUID in phrase_index_enables_exact_phrase_matching's fixture
+    #     (fixed by #212) and a genuine assertion mismatch in
+    #     recommend_by_point_id_finds_nearest_neighbor (fixed by #231, which
+    #     also made the suite safe under cargo's default multi-threaded
+    #     harness rather than --test-threads=1). Both closed.
+    #  2. The job could never reach qdrant at all: it published ports onto the
+    #     host's loopback from a runner that is itself a container. Fixed in
+    #     `Start Qdrant` below — see that step's comment.
+    #  3. An actual green run. This job had 0 successes in 52 attempts before
+    #     that fix; run 33342483836 is the first, with `Run live-Qdrant tests`
+    #     reporting "7 passed; 0 failed". It is required from that point on,
+    #     not on the strength of local runs.
     steps:
       - uses: actions/checkout@v5
         with:
@@ -233,25 +236,68 @@ jobs:
 
       - name: Start Qdrant
         run: |
-          # -v first: a persistent self-hosted runner can carry a leftover
-          # ./data/qdrant volume from a prior run — start every run clean.
-          docker compose -f docker-compose.yml down -v 2>/dev/null || true
-          docker compose -f docker-compose.yml up -d qdrant
+          # The self-hosted runner is itself a container driving the host's
+          # Docker daemon through a mounted /var/run/docker.sock, so
+          # `docker compose up` creates a SIBLING container on the host and
+          # docker-compose.yml's `127.0.0.1:6334:6334` publishes onto the
+          # HOST's loopback -- which is not this container's loopback. Every
+          # run of this job since it was added failed for that reason, first
+          # in the wait step and then in `cargo test` itself, which hardcodes
+          # http://localhost:6334 (src/qdrant.rs).
+          #
+          # Put qdrant in THIS container's network namespace instead: then
+          # `localhost:6334` is literally correct, nothing is published on the
+          # host (so two PRs' jobs can't collide on 6333/6334), and the tests
+          # need no environment plumbing. `hostname` is NOT the container ID
+          # on this runner -- derive the real one from /proc/self/mountinfo,
+          # which is data-root/storage-driver agnostic because it keys off the
+          # second-to-last path component, not a fixed prefix.
+          #
+          # `exit` after the print so an over-mounted /etc/hostname (two
+          # matching mountinfo lines) yields ONE id rather than a multi-line
+          # value that sails past the emptiness check and then fails opaquely
+          # inside `docker run --network container:<two ids>`.
+          #
+          # By design this hard-fails on a non-containerized (bare-metal)
+          # runner: there is no /etc/hostname bind mount to derive an id from,
+          # so the check below trips and this now-REQUIRED job goes red. That
+          # is deliberate -- a bare-metal runner needs the published-ports
+          # approach instead, and silently falling back to it would reintroduce
+          # the cross-PR port collision this netns trick exists to avoid.
+          # Whoever migrates runners: rework this step, don't just delete it.
+          cid=$(awk '$5=="/etc/hostname"{n=split($4,p,"/"); print p[n-1]; exit}' /proc/self/mountinfo)
+          if [[ -z "$cid" ]]; then
+            echo "::error::could not determine this runner's own container id"
+            exit 1
+          fi
+          # The container name must be unique per runner, not a fixed string:
+          # several self-hosted runner containers share one Docker daemon, so a
+          # hardcoded `ci-qdrant` means PR-B's startup `docker rm -f` destroys
+          # the server PR-A is mid-`cargo test` against -- failing PR-A's
+          # required check for a fault it did not cause. `cid` is already unique
+          # per runner, so key the name off it, and export it so the `Stop
+          # Qdrant` step (a separate step, with its own shell) removes the same
+          # container this one created.
+          name="ci-qdrant-${cid}"
+          echo "CI_QDRANT_NAME=${name}" >> "$GITHUB_ENV"
+          docker rm -f "$name" 2>/dev/null || true
+          # Image stays single-sourced from docker-compose.yml so the pin
+          # can't drift from what the deployment runs.
+          image=$(docker compose -f docker-compose.yml config --images qdrant)
+          docker run -d --name "$name" --network "container:${cid}" "$image"
 
-      - name: Wait for Qdrant to be healthy
+      - name: Wait for Qdrant to be ready
         run: |
-          # docker-compose.yml already defines qdrant's healthcheck; poll it
-          # directly instead of a fixed sleep (see deploy.sh's own fix, #198,
-          # for why a flat sleep isn't good enough here either).
+          # Now genuinely this container's loopback, so a direct probe is
+          # correct (poll, not sleep -- see deploy.sh's fix, #198).
           timeout=60
           elapsed=0
           while true; do
-            status=$(docker compose -f docker-compose.yml ps --format json qdrant |
-              jq -rs 'flatten | .[0].Health // empty')
-            [[ "$status" == "healthy" ]] && break
-            if [[ "$status" == "unhealthy" ]] || (( elapsed >= timeout )); then
-              echo "::error::qdrant did not become healthy within ${timeout}s (status: ${status:-none})"
-              docker compose -f docker-compose.yml logs qdrant
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:6333/readyz || echo "000")
+            [[ "$code" == "200" ]] && break
+            if (( elapsed >= timeout )); then
+              echo "::error::qdrant did not become ready within ${timeout}s (last HTTP status: ${code})"
+              docker logs "$CI_QDRANT_NAME"
               exit 1
             fi
             sleep 2
@@ -263,21 +309,55 @@ jobs:
 
       - name: Stop Qdrant
         if: always()
-        run: docker compose -f docker-compose.yml down -v
+        # Only ever removes THIS runner's own container (see `Start Qdrant`),
+        # never another concurrent PR's. `if: always()` means this can run when
+        # `Start Qdrant` failed before exporting the name, so guard on it being
+        # set — an unguarded `docker rm -f ""` would just be noise.
+        run: |
+          if [[ -n "${CI_QDRANT_NAME:-}" ]]; then
+            docker rm -f "$CI_QDRANT_NAME" 2>/dev/null || true
+          fi
 
   # Gate job for branch protection — set "ci-pass" as the required status check.
-  # Passes when test succeeds or was skipped (doc-only changes).
-  # qdrant-integration is deliberately NOT in this list — see its own comment.
+  # Passes when `changes` succeeded AND both test and qdrant-integration
+  # succeeded or were skipped (doc-only changes skip both identically, via the
+  # same `changes` gate) — see the step body for why `changes` is checked too.
+  # #133: qdrant-integration used to be deliberately left out of this list —
+  # see its own job comment for why that's no longer the case.
   ci-pass:
     if: always()
-    needs: [test]
+    needs: [changes, test, qdrant-integration]
     runs-on: ubuntu-latest
     steps:
       - name: Check result
         run: |
-          if [[ "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
-            echo "CI passed (test: ${{ needs.test.result }})"
+          ok=true
+          # `changes` must be in `needs` and checked explicitly, not just relied
+          # on transitively. `test` and `qdrant-integration` are both gated on
+          # `needs.changes.outputs.code`, so if `changes` itself FAILS (a
+          # paths-filter outage, a checkout failure) neither runs and both
+          # report `skipped` — indistinguishable, to the two checks below, from
+          # the legitimate doc-only case. Without this clause the gate would
+          # print "CI passed (test: skipped, ...)" and exit 0 with zero
+          # verification having happened, and auto-merge would fire on it.
+          # Requiring `changes` to have succeeded separates the two: a broken
+          # `changes` fails the gate, while a successful `changes` reporting no
+          # code changes still lets the all-skipped doc-only path pass.
+          if [[ "${{ needs.changes.result }}" != "success" ]]; then
+            echo "changes: ${{ needs.changes.result }}"
+            ok=false
+          fi
+          if [[ ! "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "test: ${{ needs.test.result }}"
+            ok=false
+          fi
+          if [[ ! "${{ needs.qdrant-integration.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "qdrant-integration: ${{ needs.qdrant-integration.result }}"
+            ok=false
+          fi
+          if [[ "$ok" == "true" ]]; then
+            echo "CI passed (test: ${{ needs.test.result }}, qdrant-integration: ${{ needs.qdrant-integration.result }})"
           else
-            echo "CI failed (test: ${{ needs.test.result }})"
+            echo "CI failed"
             exit 1
           fi
