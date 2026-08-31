@@ -375,7 +375,7 @@ pub async fn run_eval<E: QueryEmbedder, Q: RetrievalStore>(
             explain: false,
             modified_after: None,
             modified_before: None,
-            path_prefix: None,
+            path_filter: None,
             rerank_candidate_limit: search_cfg.rerank_candidate_limit,
             diversity_max_per_document: search_cfg.diversity_max_per_document,
         };

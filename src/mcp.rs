@@ -843,7 +843,12 @@ fn build_document_query(params: &SearchParams) -> Result<DocumentQuery, McpError
 
     Ok(DocumentQuery {
         filters,
-        path_prefix: params.path_prefix.clone(),
+        // #182: normalized through the same function the query-mode resolution uses,
+        // so one needle means one thing in both modes. `push_where` applies the
+        // substring `LIKE` that `DocumentIndex::paths_matching` applies for query
+        // mode, rather than resolving to a path list enumeration would only re-query.
+        path_prefix: retrieval::normalize_path_needle(params.path_prefix.as_deref())
+            .map(str::to_string),
         order_by,
         order_desc: params.descending.unwrap_or(false),
         limit: params
@@ -1022,10 +1027,11 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFiltersInput>,
 
-    /// Restrict by location. With `query`: matches whole path components (a
-    /// folder, or one document's full path) — `sys` will not match `sysadmin`.
-    /// Without `query` (enumeration): a plain string prefix, so a partial final
-    /// segment matches too. A trailing slash is optional in both modes.
+    /// Restrict by location: a case-insensitive substring of the document's path,
+    /// the same in both modes. Matches anywhere in the path, so it also finds a
+    /// document from a fragment of its name — `stir_fr` finds
+    /// `kitchen/recipes/stir_fry.md`. A short needle is correspondingly broad.
+    /// A trailing slash is optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
 
@@ -2919,6 +2925,33 @@ impl KbSearchServer {
             .await
     }
 
+    /// Resolve a `path_prefix` needle to the documents it actually matches (#182).
+    ///
+    /// The metadata index is the single authority for that question, so both query
+    /// modes route through here and enumeration applies the identical `LIKE` inline
+    /// (`state::StateDb::push_where`) — one needle can only ever mean one thing.
+    /// `None` in gives `None` out: no filter, matching everything.
+    async fn resolve_path_filter(
+        &self,
+        path_prefix: Option<&str>,
+    ) -> Result<Option<retrieval::PathFilter>, McpError> {
+        let Some(needle) = retrieval::normalize_path_needle(path_prefix) else {
+            return Ok(None);
+        };
+        let index = self.state_db().await.map_err(|e| {
+            error!("search could not open the metadata index: {:#}", e);
+            McpError::internal_error(format!("Document index unavailable: {}", e), None)
+        })?;
+        let matches = index
+            .paths_matching(needle, retrieval::PATH_FILTER_MAX_PATHS)
+            .await
+            .map_err(|e| {
+                error!("search could not resolve path_prefix '{}': {:#}", needle, e);
+                McpError::internal_error(format!("path_prefix lookup failed: {}", e), None)
+            })?;
+        Ok(Some(matches.into()))
+    }
+
     /// Build a `RetrievalDeps` bundle from this server's fields.
     fn deps(&self) -> RetrievalDeps<'_, EmbedClient, QdrantStore> {
         RetrievalDeps {
@@ -3014,6 +3047,9 @@ impl KbSearchServer {
             .transpose()
             .map_err(|e| McpError::invalid_params(e, None))?;
         let explain = params.explain.unwrap_or(false);
+        let path_filter = self
+            .resolve_path_filter(params.path_prefix.as_deref())
+            .await?;
         let opts = SearchOptions {
             limit,
             min_score: params.min_score.or(config.search.min_score),
@@ -3026,7 +3062,7 @@ impl KbSearchServer {
             explain,
             modified_after,
             modified_before,
-            path_prefix: params.path_prefix.clone(),
+            path_filter,
             rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
             diversity_max_per_document: config.search.diversity_max_per_document,
         };
@@ -3149,6 +3185,9 @@ impl KbSearchServer {
             .transpose()
             .map_err(|e| McpError::invalid_params(e, None))?;
 
+        let path_filter = self
+            .resolve_path_filter(params.path_prefix.as_deref())
+            .await?;
         let opts = SearchOptions {
             limit,
             min_score: params.min_score.or(config.search.min_score),
@@ -3172,7 +3211,7 @@ impl KbSearchServer {
             explain: false,
             modified_after,
             modified_before,
-            path_prefix: params.path_prefix.clone(),
+            path_filter,
             rerank_candidate_limit: None,
             diversity_max_per_document: None,
         };
@@ -4778,8 +4817,9 @@ fn build_chunk_search_payload(
         let mut text = "No results found.".to_string();
         if path_prefix_truncated {
             text.push_str(
-                "\n\nNote: path_prefix matched more candidates than could be over-fetched, \
-                 so this may not be exhaustive — narrow the prefix or lower limit to be sure.",
+                "\n\nNote: path_prefix matched more documents than could be filtered on at \
+                 once, so this may not be exhaustive — use a longer, more specific \
+                 path_prefix to be sure.",
             );
         }
         if offset_truncated {
@@ -4944,9 +4984,9 @@ fn build_chunk_search_payload(
 
     if path_prefix_truncated {
         output.push_str(
-            "\nNote: path_prefix matched more candidates than could be over-fetched, so \
-             fewer results than `limit` were returned and more may exist — narrow the \
-             prefix or lower limit to be sure this is exhaustive.\n",
+            "\nNote: path_prefix matched more documents than could be filtered on at once, \
+             so fewer results than `limit` were returned and more may exist — use a \
+             longer, more specific path_prefix to be sure this is exhaustive.\n",
         );
     }
     if offset_truncated {
@@ -5059,9 +5099,9 @@ fn build_grouped_search_payload(
 
     if path_prefix_truncated {
         text.push_str(
-            "\nNote: path_prefix matched more candidates than could be over-fetched, so \
-             fewer results than `limit` were returned and more may exist — narrow the \
-             prefix or lower limit to be sure this is exhaustive.\n",
+            "\nNote: path_prefix matched more documents than could be filtered on at once, \
+             so fewer results than `limit` were returned and more may exist — use a \
+             longer, more specific path_prefix to be sure this is exhaustive.\n",
         );
     }
     if offset_truncated {
@@ -7121,6 +7161,121 @@ mod tests {
         );
     }
 
+    /// #182: the discovery case the issue was filed for, through the tool surface —
+    /// a fragment the caller does not know the start of.
+    #[tokio::test]
+    async fn search_enumerate_path_prefix_matches_a_mid_path_fragment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "kitchen/recipes/stir_fry.md",
+            serde_json::json!({ "title": "Stir Fry" }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "sysadmin/zfs.md",
+            serde_json::json!({ "title": "ZFS" }),
+        )
+        .await;
+
+        // Neither the leading path component nor the whole basename — exactly what
+        // a prefix match could not find.
+        let result = server
+            .search(Parameters(SearchParams {
+                path_prefix: Some("stir_fr".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["total"], serde_json::json!(1));
+        assert_eq!(
+            structured["documents"][0]["file_path"],
+            serde_json::json!("kitchen/recipes/stir_fry.md")
+        );
+    }
+
+    /// Query mode cannot be driven end-to-end here (it needs a live Qdrant), so
+    /// this covers the part that is #182's actual change to it: the needle is
+    /// resolved against the metadata index — the same matcher enumeration uses —
+    /// before any vector search happens.
+    #[tokio::test]
+    async fn resolve_path_filter_resolves_a_fragment_to_its_documents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "kitchen/recipes/stir_fry.md",
+            serde_json::json!({ "title": "Stir Fry" }),
+        )
+        .await;
+        seed_document(
+            &server,
+            "sysadmin/zfs.md",
+            serde_json::json!({ "title": "ZFS" }),
+        )
+        .await;
+
+        let filter = server
+            .resolve_path_filter(Some("stir_fr"))
+            .await
+            .unwrap()
+            .expect("a needle resolves to a filter");
+
+        assert_eq!(filter.paths, vec!["kitchen/recipes/stir_fry.md"]);
+        assert!(!filter.truncated);
+    }
+
+    #[tokio::test]
+    async fn resolve_path_filter_is_none_without_a_needle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+
+        assert!(server.resolve_path_filter(None).await.unwrap().is_none());
+        // Empty once normalized — "match everything" is the absence of a filter,
+        // not a filter on the empty string (which as a substring matches all).
+        assert!(
+            server
+                .resolve_path_filter(Some(""))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            server
+                .resolve_path_filter(Some("/"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A needle matching nothing must resolve to an empty filter, not to `None` —
+    /// `None` means "no filter", which would return the whole corpus.
+    #[tokio::test]
+    async fn resolve_path_filter_empty_for_a_needle_that_matches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = schema_tool_server(&tmp);
+        seed_document(
+            &server,
+            "sysadmin/zfs.md",
+            serde_json::json!({ "title": "ZFS" }),
+        )
+        .await;
+
+        let filter = server
+            .resolve_path_filter(Some("nothing-matches-this"))
+            .await
+            .unwrap()
+            .expect("a needle that matches nothing is still a filter");
+
+        assert!(filter.paths.is_empty());
+        assert!(!filter.truncated);
+    }
+
     #[tokio::test]
     async fn search_enumerate_reports_an_empty_result_clearly() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7137,9 +7292,9 @@ mod tests {
         );
     }
 
-    /// Enumeration mode's `path_prefix` compiles to an exact SQL `LIKE prefix%`
+    /// Enumeration mode's `path_prefix` compiles to an exact SQL `LIKE '%needle%'`
     /// (see `state::query_documents`) — never the query-mode post-fetch retain
-    /// the over-fetch/`path_prefix_truncated` fix exists for. A selective prefix
+    /// the over-fetch/`path_prefix_truncated` fix exists for. A selective needle
     /// must still report an exact `total`/`returned`/`has_more`, and the response
     /// must carry no `path_prefix_truncated` key at all: that concept only exists
     /// where a fetch can come up short of what actually matches.
@@ -12254,7 +12409,7 @@ mod tests {
 
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
         assert!(
-            text.contains("path_prefix matched more candidates"),
+            text.contains("path_prefix matched more documents"),
             "text must render the truncation note; got: {text}"
         );
 
@@ -12274,7 +12429,7 @@ mod tests {
             serde_json::json!(true)
         );
         assert!(
-            empty_text.contains("path_prefix matched more candidates"),
+            empty_text.contains("path_prefix matched more documents"),
             "empty-results text must also render the truncation note; got: {empty_text}"
         );
     }
@@ -12535,7 +12690,7 @@ mod tests {
 
         assert_eq!(structured["path_prefix_truncated"], serde_json::json!(true));
         assert!(
-            text.contains("path_prefix matched more candidates"),
+            text.contains("path_prefix matched more documents"),
             "text must render the truncation note; got: {text}"
         );
     }

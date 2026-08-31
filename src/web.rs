@@ -798,7 +798,7 @@ async fn search_handler(
         explain: false,
         modified_after: None,
         modified_before: None,
-        path_prefix: None,
+        path_filter: None,
         rerank_candidate_limit: config.reranking.as_ref().map(|r| r.candidate_limit as u64),
         diversity_max_per_document: config.search.diversity_max_per_document,
     };
@@ -1880,7 +1880,7 @@ mod tests {
             explain: false,
             modified_after: None,
             modified_before: None,
-            path_prefix: None,
+            path_filter: None,
             rerank_candidate_limit: None,
             diversity_max_per_document: None,
         }

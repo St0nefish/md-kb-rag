@@ -525,7 +525,7 @@ async fn main() -> anyhow::Result<()> {
                 explain: args.explain,
                 modified_after,
                 modified_before,
-                path_prefix: None,
+                path_filter: None,
                 rerank_candidate_limit: cfg.reranking.as_ref().map(|r| r.candidate_limit as u64),
                 diversity_max_per_document: cfg.search.diversity_max_per_document,
             };

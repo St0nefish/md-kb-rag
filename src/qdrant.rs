@@ -241,7 +241,7 @@ pub const CHUNK_TEXT_KEY: &str = "text";
 /// There is exactly one writer — `ingest::index_paths` — and it must be the only
 /// place that ever inserts this key, same discipline as [`CHUNK_TEXT_KEY`] and for
 /// the same reason (the #61 regression). Every place that turns a `path_prefix`
-/// into a Qdrant condition (currently `retrieval::path_prefix_condition`) must go
+/// into a Qdrant condition (currently `retrieval::path_filter_condition`) must go
 /// through this constant instead of a string literal.
 pub const PATH_ANCESTORS_KEY: &str = "path_ancestors";
 
@@ -425,13 +425,14 @@ fn build_conditions(filters: &HashMap<String, serde_json::Value>) -> Result<Vec<
     Ok(conditions)
 }
 
-/// A condition that can never match, for an empty `any_of` filter set.
+/// A condition that can never match, for an empty `any_of` filter set — or, per
+/// #182, a `path_prefix` needle that resolved to no documents at all.
 ///
 /// Mirrors `state::StateDb::push_where`'s `AND 0 = 1` convention: Qdrant's filter
 /// grammar has no literal boolean constant, so this ANDs a structural check
 /// (`is_null`) against its own negation instead. Built from `is_null` rather than a
 /// value-typed condition so it never has to guess the field's Qdrant match kind.
-fn unsatisfiable(field: &str) -> Condition {
+pub(crate) fn unsatisfiable(field: &str) -> Condition {
     Condition::from(Filter {
         must: vec![Condition::is_null(field)],
         must_not: vec![Condition::is_null(field)],
@@ -896,7 +897,7 @@ impl QdrantStore {
         // not correctness, and must not fail startup.
         //
         // A keyword index on an array-valued field indexes every element, which is
-        // exactly what `path_prefix_condition`'s `Condition::matches` (single-value
+        // exactly what `path_filter_condition`'s `Condition::matches` (single-value
         // "does the array contain this element") needs to run as an index lookup
         // rather than a full collection scan.
         match self
@@ -2786,11 +2787,11 @@ mod tests {
         .await;
     }
 
-    /// #130: pin the three Qdrant server behaviors `path_prefix` is built on.
+    /// #130/#182: pin the Qdrant server behaviors `path_prefix` is built on.
     ///
-    /// `retrieval::path_prefix_condition` compiles `path_prefix` to
-    /// `should[ matches(path_ancestors, prefix), is_empty(path_ancestors) ]`,
-    /// ANDed into each RRF prefetch arm's `must`. That is only correct if three
+    /// `retrieval::path_filter_condition` compiles a resolved path set to
+    /// `should[ matches(path_ancestors, [paths...]), is_empty(path_ancestors) ]`,
+    /// ANDed into each RRF prefetch arm's `must`. That is only correct if several
     /// non-obvious things are true of the server, none of which this crate
     /// controls and none of which the qdrant-client crate documents:
     ///
@@ -2958,9 +2959,12 @@ mod tests {
                 vec!["/data/sysadmin/nodes/ares.md"],
             );
 
-            // (3) component-exactness: keyword matching is not "starts with".
-            //     This is the documented narrowing query mode carries versus
-            //     enumeration mode's SQL `LIKE prefix%`.
+            // (3) keyword matching is not "starts with" — it is exact, per entry.
+            //     #182 is what makes that a non-issue rather than a limitation:
+            //     a substring needle is resolved to whole paths against SQLite
+            //     before it ever reaches Qdrant, so what arrives here is always
+            //     an exact set. This assertion pins *why* that resolution step
+            //     has to exist.
             assert!(
                 search(vec![Condition::matches(
                     PATH_ANCESTORS_KEY,
@@ -2968,8 +2972,9 @@ mod tests {
                 )])
                 .await
                 .is_empty(),
-                "a partial path component must NOT match — query-mode path_prefix is \
-                 component-exact, unlike enumeration mode's string prefix"
+                "a partial path component must NOT match — which is precisely why a \
+                 substring needle cannot be pushed down as-is and is resolved to \
+                 concrete paths first"
             );
             assert!(
                 search(vec![Condition::matches(
@@ -2981,19 +2986,39 @@ mod tests {
                 "a partial final segment must NOT match either"
             );
 
-            // (4) the actual shipped shape: a `should` nested inside the
-            //     prefetch arm's `must` is an OR — the matching document AND the
-            //     legacy one, and nothing else.
+            // (4) a keyword match against a LIST of values is match-any, and each
+            //     value still tests element membership in the array field. This is
+            //     the #182 push-down: one condition carrying every path the needle
+            //     resolved to.
+            assert_eq!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    vec![
+                        "sysadmin/nodes/ares.md".to_string(),
+                        "food/chili.md".to_string(),
+                    ]
+                )])
+                .await,
+                vec!["/data/food/chili.md", "/data/sysadmin/nodes/ares.md"],
+                "a multi-value keyword match must be an OR across the resolved paths"
+            );
+
+            // (5) the actual shipped shape: that match-any `should`-nested inside
+            //     the prefetch arm's `must`, ORed with the legacy escape — the
+            //     resolved documents AND the legacy one, and nothing else.
             assert_eq!(
                 search(vec![Condition::from(Filter::should([
-                    Condition::matches(PATH_ANCESTORS_KEY, "sysadmin".to_string()),
+                    Condition::matches(
+                        PATH_ANCESTORS_KEY,
+                        vec!["sysadmin/nodes/ares.md".to_string()]
+                    ),
                     Condition::is_empty(PATH_ANCESTORS_KEY),
                 ]))])
                 .await,
                 vec!["/data/legacy.md", "/data/sysadmin/nodes/ares.md"],
-                "should[match, is_empty] nested in a prefetch arm's must must behave \
-                 as an OR: the prefix match plus the legacy escape, excluding the \
-                 non-matching reindexed document"
+                "should[match_any, is_empty] nested in a prefetch arm's must must \
+                 behave as an OR: the resolved paths plus the legacy escape, \
+                 excluding the non-matching reindexed document"
             );
         })
         .await;
