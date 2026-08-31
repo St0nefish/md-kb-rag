@@ -28,7 +28,8 @@ jobs:
       # per-PR sha image, and the steps below still run far enough to name the
       # image this push would have shipped, so the log says exactly what is
       # pending. Ship the batch with a workflow_dispatch run (force=true), which
-      # promotes master's current HEAD in a single restart.
+      # promotes the newest built image in a single restart — normally HEAD's,
+      # or the newest one behind it when HEAD is a non-code merge (fix #262).
       #
       # Deliberately a gate inside the job rather than disabling the workflow:
       # a disabled workflow leaves no run history, so there is no record that a
@@ -51,7 +52,7 @@ jobs:
         with:
           # Deep enough to walk back over a held batch. A forced dispatch may
           # need to look past several non-code merges to find the newest built
-          # image — see the walk in "Compute sha tag from squash merge".
+          # image — see the walk in "Resolve the image tag to ship".
           fetch-depth: 50
 
       - name: Set image name
@@ -65,7 +66,7 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Compute sha tag from squash merge
+      - name: Resolve the image tag to ship
         id: version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,14 +81,29 @@ jobs:
           # history) produces a subject with no "(#N)" at all, which broke
           # this step when it grep'd the log under `set -e` (fix #260,
           # observed in run 33344570055 on commit 4e90661).
+          #
+          # Command substitution runs in a subshell that does NOT inherit
+          # errexit unless this is set. Without it, a function whose last
+          # statement is `echo` returns 0 even when the command before it
+          # failed, so `TAG=$(tag_for_pr ...)` would swallow a `gh` outage and
+          # hand back a garbage "sha-" tag. That silently turns an API blip
+          # into "deployed nothing" (or, mid-walk, into skipping a commit that
+          # did have an image and shipping older code).
+          shopt -s inherit_errexit
+
           resolve_pr() {
             gh api "repos/${GITHUB_REPOSITORY}/commits/$1/pulls" --jq '.[0].number // empty'
           }
           tag_for_pr() {
             local head_sha
-            head_sha=$(gh pr view "$1" --json headRefOid --jq '.headRefOid')
+            head_sha=$(gh pr view "$1" --json headRefOid --jq '.headRefOid') || return 1
+            [ -n "$head_sha" ] || return 1
             echo "sha-${head_sha:0:7}"
           }
+
+          # ci.yml's paths filter, as an anchored regex. A commit touching any
+          # of these produced an image; one touching none legitimately did not.
+          CODE_PATHS='^(src/|assets/|migrations/|Cargo\.(toml|lock)$|Dockerfile$|docker-compose\.yml$|rust-toolchain\.toml$|\.dockerignore$|\.github/workflows/ci\.yml$)'
 
           PR_NUM=$(resolve_pr "${GITHUB_SHA}")
           if [ -n "$PR_NUM" ]; then
@@ -102,11 +118,21 @@ jobs:
             # #254/#258/#255 sitting behind the workflow-only #261.
             #
             # So when HEAD has no image, walk back to the most recent commit
-            # that does. Safe, because `ci-pass` is a required check: a merged
-            # commit either produced an image or had its build skipped for
-            # being a non-code change, and the code it ships is therefore
-            # identical to HEAD's. A commit with no PR at all is never walked
-            # past — that is the direct-push case below, and it stays fatal.
+            # that does. What makes that safe is not just that `ci-pass` is
+            # required, but that master's ruleset sets
+            # `strict_required_status_checks_policy: true` (branch must be up
+            # to date before merging) with `bypass_actors: []` — so the head
+            # CI built already contained every earlier master commit, and no
+            # admin can merge around it. The image found by walking back
+            # therefore carries the same code as HEAD.
+            #
+            # That argument is about what CI *did*, while a registry probe
+            # only reports what a tag resolves to *now* — a deleted or pruned
+            # image looks identical to one that was never built, and walking
+            # past it would silently ship older code. So before skipping any
+            # commit, prove from its diff that it legitimately had no build.
+            # A commit with no PR at all is never walked past either — that is
+            # the direct-push case below, and it stays fatal.
             #
             # Only on a forced dispatch. A plain docs-only push keeps the old
             # behavior (skip the retag, deploy nothing) rather than poking
@@ -114,17 +140,29 @@ jobs:
             if [ "${FORCED}" = "true" ] && ! docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" >/dev/null 2>&1; then
               echo "::notice::HEAD (${GITHUB_SHA}) has no image of its own — walking back for the newest built one."
               FOUND=""
-              for sha in $(git rev-list -n 50 "${GITHUB_SHA}"); do
-                pr=$(resolve_pr "$sha")
+              # Start at HEAD's parent: the `if` above already proved HEAD's
+              # own tag does not resolve.
+              for sha in $(git rev-list -n 50 "${GITHUB_SHA}^"); do
+                if ! pr=$(resolve_pr "$sha"); then
+                  echo "::error::Could not resolve the PR for ${sha} — the GitHub API call failed. Re-run this dispatch; no deploy was performed."
+                  exit 1
+                fi
                 if [ -z "$pr" ]; then
-                  echo "::warning::${sha} has no associated PR — stopping the walk here."
-                  break
+                  echo "::error::${sha} has no associated PR, so the walk cannot prove the commits above it were non-code. Refusing to guess an image."
+                  exit 1
                 fi
                 candidate=$(tag_for_pr "$pr")
                 if docker buildx imagetools inspect "${IMAGE_NAME}:${candidate}" >/dev/null 2>&1; then
                   FOUND="$candidate"
                   echo "::notice::Shipping ${candidate}, built for PR #${pr} at ${sha}."
                   break
+                fi
+                # No image here. Only keep walking if this commit genuinely
+                # changed nothing CI builds from; otherwise its image went
+                # missing and anything older is stale code.
+                if git diff --name-only "${sha}^" "${sha}" | grep -qE "${CODE_PATHS}"; then
+                  echo "::error::${sha} (PR #${pr}) changed code but has no image ${candidate} — it may have been deleted or pruned. Refusing to ship an older image in its place."
+                  exit 1
                 fi
               done
               if [ -z "$FOUND" ]; then
@@ -145,6 +183,18 @@ jobs:
           echo "short_sha=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Using image tag: ${TAG}"
 
+          # Whether this tag actually resolves. The held report below reads it:
+          # when a batch is held, the walk above has not run (it is scoped to
+          # forced dispatches), so HEAD's tag may name no image at all — and
+          # saying "already built and pushed" there would be the very
+          # falsehood that hid #262.
+          if docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" >/dev/null 2>&1; then
+            echo "image_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${IMAGE_NAME}:${TAG} does not exist — this commit changed nothing CI builds from."
+          fi
+
           # Also expose a tag keyed to THIS commit on master. The tag above is the
           # PR head SHA, because CI builds the image on the PR branch and this job
           # only retags it — but that SHA does not appear anywhere in master's
@@ -155,19 +205,33 @@ jobs:
 
       - name: Report held deploy
         if: steps.gate.outputs.held == 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}
+          MERGE_TAG: ${{ steps.version.outputs.merge_sha }}
+          EXISTS: ${{ steps.version.outputs.image_exists }}
         run: |
-          echo "Deploy held. This push would have shipped:"
-          echo "  ${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}"
-          echo "  (as :latest and :${{ steps.version.outputs.merge_sha }})"
-          echo ""
-          echo "The sha-tagged image is already built and pushed by CI, so nothing"
-          echo "needs rebuilding when the batch ships — the release job only retags."
+          echo "Deploy held."
+          if [ "${EXISTS}" = "true" ]; then
+            echo "This push would have shipped:"
+            echo "  ${IMAGE}"
+            echo "  (as :latest and :${MERGE_TAG})"
+            echo ""
+            echo "The sha-tagged image is already built and pushed by CI, so nothing"
+            echo "needs rebuilding when the batch ships — the release job only retags."
+            PENDING="Pending image: \`${IMAGE}\`"
+          else
+            echo "This commit changed nothing CI builds from, so it has no image of"
+            echo "its own (${IMAGE} does not exist). A forced dispatch will walk back"
+            echo "to the newest built image and ship that, so the code merges queued"
+            echo "behind this one are not stranded (fix #262)."
+            PENDING="No image for this commit; a forced dispatch ships the newest built one."
+          fi
           {
             echo "### Deploy held :pause_button:"
             echo ""
             echo "\`DEPLOY_HOLD\` is set, so this merge did not restart the service."
             echo ""
-            echo "Pending image: \`${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}\`"
+            echo "${PENDING}"
             echo ""
             echo "Ship the accumulated batch by running this workflow manually with \`force=true\`."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -179,11 +243,21 @@ jobs:
           IMAGE="${{ steps.image.outputs.name }}:${{ steps.version.outputs.short_sha }}"
           # CI only builds/pushes the sha image when code changed (see ci.yml path filter).
           # Docs-only merges (e.g. .gitignore) produce no image, so there is nothing to retag.
+          # On a forced dispatch this branch is unreachable: the version step's
+          # walk either found an image that exists or failed the job.
           if ! docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
             echo "No image $IMAGE for this push (docs-only change?) — skipping latest retag."
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          # What :latest points at now. A forced dispatch that walks back can
+          # legitimately re-ship the image :latest already carries (a batch of
+          # nothing but non-code merges), and then Watchtower correctly reports
+          # updated=0 — which its step below otherwise treats as a failure and
+          # blames on a missing opt-in label.
+          PREV_DIGEST=$(docker buildx imagetools inspect "${{ steps.image.outputs.name }}:latest" \
+            --format '{{.Manifest.Digest}}' 2>/dev/null || echo "none")
           # imagetools create builds :latest from exactly the source refs given
           # to it — it does not merge with whatever :latest already pointed at.
           # $IMAGE is amd64-only (ci.yml builds a single platform), so passing
@@ -212,6 +286,15 @@ jobs:
             "${ARM64_REFS[@]}"
           echo "skipped=false" >> "$GITHUB_OUTPUT"
 
+          NEW_DIGEST=$(docker buildx imagetools inspect "${{ steps.image.outputs.name }}:latest" \
+            --format '{{.Manifest.Digest}}' 2>/dev/null || echo "none")
+          if [ "$PREV_DIGEST" = "$NEW_DIGEST" ]; then
+            echo "::notice:::latest already pointed at this manifest (${NEW_DIGEST}) — nothing for Watchtower to update."
+            echo "digest_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "digest_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Trigger Watchtower
         if: steps.gate.outputs.held != 'true' && steps.retag.outputs.skipped != 'true'
         run: |
@@ -227,6 +310,14 @@ jobs:
           updated=$(printf '%s' "${response}" | jq -r '.summary.updated // 0')
           if [ "${updated}" -gt 0 ]; then
             echo "Watchtower updated ${updated} container(s)"
+            exit 0
+          fi
+          # updated=0 is expected and fine when :latest did not actually move —
+          # a forced dispatch whose batch contained no code changes re-ships the
+          # manifest already deployed. Only treat it as a failure when the
+          # digest really did change.
+          if [ "${{ steps.retag.outputs.digest_changed }}" = "false" ]; then
+            echo "Watchtower reported updated=0, and :latest did not move — already running this image."
             exit 0
           fi
           # We just retagged :latest to a new digest, so an update is expected.
