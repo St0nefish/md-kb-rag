@@ -128,10 +128,40 @@ impl DocumentQueryResult {
     }
 }
 
+/// The paths matching a `path_prefix` needle, plus how many matched in total.
+///
+/// #182: `paths` is capped by the caller so a very broad needle cannot build an
+/// unbounded Qdrant filter; `total` is the uncapped count, so a caller can always
+/// tell a complete answer from a truncated one — the same `total`-alongside-the-page
+/// convention as [`DocumentQueryResult`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathMatches {
+    pub paths: Vec<String>,
+    pub total: u64,
+}
+
+impl PathMatches {
+    /// True when the cap hid matches that really exist.
+    pub fn truncated(&self) -> bool {
+        (self.paths.len() as u64) < self.total
+    }
+}
+
 /// Read side of the document metadata index. Separate from [`StateDb`]'s inherent API
 /// so retrieval can be tested against a mock without SQLite.
 pub trait DocumentIndex: Send + Sync {
     async fn query_documents(&self, query: &DocumentQuery) -> Result<DocumentQueryResult>;
+
+    /// Every indexed path containing `needle`, capped at `cap`.
+    ///
+    /// #182: this is the single authority for what a `path_prefix` matches. Both
+    /// search modes resolve through it — enumeration applies the same `LIKE` inline
+    /// via `push_where`, query mode pushes the paths this returns down to Qdrant —
+    /// so one matcher decides, rather than SQL and the vector store's `path_ancestors`
+    /// index each deciding differently for the same input (issue #259).
+    ///
+    /// Matching is case-insensitive for ASCII, inherited from SQLite's `LIKE`.
+    async fn paths_matching(&self, needle: &str, cap: u64) -> Result<PathMatches>;
 
     /// Every indexed document's file path, unfiltered and unordered.
     ///
@@ -1184,9 +1214,9 @@ impl StateDb {
     fn push_where(builder: &mut QueryBuilder<'_, Sqlite>, query: &DocumentQuery) {
         builder.push(" WHERE 1 = 1");
 
-        if let Some(prefix) = &query.path_prefix {
+        if let Some(needle) = &query.path_prefix {
             builder.push(" AND d.file_path LIKE ");
-            builder.push_bind(escape_like_prefix(prefix));
+            builder.push_bind(escape_like_substring(needle));
             builder.push(" ESCAPE '\\'");
         }
 
@@ -1390,12 +1420,15 @@ fn promoted_column(field: &str) -> Option<&'static str> {
     }
 }
 
-/// Escape a caller-supplied path prefix for use with `LIKE ... ESCAPE '\'`.
+/// Escape a caller-supplied path fragment's LIKE metacharacters.
 ///
 /// Real KB paths routinely contain `_`, which is a single-character LIKE wildcard —
 /// left unescaped, `lifestyle/my_notes/` would also match `lifestyle/myXnotes/`.
-fn escape_like_prefix(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 1);
+///
+/// Returns only the escaped needle; the caller adds its own wildcards, which is what
+/// keeps every wildcard in the final pattern non-caller-controlled.
+fn escape_like_metachars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
@@ -1404,9 +1437,19 @@ fn escape_like_prefix(raw: &str) -> String {
             c => out.push(c),
         }
     }
-    // Our wildcard, appended after escaping so it is never caller-controlled.
-    out.push('%');
     out
+}
+
+/// Escape a caller-supplied path fragment for a *substring* `LIKE ... ESCAPE '\'`.
+///
+/// #182: `path_prefix` matches anywhere in the KB-relative path, not just at its
+/// start, so an agent can find a document from a half-remembered fragment
+/// (`stir_fr`) or a mid-path one. SQLite's `LIKE` is ASCII-case-insensitive, which
+/// is where this match's case-insensitivity comes from — there is no explicit
+/// folding here, and non-ASCII characters therefore stay case-sensitive.
+fn escape_like_substring(raw: &str) -> String {
+    // Our wildcards, added after escaping so they are never caller-controlled.
+    format!("%{}%", escape_like_metachars(raw))
 }
 
 /// Look up a dot-path inside parsed frontmatter.
@@ -1514,6 +1557,36 @@ impl DocumentIndex for StateDb {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(|(file_path,)| file_path).collect())
+    }
+
+    async fn paths_matching(&self, needle: &str, cap: u64) -> Result<PathMatches> {
+        let pattern = escape_like_substring(needle);
+
+        // Count and page share one transaction so `total` and `paths` reflect the same
+        // committed snapshot — same reasoning as `query_documents`.
+        let mut tx = self.pool.begin().await?;
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM documents WHERE file_path LIKE ? ESCAPE '\\'")
+                .bind(&pattern)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT file_path FROM documents WHERE file_path LIKE ? ESCAPE '\\' \
+             ORDER BY file_path ASC LIMIT ?",
+        )
+        .bind(&pattern)
+        .bind(cap as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(PathMatches {
+            paths: rows.into_iter().map(|(file_path,)| file_path).collect(),
+            total: total.max(0) as u64,
+        })
     }
 
     async fn get_summaries_by_paths(
@@ -2889,6 +2962,123 @@ mod tests {
             0,
             "underscore must not behave as a wildcard"
         );
+    }
+
+    #[tokio::test]
+    async fn path_prefix_matches_a_mid_path_fragment() {
+        // #182: the discovery case the old prefix-only match could not serve — a
+        // fragment the caller does not know the start of.
+        let (db, _dir) = seeded_db().await;
+        let query = DocumentQuery {
+            path_prefix: Some("recipes/stir".into()),
+            ..Default::default()
+        };
+        let result = db.query_documents(&query).await.unwrap();
+
+        assert_eq!(paths(&result), vec!["kitchen/recipes/stir_fry.md"]);
+    }
+
+    #[tokio::test]
+    async fn path_prefix_matches_a_bare_filename_fragment() {
+        // The half-remembered filename from the issue, with no path context at all.
+        let (db, _dir) = seeded_db().await;
+        let query = DocumentQuery {
+            path_prefix: Some("stir_fr".into()),
+            ..Default::default()
+        };
+        let result = db.query_documents(&query).await.unwrap();
+
+        assert_eq!(paths(&result), vec!["kitchen/recipes/stir_fry.md"]);
+    }
+
+    #[tokio::test]
+    async fn path_prefix_is_case_insensitive() {
+        // Inherited from SQLite's `LIKE`, which folds ASCII. Documented as such
+        // because it is behavior we rely on rather than implement.
+        let (db, _dir) = seeded_db().await;
+        let query = DocumentQuery {
+            path_prefix: Some("STIR_FRY".into()),
+            ..Default::default()
+        };
+        let result = db.query_documents(&query).await.unwrap();
+
+        assert_eq!(paths(&result), vec!["kitchen/recipes/stir_fry.md"]);
+    }
+
+    #[tokio::test]
+    async fn paths_matching_returns_every_match_under_the_cap() {
+        let (db, _dir) = seeded_db().await;
+        let matches = db.paths_matching("recipes", 100).await.unwrap();
+
+        assert_eq!(matches.total, 3);
+        assert_eq!(
+            matches.paths,
+            vec![
+                "kitchen/recipes/chili.md",
+                "kitchen/recipes/congee.md",
+                "kitchen/recipes/stir_fry.md",
+            ],
+            "ordered by path, so a capped resolution is at least deterministic"
+        );
+        assert!(!matches.truncated());
+    }
+
+    #[tokio::test]
+    async fn paths_matching_reports_a_total_beyond_the_cap() {
+        // The cap must never look like exhaustion — `total` is what tells a caller
+        // its filter is an incomplete picture of what matches.
+        let (db, _dir) = seeded_db().await;
+        let matches = db.paths_matching("recipes", 2).await.unwrap();
+
+        assert_eq!(matches.paths.len(), 2);
+        assert_eq!(matches.total, 3);
+        assert!(matches.truncated());
+    }
+
+    #[tokio::test]
+    async fn paths_matching_escapes_like_wildcards() {
+        // Same wildcard hazard as `path_prefix_escapes_like_wildcards`, on the
+        // resolution path this time: `_` must be a literal underscore.
+        let (db, _dir) = seeded_db().await;
+
+        let hit = db.paths_matching("stir_fry", 100).await.unwrap();
+        assert_eq!(hit.paths, vec!["kitchen/recipes/stir_fry.md"]);
+
+        let miss = db.paths_matching("stirXfry", 100).await.unwrap();
+        assert_eq!(
+            miss.total, 0,
+            "underscore must not behave as a wildcard during resolution either"
+        );
+
+        // `%` likewise — a needle of pure wildcards must match nothing, not
+        // everything.
+        let percent = db.paths_matching("%", 100).await.unwrap();
+        assert_eq!(percent.total, 0);
+    }
+
+    #[tokio::test]
+    async fn paths_matching_and_query_documents_agree_on_the_same_needle() {
+        // #182/#259: the two search modes resolve paths through these two calls.
+        // If they ever disagree, one needle means two things again.
+        let (db, _dir) = seeded_db().await;
+        for needle in ["recipes", "stir_fr", "STIR_FRY", "sysadmin", "zfs.md", "/"] {
+            let resolved = db.paths_matching(needle, 100).await.unwrap();
+            let query = DocumentQuery {
+                path_prefix: Some(needle.into()),
+                ..Default::default()
+            };
+            let enumerated = db.query_documents(&query).await.unwrap();
+
+            assert_eq!(
+                resolved.total, enumerated.total,
+                "needle '{needle}' matched differently in the two modes"
+            );
+            let mut a = resolved.paths.clone();
+            let mut b = paths(&enumerated);
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "needle '{needle}' resolved to a different set");
+        }
     }
 
     #[tokio::test]

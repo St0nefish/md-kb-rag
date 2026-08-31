@@ -1430,8 +1430,8 @@ pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
 
 /// Derive the ancestor-path keyword array (#130) stored under
 /// [`crate::qdrant::PATH_ANCESTORS_KEY`], which is what turns `path_prefix` from a
-/// post-fetch retain (`retrieval::apply_path_prefix`) into a native, exact Qdrant
-/// payload filter (`retrieval::path_prefix_condition`).
+/// post-fetch retain (`retrieval::apply_path_filter`) into a native, exact Qdrant
+/// payload filter (`retrieval::path_filter_condition`).
 ///
 /// For `sysadmin/nodes/ares/boot/efi.md` this returns, in order:
 /// `["sysadmin", "sysadmin/nodes", "sysadmin/nodes/ares",

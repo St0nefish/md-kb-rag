@@ -123,7 +123,7 @@ pub(crate) fn dedup_search_opts() -> crate::retrieval::SearchOptions {
         explain: false,
         modified_after: None,
         modified_before: None,
-        path_prefix: None,
+        path_filter: None,
         rerank_candidate_limit: None,
         // The dedup gate wants the single closest existing chunk, full stop — not
         // a diversified page of results (limit: 1 above makes a per-document cap
