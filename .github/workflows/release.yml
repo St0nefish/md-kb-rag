@@ -49,16 +49,28 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 2
+          # Deep enough to walk back over a held batch. A forced dispatch may
+          # need to look past several non-code merges to find the newest built
+          # image — see the walk in "Compute sha tag from squash merge".
+          fetch-depth: 50
 
       - name: Set image name
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
+      # Must precede the version step: that step inspects the registry to find
+      # which candidate images actually exist, which needs an authenticated
+      # daemon.
+      - name: Login to container registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
       - name: Compute sha tag from squash merge
         id: version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          FORCED: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
         run: |
           # Resolve the PR that contains this commit via the API rather than
           # parsing the commit subject for a "(#123)" suffix. That suffix is
@@ -68,10 +80,59 @@ jobs:
           # history) produces a subject with no "(#N)" at all, which broke
           # this step when it grep'd the log under `set -e` (fix #260,
           # observed in run 33344570055 on commit 4e90661).
-          PR_NUM=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '.[0].number // empty')
+          resolve_pr() {
+            gh api "repos/${GITHUB_REPOSITORY}/commits/$1/pulls" --jq '.[0].number // empty'
+          }
+          tag_for_pr() {
+            local head_sha
+            head_sha=$(gh pr view "$1" --json headRefOid --jq '.headRefOid')
+            echo "sha-${head_sha:0:7}"
+          }
+
+          PR_NUM=$(resolve_pr "${GITHUB_SHA}")
           if [ -n "$PR_NUM" ]; then
-            HEAD_SHA=$(gh pr view "$PR_NUM" --json headRefOid --jq '.headRefOid')
-            TAG="sha-${HEAD_SHA:0:7}"
+            TAG=$(tag_for_pr "$PR_NUM")
+
+            # A forced dispatch ships an accumulated batch, and the batch's
+            # final merge is not necessarily the one that built an image: CI
+            # only builds when code changed (ci.yml's paths filter), so a
+            # docs- or workflow-only merge lands on master with no image of
+            # its own. Retagging nothing in that case strands every code
+            # change queued behind it — which is exactly what happened to
+            # #254/#258/#255 sitting behind the workflow-only #261.
+            #
+            # So when HEAD has no image, walk back to the most recent commit
+            # that does. Safe, because `ci-pass` is a required check: a merged
+            # commit either produced an image or had its build skipped for
+            # being a non-code change, and the code it ships is therefore
+            # identical to HEAD's. A commit with no PR at all is never walked
+            # past — that is the direct-push case below, and it stays fatal.
+            #
+            # Only on a forced dispatch. A plain docs-only push keeps the old
+            # behavior (skip the retag, deploy nothing) rather than poking
+            # Watchtower to redeploy an image it already runs.
+            if [ "${FORCED}" = "true" ] && ! docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" >/dev/null 2>&1; then
+              echo "::notice::HEAD (${GITHUB_SHA}) has no image of its own — walking back for the newest built one."
+              FOUND=""
+              for sha in $(git rev-list -n 50 "${GITHUB_SHA}"); do
+                pr=$(resolve_pr "$sha")
+                if [ -z "$pr" ]; then
+                  echo "::warning::${sha} has no associated PR — stopping the walk here."
+                  break
+                fi
+                candidate=$(tag_for_pr "$pr")
+                if docker buildx imagetools inspect "${IMAGE_NAME}:${candidate}" >/dev/null 2>&1; then
+                  FOUND="$candidate"
+                  echo "::notice::Shipping ${candidate}, built for PR #${pr} at ${sha}."
+                  break
+                fi
+              done
+              if [ -z "$FOUND" ]; then
+                echo "::error::No built image found in the last 50 commits of master. Nothing can be deployed — check that CI built and pushed an image for at least one merged code change."
+                exit 1
+              fi
+              TAG="$FOUND"
+            fi
           else
             # No PR is associated with this commit — a direct push to master.
             # CI only builds and tags images on PR branches (sha-<PR head
@@ -91,10 +152,6 @@ jobs:
           # master commit. That matters when a deploy needs rolling back: you know
           # the master commit you want to return to, not the PR head it came from.
           echo "merge_sha=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Login to container registry
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Report held deploy
         if: steps.gate.outputs.held == 'true'
