@@ -1460,13 +1460,26 @@ pub(crate) fn derive_domain(rel_path: &str) -> Option<String> {
 /// enumeration mode (`search` with no `query`, which compiles `path_prefix` to SQL
 /// `LIKE prefix%` in `state.rs` — untouched by this change).
 ///
-/// Returns an empty vector for a document at the knowledge-base root (mirroring
-/// `derive_domain`'s "no area" case) plus, still, its own full path as the sole
-/// entry — a root-level document is a legitimate `path_prefix` target too.
+/// For a document at the knowledge-base root there are no ancestor directories to
+/// record (mirroring `derive_domain`'s "no area" case), so the result is the
+/// one-element vector holding just the document's own path — a root-level document
+/// is a legitimate `path_prefix` target too.
+///
+/// **Precondition:** `rel_path` is an already-normalized, KB-relative forward-slash
+/// path — which every caller's is, because `index_paths` derives it by stripping
+/// `data_path` from a canonicalized walk entry. Only `Component::Normal` is
+/// accumulated below, so anything else is dropped silently: in particular a
+/// `..` would be *elided* rather than resolved, mapping `"a/../b.md"` to
+/// `["a", "a/b.md"]` — an ancestor list for a path that does not exist. That is
+/// unreachable given the precondition, and is deliberately not defended against
+/// here (this is a pure string helper, not the place to re-litigate path safety);
+/// a future caller that can supply a non-normalized path must normalize first.
 pub(crate) fn derive_path_ancestors(rel_path: &str) -> Vec<String> {
     let mut ancestors = Vec::new();
     let mut built = String::new();
     for component in Path::new(rel_path).components() {
+        // Skips RootDir/CurDir/Prefix — and ParentDir, which per this function's
+        // precondition cannot occur; see its doc comment.
         let std::path::Component::Normal(name) = component else {
             continue;
         };
@@ -5040,6 +5053,35 @@ mod tests {
         assert_eq!(
             derive_path_ancestors("food/chili.md"),
             vec!["food".to_string(), "food/chili.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_ancestors_ignore_a_leading_current_dir() {
+        // `Component::CurDir` is skipped, so a `./`-prefixed path produces the
+        // same ancestors as the bare one — the entries must match what
+        // `path_prefix` callers actually pass, which never carries a `./`.
+        assert_eq!(
+            derive_path_ancestors("./food/chili.md"),
+            derive_path_ancestors("food/chili.md")
+        );
+        assert_eq!(
+            derive_path_ancestors("./food/chili.md"),
+            vec!["food".to_string(), "food/chili.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_ancestors_preserve_spaces_and_non_ascii_verbatim() {
+        // Ancestors are matched as exact Qdrant keywords, so any normalization
+        // (case folding, whitespace trimming, unicode mangling) here would make
+        // a caller's literal `path_prefix` unmatchable. Byte-for-byte or bust.
+        assert_eq!(
+            derive_path_ancestors("dir with space/ünïcode ✓.md"),
+            vec![
+                "dir with space".to_string(),
+                "dir with space/ünïcode ✓.md".to_string(),
+            ]
         );
     }
 

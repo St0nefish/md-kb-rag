@@ -2786,6 +2786,219 @@ mod tests {
         .await;
     }
 
+    /// #130: pin the three Qdrant server behaviors `path_prefix` is built on.
+    ///
+    /// `retrieval::path_prefix_condition` compiles `path_prefix` to
+    /// `should[ matches(path_ancestors, prefix), is_empty(path_ancestors) ]`,
+    /// ANDed into each RRF prefetch arm's `must`. That is only correct if three
+    /// non-obvious things are true of the server, none of which this crate
+    /// controls and none of which the qdrant-client crate documents:
+    ///
+    ///   1. `is_empty` matches a point whose key is **missing entirely**, not
+    ///      only one whose value is `[]`. This is the whole
+    ///      backward-compatibility escape: documents indexed before
+    ///      `path_ancestors` existed carry no such key, and if `is_empty`
+    ///      stopped matching them, `path_prefix` would return **zero results
+    ///      for the entire un-reindexed corpus** — silently, with a green
+    ///      mock-only suite.
+    ///   2. A keyword `match` against an **array-valued** field tests element
+    ///      membership, not equality against the whole array. Every ancestor
+    ///      entry past the first depends on this.
+    ///   3. A `should` nested inside a prefetch arm's `must` behaves as an OR
+    ///      *within* that arm, rather than being flattened or dropped.
+    ///
+    /// All three were verified by hand against `qdrant/qdrant:v1.17.0` when this
+    /// was written; this test is what makes a future server changing any of them
+    /// fail loudly here instead of quietly at the top of someone's search
+    /// results. `retrieval.rs`'s own coverage cannot substitute — its
+    /// `MockRetrievalStore` never evaluates the `Filter` it is handed.
+    ///
+    /// Requires a running Qdrant instance at localhost:6334.
+    /// Run with: cargo test path_prefix_filter_semantics_hold_on_a_live_server -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn path_prefix_filter_semantics_hold_on_a_live_server() {
+        let config = ResolvedQdrantConfig {
+            url: "http://localhost:6334".into(),
+            collection: live_test_collection("path_prefix_filter_semantics_hold_on_a_live_server"),
+        };
+        let store = QdrantStore::new(&config).unwrap();
+
+        let _ = store.client.delete_collection(&config.collection).await;
+
+        let vector_size = 4;
+        store
+            .ensure_collection(
+                &config.collection,
+                vector_size,
+                &[IndexedField::keyword("file_path")],
+                false,
+            )
+            .await
+            .unwrap();
+
+        with_collection_cleanup(&store, &config.collection, || async {
+            // `ancestors: None` is the legacy shape under test — the key is not
+            // written at all, exactly as a pre-#130 point carries it.
+            let make_point = |id: &str, file: &str, ancestors: Option<Vec<&str>>| {
+                let mut payload = HashMap::new();
+                payload.insert("file_path".into(), serde_json::json!(file));
+                if let Some(ancestors) = ancestors {
+                    payload.insert(PATH_ANCESTORS_KEY.into(), serde_json::json!(ancestors));
+                }
+                QdrantPoint {
+                    id: id.into(),
+                    // Identical vectors: relevance is irrelevant here, the
+                    // filter is the entire subject.
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                    sparse: None,
+                    payload,
+                }
+            };
+
+            let points = vec![
+                make_point(
+                    "00000000-0000-0000-0000-0000000001a1",
+                    "/data/sysadmin/nodes/ares.md",
+                    Some(vec!["sysadmin", "sysadmin/nodes", "sysadmin/nodes/ares.md"]),
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-0000000001b1",
+                    "/data/food/chili.md",
+                    Some(vec!["food", "food/chili.md"]),
+                ),
+                make_point(
+                    "00000000-0000-0000-0000-0000000001c1",
+                    "/data/legacy.md",
+                    None,
+                ),
+            ];
+            store
+                .upsert_points(&config.collection, points)
+                .await
+                .unwrap();
+
+            let search = async |conditions: Vec<Condition>| -> Vec<String> {
+                let mut files: Vec<String> = store
+                    .hybrid_search(
+                        &config.collection,
+                        vec![1.0, 0.0, 0.0, 0.0],
+                        None,
+                        &[],
+                        HashMap::new(),
+                        conditions,
+                        10,
+                        50,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|r| {
+                        r.payload
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                // Sort so assertions pin membership, not RRF tie-break order
+                // between three identical vectors.
+                files.sort();
+                files
+            };
+
+            // Establish write visibility once, unfiltered, before asserting on
+            // any filter -- see retry_until's doc comment (#231).
+            let all = retry_until(
+                20,
+                std::time::Duration::from_millis(250),
+                || search(Vec::new()),
+                |files| files.len() >= 3,
+            )
+            .await;
+            assert_eq!(
+                all,
+                vec![
+                    "/data/food/chili.md",
+                    "/data/legacy.md",
+                    "/data/sysadmin/nodes/ares.md"
+                ],
+                "all three fixture points must be visible before filters are judged"
+            );
+
+            // (1) is_empty matches the point with NO `path_ancestors` key at all
+            //     -- and only that one.
+            assert_eq!(
+                search(vec![Condition::is_empty(PATH_ANCESTORS_KEY)]).await,
+                vec!["/data/legacy.md"],
+                "is_empty must match a MISSING key, not just an empty array — the \
+                 entire legacy-document escape hangs on this"
+            );
+
+            // (2) a keyword match against an array-valued field is element
+            //     membership: "sysadmin" is one of three entries, and matching
+            //     it must not also drag in the point that has no such entry.
+            assert_eq!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    "sysadmin".to_string()
+                )])
+                .await,
+                vec!["/data/sysadmin/nodes/ares.md"],
+                "a keyword match on an array field tests element membership"
+            );
+            // The deep entry matches on the same terms — this is what lets a
+            // caller scope to one specific document by its full path.
+            assert_eq!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    "sysadmin/nodes/ares.md".to_string()
+                )])
+                .await,
+                vec!["/data/sysadmin/nodes/ares.md"],
+            );
+
+            // (3) component-exactness: keyword matching is not "starts with".
+            //     This is the documented narrowing query mode carries versus
+            //     enumeration mode's SQL `LIKE prefix%`.
+            assert!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    "sys".to_string()
+                )])
+                .await
+                .is_empty(),
+                "a partial path component must NOT match — query-mode path_prefix is \
+                 component-exact, unlike enumeration mode's string prefix"
+            );
+            assert!(
+                search(vec![Condition::matches(
+                    PATH_ANCESTORS_KEY,
+                    "sysadmin/nodes/ares".to_string()
+                )])
+                .await
+                .is_empty(),
+                "a partial final segment must NOT match either"
+            );
+
+            // (4) the actual shipped shape: a `should` nested inside the
+            //     prefetch arm's `must` is an OR — the matching document AND the
+            //     legacy one, and nothing else.
+            assert_eq!(
+                search(vec![Condition::from(Filter::should([
+                    Condition::matches(PATH_ANCESTORS_KEY, "sysadmin".to_string()),
+                    Condition::is_empty(PATH_ANCESTORS_KEY),
+                ]))])
+                .await,
+                vec!["/data/legacy.md", "/data/sysadmin/nodes/ares.md"],
+                "should[match, is_empty] nested in a prefetch arm's must must behave \
+                 as an OR: the prefix match plus the legacy escape, excluding the \
+                 non-matching reindexed document"
+            );
+        })
+        .await;
+    }
+
     // ------------------------------------------------------------------
     // lower_field_filters
     // ------------------------------------------------------------------

@@ -1022,7 +1022,10 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFiltersInput>,
 
-    /// Restrict to paths starting with this prefix.
+    /// Restrict by location. With `query`: matches whole path components (a
+    /// folder, or one document's full path) — `sys` will not match `sysadmin`.
+    /// Without `query` (enumeration): a plain string prefix, so a partial final
+    /// segment matches too. A trailing slash is optional in both modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
 

@@ -157,11 +157,13 @@ jobs:
             .
 
   # The mocked VectorStore suite proves nothing about real Qdrant wire
-  # semantics — filters, phrase matching, RRF, recommend. The seven tests that
+  # semantics — filters, phrase matching, RRF, recommend. The eight tests that
   # do exercise a live server (src/qdrant.rs) are #[ignore]d, and plain
   # `cargo test` (above) never passes --ignored, so none of them ran in CI
-  # before this job was added (#186, and its narrower instance #133). Bring up
-  # the project's own qdrant service and run just those.
+  # before this job was added (#186, and its narrower instance #133). Start a
+  # qdrant container (image pin single-sourced from docker-compose.yml, but
+  # NOT the compose service itself — see `Start Qdrant` for why) and run just
+  # those.
   qdrant-integration:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
@@ -250,16 +252,39 @@ jobs:
           # on this runner -- derive the real one from /proc/self/mountinfo,
           # which is data-root/storage-driver agnostic because it keys off the
           # second-to-last path component, not a fixed prefix.
-          docker rm -f ci-qdrant 2>/dev/null || true
-          cid=$(awk '$5=="/etc/hostname"{n=split($4,p,"/"); print p[n-1]}' /proc/self/mountinfo)
+          #
+          # `exit` after the print so an over-mounted /etc/hostname (two
+          # matching mountinfo lines) yields ONE id rather than a multi-line
+          # value that sails past the emptiness check and then fails opaquely
+          # inside `docker run --network container:<two ids>`.
+          #
+          # By design this hard-fails on a non-containerized (bare-metal)
+          # runner: there is no /etc/hostname bind mount to derive an id from,
+          # so the check below trips and this now-REQUIRED job goes red. That
+          # is deliberate -- a bare-metal runner needs the published-ports
+          # approach instead, and silently falling back to it would reintroduce
+          # the cross-PR port collision this netns trick exists to avoid.
+          # Whoever migrates runners: rework this step, don't just delete it.
+          cid=$(awk '$5=="/etc/hostname"{n=split($4,p,"/"); print p[n-1]; exit}' /proc/self/mountinfo)
           if [[ -z "$cid" ]]; then
             echo "::error::could not determine this runner's own container id"
             exit 1
           fi
+          # The container name must be unique per runner, not a fixed string:
+          # several self-hosted runner containers share one Docker daemon, so a
+          # hardcoded `ci-qdrant` means PR-B's startup `docker rm -f` destroys
+          # the server PR-A is mid-`cargo test` against -- failing PR-A's
+          # required check for a fault it did not cause. `cid` is already unique
+          # per runner, so key the name off it, and export it so the `Stop
+          # Qdrant` step (a separate step, with its own shell) removes the same
+          # container this one created.
+          name="ci-qdrant-${cid}"
+          echo "CI_QDRANT_NAME=${name}" >> "$GITHUB_ENV"
+          docker rm -f "$name" 2>/dev/null || true
           # Image stays single-sourced from docker-compose.yml so the pin
           # can't drift from what the deployment runs.
           image=$(docker compose -f docker-compose.yml config --images qdrant)
-          docker run -d --name ci-qdrant --network "container:${cid}" "$image"
+          docker run -d --name "$name" --network "container:${cid}" "$image"
 
       - name: Wait for Qdrant to be ready
         run: |
@@ -272,7 +297,7 @@ jobs:
             [[ "$code" == "200" ]] && break
             if (( elapsed >= timeout )); then
               echo "::error::qdrant did not become ready within ${timeout}s (last HTTP status: ${code})"
-              docker logs ci-qdrant
+              docker logs "$CI_QDRANT_NAME"
               exit 1
             fi
             sleep 2
@@ -284,21 +309,44 @@ jobs:
 
       - name: Stop Qdrant
         if: always()
-        run: docker rm -f ci-qdrant 2>/dev/null || true
+        # Only ever removes THIS runner's own container (see `Start Qdrant`),
+        # never another concurrent PR's. `if: always()` means this can run when
+        # `Start Qdrant` failed before exporting the name, so guard on it being
+        # set — an unguarded `docker rm -f ""` would just be noise.
+        run: |
+          if [[ -n "${CI_QDRANT_NAME:-}" ]]; then
+            docker rm -f "$CI_QDRANT_NAME" 2>/dev/null || true
+          fi
 
   # Gate job for branch protection — set "ci-pass" as the required status check.
-  # Passes when both test and qdrant-integration succeed or were skipped
-  # (doc-only changes skip both identically, via the same `changes` gate).
+  # Passes when `changes` succeeded AND both test and qdrant-integration
+  # succeeded or were skipped (doc-only changes skip both identically, via the
+  # same `changes` gate) — see the step body for why `changes` is checked too.
   # #133: qdrant-integration used to be deliberately left out of this list —
   # see its own job comment for why that's no longer the case.
   ci-pass:
     if: always()
-    needs: [test, qdrant-integration]
+    needs: [changes, test, qdrant-integration]
     runs-on: ubuntu-latest
     steps:
       - name: Check result
         run: |
           ok=true
+          # `changes` must be in `needs` and checked explicitly, not just relied
+          # on transitively. `test` and `qdrant-integration` are both gated on
+          # `needs.changes.outputs.code`, so if `changes` itself FAILS (a
+          # paths-filter outage, a checkout failure) neither runs and both
+          # report `skipped` — indistinguishable, to the two checks below, from
+          # the legitimate doc-only case. Without this clause the gate would
+          # print "CI passed (test: skipped, ...)" and exit 0 with zero
+          # verification having happened, and auto-merge would fire on it.
+          # Requiring `changes` to have succeeded separates the two: a broken
+          # `changes` fails the gate, while a successful `changes` reporting no
+          # code changes still lets the all-skipped doc-only path pass.
+          if [[ "${{ needs.changes.result }}" != "success" ]]; then
+            echo "changes: ${{ needs.changes.result }}"
+            ok=false
+          fi
           if [[ ! "${{ needs.test.result }}" =~ ^(success|skipped)$ ]]; then
             echo "test: ${{ needs.test.result }}"
             ok=false

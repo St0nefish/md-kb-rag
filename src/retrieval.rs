@@ -292,6 +292,33 @@ fn path_prefix_fetch_limit(fetch_limit: u64, path_prefix: Option<&str>) -> u64 {
     }
 }
 
+/// Canonicalize a caller-supplied `path_prefix` into the one form
+/// [`path_prefix_condition`] and [`apply_path_prefix`] must both see.
+///
+/// The two enforce the same prefix by different means — a Qdrant keyword match
+/// against `path_ancestors`, and a client-side `str::starts_with` against
+/// `file_path` — so they can only agree if they are handed *identical* input.
+/// They were not: the condition normalized and the retain did not, which meant
+/// `path_prefix = "sysadmin/nodes/ares/boot/efi.md/"` matched Qdrant-side (via
+/// the terminal full-path ancestor entry, trailing slash stripped) and was then
+/// dropped by `"sysadmin/nodes/ares/boot/efi.md".starts_with(".../efi.md/")`,
+/// returning zero results where the same prefix without the trailing slash
+/// returned the document. Hence: normalize once, at the top of `search_paged`
+/// and `search_grouped`, and pass the result to everything downstream.
+///
+/// `trim_end_matches`, not `strip_suffix`: one strip leaves `"sysadmin//"` as
+/// `"sysadmin/"`, which is neither empty nor a valid `path_ancestors` entry and
+/// so matches nothing at all. Returns `None` for a prefix that is empty once
+/// trimmed (`""`, `"/"`, `"//"`) — "match everything" is the absence of a
+/// filter, not a filter on the empty string.
+///
+/// Idempotent, so it is safe for `path_prefix_condition` to re-apply it
+/// defensively on an already-normalized value.
+fn normalize_path_prefix(path_prefix: Option<&str>) -> Option<&str> {
+    let trimmed = path_prefix?.trim_end_matches('/');
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// Build the Qdrant condition that enforces `path_prefix` (#130), and the
 /// backward-compatibility story behind it.
 ///
@@ -305,12 +332,14 @@ fn path_prefix_fetch_limit(fetch_limit: u64, path_prefix: Option<&str>) -> u64 {
 /// normalized_prefix)` checks Qdrant's own keyword index rather than pulling
 /// candidates back and re-checking a string prefix client-side.
 ///
-/// A single trailing `/` is stripped before the match so `sysadmin/` and
-/// `sysadmin` compile to the identical condition — `path_ancestors` entries never
-/// carry a trailing slash, so leaving one in the query value would silently never
-/// match anything. An empty prefix (after stripping — `""` or `"/"`) returns
-/// `None`: "match everything" needs no condition at all, mirroring
-/// `apply_path_prefix`'s historical treatment of an empty prefix as a no-op.
+/// Trailing slashes are stripped before the match (by [`normalize_path_prefix`],
+/// which callers apply once and hand to this function *and* [`apply_path_prefix`])
+/// so `sysadmin/` and `sysadmin` compile to the identical condition —
+/// `path_ancestors` entries never carry a trailing slash, so leaving one in the
+/// query value would silently never match anything. An empty prefix (after
+/// stripping — `""`, `"/"`, `"//"`) returns `None`: "match everything" needs no
+/// condition at all, mirroring `apply_path_prefix`'s historical treatment of an
+/// empty prefix as a no-op.
 ///
 /// ## The backward-compatibility problem
 ///
@@ -332,8 +361,14 @@ fn path_prefix_fetch_limit(fetch_limit: u64, path_prefix: Option<&str>) -> u64 {
 /// The condition this function builds is not a bare equality — it is
 /// `path_ancestors MATCHES prefix OR path_ancestors IS EMPTY`
 /// (`Condition::is_empty` matches a key that is missing, `null`, or `[]` — exactly
-/// the "never reindexed under this field" case, per the qdrant-client crate's own
-/// doc comment on that constructor). Concretely, per document:
+/// the "never reindexed under this field" case). That the *missing*-key case
+/// counts is the load-bearing part and is not something the qdrant-client crate
+/// documents — its doc comment on the constructor says only "check if a field is
+/// empty". It is Qdrant server behavior (`IsEmpty` treats an absent key as empty),
+/// verified empirically against `qdrant/qdrant:v1.17.0` and pinned by
+/// `qdrant::tests::path_prefix_filter_semantics_hold_on_a_live_server`, which
+/// fails loudly if a future server narrows it to "empty array only".
+/// Concretely, per document:
 ///
 ///   - **Reindexed** (carries `path_ancestors`): the `MATCHES` arm decides —
 ///     exact, no over-fetch needed for this document, no risk of losing it to a
@@ -373,11 +408,7 @@ fn path_prefix_fetch_limit(fetch_limit: u64, path_prefix: Option<&str>) -> u64 {
 /// anyway — `status.rs` is out of scope for this change. Self-adapting per document
 /// is strictly simpler and cannot be stale.
 fn path_prefix_condition(path_prefix: Option<&str>) -> Option<Condition> {
-    let prefix = path_prefix?;
-    let normalized = prefix.strip_suffix('/').unwrap_or(prefix);
-    if normalized.is_empty() {
-        return None;
-    }
+    let normalized = normalize_path_prefix(path_prefix)?;
     Some(Condition::from(Filter::should([
         Condition::matches(PATH_ANCESTORS_KEY, normalized.to_string()),
         Condition::is_empty(PATH_ANCESTORS_KEY),
@@ -386,6 +417,10 @@ fn path_prefix_condition(path_prefix: Option<&str>) -> Option<Condition> {
 
 /// Restrict `results` to those whose (KB-relative) `file_path` starts with `prefix`,
 /// when one is given.
+///
+/// `prefix` must already have been through [`normalize_path_prefix`] — the same
+/// value [`path_prefix_condition`] was built from. See that function's doc comment
+/// for what goes wrong when the two disagree.
 ///
 /// #130: no longer the primary enforcement mechanism — [`path_prefix_condition`]
 /// now asks Qdrant to filter exactly for any document carrying `path_ancestors`.
@@ -1007,12 +1042,18 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
     let embed_ms = embed_start.elapsed().as_millis();
 
     let filter_map = mtime_filter_map(opts);
+    // Normalized exactly once, here, and used for every path_prefix decision
+    // below — the Qdrant condition, the over-fetch, the post-fetch retain, and
+    // the truncation signal. See `normalize_path_prefix`'s doc comment for the
+    // trailing-slash mismatch that came of letting the condition and the retain
+    // each normalize (or not) on their own.
+    let path_prefix = normalize_path_prefix(opts.path_prefix.as_deref());
     // #130: AND the exact-or-legacy-escape `path_ancestors` condition onto whatever
     // conditions the caller already built — see `path_prefix_condition`'s doc
     // comment for the full backward-compatibility reasoning. A no-op (no condition
     // appended) when `opts.path_prefix` is `None`.
     let mut extra_conditions = filters.conditions.clone();
-    extra_conditions.extend(path_prefix_condition(opts.path_prefix.as_deref()));
+    extra_conditions.extend(path_prefix_condition(path_prefix));
 
     // See this function's doc comment for the full reasoning — `page_depth` is
     // how many ranked candidates the funnel needs to produce to serve
@@ -1040,7 +1081,7 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
         // anything to page into.
         page_depth
     };
-    let fetch_limit = path_prefix_fetch_limit(fetch_limit, opts.path_prefix.as_deref());
+    let fetch_limit = path_prefix_fetch_limit(fetch_limit, path_prefix);
 
     let search_start = std::time::Instant::now();
     // Tokenize the flattened query into a sparse vector when hybrid is on; an
@@ -1097,12 +1138,12 @@ pub async fn search_paged<E: QueryEmbedder, Q: RetrievalStore>(
     let search_ms = search_start.elapsed().as_millis();
 
     let pre_prefix_count = results.len() as u64;
-    apply_path_prefix(&mut results, opts.path_prefix.as_deref(), deps.data_path);
+    apply_path_prefix(&mut results, path_prefix, deps.data_path);
     // Measured against `page_depth`, not `opts.limit`: with `offset` set, the
     // retain needs to have kept `page_depth` survivors to serve the requested
     // page, not merely `opts.limit` of them — see this function's doc comment.
     let path_prefix_truncated = path_prefix_truncated(
-        opts.path_prefix.as_deref(),
+        path_prefix,
         page_depth,
         fetch_limit,
         pre_prefix_count,
@@ -1462,10 +1503,13 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
     };
 
     let filter_map = mtime_filter_map(opts);
+    // Normalized once and reused for every path_prefix decision below, exactly as
+    // in `search_paged` — see `normalize_path_prefix`'s doc comment.
+    let path_prefix = normalize_path_prefix(opts.path_prefix.as_deref());
     // #130: same exact-or-legacy-escape condition `search_paged` ANDs in — see
     // `path_prefix_condition`'s doc comment.
     let mut extra_conditions = filters.conditions.clone();
-    extra_conditions.extend(path_prefix_condition(opts.path_prefix.as_deref()));
+    extra_conditions.extend(path_prefix_condition(path_prefix));
 
     // See `search_paged`'s doc comment for the full reasoning — `page_depth` is
     // how many ranked candidates the funnel needs to produce to serve
@@ -1476,7 +1520,7 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
     let offset_truncated = requested_depth > MAX_OFFSET_DEPTH;
     let page_depth = requested_depth.min(MAX_OFFSET_DEPTH);
 
-    let fetch_limit = path_prefix_fetch_limit(page_depth, opts.path_prefix.as_deref());
+    let fetch_limit = path_prefix_fetch_limit(page_depth, path_prefix);
 
     let search_start = std::time::Instant::now();
     let mut results = deps
@@ -1498,11 +1542,11 @@ pub async fn search_grouped<E: QueryEmbedder, Q: RetrievalStore, D: DocumentInde
     let search_ms = search_start.elapsed().as_millis();
 
     let pre_prefix_count = results.len() as u64;
-    apply_path_prefix(&mut results, opts.path_prefix.as_deref(), deps.data_path);
+    apply_path_prefix(&mut results, path_prefix, deps.data_path);
     // Measured against `page_depth`, not `opts.limit` — see `search_paged`'s
     // identical adjustment for why.
     let path_prefix_truncated = path_prefix_truncated(
-        opts.path_prefix.as_deref(),
+        path_prefix,
         page_depth,
         fetch_limit,
         pre_prefix_count,
@@ -2641,11 +2685,92 @@ mod tests {
         // Qdrant-side equivalent of "don't filter at all".
         assert_eq!(path_prefix_condition(Some("")), None);
         assert_eq!(path_prefix_condition(Some("/")), None);
+        assert_eq!(path_prefix_condition(Some("//")), None);
+    }
+
+    #[test]
+    fn normalize_path_prefix_trims_every_trailing_slash() {
+        // `strip_suffix('/')` would leave "sysadmin/" here — neither empty nor a
+        // `path_ancestors` entry that can ever match, i.e. silently zero results.
+        assert_eq!(normalize_path_prefix(Some("sysadmin//")), Some("sysadmin"));
+        assert_eq!(normalize_path_prefix(Some("sysadmin/")), Some("sysadmin"));
+        assert_eq!(normalize_path_prefix(Some("sysadmin")), Some("sysadmin"));
+        assert_eq!(normalize_path_prefix(Some("///")), None);
+        assert_eq!(normalize_path_prefix(Some("")), None);
+        assert_eq!(normalize_path_prefix(None), None);
+        // Idempotent — `path_prefix_condition` re-applies it on an already
+        // normalized value, so this must be a fixed point.
+        assert_eq!(
+            normalize_path_prefix(normalize_path_prefix(Some("a/b//"))),
+            Some("a/b")
+        );
     }
 
     // ------------------------------------------------------------------
     // search() unit tests with mocks
     // ------------------------------------------------------------------
+
+    /// Regression: a trailing slash must not change what comes back.
+    ///
+    /// `path_prefix_condition` normalized its prefix and `apply_path_prefix`
+    /// retained on the raw one, so for a prefix naming a whole document
+    /// (`.../efi.md/`) Qdrant matched via the terminal full-path ancestor entry
+    /// and the retain then dropped the very same document —
+    /// `"…/efi.md".starts_with("…/efi.md/")` is false. Zero results with the
+    /// slash, one without.
+    ///
+    /// Exercised end-to-end through `search` (i.e. through the retain) rather
+    /// than by comparing two conditions to each other: the condition-level test
+    /// above passes either way, which is exactly why it never caught this.
+    #[tokio::test]
+    async fn search_path_prefix_results_are_identical_with_and_without_a_trailing_slash() {
+        async fn results_for(prefix: &str) -> Vec<String> {
+            let store = MockRetrievalStore::with_results(vec![
+                make_result_for("sysadmin/nodes/ares/boot/efi.md", 0.9),
+                make_result_for("food/recipes/chili.md", 0.8),
+            ]);
+            let embed = MockEmbedder::ok(vec![0.1]);
+            let gs = make_md_globset();
+            let data_path = Path::new("/data");
+            let deps = make_deps(&embed, &store, data_path, &gs);
+            let opts = SearchOptions {
+                path_prefix: Some(prefix.to_string()),
+                ..default_opts()
+            };
+            search(&deps, "q", &SearchFilters::default(), &opts)
+                .await
+                .unwrap()
+                .results
+                .iter()
+                .map(|r| {
+                    r.payload
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        // A prefix naming one specific document — the shape that broke.
+        let bare = results_for("sysadmin/nodes/ares/boot/efi.md").await;
+        let slashed = results_for("sysadmin/nodes/ares/boot/efi.md/").await;
+        assert_eq!(
+            bare,
+            vec!["sysadmin/nodes/ares/boot/efi.md".to_string()],
+            "the document's own full path is a legitimate path_prefix target"
+        );
+        assert_eq!(
+            slashed, bare,
+            "a trailing slash must not change the result set"
+        );
+
+        // And the ordinary folder shape, including a doubled slash.
+        let folder = results_for("sysadmin").await;
+        assert_eq!(results_for("sysadmin/").await, folder);
+        assert_eq!(results_for("sysadmin//").await, folder);
+        assert_eq!(folder.len(), 1);
+    }
 
     #[tokio::test]
     async fn search_path_prefix_truncated_set_when_overfetch_is_saturated() {
