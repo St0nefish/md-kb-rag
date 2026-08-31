@@ -60,14 +60,26 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Squash merge commit message contains "(#123)" — extract PR number
-          PR_NUM=$(git log -1 --pretty=%s | grep -oP '\(#\K[0-9]+(?=\))')
+          # Resolve the PR that contains this commit via the API rather than
+          # parsing the commit subject for a "(#123)" suffix. That suffix is
+          # only GitHub's *default* squash-merge subject — a merge that
+          # supplies an explicit commit_title (the correct way to keep a
+          # stale or misleading branch commit message out of master's
+          # history) produces a subject with no "(#N)" at all, which broke
+          # this step when it grep'd the log under `set -e` (fix #260,
+          # observed in run 33344570055 on commit 4e90661).
+          PR_NUM=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '.[0].number // empty')
           if [ -n "$PR_NUM" ]; then
             HEAD_SHA=$(gh pr view "$PR_NUM" --json headRefOid --jq '.headRefOid')
             TAG="sha-${HEAD_SHA:0:7}"
           else
-            # Direct push fallback
-            TAG="sha-$(git rev-parse --short HEAD)"
+            # No PR is associated with this commit — a direct push to master.
+            # CI only builds and tags images on PR branches (sha-<PR head
+            # SHA>), so there is no prebuilt image for a bare master commit
+            # to fall back to. Fail loudly rather than silently computing a
+            # sha-<master SHA> tag that would 404 on pull.
+            echo "::error::No pull request found for commit ${GITHUB_SHA} — this looks like a direct push to master. No image was built for this commit (CI only builds on PR branches), so there is nothing to release. Open a PR so CI builds and pushes an image."
+            exit 1
           fi
           echo "short_sha=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Using image tag: ${TAG}"
