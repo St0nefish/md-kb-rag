@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -574,23 +575,50 @@ fn default_extensions_path() -> String {
 pub struct RateLimitConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_rate_limit_per_second")]
-    pub per_second: u64,
+    /// Sustained refill rate, in requests per second, once `burst_size` is spent.
+    ///
+    /// Named to say what it is. The predecessor key was `per_second`, which read as
+    /// a rate but was passed straight to `tower_governor`'s
+    /// `GovernorConfigBuilder::per_second` — and *that* method takes the interval
+    /// after which one token is replenished, in seconds. `per_second: 25` therefore
+    /// meant one request every 25 seconds (0.04 req/s), not 25 req/s: off by 625x in
+    /// the restrictive direction, and the docs described the intent, not the
+    /// behaviour. `#[serde(alias)]` keeps old configs parsing — deliberately reading
+    /// the old number as the rate it was always documented to be — so an image
+    /// rollout that lands before its config edit does not fail to boot. See
+    /// `replenish_period` for the conversion.
+    #[serde(
+        default = "default_rate_limit_requests_per_second",
+        alias = "per_second"
+    )]
+    pub requests_per_second: u64,
     #[serde(default = "default_rate_limit_burst_size")]
     pub burst_size: u32,
+}
+
+impl RateLimitConfig {
+    /// The interval after which the token bucket replenishes one request, which is
+    /// the unit `tower_governor`'s builder actually accepts.
+    ///
+    /// Inverts `requests_per_second`, which `Config::resolve` has already validated
+    /// as `>= 1` — so the period is between 1ns and 1s and the division cannot
+    /// divide by zero.
+    pub fn replenish_period(&self) -> Duration {
+        Duration::from_nanos(1_000_000_000 / self.requests_per_second.max(1))
+    }
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            per_second: default_rate_limit_per_second(),
+            requests_per_second: default_rate_limit_requests_per_second(),
             burst_size: default_rate_limit_burst_size(),
         }
     }
 }
 
-fn default_rate_limit_per_second() -> u64 {
+fn default_rate_limit_requests_per_second() -> u64 {
     20
 }
 
@@ -942,7 +970,7 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("mcp.allowed_hosts", "mcp"),
     ("mcp.extensions_path", "mcp"),
     ("rate_limit.enabled", "rate_limit"),
-    ("rate_limit.per_second", "rate_limit"),
+    ("rate_limit.requests_per_second", "rate_limit"),
     ("rate_limit.burst_size", "rate_limit"),
     ("write.dedup_enabled", "write"),
     ("write.dedup_threshold", "write"),
@@ -1337,8 +1365,8 @@ impl Config {
         if self.chunking.max_chunk_size == 0 {
             anyhow::bail!("chunking.max_chunk_size must be >= 1");
         }
-        if self.rate_limit.per_second == 0 {
-            anyhow::bail!("rate_limit.per_second must be >= 1");
+        if self.rate_limit.requests_per_second == 0 {
+            anyhow::bail!("rate_limit.requests_per_second must be >= 1");
         }
         if self.rate_limit.burst_size == 0 {
             anyhow::bail!("rate_limit.burst_size must be >= 1");
@@ -1770,7 +1798,7 @@ mcp:
         assert_eq!(cfg.embedding.batch_size, 32);
         assert_eq!(cfg.embedding.api_key_env, "EMBEDDING_API_KEY");
         assert!(cfg.validation.enabled);
-        assert_eq!(cfg.rate_limit.per_second, 20);
+        assert_eq!(cfg.rate_limit.requests_per_second, 20);
         assert_eq!(cfg.rate_limit.burst_size, 50);
     }
 
@@ -2638,23 +2666,54 @@ chunking:
     }
 
     #[test]
-    fn zero_per_second_is_rejected() {
+    fn zero_requests_per_second_is_rejected() {
         let _lock = ENV_MUTEX.lock().unwrap();
         set_required_env();
 
         let yaml = r#"
 rate_limit:
-  per_second: 0
+  requests_per_second: 0
 "#;
         let result = Config::from_str_raw(yaml).unwrap().resolve();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("rate_limit.per_second"),
-            "error should mention rate_limit.per_second: {err}"
+            err.contains("rate_limit.requests_per_second"),
+            "error should mention rate_limit.requests_per_second: {err}"
         );
 
         clear_required_env();
+    }
+
+    /// The pre-rename key still parses, so a new image booting against a config that
+    /// has not been migrated yet does not die on `deny_unknown_fields`.
+    #[test]
+    fn legacy_per_second_key_is_accepted_as_the_rate() {
+        let yaml = r#"
+rate_limit:
+  per_second: 25
+"#;
+        let cfg = Config::from_str_raw(yaml).unwrap();
+        assert_eq!(cfg.rate_limit.requests_per_second, 25);
+    }
+
+    /// Pins the inversion that the old code got backwards: the value is a rate, and
+    /// what the governor wants is the interval between replenished tokens.
+    #[test]
+    fn replenish_period_inverts_the_rate() {
+        let cfg = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 25,
+            burst_size: 100,
+        };
+        assert_eq!(cfg.replenish_period(), Duration::from_millis(40));
+
+        let one_per_second = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 1,
+            burst_size: 1,
+        };
+        assert_eq!(one_per_second.replenish_period(), Duration::from_secs(1));
     }
 
     #[test]

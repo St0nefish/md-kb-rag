@@ -415,12 +415,19 @@ rate_limit:
   # Set to false to disable rate limiting entirely (e.g. in trusted internal deployments).
   enabled: true
 
-  # Token replenishment rate: one token is added every 1/per_second seconds.
-  per_second: 20
+  # Sustained refill rate in requests per second, per IP: once the burst below is
+  # spent, one further request is admitted every 1/requests_per_second seconds.
+  # Must be >= 1, so 1 req/s is the slowest configurable sustained rate.
+  #
+  # Renamed from `per_second` (still accepted as an alias, so an un-migrated config
+  # keeps booting). That key was handed straight to tower_governor's `per_second`,
+  # which takes the replenish interval *in seconds* rather than a rate — so the old
+  # `per_second: 20` admitted one request every 20 seconds, not 20 per second.
+  requests_per_second: 20
 
   # Maximum burst size: how many requests can be made before rate limiting
   # kicks in. After the burst is exhausted, requests are limited to the
-  # per_second rate.
+  # requests_per_second rate.
   burst_size: 50
 
 

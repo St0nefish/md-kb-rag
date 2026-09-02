@@ -34,6 +34,19 @@ sample rather than an exhaustive list.
 
 ### Server hardening
 
+- **Breaking (config key rename):** `rate_limit.per_second` is now
+  `rate_limit.requests_per_second`, and it finally means what it says. The old key
+  was passed straight to `tower_governor`'s `GovernorConfigBuilder::per_second`,
+  which takes *the interval between replenished tokens, in seconds* — not a rate. A
+  config reading `per_second: 25` therefore admitted **one request every 25 seconds**
+  (0.04 req/s) rather than 25 req/s, and the shipped default of `20` was one request
+  every 20 seconds. The server now inverts the configured rate into a period
+  (`RateLimitConfig::replenish_period`) before handing it to the builder, so the
+  default is a genuine 20 req/s per IP. The old key still parses as an alias for the
+  new one, so an image rollout that lands ahead of its config edit keeps booting;
+  note that on upgrade this makes an existing limit dramatically *more* permissive —
+  which was always the documented intent — so re-check the value if you were relying
+  on the accidental behaviour. Minimum is 1 req/s.
 - `POST /admin/reload` now warns explicitly about the class of settings it cannot
   apply live; the reindex worker is supervised and restarted rather than silently
   dying; `/mcp` request bodies are size-bounded; passive detection was added for a

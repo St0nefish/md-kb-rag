@@ -2217,10 +2217,17 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         .ok()
         .filter(|s| !s.is_empty());
 
-    // Rate limiting (per-IP via SmartIpKeyExtractor for proxy-aware extraction)
+    // Rate limiting (per-IP via SmartIpKeyExtractor for proxy-aware extraction).
+    //
+    // Use `.period()`, never `.per_second()`. Despite the name, tower_governor's
+    // `per_second(n)` sets the interval between replenished tokens to n *seconds*
+    // ("replenishes one element every minute" is its own doc example for
+    // `per_second(60)`) — it is a period, not a rate. Passing a requests-per-second
+    // number straight into it is what made the old `per_second: 25` admit one
+    // request every 25 seconds. `replenish_period` does the inversion.
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(config.rate_limit.per_second)
+            .period(config.rate_limit.replenish_period())
             .burst_size(config.rate_limit.burst_size)
             .key_extractor(SmartIpKeyExtractor)
             .use_headers()
@@ -3974,6 +3981,11 @@ mod tests {
         }
     }
 
+    // `.per_second(1)` is correct *here* and is not the bug fixed for
+    // `rate_limit.requests_per_second`: these tests assert burst exhaustion, so they
+    // want the slowest replenishment the builder offers — one token per second, far
+    // longer than the test takes — rather than a rate. Production wiring goes
+    // through `RateLimitConfig::replenish_period` instead; see `run_server`.
     fn rate_limited_app(burst_size: u32) -> Router {
         let governor_conf = Arc::new(
             GovernorConfigBuilder::default()
