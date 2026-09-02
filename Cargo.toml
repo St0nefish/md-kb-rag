@@ -97,6 +97,18 @@ futures = "0.3"
 
 # Date/time parsing for mtime range filters and CLI date flags
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# JWT verification for the OAuth 2.1 resource-server path (src/oauth.rs): RS256
+# signature checking plus issuer/audience/expiry validation against a fetched JWKS.
+#
+# Pinned to 9.x, NOT the current 11.x, on purpose. 11.x dropped `ring` and requires
+# picking one of two crypto backends: `rust_crypto`, which pulls in the `rsa` crate
+# and with it RUSTSEC-2023-0071 (Marvin timing sidechannel, no fixed version) —
+# `cargo audit` runs in CI and there is no version of that we could upgrade to — or
+# `aws_lc_rs`, which needs cmake and a C toolchain in the Docker builder. 9.x uses
+# `ring`, which is already compiled into this tree via rustls/reqwest, so this adds
+# no new crypto implementation at all. Revisit when jsonwebtoken offers a backend
+# that is neither unpatched nor a new build-tooling requirement.
+jsonwebtoken = "9"
 
 [dev-dependencies]
 tempfile = "3"

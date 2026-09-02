@@ -7,6 +7,7 @@ mod eval;
 mod git;
 mod ingest;
 mod mcp;
+mod oauth;
 mod qdrant;
 mod reindex;
 mod reload;

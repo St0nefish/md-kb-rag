@@ -549,6 +549,94 @@ const DIFF_TABLE: &[DiffField] = &[
                    on the next tick, within mcp.metadata_refresh_secs seconds.",
         }],
     },
+    // ── mcp.oauth ────────────────────────────────────────────────────────────
+    // The whole block is restart-required for the same reason `mcp.bearer_token_env`
+    // is: `AuthState` — including the `OAuthValidator` and its JWKS cache — is built
+    // once in `server.rs run_server` and stored by value on the middleware. Making
+    // any of it live would mean an authorization server, audience or required scope
+    // could change under an in-flight request, which is not a property worth having
+    // on the credential-checking path.
+    DiffField {
+        path: "mcp.oauth.enabled",
+        // Mirrors `reranking.enabled`: the resolved side collapses the flag into an
+        // `Option`, so "is it on" is `is_some()`, and every field below is skipped
+        // unless BOTH snapshots had it on (an on/off transition is reported once,
+        // here).
+        get: |c| Some(d(&c.mcp.oauth.is_some())),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.enabled",
+            note: "gates whether AuthState holds an OAuthValidator at all, and whether the \
+                   /.well-known/oauth-protected-resource routes serve metadata (server.rs \
+                   run_server / assemble_router) — decided once at startup.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.issuer",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.issuer)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.issuer",
+            note: "baked into the jsonwebtoken Validation the OAuthValidator builds at \
+                   construction (oauth.rs OAuthValidator::new), and into the metadata \
+                   document's authorization_servers.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.jwks_uri",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.jwks_uri)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.jwks_uri",
+            note: "stored on the OAuthValidator alongside its in-memory key cache \
+                   (oauth.rs) — a new URL would also have to invalidate that cache, so it \
+                   is deliberately restart-only.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.audience",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.audience)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.audience",
+            note: "baked into the jsonwebtoken Validation at OAuthValidator construction \
+                   (oauth.rs) — this is the OAuth client_id, not the resource URL; see \
+                   config.rs OAuthConfig::audience.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.resource",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.resource)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.resource",
+            note: "the protected-resource metadata document and the resource_metadata URL \
+                   in every WWW-Authenticate challenge are derived from it once at \
+                   OAuthValidator construction (oauth.rs).",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.required_scope",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.required_scope)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.required_scope",
+            note: "held by the OAuthValidator built at startup (oauth.rs) — \
+                   security-critical, deliberately not made live, same posture as \
+                   mcp.bearer_token_env.",
+        }],
+    },
+    DiffField {
+        path: "mcp.oauth.scopes_supported",
+        get: |c| c.mcp.oauth.as_ref().map(|o| d(&o.scopes_supported)),
+        consumers: &[ConsumerEntry {
+            effect: ReloadEffect::RestartRequired,
+            setting: "mcp.oauth.scopes_supported",
+            note: "advertised in the protected-resource metadata document and the \
+                   WWW-Authenticate scope parameter, both rendered once at \
+                   OAuthValidator construction (oauth.rs).",
+        }],
+    },
     // ── rate_limit ───────────────────────────────────────────────────────────
     // The whole section is restart-required: whether GovernorLayer is even added to
     // the router, and every knob on it, is decided once when the router is built.

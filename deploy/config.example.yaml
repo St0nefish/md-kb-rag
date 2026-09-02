@@ -336,6 +336,64 @@ mcp:
   # allowed_hosts:
   #   - "kb.example.com"
 
+  # OAuth 2.1 resource-server mode (RFC 9728 + the MCP authorization spec).
+  # Disabled by default; omit the whole block and nothing changes.
+  #
+  # This is ADDITIVE to bearer_token_env above, never a replacement: with both
+  # configured a request authenticates if EITHER the static token matches OR a
+  # valid access token is presented. Claude Code uses the static token; the
+  # OAuth path exists so Claude's hosted surfaces (claude.ai / Desktop / iOS)
+  # can connect as a custom connector, which requires an authorization-code
+  # flow. Enabling OAuth also satisfies the "must have some authentication"
+  # startup check, so bearer_token_env may be left unset if you only want OAuth.
+  #
+  # When enabled, two unauthenticated discovery routes appear:
+  #   /.well-known/oauth-protected-resource/mcp
+  #   /.well-known/oauth-protected-resource
+  # Both must stay publicly reachable — they are how a client with no token
+  # finds out where to get one.
+  #
+  # RESTART REQUIRED for every key below: the validator, its JWKS cache and the
+  # metadata document are all built once at startup, the same posture as
+  # bearer_token_env.
+  #
+  # oauth:
+  #   enabled: true
+  #
+  #   # The authorization server's issuer, compared BYTE-EXACTLY against each
+  #   # token's `iss`. Copy it from the AS's discovery document including any
+  #   # trailing slash — Authentik's has one, and dropping it rejects every
+  #   # token.
+  #   issuer: "https://authentik.example.com/application/o/mcp-kb-rag/"
+  #
+  #   # Where the signing keys live. Fetched lazily on first token and cached;
+  #   # an unknown `kid` triggers at most one refetch per minute.
+  #   jwks_uri: "https://authentik.example.com/application/o/mcp-kb-rag/jwks/"
+  #
+  #   # The value each token's `aud` claim must contain. This is the OAuth
+  #   # CLIENT ID, not the resource URL below, and that is deliberate:
+  #   # Authentik does not implement RFC 8707 resource indicators — it ignores
+  #   # the `resource` request parameter and hardcodes the audience to the
+  #   # provider's client_id. Setting this to the resource URL will reject
+  #   # every real token.
+  #   audience: "your-oauth-client-id"
+  #
+  #   # This server's public MCP URL. Published as `resource` in the metadata
+  #   # document and used to derive the resource_metadata URL advertised in
+  #   # WWW-Authenticate. Not compared against `aud` — see above.
+  #   resource: "https://kb.example.com/mcp"
+  #
+  #   # Scope a token must carry to get past the auth middleware. A valid token
+  #   # without it gets 403 insufficient_scope rather than 401.
+  #   #
+  #   # NOTE: per-tool write-scope enforcement is NOT implemented — the auth
+  #   # middleware cannot see which MCP tool a request invokes. Any token that
+  #   # passes this check currently has full access, writes included.
+  #   required_scope: "mcp:read"
+  #
+  #   # Advertised to clients in the metadata document. Declarative only.
+  #   scopes_supported: ["mcp:read", "mcp:write"]
+
   # DEPRECATED: custom narrative for MCP server instructions. Replaced by a
   # server.md file under mcp.extensions_path in the served knowledge base,
   # which is editable through write_document without a restart — see
