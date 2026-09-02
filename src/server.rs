@@ -30,6 +30,7 @@ use crate::embed::EmbedClient;
 use crate::git;
 use crate::ingest;
 use crate::mcp::KbSearchServer;
+use crate::oauth::{OAuthValidator, PROTECTED_RESOURCE_METADATA_PREFIX, TokenRejection};
 use crate::qdrant::QdrantStore;
 use crate::rerank::RerankClient;
 use crate::schema::{self, SchemaCache};
@@ -1116,20 +1117,82 @@ pub fn render_prometheus(
     s
 }
 
+/// The credentials this server accepts, resolved once at startup.
+///
+/// Both fields are independently optional and the middleware below accepts EITHER,
+/// which is the whole design: adding OAuth must not disturb the static token, since
+/// Claude Code authenticates with it and is not being migrated. `bearer_token` is
+/// `None` only under `mcp.allow_unauthenticated`; `oauth` is `None` unless
+/// `mcp.oauth.enabled` (see `config::OAuthConfig`).
 #[derive(Clone)]
 struct AuthState {
     bearer_token: Option<String>,
+    oauth: Option<Arc<OAuthValidator>>,
 }
 
+impl AuthState {
+    /// Build the `WWW-Authenticate` challenge for a refusal, when there is one to
+    /// build. `None` for a deployment with no OAuth configured — RFC 6750 would let
+    /// us emit a bare `Bearer` realm challenge there, but nothing consumes it and
+    /// the existing static-token clients have never seen one.
+    fn challenge(&self, rejection: &TokenRejection) -> Option<String> {
+        let oauth = self.oauth.as_ref()?;
+        Some(match rejection {
+            TokenRejection::InsufficientScope => oauth.insufficient_scope_challenge(),
+            TokenRejection::Invalid(_) => oauth.invalid_token_challenge(),
+        })
+    }
+}
+
+/// Turn a refusal into a response, attaching the challenge header when OAuth is
+/// configured.
+///
+/// The header is load-bearing rather than decorative: claude.ai has been observed
+/// not starting the authorization flow at all when a 401 arrives without
+/// `resource_metadata`, because that parameter is how it discovers the
+/// authorization server. Claude Code tolerates its absence — which is precisely why
+/// a missing header is easy to ship and hard to notice. It therefore goes on EVERY
+/// refusal once OAuth is configured, including a failed static-token request: the
+/// server cannot tell which credential the caller meant to present, and a static
+/// token is exactly what a hosted client that has not yet run the flow does not
+/// have.
+fn auth_rejection(auth: &AuthState, rejection: TokenRejection) -> Response {
+    let status = match rejection {
+        TokenRejection::InsufficientScope => StatusCode::FORBIDDEN,
+        TokenRejection::Invalid(_) => StatusCode::UNAUTHORIZED,
+    };
+    let mut response = Response::builder().status(status);
+    if let Some(challenge) = auth.challenge(&rejection)
+        && let Ok(value) = axum::http::HeaderValue::from_str(&challenge)
+    {
+        response = response.header(axum::http::header::WWW_AUTHENTICATE, value);
+    }
+    response
+        .body(axum::body::Body::empty())
+        .expect("a status-and-header-only response is always constructible")
+}
+
+/// Dual-mode bearer auth: a request is authenticated if the presented credential
+/// matches the static token OR validates as an OAuth access token.
+///
+/// The static path is unchanged and is tried first — it is a constant-time
+/// comparison against an in-memory string, so it costs nothing, and putting it
+/// first means the overwhelmingly common Claude Code request never touches the JWT
+/// machinery. Only if that fails (or is not configured) does the OAuth validator
+/// get a look.
+///
+/// Note what happens with NEITHER configured: the request is let through, exactly
+/// as before, which is `mcp.allow_unauthenticated`. Configuring either credential
+/// closes that door.
 async fn bearer_auth(
     State(auth): State<AuthState>,
     headers: HeaderMap,
     request: axum::extract::Request,
     next: Next,
-) -> Result<Response, StatusCode> {
-    let Some(ref expected_token) = auth.bearer_token else {
-        return Ok(next.run(request).await);
-    };
+) -> Response {
+    if auth.bearer_token.is_none() && auth.oauth.is_none() {
+        return next.run(request).await;
+    }
 
     let path = request.uri().path().to_string();
 
@@ -1140,11 +1203,64 @@ async fn bearer_auth(
 
     let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
 
-    if token.as_bytes().ct_eq(expected_token.as_bytes()).into() {
-        Ok(next.run(request).await)
-    } else {
+    if let Some(ref expected_token) = auth.bearer_token
+        && token.as_bytes().ct_eq(expected_token.as_bytes()).into()
+    {
+        return next.run(request).await;
+    }
+
+    let Some(ref oauth) = auth.oauth else {
         warn!(path = %path, "Bearer auth rejected");
-        Err(StatusCode::UNAUTHORIZED)
+        return auth_rejection(
+            &auth,
+            TokenRejection::Invalid("static token mismatch".into()),
+        );
+    };
+
+    match oauth.validate(token).await {
+        Ok(claims) => {
+            debug!(
+                path = %path,
+                subject = ?claims.subject,
+                scopes = ?claims.scopes,
+                "OAuth bearer auth accepted"
+            );
+            // Stashed for a future per-tool scope check. NOTHING READS IT YET:
+            // write-scope enforcement (`mcp:write` for write_document /
+            // delete_document / update_schema) is not implemented, because this
+            // middleware cannot see which MCP tool a request invokes — that is in
+            // the JSON-RPC body, which only rmcp parses. Any valid token therefore
+            // grants full access today, writes included. See `oauth.rs`'s module
+            // doc.
+            let mut request = request;
+            request.extensions_mut().insert(claims);
+            next.run(request).await
+        }
+        Err(rejection) => {
+            warn!(path = %path, reason = ?rejection, "OAuth bearer auth rejected");
+            auth_rejection(&auth, rejection)
+        }
+    }
+}
+
+/// `GET /.well-known/oauth-protected-resource[/mcp]` — RFC 9728 protected-resource
+/// metadata.
+///
+/// Deliberately registered OUTSIDE `bearer_auth`: this document is how an
+/// unauthenticated client discovers *where to authenticate*, so gating it behind
+/// authentication would make the OAuth flow unstartable. It contains nothing
+/// secret — an issuer URL, an audience-free scope list, and this server's own
+/// public URL, all of which the client already needs before it has any credential.
+///
+/// 404s when OAuth is not configured, rather than serving an empty document: a
+/// client that finds metadata will act on it, and metadata pointing at no
+/// authorization server is worse than no metadata at all.
+async fn oauth_metadata_handler(
+    State(oauth): State<Option<Arc<OAuthValidator>>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match oauth {
+        Some(v) => Ok(Json(v.metadata())),
+        None => Err(StatusCode::NOT_FOUND),
     }
 }
 
@@ -1714,6 +1830,26 @@ const MCP_PATH: &str = "/mcp";
 /// `/health` and the UI routes carry no `bearer_auth` layer.
 const HEALTH_PATH: &str = "/health";
 
+/// RFC 9728 protected-resource metadata, served at BOTH the path-suffixed and the
+/// bare form. Two routes, not one, because clients probe the suffixed form first
+/// and fall back to the root — Anthropic's own sample resource server registers
+/// both, and a client that finds neither never starts the authorization flow.
+///
+/// Open by design, like `HEALTH_PATH` above and for a sharper reason: this document
+/// is how a caller with no credential discovers where to GET one. Gating discovery
+/// behind the authentication it is meant to bootstrap makes the flow unstartable.
+/// They are deliberately NOT part of the protected-path list
+/// `router_assembly_rejects_unauthenticated_requests_on_every_protected_route`
+/// walks; `oauth_metadata_routes_are_reachable_without_credentials` asserts the
+/// opposite property for them.
+///
+/// This one must stay `{OAUTH_METADATA_ROOT_PATH}{MCP_PATH}`. It is spelled out
+/// rather than composed because `concat!` takes literals only, and the relationship
+/// is asserted by `oauth_metadata_paths_agree_with_the_rfc_prefix`.
+const OAUTH_METADATA_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
+/// The bare form of [`OAUTH_METADATA_MCP_PATH`] — same handler, same openness.
+const OAUTH_METADATA_ROOT_PATH: &str = PROTECTED_RESOURCE_METADATA_PREFIX;
+
 /// The startup warning `run_server` logs when `mcp.allow_unauthenticated: true` and
 /// no bearer token is configured — i.e. every route in the `STATUS_PATH`/
 /// `METRICS_PATH`/`ADMIN_RELOAD_PATH`/`MCP_PATH` group above is reachable by anyone.
@@ -1816,11 +1952,27 @@ fn assemble_router(deps: RouterAssemblyDeps) -> Router {
             bearer_auth,
         ));
 
+    // Both well-known routes, merged here rather than into any of the
+    // `route_layer(bearer_auth)` routers above — see the path constants' doc
+    // comment: discovery has to work for a caller who does not yet have a
+    // credential, which is the entire point of it.
+    let oauth_metadata_router = Router::new()
+        .route(
+            OAUTH_METADATA_MCP_PATH,
+            axum::routing::get(oauth_metadata_handler),
+        )
+        .route(
+            OAUTH_METADATA_ROOT_PATH,
+            axum::routing::get(oauth_metadata_handler),
+        )
+        .with_state(deps.auth_state.oauth.clone());
+
     let mut app = Router::new()
         .route(
             HEALTH_PATH,
             axum::routing::get(health_handler).with_state(deps.health_state),
         )
+        .merge(oauth_metadata_router)
         .merge(status_router)
         .merge(admin_router)
         .merge(mcp_router)
@@ -2191,26 +2343,63 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
         mcp_transport_config(ct.child_token(), &config.mcp.allowed_hosts),
     );
 
+    // OAuth resource-server validator — `Some` only when `mcp.oauth.enabled`.
+    // Built before the bearer-token lookup below because it changes what a missing
+    // static token means: with OAuth on, the endpoints are still authenticated, so
+    // an absent static token is a supported configuration rather than the
+    // wide-open one `unauthenticated_mcp_warning` describes.
+    let oauth = match config.mcp.oauth {
+        Some(ref oauth_config) => {
+            info!(
+                issuer = %oauth_config.issuer,
+                resource = %oauth_config.resource,
+                required_scope = %oauth_config.required_scope,
+                "OAuth resource-server validation enabled (accepted alongside the static \
+                 bearer token, not instead of it)"
+            );
+            Some(Arc::new(
+                OAuthValidator::new(oauth_config).context("Failed to build the OAuth validator")?,
+            ))
+        }
+        None => None,
+    };
+
     // Bearer token for MCP auth
     let bearer_token = match std::env::var(&config.mcp.bearer_token_env) {
         Ok(val) if !val.is_empty() => Some(val),
         _ => {
-            if !config.mcp.allow_unauthenticated {
+            // OAuth alone is a complete authentication story, so it satisfies this
+            // gate the same way a static token does — but only actual OAuth, never
+            // the mere presence of the config block, which is why this reads the
+            // resolved `oauth` rather than `config.mcp.oauth`.
+            if !config.mcp.allow_unauthenticated && oauth.is_none() {
                 anyhow::bail!(
                     "Environment variable '{}' is not set or empty. \
-                     Set it to a bearer token, or set mcp.allow_unauthenticated: true \
-                     in config.yaml to explicitly opt out of authentication.",
+                     Set it to a bearer token, enable mcp.oauth, or set \
+                     mcp.allow_unauthenticated: true in config.yaml to explicitly opt out \
+                     of authentication.",
                     config.mcp.bearer_token_env
                 );
             }
-            warn!(
-                "{}",
-                unauthenticated_mcp_warning(&config.mcp.bearer_token_env)
-            );
+            if oauth.is_none() {
+                warn!(
+                    "{}",
+                    unauthenticated_mcp_warning(&config.mcp.bearer_token_env)
+                );
+            } else {
+                info!(
+                    "No static bearer token configured ('{}' unset) — OAuth access tokens \
+                     are the only accepted credential",
+                    config.mcp.bearer_token_env
+                );
+            }
             None
         }
     };
-    let auth_state = AuthState { bearer_token };
+    let auth_state = AuthState {
+        bearer_token,
+        oauth,
+    };
 
     // Webhook state — optional, skip if secret is unset/empty
     let webhook_secret = std::env::var(&config.webhook.secret_env)
@@ -2297,6 +2486,13 @@ pub async fn run_server(config: ResolvedConfig, config_path: std::path::PathBuf)
     info!("  Status endpoints: /status (JSON), /metrics (Prometheus)");
     info!("  Admin endpoint: POST /admin/reload (re-reads config.yaml without a restart)");
     info!("  Web UI: / (unauthenticated — see web.rs's module doc)");
+    if auth_state.oauth.is_some() {
+        info!(
+            "  OAuth discovery: {OAUTH_METADATA_MCP_PATH} and {OAUTH_METADATA_ROOT_PATH} \
+             (unauthenticated by design — this is how a client finds the authorization \
+             server before it has a token)"
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -3064,6 +3260,7 @@ mod tests {
         // /mcp, while /health stays open.
         let auth_state = AuthState {
             bearer_token: Some("secret".into()),
+            oauth: None,
         };
         let protected = Router::new()
             .route("/status", get(|| async { "status" }))
@@ -3152,7 +3349,10 @@ mod tests {
         config_path: std::path::PathBuf,
         shared_config: SharedConfig,
     ) -> Router {
-        let auth_state = AuthState { bearer_token };
+        let auth_state = AuthState {
+            bearer_token,
+            oauth: None,
+        };
         let admin_state = AdminState {
             shared_config,
             config_path: Arc::new(config_path),
@@ -3874,6 +4074,7 @@ mod tests {
     fn test_app(token: Option<String>) -> Router {
         let auth_state = AuthState {
             bearer_token: token,
+            oauth: None,
         };
         Router::new()
             .route("/test", get(|| async { "ok" }))
@@ -4165,6 +4366,17 @@ mod tests {
         data_path: &std::path::Path,
         bearer_token: Option<String>,
     ) -> RouterAssemblyDeps {
+        test_router_assembly_deps_with_oauth(data_path, bearer_token, None)
+    }
+
+    /// As above, plus the OAuth half of `AuthState`. Separate entry point rather
+    /// than a fourth argument on every existing call site, so the pre-OAuth tests
+    /// keep reading as they did.
+    fn test_router_assembly_deps_with_oauth(
+        data_path: &std::path::Path,
+        bearer_token: Option<String>,
+        oauth: Option<Arc<OAuthValidator>>,
+    ) -> RouterAssemblyDeps {
         let config = status_config(data_path);
         let shared_config = config::shared_config(Arc::clone(&config));
         let qdrant = Arc::new(QdrantStore::new(&config.qdrant).unwrap());
@@ -4215,7 +4427,10 @@ mod tests {
 
         RouterAssemblyDeps {
             mcp_service,
-            auth_state: AuthState { bearer_token },
+            auth_state: AuthState {
+                bearer_token,
+                oauth,
+            },
             health_state: HealthState {
                 qdrant: Arc::clone(&qdrant),
                 embed: Arc::clone(&embed),
@@ -4359,6 +4574,293 @@ mod tests {
             "a webhook body over 1 MB must be rejected before signature \
              verification even runs"
         );
+    }
+
+    // --- OAuth 2.1 resource server ---
+    //
+    // The load-bearing property across all of these is that adding OAuth changed
+    // nothing about the static bearer token: every test below that mints a JWT has
+    // a sibling asserting the static path still behaves identically, because Claude
+    // Code authenticates with the static token and is not being migrated.
+
+    use crate::oauth::testing as oauth_testing;
+
+    fn test_oauth_validator(jwks_uri: &str) -> Arc<OAuthValidator> {
+        Arc::new(
+            OAuthValidator::new(&crate::config::ResolvedOAuthConfig {
+                issuer: oauth_testing::ISSUER.to_string(),
+                jwks_uri: jwks_uri.to_string(),
+                audience: oauth_testing::AUDIENCE.to_string(),
+                resource: oauth_testing::RESOURCE.to_string(),
+                required_scope: "mcp:read".to_string(),
+                scopes_supported: vec!["mcp:read".to_string(), "mcp:write".to_string()],
+            })
+            .unwrap(),
+        )
+    }
+
+    /// A bare `/test` route behind the real `bearer_auth`, for asserting on status
+    /// codes and headers without dragging the whole assembled router in. Mirrors
+    /// `test_app` above, which predates OAuth.
+    fn oauth_test_app(bearer_token: Option<String>, oauth: Option<Arc<OAuthValidator>>) -> Router {
+        let auth_state = AuthState {
+            bearer_token,
+            oauth,
+        };
+        Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(auth_state, bearer_auth))
+    }
+
+    async fn get_with_auth(app: &Router, header: Option<&str>) -> Response {
+        let mut req = Request::builder().uri("/test");
+        if let Some(h) = header {
+            req = req.header("authorization", h);
+        }
+        app.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn www_authenticate(resp: &Response) -> String {
+        resp.headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a refusal from an OAuth-enabled server must carry a \
+                 WWW-Authenticate challenge — claude.ai has been observed not starting the \
+                 authorization flow at all without one"
+                )
+            })
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn oauth_metadata_paths_agree_with_the_rfc_prefix() {
+        // The suffixed constant is spelled out (concat! takes literals only), so
+        // assert the relationship the RFC actually defines rather than trusting two
+        // hand-typed strings to stay in step.
+        assert_eq!(
+            OAUTH_METADATA_MCP_PATH,
+            format!("{OAUTH_METADATA_ROOT_PATH}{MCP_PATH}")
+        );
+    }
+
+    #[tokio::test]
+    async fn static_bearer_token_is_unchanged_when_oauth_is_disabled() {
+        let app = oauth_test_app(Some("secret".into()), None);
+        assert_eq!(
+            get_with_auth(&app, Some("Bearer secret")).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_with_auth(&app, Some("Bearer wrong")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_with_auth(&app, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn static_bearer_token_still_works_with_oauth_enabled() {
+        // The regression that would hurt most: Claude Code's credential must keep
+        // working byte-for-byte once OAuth is switched on. The JWKS endpoint here is
+        // unreachable on purpose — a static-token request must never even reach the
+        // OAuth validator, let alone depend on the IdP being up.
+        let app = oauth_test_app(
+            Some("secret".into()),
+            Some(test_oauth_validator("http://127.0.0.1:1/jwks")),
+        );
+        assert_eq!(
+            get_with_auth(&app, Some("Bearer secret")).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oauth_token_is_accepted_alongside_the_static_token() {
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let app = oauth_test_app(Some("secret".into()), Some(test_oauth_validator(&jwks.url)));
+
+        let header = format!("Bearer {}", oauth_testing::valid_token());
+        assert_eq!(
+            get_with_auth(&app, Some(&header)).await.status(),
+            StatusCode::OK
+        );
+        // ...and the static token still works on the very same router.
+        assert_eq!(
+            get_with_auth(&app, Some("Bearer secret")).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_credential_gets_401_with_a_well_formed_challenge() {
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let app = oauth_test_app(Some("secret".into()), Some(test_oauth_validator(&jwks.url)));
+
+        // No header at all, and a wrong STATIC token: both must carry the challenge.
+        // The second is the case that is easy to miss — the server cannot tell which
+        // credential the caller meant to present, and a hosted client that has not
+        // run the flow yet has no static token to present.
+        for header in [None, Some("Bearer not-the-secret")] {
+            let resp = get_with_auth(&app, header).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "header: {header:?}"
+            );
+            let challenge = www_authenticate(&resp);
+            assert!(
+                challenge.starts_with("Bearer error=\"invalid_token\""),
+                "{challenge}"
+            );
+            assert!(
+                challenge.contains(
+                    "resource_metadata=\"https://kb.example.test\
+                     /.well-known/oauth-protected-resource/mcp\""
+                ),
+                "the resource_metadata parameter is how the client finds the \
+                 authorization server: {challenge}"
+            );
+            assert!(
+                challenge.contains("scope=\"mcp:read mcp:write\""),
+                "{challenge}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_token_gets_401_and_an_insufficient_scope_token_gets_403() {
+        let jwks = oauth_testing::spawn_jwks_server("200 OK", oauth_testing::jwks_body()).await;
+        let app = oauth_test_app(None, Some(test_oauth_validator(&jwks.url)));
+
+        let expired = oauth_testing::mint(
+            oauth_testing::KEY_A_PEM,
+            oauth_testing::KID_A,
+            serde_json::json!({
+                "iss": oauth_testing::ISSUER, "aud": oauth_testing::AUDIENCE,
+                "exp": oauth_testing::now() - 3600, "scope": "mcp:read",
+            }),
+        );
+        let resp = get_with_auth(&app, Some(&format!("Bearer {expired}"))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(www_authenticate(&resp).contains("error=\"invalid_token\""));
+
+        let unscoped = oauth_testing::mint(
+            oauth_testing::KEY_A_PEM,
+            oauth_testing::KID_A,
+            serde_json::json!({
+                "iss": oauth_testing::ISSUER, "aud": oauth_testing::AUDIENCE,
+                "exp": oauth_testing::now() + 3600, "scope": "openid profile",
+            }),
+        );
+        let resp = get_with_auth(&app, Some(&format!("Bearer {unscoped}"))).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a valid token missing the scope is 403, not 401 — a client told 401 will \
+             loop through the authorization flow back to the same refusal"
+        );
+        let challenge = www_authenticate(&resp);
+        assert_eq!(
+            challenge,
+            "Bearer error=\"insufficient_scope\", scope=\"mcp:read\", \
+             resource_metadata=\"https://kb.example.test\
+             /.well-known/oauth-protected-resource/mcp\""
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_metadata_routes_are_reachable_without_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = assemble_router(test_router_assembly_deps_with_oauth(
+            dir.path(),
+            Some("secret".into()),
+            Some(test_oauth_validator("http://127.0.0.1:1/jwks")),
+        ));
+
+        // Both forms: clients probe the path-suffixed one first and fall back to the
+        // root, so a deployment serving only one of them can leave a client unable
+        // to discover anything.
+        for path in [OAUTH_METADATA_MCP_PATH, OAUTH_METADATA_ROOT_PATH] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} must be served WITHOUT a credential — it is how a client with \
+                 no token discovers where to get one"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(doc["resource"], oauth_testing::RESOURCE);
+            // Byte-identical issuer, trailing slash included.
+            assert_eq!(doc["authorization_servers"][0], oauth_testing::ISSUER);
+            assert_eq!(
+                doc["scopes_supported"],
+                serde_json::json!(["mcp:read", "mcp:write"])
+            );
+            assert_eq!(
+                doc["bearer_methods_supported"],
+                serde_json::json!(["header"])
+            );
+            assert!(doc["resource_name"].is_string(), "{doc}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_metadata_routes_404_when_oauth_is_not_configured() {
+        // Metadata pointing at no authorization server is worse than no metadata:
+        // a client that finds a document will act on it.
+        let dir = tempfile::tempdir().unwrap();
+        let app = assemble_router(test_router_assembly_deps(dir.path(), Some("secret".into())));
+        for path in [OAUTH_METADATA_MCP_PATH, OAUTH_METADATA_ROOT_PATH] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_alone_still_protects_every_protected_route() {
+        // No static token at all: the protected group must still refuse an
+        // unauthenticated caller, i.e. enabling OAuth is not a way to accidentally
+        // open the server up by leaving MCP_BEARER_TOKEN unset.
+        let dir = tempfile::tempdir().unwrap();
+        let app = assemble_router(test_router_assembly_deps_with_oauth(
+            dir.path(),
+            None,
+            Some(test_oauth_validator("http://127.0.0.1:1/jwks")),
+        ));
+        for (method, path) in [
+            ("GET", STATUS_PATH),
+            ("GET", METRICS_PATH),
+            ("POST", ADMIN_RELOAD_PATH),
+            ("POST", MCP_PATH),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} must refuse an unauthenticated caller"
+            );
+            assert!(www_authenticate(&resp).contains("error=\"invalid_token\""));
+        }
     }
 
     // #205: `mcp_router`'s 10 MB limit used to be `DefaultBodyLimit`, which is a

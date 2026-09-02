@@ -519,6 +519,11 @@ pub struct McpConfig {
     /// logged once at startup. Empty disables extension loading entirely.
     #[serde(default = "default_extensions_path")]
     pub extensions_path: String,
+    /// OAuth 2.1 resource-server settings. Disabled by default, and the whole
+    /// block is optional in YAML — an existing `config.yaml` that has never heard
+    /// of OAuth keeps parsing and keeps behaving exactly as it did.
+    #[serde(default)]
+    pub oauth: OAuthConfig,
 }
 
 impl Default for McpConfig {
@@ -530,8 +535,105 @@ impl Default for McpConfig {
             metadata_refresh_secs: default_metadata_refresh_secs(),
             allowed_hosts: Vec::new(),
             extensions_path: default_extensions_path(),
+            oauth: OAuthConfig::default(),
         }
     }
+}
+
+/// `mcp.oauth` — YAML side. Turns this process into an OAuth 2.1 *resource
+/// server* (RFC 9728 + the MCP authorization spec, revision 2026-07-28): it
+/// verifies access tokens minted by a separate authorization server, and never
+/// issues, refreshes or introspects anything itself.
+///
+/// This is strictly ADDITIVE to `bearer_token_env`. Enabling it does not
+/// deprecate or gate the static bearer token — see `server::bearer_auth`, which
+/// accepts either credential — because Claude Code authenticates with the static
+/// token and is not being migrated. The OAuth path exists for Claude's hosted
+/// surfaces (claude.ai / Desktop / iOS), which can only connect as a custom
+/// connector via an authorization-code flow.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthConfig {
+    /// Master switch. False (the default) means no JWT validation happens at all,
+    /// the `/.well-known/oauth-protected-resource*` routes 404, and no 401 carries
+    /// a `WWW-Authenticate` challenge — i.e. byte-for-byte today's behaviour.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The authorization server's issuer identifier, compared BYTE-EXACTLY against
+    /// each token's `iss` claim and echoed verbatim in the protected-resource
+    /// metadata's `authorization_servers`. Copy it from the AS's own discovery
+    /// document including any trailing slash — Authentik's issuer ends in one, and
+    /// a token minted with `.../mcp-kb-rag/` will not match `.../mcp-kb-rag`.
+    #[serde(default)]
+    pub issuer: String,
+    /// Where to fetch the signing keys (JWKS). Fetched lazily on first token and
+    /// cached in memory; see `oauth::JwksCache` for the unknown-`kid` refetch rule.
+    #[serde(default)]
+    pub jwks_uri: String,
+    /// The value each token's `aud` claim must contain.
+    ///
+    /// This is the OAuth CLIENT ID, not the resource URL, and that is deliberate.
+    /// RFC 8707 resource indicators would have the AS stamp the resource URL into
+    /// `aud`, but Authentik does not implement RFC 8707: it ignores the `resource`
+    /// parameter entirely and hardcodes the audience to the provider's client_id.
+    /// That is a known, accepted deviation for this deployment, so the resource
+    /// server validates against the client_id and does NOT try to match `resource`
+    /// below. Do not "fix" this to compare against the resource URL — every token
+    /// the live AS issues would start failing.
+    #[serde(default)]
+    pub audience: String,
+    /// This resource server's canonical identifier, published as `resource` in the
+    /// protected-resource metadata and used to derive the metadata URL advertised
+    /// in `WWW-Authenticate` (see `oauth::resource_metadata_url`). Typically the
+    /// public URL of the MCP endpoint, e.g. `https://kb.example.com/mcp`.
+    ///
+    /// Not compared against `aud` — see `audience` above for why.
+    #[serde(default)]
+    pub resource: String,
+    /// Scope a token must carry to be allowed through the auth middleware at all.
+    /// A valid token missing it gets 403 `insufficient_scope`, not 401.
+    #[serde(default = "default_oauth_required_scope")]
+    pub required_scope: String,
+    /// Advertised in the metadata document's `scopes_supported` so a client knows
+    /// what to ask for. Purely declarative — enforcement is `required_scope`.
+    #[serde(default = "default_oauth_scopes_supported")]
+    pub scopes_supported: Vec<String>,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: String::new(),
+            jwks_uri: String::new(),
+            audience: String::new(),
+            resource: String::new(),
+            required_scope: default_oauth_required_scope(),
+            scopes_supported: default_oauth_scopes_supported(),
+        }
+    }
+}
+
+fn default_oauth_required_scope() -> String {
+    "mcp:read".to_string()
+}
+
+fn default_oauth_scopes_supported() -> Vec<String> {
+    vec!["mcp:read".to_string(), "mcp:write".to_string()]
+}
+
+/// `mcp.oauth` — resolved side. Only ever constructed when `enabled` is true and
+/// every required field passed validation, so the server never has to re-check
+/// "is OAuth actually usable": `ResolvedMcpConfig::oauth` being `Some` IS the
+/// answer, the same shape `reranking` already uses.
+#[derive(Debug, Clone)]
+pub struct ResolvedOAuthConfig {
+    pub issuer: String,
+    pub jwks_uri: String,
+    pub audience: String,
+    pub resource: String,
+    pub required_scope: String,
+    pub scopes_supported: Vec<String>,
 }
 
 /// `mcp` — resolved side. `port` is read once from `MCP_PORT` in
@@ -546,6 +648,8 @@ pub struct ResolvedMcpConfig {
     pub metadata_refresh_secs: u64,
     pub allowed_hosts: Vec<String>,
     pub extensions_path: String,
+    /// `Some` exactly when `mcp.oauth.enabled` was true and validation passed.
+    pub oauth: Option<ResolvedOAuthConfig>,
 }
 
 impl Default for ResolvedMcpConfig {
@@ -558,6 +662,7 @@ impl Default for ResolvedMcpConfig {
             metadata_refresh_secs: default_metadata_refresh_secs(),
             allowed_hosts: Vec::new(),
             extensions_path: default_extensions_path(),
+            oauth: None,
         }
     }
 }
@@ -969,6 +1074,13 @@ const YAML_ONLY_SETTINGS: &[(&str, &str)] = &[
     ("mcp.metadata_refresh_secs", "mcp"),
     ("mcp.allowed_hosts", "mcp"),
     ("mcp.extensions_path", "mcp"),
+    ("mcp.oauth.enabled", "mcp"),
+    ("mcp.oauth.issuer", "mcp"),
+    ("mcp.oauth.jwks_uri", "mcp"),
+    ("mcp.oauth.audience", "mcp"),
+    ("mcp.oauth.resource", "mcp"),
+    ("mcp.oauth.required_scope", "mcp"),
+    ("mcp.oauth.scopes_supported", "mcp"),
     ("rate_limit.enabled", "rate_limit"),
     ("rate_limit.requests_per_second", "rate_limit"),
     ("rate_limit.burst_size", "rate_limit"),
@@ -1410,6 +1522,40 @@ impl Config {
         if !(0.0..=1.0).contains(&self.ui.semantic_edges.min_score) {
             anyhow::bail!("ui.semantic_edges.min_score must be between 0.0 and 1.0");
         }
+        // OAuth is all-or-nothing: a half-filled block would either fail open (no
+        // issuer to pin `iss` against) or fail every request at runtime with a
+        // message far from the config that caused it. Named all at once, same
+        // reasoning as the missing-env-var block below.
+        if self.mcp.oauth.enabled {
+            let mut blank = Vec::new();
+            for (name, value) in [
+                ("mcp.oauth.issuer", &self.mcp.oauth.issuer),
+                ("mcp.oauth.jwks_uri", &self.mcp.oauth.jwks_uri),
+                ("mcp.oauth.audience", &self.mcp.oauth.audience),
+                ("mcp.oauth.resource", &self.mcp.oauth.resource),
+            ] {
+                if value.trim().is_empty() {
+                    blank.push(name);
+                }
+            }
+            if !blank.is_empty() {
+                anyhow::bail!(
+                    "mcp.oauth.enabled is true but these required settings are empty: {}. \
+                     Set them to the authorization server's issuer (byte-exact, including \
+                     any trailing slash), its JWKS URL, the OAuth client_id this server \
+                     accepts as the token audience, and this server's public MCP URL — \
+                     or set mcp.oauth.enabled: false.",
+                    blank.join(", ")
+                );
+            }
+            if self.mcp.oauth.required_scope.trim().is_empty() {
+                anyhow::bail!(
+                    "mcp.oauth.required_scope must not be empty — a blank required scope \
+                     would let any signed token through unscoped. Use \"mcp:read\" (the \
+                     default) or a scope your authorization server actually issues."
+                );
+            }
+        }
 
         // Validate required env vars — named all at once, not one at a time, so a
         // fresh deployment finds every missing var on the first failed start
@@ -1505,6 +1651,18 @@ impl Config {
                 metadata_refresh_secs: self.mcp.metadata_refresh_secs,
                 allowed_hosts: self.mcp.allowed_hosts,
                 extensions_path: self.mcp.extensions_path,
+                oauth: if self.mcp.oauth.enabled {
+                    Some(ResolvedOAuthConfig {
+                        issuer: self.mcp.oauth.issuer,
+                        jwks_uri: self.mcp.oauth.jwks_uri,
+                        audience: self.mcp.oauth.audience,
+                        resource: self.mcp.oauth.resource,
+                        required_scope: self.mcp.oauth.required_scope,
+                        scopes_supported: self.mcp.oauth.scopes_supported,
+                    })
+                } else {
+                    None
+                },
             },
             rate_limit: self.rate_limit,
             write: self.write,
@@ -2910,6 +3068,105 @@ ui:
         assert!(cfg.ui.semantic_edges.enabled);
         assert_eq!(cfg.ui.semantic_edges.k, 8);
         assert_eq!(cfg.ui.semantic_edges.min_score, 0.75);
+    }
+
+    // ── mcp.oauth ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mcp_oauth_is_absent_and_disabled_by_default() {
+        // The property that matters most: an existing config.yaml with no `oauth`
+        // key keeps parsing, and resolves to no OAuth at all.
+        let cfg = Config::from_str_raw(MINIMAL_CONFIG).unwrap();
+        assert!(!cfg.mcp.oauth.enabled);
+        assert_eq!(cfg.mcp.oauth.required_scope, "mcp:read");
+        assert_eq!(cfg.mcp.oauth.scopes_supported, ["mcp:read", "mcp:write"]);
+    }
+
+    #[test]
+    fn mcp_oauth_disabled_resolves_to_none() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let cfg = Config::from_str(MINIMAL_CONFIG).unwrap();
+        assert!(
+            cfg.mcp.oauth.is_none(),
+            "the resolved Option IS the enabled flag — nothing downstream should have \
+             to re-check a boolean"
+        );
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_oauth_round_trips_from_yaml() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let yaml = format!(
+            "{MINIMAL_CONFIG}
+mcp:
+  oauth:
+    enabled: true
+    issuer: \"https://authentik.example.test/application/o/mcp-kb-rag/\"
+    jwks_uri: \"https://authentik.example.test/application/o/mcp-kb-rag/jwks/\"
+    audience: \"some-client-id\"
+    resource: \"https://kb.example.test/mcp\"
+"
+        );
+        let cfg = Config::from_str(&yaml).unwrap();
+        let oauth = cfg.mcp.oauth.expect("oauth should resolve when enabled");
+        // The trailing slash must survive verbatim: it is compared byte-exactly
+        // against the `iss` claim, and Authentik's issuer has one.
+        assert_eq!(
+            oauth.issuer,
+            "https://authentik.example.test/application/o/mcp-kb-rag/"
+        );
+        assert_eq!(oauth.audience, "some-client-id");
+        assert_eq!(oauth.resource, "https://kb.example.test/mcp");
+        // Unspecified keys fall back to their defaults.
+        assert_eq!(oauth.required_scope, "mcp:read");
+        assert_eq!(oauth.scopes_supported, ["mcp:read", "mcp:write"]);
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_oauth_enabled_with_blank_required_settings_is_rejected_naming_all_of_them() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let yaml = format!("{MINIMAL_CONFIG}\nmcp:\n  oauth:\n    enabled: true\n");
+        let err = Config::from_str(&yaml).unwrap_err().to_string();
+        // All at once, not one restart at a time — same reasoning as the
+        // missing-env-var block.
+        for setting in [
+            "mcp.oauth.issuer",
+            "mcp.oauth.jwks_uri",
+            "mcp.oauth.audience",
+            "mcp.oauth.resource",
+        ] {
+            assert!(err.contains(setting), "{setting} missing from: {err}");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn mcp_oauth_with_a_blank_required_scope_is_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        set_required_env();
+        let yaml = format!(
+            "{MINIMAL_CONFIG}
+mcp:
+  oauth:
+    enabled: true
+    issuer: \"https://idp.example.test/\"
+    jwks_uri: \"https://idp.example.test/jwks/\"
+    audience: \"client\"
+    resource: \"https://kb.example.test/mcp\"
+    required_scope: \"\"
+"
+        );
+        let err = Config::from_str(&yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("mcp.oauth.required_scope"),
+            "an empty required scope lets any signed token through unscoped: {err}"
+        );
+        clear_required_env();
     }
 
     #[test]
