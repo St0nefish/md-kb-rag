@@ -345,7 +345,7 @@ This service is designed for intranet/tailnet deployment — the threat model as
 | Path traversal | Every path-taking tool (`get_document`, `write_document`, `delete_document`, `get_schema`, `update_schema`) and the equivalent web UI routes resolve and canonicalize paths, then check `starts_with(data_path)`; a leading `/` is treated as the KB root, not a filesystem escape hatch, and `..` components are rejected either way (see [Retrieval](#retrieval)) |
 | File-type restriction | `get_document`, the write tools, and the web UI's write route check the resolved path against `indexing.include` glob patterns |
 | Facet value sanitization | MCP server instructions embed live facet values (available domains/types/tags) read from **indexed document frontmatter** in Qdrant; these are sanitized (control characters stripped, length-capped) before inclusion to mitigate prompt-injection against connected AI clients |
-| Rate limiting | Configurable token-bucket rate limiter (`rate_limit.per_second`, `rate_limit.burst_size`), applied to the whole app — MCP, webhook, and the unauthenticated web UI routes alike, since the `GovernorLayer` wraps the fully-merged router |
+| Rate limiting | Configurable token-bucket rate limiter (`rate_limit.requests_per_second`, `rate_limit.burst_size`), applied to the whole app — MCP, webhook, and the unauthenticated web UI routes alike, since the `GovernorLayer` wraps the fully-merged router |
 
 ## Configuration and Environment Variables
 

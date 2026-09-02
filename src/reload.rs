@@ -563,11 +563,11 @@ const DIFF_TABLE: &[DiffField] = &[
         }],
     },
     DiffField {
-        path: "rate_limit.per_second",
-        get: |c| Some(d(&c.rate_limit.per_second)),
+        path: "rate_limit.requests_per_second",
+        get: |c| Some(d(&c.rate_limit.requests_per_second)),
         consumers: &[ConsumerEntry {
             effect: ReloadEffect::RestartRequired,
-            setting: "rate_limit.per_second",
+            setting: "rate_limit.requests_per_second",
             note: "baked into the GovernorConfigBuilder when the rate limiter is built \
                    once at startup (server.rs run_server).",
         }],
@@ -893,17 +893,20 @@ mod tests {
     fn a_restart_required_setting_is_never_reported_as_applied() {
         let mut old = base_config();
         let mut new = base_config();
-        old.rate_limit.per_second = 20;
-        new.rate_limit.per_second = 5;
+        old.rate_limit.requests_per_second = 20;
+        new.rate_limit.requests_per_second = 5;
 
         let report = diff(&old, &new);
         assert!(
             report.applied.is_empty(),
-            "rate_limit.per_second must never be claimed as applied: {:?}",
+            "rate_limit.requests_per_second must never be claimed as applied: {:?}",
             report.applied
         );
         assert_eq!(report.restart_required.len(), 1);
-        assert_eq!(report.restart_required[0].setting, "rate_limit.per_second");
+        assert_eq!(
+            report.restart_required[0].setting,
+            "rate_limit.requests_per_second"
+        );
     }
 
     #[test]
