@@ -1,4 +1,4 @@
-# Single source of truth for md-kb-rag's pinned Rust toolchain (#235).
+# Single source of truth for mcp-md-wiki's pinned Rust toolchain (#235).
 #
 # rustup honors this file automatically for every `cargo`/`rustc` invocation
 # anywhere under this directory tree, so local dev needs nothing extra once

@@ -39,7 +39,7 @@ pub enum ReloadEffect {
     /// Read fresh by the indexer on its next run, but the change only reaches
     /// documents indexed AFTER that point — existing Qdrant points keep the chunk
     /// boundaries (or text basis) the OLD setting produced, so the corpus is
-    /// inconsistent with the new config until `md-kb-rag index --full` rewrites it.
+    /// inconsistent with the new config until `mcp-md-wiki index --full` rewrites it.
     ReindexRequired,
 }
 
@@ -310,7 +310,7 @@ const DIFF_TABLE: &[DiffField] = &[
                    effective_indexed_fields on every run (ingest.rs), so a newly indexed \
                    field gets its payload index on the next run; existing documents' \
                    document_fields projection for that field backfills only when they are \
-                   next reindexed, or immediately via `md-kb-rag reproject-fields`.",
+                   next reindexed, or immediately via `mcp-md-wiki reproject-fields`.",
         }],
     },
     DiffField {
@@ -345,7 +345,7 @@ const DIFF_TABLE: &[DiffField] = &[
             setting: "chunking.max_chunk_size",
             note: "read fresh by the chunker on the next indexing run, but only for \
                    documents that run touches — existing Qdrant chunks keep the old \
-                   boundaries. Run `md-kb-rag index --full` for a consistent corpus.",
+                   boundaries. Run `mcp-md-wiki index --full` for a consistent corpus.",
         }],
     },
     DiffField {
@@ -355,7 +355,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::ReindexRequired,
             setting: "chunking.target_chunk_size",
             note: "same as chunking.max_chunk_size: applies to future chunking only. Run \
-                   `md-kb-rag index --full` for a consistent corpus.",
+                   `mcp-md-wiki index --full` for a consistent corpus.",
         }],
     },
     DiffField {
@@ -366,7 +366,7 @@ const DIFF_TABLE: &[DiffField] = &[
             setting: "chunking.prepend_description",
             note: "changes the text every future chunk embeds (and, incidentally, the \
                    create_document dedup query text — mcp.rs build_dedup_query); existing \
-                   chunks were embedded on the old basis. Run `md-kb-rag index --full` for \
+                   chunks were embedded on the old basis. Run `mcp-md-wiki index --full` for \
                    a consistent corpus.",
         }],
     },
@@ -380,7 +380,7 @@ const DIFF_TABLE: &[DiffField] = &[
                    breadcrumb is prepended before embedding, so existing chunks were embedded \
                    on the other basis. Unlike prepend_description this does NOT affect the \
                    create_document dedup query (a document's first chunk never carries a \
-                   breadcrumb — see write.rs build_dedup_query). Run `md-kb-rag index --full` \
+                   breadcrumb — see write.rs build_dedup_query). Run `mcp-md-wiki index --full` \
                    for a consistent corpus.",
         }],
     },
@@ -819,13 +819,13 @@ const DIFF_TABLE: &[DiffField] = &[
     // after `upsert_pending`). A reload's automatic full reconcile
     // (`queue.mark_full()`, unconditional — see `reload_config`'s doc comment)
     // still goes through the worker's ordinary `scan_for_dirty`, which skips any
-    // file whose content hash is unchanged; only `md-kb-rag index --full`
+    // file whose content hash is unchanged; only `mcp-md-wiki index --full`
     // (`force = true`) bypasses that skip and reprocesses everything. So exactly
     // like `chunking.*` above: flipping `ui.semantic_edges.enabled` on does not
     // retroactively populate semantic edges for the existing corpus, and
     // flipping it off does not retroactively remove already-computed ones —
     // both only apply to documents a future run actually touches, same caveat,
-    // same fix (`md-kb-rag index --full`).
+    // same fix (`mcp-md-wiki index --full`).
     DiffField {
         path: "ui.semantic_edges.enabled",
         get: |c| Some(d(&c.ui.semantic_edges.enabled)),
@@ -835,7 +835,7 @@ const DIFF_TABLE: &[DiffField] = &[
             note: "read fresh by the indexer on the next run (ingest.rs \
                    update_semantic_edges), but only for documents that run re-embeds — \
                    existing (or missing) semantic edges in the graph view are \
-                   unchanged otherwise. Run `md-kb-rag index --full` for a consistent \
+                   unchanged otherwise. Run `mcp-md-wiki index --full` for a consistent \
                    corpus.",
         }],
     },
@@ -846,7 +846,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::ReindexRequired,
             setting: "ui.semantic_edges.k",
             note: "same as ui.semantic_edges.enabled: applies to future re-embeds only. \
-                   Run `md-kb-rag index --full` for a consistent corpus.",
+                   Run `mcp-md-wiki index --full` for a consistent corpus.",
         }],
     },
     DiffField {
@@ -856,7 +856,7 @@ const DIFF_TABLE: &[DiffField] = &[
             effect: ReloadEffect::ReindexRequired,
             setting: "ui.semantic_edges.min_score",
             note: "same as ui.semantic_edges.enabled: applies to future re-embeds only. \
-                   Run `md-kb-rag index --full` for a consistent corpus.",
+                   Run `mcp-md-wiki index --full` for a consistent corpus.",
         }],
     },
 ];

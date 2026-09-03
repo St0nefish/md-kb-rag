@@ -468,13 +468,13 @@ pub async fn compute_hash(path: &Path) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Project-specific UUID v5 namespace (generated once, never change after first index).
-const NAMESPACE_MDKBRAG: Uuid = Uuid::from_bytes([
+const NAMESPACE_MCPMDWIKI: Uuid = Uuid::from_bytes([
     0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
 pub fn make_point_id(file_path: &str, chunk_index: usize) -> String {
     let name = format!("{}::{}", file_path, chunk_index);
-    Uuid::new_v5(&NAMESPACE_MDKBRAG, name.as_bytes()).to_string()
+    Uuid::new_v5(&NAMESPACE_MCPMDWIKI, name.as_bytes()).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +602,7 @@ enum FileOutcome {
 /// Process a single file: hash, skip-if-unchanged, validate, chunk.
 ///
 /// `force` bypasses the skip-if-unchanged check below — set only by `index_paths`'
-/// destructive `md-kb-rag index --full` path, where the state DB has just been
+/// destructive `mcp-md-wiki index --full` path, where the state DB has just been
 /// cleared, so there is nothing meaningful to compare against anyway.
 #[allow(clippy::too_many_arguments)]
 async fn process_file(
@@ -2561,7 +2561,7 @@ pub async fn scan_for_dirty(config: &ResolvedConfig) -> Result<Vec<PathBuf>> {
 ///
 /// `force = true` bypasses the skip-if-unchanged check and, before touching any path,
 /// drops and recreates the Qdrant collection and clears the state DB — this is
-/// `md-kb-rag index --full`'s destructive-rebuild semantics, unchanged from before this
+/// `mcp-md-wiki index --full`'s destructive-rebuild semantics, unchanged from before this
 /// module split scanning out of indexing. **It is safe only when `paths` is the
 /// complete set of files on disk**, which [`scan_and_index`] guarantees by discovering
 /// fresh rather than scanning. Calling this with `force = true` on a partial path list
@@ -3211,7 +3211,7 @@ async fn detect_qdrant_wipe<Q: VectorStore>(
 }
 
 /// Scan, then index whatever the scan found — for callers that have no background
-/// worker to hand a dirty-path queue to: the `md-kb-rag index` CLI subcommand, and the
+/// worker to hand a dirty-path queue to: the `mcp-md-wiki index` CLI subcommand, and the
 /// server's own pre-worker bootstrap immediately after a fresh git clone. Both need a
 /// synchronous, in-process "bring the index up to date" call, which this provides by
 /// composing [`scan_for_dirty`] and [`index_paths`]. It is also, since #155, the

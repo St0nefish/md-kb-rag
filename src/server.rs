@@ -256,7 +256,7 @@ pub struct StatusState {
 impl StatusState {
     /// Build a status collector outside the server, for the `status` subcommand.
     ///
-    /// Sharing the collector is what keeps `md-kb-rag status --json` and the `/status`
+    /// Sharing the collector is what keeps `mcp-md-wiki status --json` and the `/status`
     /// endpoint from drifting apart. The `indexing` half will always report idle here:
     /// run state is per-process, and the CLI is not the process doing the indexing.
     /// `reindex_queue` is built fresh and never shared with anything — the CLI has
@@ -350,7 +350,7 @@ pub struct StatusResponse {
     pub data_path: String,
     pub indexing: crate::status::StatusSnapshot,
     /// Pending work on the reindex worker's dirty-path queue — always idle (0 paths,
-    /// no full reconcile pending) for `md-kb-rag status`, which runs in its own
+    /// no full reconcile pending) for `mcp-md-wiki status`, which runs in its own
     /// process with no worker of its own, same caveat as `indexing`.
     pub queue: crate::reindex::QueueSnapshot,
     pub store: StoreCounts,
@@ -389,7 +389,7 @@ fn qdrant_deficit_error(chunk_sum: i64, points: u64, indexing: bool) -> Option<S
             "qdrant has {deficit} fewer point(s) than state.db's chunk_count sum \
              ({points} vs {chunk_sum}); this can mean Qdrant's data was wiped while \
              state.db survived, and search may be silently returning incomplete or \
-             empty results for the whole knowledge base. Run `md-kb-rag index --full` \
+             empty results for the whole knowledge base. Run `mcp-md-wiki index --full` \
              to force a reconcile."
         ))
     } else {
@@ -429,7 +429,7 @@ pub async fn collect_status(state: &StatusState) -> StatusResponse {
                 // negative value means something violated that — most plausibly a CLI
                 // `index` run interleaving with the server's, since the reindex worker
                 // (`src/reindex.rs`) is the sole index mutator only WITHIN a process; it
-                // has no way to coordinate with a separate `md-kb-rag index` process.
+                // has no way to coordinate with a separate `mcp-md-wiki index` process.
                 // Clamping it to zero would report perfect health for exactly the
                 // corruption this field exists to catch.
                 if missing < 0 {
@@ -615,7 +615,7 @@ async fn cached_status(state: &StatusState) -> StatusResponse {
 ///
 /// `retrieval`/`phrase_matching_available` are deliberately NOT fields on
 /// [`StatusResponse`] itself: that struct is constructed by literal in more than
-/// one place this change must not touch (`md-kb-rag status`'s own JSON/text
+/// one place this change must not touch (`mcp-md-wiki status`'s own JSON/text
 /// rendering builds and consumes it directly, in `main.rs`, which is out of
 /// scope for #168 — see the module docs on why `RetrievalMetrics` lives in
 /// `status.rs` rather than being threaded through `collect_status`). Adding a
@@ -623,7 +623,7 @@ async fn cached_status(state: &StatusState) -> StatusResponse {
 /// call sites. Flattening a second struct alongside it at the JSON boundary gets
 /// the same wire shape (retrieval fields appear as ordinary top-level `/status`
 /// keys) without touching `StatusResponse`'s definition or its other
-/// constructors at all. `md-kb-rag status --json` (main.rs) therefore does not
+/// constructors at all. `mcp-md-wiki status --json` (main.rs) therefore does not
 /// gain these fields — acceptable, since that command runs in its own
 /// short-lived process that never serves a query, so they would only ever read
 /// as zero there anyway (the same caveat `StatusResponse::queue`/`indexing`
@@ -4137,7 +4137,7 @@ mod tests {
 
     /// A failing component must report *why* it failed, not just "unavailable".
     /// The `error` field is the only channel for that — `/health` and the
-    /// `md-kb-rag health` CLI (see `print_component` in main.rs) surface nothing
+    /// `mcp-md-wiki health` CLI (see `print_component` in main.rs) surface nothing
     /// else, so leaving it `None` forces operators to grep container logs.
     #[tokio::test]
     async fn health_handler_reports_component_errors() {

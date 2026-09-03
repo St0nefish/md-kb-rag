@@ -2298,7 +2298,7 @@ mod tests {
         }
         std::fs::write(&abs, content).unwrap();
         let message =
-            format!("docs: update {rel_path}\n\nTool: md-kb-rag\nOperation: write_document");
+            format!("docs: update {rel_path}\n\nTool: mcp-md-wiki\nOperation: write_document");
         std::process::Command::new("git")
             .args(["add", rel_path])
             .current_dir(work.path())
@@ -2353,7 +2353,7 @@ mod tests {
         // README.md's seed commit (hand-authored, from create_bare_repo) plus
         // the tool-authored one just made above.
         assert_eq!(commits.len(), 2);
-        assert_eq!(commits[0]["tool"], "md-kb-rag");
+        assert_eq!(commits[0]["tool"], "mcp-md-wiki");
         assert_eq!(commits[0]["operation"], "write_document");
         assert_eq!(commits[0]["tool_authored"], true);
         assert_eq!(commits[1]["tool_authored"], false);

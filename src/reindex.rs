@@ -68,7 +68,7 @@ struct QueueState {
     /// the whole corpus rather than trusting an explicit path list — is pending.
     ///
     /// This is NOT the same thing as `ingest::index_paths`'s own `force` flag (the
-    /// destructive `md-kb-rag index --full` drop-and-rebuild). This one only means "run
+    /// destructive `mcp-md-wiki index --full` drop-and-rebuild). This one only means "run
     /// the scanner first" — used by the startup catch-up and the periodic safety-net
     /// sweep, both of which still index through the ordinary scoped, non-destructive
     /// path once the scan produces a worklist. Nothing in this module ever sets

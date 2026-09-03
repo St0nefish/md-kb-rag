@@ -34,7 +34,7 @@ COPY assets/ assets/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=md-rag-target,target=/build/target \
     touch src/main.rs && cargo build --release && \
-    cp target/release/md-kb-rag /usr/local/bin/md-kb-rag
+    cp target/release/mcp-md-wiki /usr/local/bin/mcp-md-wiki
 
 # Runtime image
 FROM alpine:3.21
@@ -51,11 +51,11 @@ ARG REVISION=unknown
 
 LABEL org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
-      org.opencontainers.image.source="https://github.com/St0nefish/md-kb-rag"
+      org.opencontainers.image.source="https://github.com/St0nefish/mcp-md-wiki"
 
 RUN apk add --no-cache ca-certificates git
 
-COPY --from=builder /usr/local/bin/md-kb-rag /usr/local/bin/md-kb-rag
+COPY --from=builder /usr/local/bin/mcp-md-wiki /usr/local/bin/mcp-md-wiki
 
 RUN addgroup -g 65532 -S nonroot && adduser -u 65532 -S nonroot -G nonroot
 
@@ -71,7 +71,7 @@ RUN mkdir -p /data && chown nonroot:nonroot /data
 USER nonroot
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=10s \
-  CMD ["md-kb-rag", "health"]
+  CMD ["mcp-md-wiki", "health"]
 
-ENTRYPOINT ["md-kb-rag"]
+ENTRYPOINT ["mcp-md-wiki"]
 CMD ["serve"]

@@ -7438,7 +7438,7 @@ mod tests {
     fn commit_message_create_document_trailer() {
         let msg = build_commit_message(None, "docs: add notes/guide.md", "create_document");
         assert!(
-            msg.contains("Tool: md-kb-rag"),
+            msg.contains("Tool: mcp-md-wiki"),
             "should contain Tool trailer: {msg}"
         );
         assert!(
@@ -7499,7 +7499,7 @@ mod tests {
         let msg = build_commit_message(None, "docs: add test.md", "create_document");
         // Git requires a blank line between subject and trailer block
         assert!(
-            msg.contains("\n\nTool: md-kb-rag"),
+            msg.contains("\n\nTool: mcp-md-wiki"),
             "blank line must precede trailer block: {msg}"
         );
     }
@@ -9162,8 +9162,8 @@ mod tests {
             write: crate::config::WriteConfig {
                 dedup_enabled: false,
                 dedup_threshold: 0.85,
-                commit_author_name: "md-kb-rag".to_string(),
-                commit_author_email: "md-kb-rag@localhost".to_string(),
+                commit_author_name: "mcp-md-wiki".to_string(),
+                commit_author_email: "mcp-md-wiki@localhost".to_string(),
             },
             search: crate::config::SearchConfig::default(),
             reranking: None,
@@ -9346,7 +9346,7 @@ mod tests {
     fn delete_document_commit_message_has_correct_trailers() {
         let msg = build_commit_message(None, "docs: delete notes/guide.md", "delete_document");
         assert!(
-            msg.contains("Tool: md-kb-rag"),
+            msg.contains("Tool: mcp-md-wiki"),
             "should contain Tool trailer: {msg}"
         );
         assert!(

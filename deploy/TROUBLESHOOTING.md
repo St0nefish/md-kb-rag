@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Common issues and fixes for md-kb-rag.
+Common issues and fixes for mcp-md-wiki.
 
 ## Backup and Recovery
 
@@ -8,7 +8,7 @@ Of the three stateful things this project touches — the KB's git clone, `state
 and the Qdrant collection — **only the git repo is authoritative.** `state.db` (the
 SQLite state and metadata index) and Qdrant's vectors are both fully **derived** from
 the corpus: every row and every point can be rebuilt from the markdown files and their
-frontmatter via `md-kb-rag index --full`. So the short version of a backup policy
+frontmatter via `mcp-md-wiki index --full`. So the short version of a backup policy
 here is: back up the git repo the way you'd back up any other git-hosted content
 (forge-level backups, a mirror remote, or trusting the forge's own durability), and
 you've covered the one thing that genuinely cannot be reconstructed. Backing up
@@ -24,13 +24,13 @@ stores buys you" below for what it saves you over a rebuild.
 2. Run a full reindex:
 
    ```bash
-   docker compose exec kb-rag md-kb-rag index --full
+   docker compose exec mcp-md-wiki mcp-md-wiki index --full
    ```
 
    This drops and recreates the Qdrant collection, clears `state.db`'s
    `indexed_files`/`documents`/`document_fields` tables, and re-processes every file
    from scratch — re-chunking, re-embedding, and rebuilding the metadata index.
-3. Confirm the recovery with `md-kb-rag status --json` (or `GET /status`): a healthy
+3. Confirm the recovery with `mcp-md-wiki status --json` (or `GET /status`): a healthy
    result has `qdrant_points_deficit` at or near zero, and `indexed_files`/`documents`
    counts matching your corpus size.
 
@@ -52,7 +52,7 @@ index instead.
 This means a disaster recovery can be blocked by a pre-existing, unrelated schema
 problem — see [Documents stop being reindexed after a schema edit](#documents-stop-being-reindexed-after-a-schema-edit-schema-frozen)
 below for how to find and fix it. Once the schema is valid again, retry
-`index --full`. An incremental `md-kb-rag index` (no `--full`) is unaffected by scopes
+`index --full`. An incremental `mcp-md-wiki index` (no `--full`) is unaffected by scopes
 frozen elsewhere in the tree and can make partial progress in the meantime, but it
 will not touch the frozen scope's own documents either way.
 
@@ -74,7 +74,7 @@ small slack — a real wipe blows past that slack by orders of magnitude, since 
 zeroes the whole collection at once rather than losing a handful of points. Detection
 is currently passive only — the check tells you something is wrong, it does not
 itself trigger a reindex. If you see this error, or a `kb_qdrant_points_deficit`
-metric that stays large and positive, run `md-kb-rag index --full` to force a full
+metric that stays large and positive, run `mcp-md-wiki index --full` to force a full
 reconcile (subject to the frozen-schema caveat above).
 
 ### What backing up the derived stores buys you
@@ -133,9 +133,9 @@ The auto-clone on startup found a non-empty `DATA_PATH` without a `.git` directo
 **Fix:** Remove the volume and let the auto-clone start fresh:
 
 ```bash
-docker compose down kb-rag
+docker compose down mcp-md-wiki
 docker volume rm <project>_kb_data
-docker compose up -d kb-rag
+docker compose up -d mcp-md-wiki
 ```
 
 ### `/data/.git: Permission denied` on startup
@@ -146,15 +146,15 @@ Images from this fix forward create and chown `/data` in the image, so a fresh n
 
 ```bash
 docker run --rm -v <volume_name>:/data --user root --entrypoint chown \
-  ghcr.io/st0nefish/md-kb-rag:latest 65532:65532 /data
+  ghcr.io/st0nefish/mcp-md-wiki:latest 65532:65532 /data
 ```
 
 If you're running the container with a custom compose `user:` override instead of the image default, replace `65532:65532` with that uid:gid. This only needs to be done once per pre-existing volume.
 
-### `docker compose up` hangs; `kb-rag` never starts; `qdrant` shows `starting` then `unhealthy`
+### `docker compose up` hangs; `mcp-md-wiki` never starts; `qdrant` shows `starting` then `unhealthy`
 
 **Symptom.** `docker compose ps` shows `qdrant` stuck in `(health: starting)` and then
-`(unhealthy)` once its `retries` are exhausted. `kb-rag` never even shows as `Created`
+`(unhealthy)` once its `retries` are exhausted. `mcp-md-wiki` never even shows as `Created`
 starting a container — `depends_on: qdrant: condition: service_healthy` means compose
 won't start it until qdrant reports healthy, which here it never will. This hits a
 clean `docker compose up` on any host: a first-time deployment, a disaster-recovery
@@ -279,7 +279,7 @@ the server rejects the whole request rather than that one document. llama.cpp
 defaults `--ubatch-size` to 512 tokens; chunks at the default `max_chunk_size` of
 1500 characters can exceed that.
 
-**Fix.** md-kb-rag now truncates each document to `chunking.max_chunk_size` bytes
+**Fix.** mcp-md-wiki now truncates each document to `chunking.max_chunk_size` bytes
 before sending it, so an over-long chunk degrades *that document's* score instead of
 costing the whole query its reranking. When this happens you get one warning per
 request rather than a silent fallback:
@@ -337,7 +337,7 @@ it is sent — check that chunks carry text in the payload field retrieval reads
 
 Files are missing a field listed in `frontmatter.required`.
 
-**Fix:** Either add the missing field to the file's frontmatter, or remove it from the `required` list in your config. Run `md-kb-rag validate` to check all files.
+**Fix:** Either add the missing field to the file's frontmatter, or remove it from the `required` list in your config. Run `mcp-md-wiki validate` to check all files.
 
 ### `target_chunk_size must be <= max_chunk_size`
 
@@ -351,7 +351,7 @@ The values are swapped — `target_chunk_size` must be the smaller value.
 start — and afterward, documents under that directory (and everything beneath it)
 simply stop updating. New files placed there never get indexed, edits to existing
 files never show up in search, and nothing crashes or logs an error against any
-individual document. `md-kb-rag index --full` may additionally refuse to run at all,
+individual document. `mcp-md-wiki index --full` may additionally refuse to run at all,
 printing something like:
 
 ```text
@@ -377,7 +377,7 @@ wrong, the directory just quietly stops moving.
 **Diagnosis.** Run:
 
 ```bash
-md-kb-rag validate
+mcp-md-wiki validate
 ```
 
 Broken schema files are reported in a dedicated `SCHEMA ERRORS` section, naming the
@@ -404,13 +404,13 @@ FROZEN (12): under an invalid schema, not indexed, not validated
 a `values:` list, a field that mixes a scalar `type` with nested `fields:`, or plain
 invalid YAML. See [Directory Schemas](USAGE.md#directory-schemas-kb-schemayaml) in
 USAGE.md for the authoring rules. Once the file is valid again, an incremental
-`md-kb-rag index` is enough to catch the scope back up — the fix is detected via the
+`mcp-md-wiki index` is enough to catch the scope back up — the fix is detected via the
 per-file `schema_hash` fingerprint, the same mechanism that revalidates a file after
 any other schema change, so there's no need to force a full reindex just to pick it up.
 
 While the schema is still broken, you can keep making progress everywhere else: an
-incremental `md-kb-rag index` is unaffected by scopes frozen elsewhere in the tree.
-`md-kb-rag index --full`, however, refuses to run at all while any scope is frozen — a
+incremental `mcp-md-wiki index` is unaffected by scopes frozen elsewhere in the tree.
+`mcp-md-wiki index --full`, however, refuses to run at all while any scope is frozen — a
 full run drops and rebuilds the whole Qdrant collection, and a frozen scope's
 documents would be skipped during that rebuild, permanently losing their vectors
 rather than merely staying stale. Fix the schema first, or stick to incremental
@@ -451,7 +451,7 @@ The webhook verified successfully but the in-container `git fetch` or `git merge
 - **SSH URL without keys** — SSH URLs bypass token injection, but the container needs SSH keys configured. For Docker deployments, HTTPS with a token is simpler.
 - **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. This usually means someone modified files directly in the bind-mounted directory. Using a named volume (recommended) avoids this by keeping the repo inaccessible from the host.
 
-**Fix:** Check `docker logs kb-rag` for the specific error (tokens are redacted in log output). Verify the URL and token work from the host:
+**Fix:** Check `docker logs mcp-md-wiki` for the specific error (tokens are redacted in log output). Verify the URL and token work from the host:
 
 ```bash
 git ls-remote "https://<token>@your-forge.example.com/org/repo.git"
@@ -467,13 +467,13 @@ Your reverse proxy is redirecting HTTP to HTTPS, but the webhook is configured w
 
 ### `curl` to `/health` or `/status` returns a 302 redirect to an SSO login page
 
-This is the default proxy-with-SSO posture doing exactly what it's configured to do — see [Deployment Posture: Network Exposure and Access Control](USAGE.md#deployment-posture-network-exposure-and-access-control) in USAGE.md for the full picture. The reverse proxy in front of the container (Authentik via Traefik, in the reference deployment) intercepts the request before it ever reaches md-kb-rag and redirects it to the identity provider's login page, because the proxy has no way to distinguish a diagnostic `curl` from a browser that can complete the SSO flow. The 302 never originates from the binary itself: `/health` handles GET with no gate at all, and `/status` is bearer-gated, not SSO-gated — neither returns a redirect on its own.
+This is the default proxy-with-SSO posture doing exactly what it's configured to do — see [Deployment Posture: Network Exposure and Access Control](USAGE.md#deployment-posture-network-exposure-and-access-control) in USAGE.md for the full picture. The reverse proxy in front of the container (Authentik via Traefik, in the reference deployment) intercepts the request before it ever reaches mcp-md-wiki and redirects it to the identity provider's login page, because the proxy has no way to distinguish a diagnostic `curl` from a browser that can complete the SSO flow. The 302 never originates from the binary itself: `/health` handles GET with no gate at all, and `/status` is bearer-gated, not SSO-gated — neither returns a redirect on its own.
 
 Passing a bearer token doesn't change the outcome. This was confirmed against the reference deployment during verification: `curl` with `-H "Authorization: Bearer $MCP_BEARER_TOKEN"` and `curl` with no header at all returned the identical 302 to Authentik's login page, because the token is meaningless to the proxy's SSO layer — it redirects unauthenticated *browsers*, it does not inspect bearer credentials.
 
 **Two ways out, neither requiring an interactive SSO session from a script:**
 
-1. **Reach the container directly, bypassing the proxy.** From inside the Docker network: `docker compose exec kb-rag curl http://localhost:8001/health`. From the host, if the port happens to be published: `curl http://localhost:8001/health` against the mapped port. Either way skips the proxy hop entirely, so nothing intercepts the request or has a chance to redirect it.
+1. **Reach the container directly, bypassing the proxy.** From inside the Docker network: `docker compose exec mcp-md-wiki curl http://localhost:8001/health`. From the host, if the port happens to be published: `curl http://localhost:8001/health` against the mapped port. Either way skips the proxy hop entirely, so nothing intercepts the request or has a chance to redirect it.
 2. **Use the bearer token against a route the proxy doesn't intercept.** `/status` is gated inside the binary itself (the same `bearer_auth` layer that protects `/mcp`), which is a different mechanism from the proxy's SSO layer that's producing the 302:
 
    ```bash
@@ -490,7 +490,7 @@ If you want `/health` and `/status` reachable from the LAN without a proxy hop o
 
 Changing the embedding model (or `EMBEDDING_VECTOR_SIZE`) makes existing vectors incompatible.
 
-**Fix:** Run `md-kb-rag index --full` to drop and recreate the Qdrant collection with the new dimensions.
+**Fix:** Run `mcp-md-wiki index --full` to drop and recreate the Qdrant collection with the new dimensions.
 
 ## Logging and Observability
 
@@ -501,8 +501,8 @@ Set `RUST_LOG` in your `.env` file or compose environment. The server warns on s
 | Value | Effect |
 |---|---|
 | `info` | Default — startup events, webhook accepts, indexing summaries |
-| `md_kb_rag=debug` | Verbose app logging: per-file decisions, search timing, per-batch embed progress |
-| `info,md_kb_rag::webhook=debug` | Info everywhere + detailed webhook trace |
+| `mcp_md_wiki=debug` | Verbose app logging: per-file decisions, search timing, per-batch embed progress |
+| `info,mcp_md_wiki::webhook=debug` | Info everywhere + detailed webhook trace |
 | `debug` | Very verbose — includes library internals (noisy) |
 
 ### Key log events and how to find them
@@ -532,7 +532,7 @@ Indexing run complete discovered=42 indexed=5 skipped=36 invalid=0 empty=0 read_
 | `orphans_removed` | Qdrant points removed for files no longer on disk |
 | `elapsed_secs` | Wall-clock time for the run |
 
-If a file you expected to be indexed shows up under `skipped`, its hash matches the last indexed version — it hasn't changed since the last run. If it shows under `invalid`, run `md-kb-rag validate` for details.
+If a file you expected to be indexed shows up under `skipped`, its hash matches the last indexed version — it hasn't changed since the last run. If it shows under `invalid`, run `mcp-md-wiki validate` for details.
 
 `git fetch timed out after Xs` / `git merge timed out after Xs` (ERROR) — webhook-triggered git subprocess exceeded the 120-second timeout. Check that `GIT_URL` is reachable from inside the container.
 
@@ -546,6 +546,6 @@ The llama.cpp Docker images don't support Apple Metal GPU acceleration. Docker o
 
 **Options:**
 
-1. **Run llama-server natively** — `brew install llama.cpp`, then run `llama-server` with your model and point `EMBEDDING_BASE_URL` at it (e.g. `http://host.docker.internal:8080/v1` if kb-rag is still in Docker).
+1. **Run llama-server natively** — `brew install llama.cpp`, then run `llama-server` with your model and point `EMBEDDING_BASE_URL` at it (e.g. `http://host.docker.internal:8080/v1` if mcp-md-wiki is still in Docker).
 2. **Use the CPU Docker image** — works but is slower than native Metal.
 3. **Use an external API** — point `EMBEDDING_BASE_URL` at OpenAI, Ollama, or any OpenAI-compatible endpoint and remove the `embeddings` service from compose.

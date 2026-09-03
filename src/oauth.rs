@@ -223,7 +223,7 @@ impl OAuthValidator {
             "authorization_servers": [config.issuer],
             "scopes_supported": config.scopes_supported,
             "bearer_methods_supported": ["header"],
-            "resource_name": "md-kb-rag knowledge base (MCP)",
+            "resource_name": "mcp-md-wiki knowledge base (MCP)",
         });
 
         let http = reqwest::Client::builder()

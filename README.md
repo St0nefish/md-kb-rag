@@ -1,4 +1,4 @@
-# md-kb-rag
+# mcp-md-wiki
 
 A Docker-first RAG server that indexes markdown knowledge bases with YAML frontmatter into Qdrant and exposes them over MCP (Streamable HTTP) — semantic search, document retrieval, and agent-driven writes (create/edit/delete) that commit straight back to the knowledge base's git repo.
 
@@ -15,8 +15,8 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 
 ```bash
 # Clone and configure
-git clone https://github.com/St0nefish/md-kb-rag.git
-cd md-kb-rag
+git clone https://github.com/St0nefish/mcp-md-wiki.git
+cd mcp-md-wiki
 cp deploy/.env.example .env
 # Edit .env: set MCP_BEARER_TOKEN and MODEL_PATH/MODEL_FILE
 # (GIT_PULL_TOKEN is optional — only needed to clone/fetch a private knowledge-base repo)
@@ -79,26 +79,26 @@ Three Docker services:
 |---|---|
 | `qdrant` | Vector database (gRPC + REST) |
 | `embeddings` | Local embedding server (llama.cpp, OpenAI-compatible API) |
-| `kb-rag` | Indexer, MCP server, and webhook handler (single Rust binary) |
+| `mcp-md-wiki` | Indexer, MCP server, and webhook handler (single Rust binary) |
 
 ## CLI Commands
 
 ```bash
-md-kb-rag serve              # Start server (MCP + webhook endpoints + web UI)
-md-kb-rag index              # Incremental index (only changed files)
-md-kb-rag index --full       # Full re-index (clear state, re-embed everything)
-md-kb-rag validate           # Validate all markdown files without indexing
-md-kb-rag search "query"     # Search the knowledge base from the CLI (same pipeline as MCP search)
-md-kb-rag search "query" --limit 10 --explain      # Score-breakdown per result
-md-kb-rag search "query" --domain infra --type guide --tags docker,node:ares
-md-kb-rag search "query" --modified-after 2026-01-01 --json
-md-kb-rag get PATH           # Print one document (path resolves like the MCP tool)
-md-kb-rag get PATH --start-line 40 --end-line 60   # ...or just those lines, 1-based inclusive
-md-kb-rag status             # Aggregate counts + metadata breakdown
-md-kb-rag status --json      # Same data as the server's /status endpoint
-md-kb-rag status --files     # List every indexed file instead
-md-kb-rag health             # Check if server is healthy
-md-kb-rag reproject-fields   # Rebuild document_fields from stored frontmatter (no re-embed)
+mcp-md-wiki serve              # Start server (MCP + webhook endpoints + web UI)
+mcp-md-wiki index              # Incremental index (only changed files)
+mcp-md-wiki index --full       # Full re-index (clear state, re-embed everything)
+mcp-md-wiki validate           # Validate all markdown files without indexing
+mcp-md-wiki search "query"     # Search the knowledge base from the CLI (same pipeline as MCP search)
+mcp-md-wiki search "query" --limit 10 --explain      # Score-breakdown per result
+mcp-md-wiki search "query" --domain infra --type guide --tags docker,node:ares
+mcp-md-wiki search "query" --modified-after 2026-01-01 --json
+mcp-md-wiki get PATH           # Print one document (path resolves like the MCP tool)
+mcp-md-wiki get PATH --start-line 40 --end-line 60   # ...or just those lines, 1-based inclusive
+mcp-md-wiki status             # Aggregate counts + metadata breakdown
+mcp-md-wiki status --json      # Same data as the server's /status endpoint
+mcp-md-wiki status --files     # List every indexed file instead
+mcp-md-wiki health             # Check if server is healthy
+mcp-md-wiki reproject-fields   # Rebuild document_fields from stored frontmatter (no re-embed)
 ```
 
 ## Configuration
@@ -152,7 +152,7 @@ See [deploy/config.example.yaml](deploy/config.example.yaml) for all options:
 - **reranking** — Optional cross-encoder reranking pass over the top hybrid candidates (`enabled`, default `false`; `candidate_limit`, default `50`). Requires `RERANKING_BASE_URL`/`RERANKING_MODEL` when enabled — see [Configuration](#configuration) above and `deploy/config.example.yaml`
 - **ui** — Web UI graph-view tuning: `semantic_edges` adds precomputed kNN neighbor edges alongside markdown-link edges (off by default — each enabled run costs one Qdrant `recommend` query per indexed document). See [Web UI](#web-ui) below.
 
-> **Hybrid search migration:** collections now use named `dense` + `sparse` vectors. Upgrading a knowledge base that was indexed by a pre-hybrid version requires a one-time full reindex (`md-kb-rag index --full`) — the old single-unnamed-vector schema is incompatible. After that, toggling `search.hybrid` needs no reindex (both vectors are always stored).
+> **Hybrid search migration:** collections now use named `dense` + `sparse` vectors. Upgrading a knowledge base that was indexed by a pre-hybrid version requires a one-time full reindex (`mcp-md-wiki index --full`) — the old single-unnamed-vector schema is incompatible. After that, toggling `search.hybrid` needs no reindex (both vectors are always stored).
 
 ## Embedding Models
 
@@ -255,7 +255,7 @@ Simpler driver setup than ROCm — works with standard Mesa Vulkan drivers. In `
 
 Metal GPU acceleration is **not available in Docker** (Docker on macOS runs a Linux VM). Options:
 
-1. **Run llama-server natively** — `brew install llama.cpp`, then start it with your model and point `EMBEDDING_BASE_URL` at it (`http://host.docker.internal:8080/v1` if kb-rag runs in Docker).
+1. **Run llama-server natively** — `brew install llama.cpp`, then start it with your model and point `EMBEDDING_BASE_URL` at it (`http://host.docker.internal:8080/v1` if mcp-md-wiki runs in Docker).
 2. **Use the CPU Docker image** — works but is slower than native Metal.
 
 ### External API
@@ -327,7 +327,7 @@ Returns plain text plus `structured_content` (`path`, `frozen`, `frozen_reason`,
 
 ### Write
 
-Both write tools share the same pipeline: **path-safety guard** (no `..`, no symlink escapes, must match `indexing.include`) → **frontmatter validation** (against the *destination* directory's schema, for a move) → **filesystem write** → **git commit with provenance trailers** (`Tool: md-kb-rag`, `Operation: <tool>`) → **push to the remote** → **incremental reindex** (serialized against webhook reindexes via an internal lock). Each returns a summary line with the commit SHA plus a unified diff. Commits are authored under the `write.commit_author_*` identity so tool edits are easy to spot in `git log`.
+Both write tools share the same pipeline: **path-safety guard** (no `..`, no symlink escapes, must match `indexing.include`) → **frontmatter validation** (against the *destination* directory's schema, for a move) → **filesystem write** → **git commit with provenance trailers** (`Tool: mcp-md-wiki`, `Operation: <tool>`) → **push to the remote** → **incremental reindex** (serialized against webhook reindexes via an internal lock). Each returns a summary line with the commit SHA plus a unified diff. Commits are authored under the `write.commit_author_*` identity so tool edits are easy to spot in `git log`.
 
 **`write_document`** — create, edit, and/or move a document. It's an upsert: `content` creates `path` when it's new and replaces it when it already exists. This one tool replaces the old `create_document`, `edit_document`, and `move_directory` tools.
 
@@ -423,9 +423,9 @@ A field can't declare both a scalar `type` and nested `fields:` — it's either 
 
 ### Freezing
 
-A malformed `.kb-schema.yaml` **freezes its subtree**: nothing under it is indexed or re-indexed, and existing index entries are left untouched. It never silently falls back to the parent's rules. `md-kb-rag validate` reports broken schema files loudly in a `SCHEMA ERRORS` section, and they count as a failure under strict mode (`validation.strict: true`).
+A malformed `.kb-schema.yaml` **freezes its subtree**: nothing under it is indexed or re-indexed, and existing index entries are left untouched. It never silently falls back to the parent's rules. `mcp-md-wiki validate` reports broken schema files loudly in a `SCHEMA ERRORS` section, and they count as a failure under strict mode (`validation.strict: true`).
 
-`md-kb-rag index --full` **refuses to run** while any scope is frozen, naming the offending directories — a full run rebuilds the Qdrant collection from scratch and cannot reindex a frozen scope, so its vectors would be lost rather than merely stale. Fix the schema(s) first, or reindex incrementally in the meantime; incremental indexing is unaffected by frozen scopes elsewhere in the tree.
+`mcp-md-wiki index --full` **refuses to run** while any scope is frozen, naming the offending directories — a full run rebuilds the Qdrant collection from scratch and cannot reindex a frozen scope, so its vectors would be lost rather than merely stale. Fix the schema(s) first, or reindex incrementally in the meantime; incremental indexing is unaffected by frozen scopes elsewhere in the tree.
 
 A `.kb-schema.yaml` over 256 KB is refused purely on file size — it's never read or parsed — and freezes its subtree through that same mechanism.
 
@@ -460,12 +460,12 @@ Four HTTP endpoints, with different audiences and different auth:
 
 ```yaml
 scrape_configs:
-  - job_name: md-kb-rag
+  - job_name: mcp-md-wiki
     metrics_path: /metrics
     authorization:
       credentials: ${MCP_BEARER_TOKEN}
     static_configs:
-      - targets: ["kb-rag:8001"]
+      - targets: ["mcp-md-wiki:8001"]
 ```
 
 Both report:
@@ -496,7 +496,7 @@ The response reports exactly what happened, bucketed by whether the change actua
 
 - **`applied`** — read fresh by the code that uses it (an MCP tool call, a webhook request, the reindex worker's next drain, a periodic timer's next tick), so the very next read observes the new value. `search.*`, `write.*`, `webhook.provider`, `indexing.include`/`exclude`, `frontmatter.*`, `validation.*`, `mcp.instructions`, `mcp.extensions_path`, and more fall here.
 - **`restart_required`** — baked into a value or service built once at server startup (the embedding client's `reqwest::Client` timeout, the MCP path-filter `GlobSet`, the rate limiter, anything security-critical like the bearer token or `allow_unauthenticated`). The swap updates what everything else sees, but this particular consumer keeps behaving exactly as it did before the reload.
-- **`reindex_required`** — `chunking.*`. The indexer reads the new value on its next run, but only for documents that run touches; existing Qdrant chunks keep the old boundaries. Run `md-kb-rag index --full` for a consistent corpus.
+- **`reindex_required`** — `chunking.*`. The indexer reads the new value on its next run, but only for documents that run touches; existing Qdrant chunks keep the old boundaries. Run `mcp-md-wiki index --full` for a consistent corpus.
 
 A malformed or invalid `config.yaml` — bad YAML, a value that fails validation, a missing required env var — is rejected with a 400 and that error message, and the running config is left **completely untouched**, the same guarantee a failed restart on that file would give you. A successful reload also queues an immediate full reconcile, so indexing-observing changes reach the corpus on the reindex worker's very next wake rather than waiting for the periodic sweep.
 

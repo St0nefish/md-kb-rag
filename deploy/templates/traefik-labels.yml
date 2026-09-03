@@ -1,21 +1,21 @@
-# Traefik reverse proxy labels for the kb-rag service.
+# Traefik reverse proxy labels for the mcp-md-wiki service.
 #
-# Merge these labels into your docker-compose.yml kb-rag service.
+# Merge these labels into your docker-compose.yml mcp-md-wiki service.
 # Replace placeholders:
-#   {{HOSTNAME}}        — your domain (e.g. kb-rag.example.com)
+#   {{HOSTNAME}}        — your domain (e.g. mcp-md-wiki.example.com)
 #   {{RESOLVER}}        — your ACME resolver name (e.g. letsencrypt)
 #   {{TRAEFIK_NETWORK}} — your Traefik Docker network (e.g. traefik)
 #
-# When using Traefik, remove the `ports:` mapping from the kb-rag service
+# When using Traefik, remove the `ports:` mapping from the mcp-md-wiki service
 # since Traefik routes traffic directly via the Docker network.
 
-# Add to kb-rag service:
+# Add to mcp-md-wiki service:
 labels:
   - "traefik.enable=true"
-  - "traefik.http.routers.kb-rag.rule=Host(`{{HOSTNAME}}`)"
-  - "traefik.http.routers.kb-rag.entrypoints=websecure"
-  - "traefik.http.routers.kb-rag.tls.certresolver={{RESOLVER}}"
-  - "traefik.http.services.kb-rag.loadbalancer.server.port=8001"
+  - "traefik.http.routers.mcp-md-wiki.rule=Host(`{{HOSTNAME}}`)"
+  - "traefik.http.routers.mcp-md-wiki.entrypoints=websecure"
+  - "traefik.http.routers.mcp-md-wiki.tls.certresolver={{RESOLVER}}"
+  - "traefik.http.services.mcp-md-wiki.loadbalancer.server.port=8001"
 
 # Add to top-level networks:
 networks:
@@ -24,7 +24,7 @@ networks:
     external: true
     name: {{TRAEFIK_NETWORK}}
 
-# Add to kb-rag service:
+# Add to mcp-md-wiki service:
 # networks:
 #   - default
 #   - traefik

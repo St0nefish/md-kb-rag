@@ -2,7 +2,7 @@
  * assets/edit.js — in-browser document editing for the Knowledge Base
  * viewer. NOT part of the forked OKF viewer (see viz.js's header comment
  * for the license/provenance of the graph code this file sits on top of);
- * this is new code written for md-kb-rag's web UI.
+ * this is new code written for mcp-md-wiki's web UI.
  *
  * Talks to the write pipeline via the fixed HTTP API contract:
  *   GET    api/schema/<path>  -> schema hints panel + new-document template
