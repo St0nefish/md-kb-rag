@@ -22,7 +22,7 @@ services:
       # dash has no /dev/tcp — confirmed empirically, it fails with "cannot create
       # /dev/tcp/...: Directory nonexistent". So this has to be exec-form CMD invoking
       # bash directly. Probes 6334 (gRPC) rather than 6333 (REST) because gRPC is what
-      # QDRANT_URL points kb-rag at — a check that proves REST is up while gRPC isn't
+      # QDRANT_URL points mcp-md-wiki at — a check that proves REST is up while gRPC isn't
       # would be the same class of bug this replaces.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6334"]
       interval: 10s
@@ -48,8 +48,8 @@ services:
       retries: 10
       start_period: 30s
 
-  kb-rag:
-    image: ghcr.io/st0nefish/md-kb-rag:latest
+  mcp-md-wiki:
+    image: ghcr.io/st0nefish/mcp-md-wiki:latest
     restart: unless-stopped
     labels:
       # Opt in to Watchtower auto-updates. Required when Watchtower runs with

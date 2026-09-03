@@ -6,7 +6,7 @@ services:
       - ./data/qdrant:/qdrant/storage
     ports:
       - "127.0.0.1:6333:6333"   # REST API (debugging only)
-      - "127.0.0.1:6334:6334"   # gRPC (used by kb-rag)
+      - "127.0.0.1:6334:6334"   # gRPC (used by mcp-md-wiki)
     healthcheck:
       # No curl/wget/nc in this image, and /health was dropped upstream in favor of
       # /readyz, /healthz, /livez — moot anyway with nothing on board to reach them
@@ -15,7 +15,7 @@ services:
       # dash has no /dev/tcp — confirmed empirically, it fails with "cannot create
       # /dev/tcp/...: Directory nonexistent". So this has to be exec-form CMD invoking
       # bash directly. Probes 6334 (gRPC) rather than 6333 (REST) because gRPC is what
-      # QDRANT_URL below actually points kb-rag at — a check that proves REST is up
+      # QDRANT_URL below actually points mcp-md-wiki at — a check that proves REST is up
       # while gRPC isn't would be the same class of bug this replaces.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6334"]
       interval: 10s
@@ -101,7 +101,7 @@ services:
     # devices:
     #   - /dev/dri:/dev/dri
 
-  kb-rag:
+  mcp-md-wiki:
     build: .
     restart: unless-stopped
     # user: "1000:1000"  # recommended: run as non-root

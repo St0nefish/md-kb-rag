@@ -442,7 +442,7 @@ GIT_BRANCH=master
 ```
 
 ```yaml
-# docker-compose.yml (kb-rag service)
+# docker-compose.yml (mcp-md-wiki service)
 volumes:
   - kb_data:/data:rw
 
@@ -464,7 +464,7 @@ On first start with an empty volume, the server automatically clones the repo (a
 
 ```bash
 docker run --rm -v kb_data:/data --user root --entrypoint chown \
-  ghcr.io/st0nefish/md-kb-rag:latest 1000:1000 /data
+  ghcr.io/st0nefish/mcp-md-wiki:latest 1000:1000 /data
 ```
 
 Replace `1000:1000` with the UID:GID from your compose `user:` setting.
@@ -474,14 +474,14 @@ Replace `1000:1000` with the UID:GID from your compose `user:` setting.
 Mount a pre-cloned repo from the host. Useful when you need direct host access to the files or can't use `GIT_URL` (e.g. local-only repos).
 
 ```yaml
-# docker-compose.yml (kb-rag service)
+# docker-compose.yml (mcp-md-wiki service)
 volumes:
   - ${KB_PATH:-./data/repo}:/data:rw
 ```
 
 With this approach, you're responsible for keeping the directory up to date. If `GIT_URL` is also set, the webhook will still run `git fetch` + `git merge` inside the container, but having the directory accessible on the host risks accidental modifications that could cause merge conflicts.
 
-Without `GIT_URL`, you'll need an external process to update the bind-mounted directory and trigger a reindex (either via webhook or by running `docker compose exec kb-rag mcp-md-wiki index`).
+Without `GIT_URL`, you'll need an external process to update the bind-mounted directory and trigger a reindex (either via webhook or by running `docker compose exec mcp-md-wiki mcp-md-wiki index`).
 
 ## Deployment Posture: Network Exposure and Access Control
 
@@ -489,7 +489,7 @@ mcp-md-wiki serves everything — the MCP endpoint, diagnostics, and the web UI 
 
 ### Posture A: reverse proxy with SSO (the default)
 
-This is the posture the project targets by default: the container's port is never published to the host at all (no `ports:` mapping, or one removed in favor of `docker-compose`'s internal network — see [`deploy/templates/traefik-labels.yml`](templates/traefik-labels.yml)'s own note that using Traefik means dropping the `ports:` mapping from the kb-rag service). An identity-aware reverse proxy — Authentik via Traefik, in the reference deployment — sits in front of the whole port, and every route the binary doesn't gate itself is gated by that proxy instead. `/mcp`, `/status`, `/metrics`, and `/admin/reload` still additionally require the bearer token even behind the proxy — the proxy and the bearer check are two independent layers, not a substitute for each other. See [README.md's Web UI section](../README.md#web-ui) for the full statement of what the web UI's routes grant if this proxy layer is ever missing, and [`deploy/templates/traefik-labels.yml`](templates/traefik-labels.yml) for the label set.
+This is the posture the project targets by default: the container's port is never published to the host at all (no `ports:` mapping, or one removed in favor of `docker-compose`'s internal network — see [`deploy/templates/traefik-labels.yml`](templates/traefik-labels.yml)'s own note that using Traefik means dropping the `ports:` mapping from the mcp-md-wiki service). An identity-aware reverse proxy — Authentik via Traefik, in the reference deployment — sits in front of the whole port, and every route the binary doesn't gate itself is gated by that proxy instead. `/mcp`, `/status`, `/metrics`, and `/admin/reload` still additionally require the bearer token even behind the proxy — the proxy and the bearer check are two independent layers, not a substitute for each other. See [README.md's Web UI section](../README.md#web-ui) for the full statement of what the web UI's routes grant if this proxy layer is ever missing, and [`deploy/templates/traefik-labels.yml`](templates/traefik-labels.yml) for the label set.
 
 This is a sound default, and it's the only posture worth reaching for on any network that isn't fully trusted. It has two costs worth naming, both confirmed against the reference deployment rather than theoretical:
 
@@ -635,16 +635,16 @@ If you set `GIT_URL`, also set `GIT_PULL_TOKEN` to a personal access token. Read
 docker compose up -d
 ```
 
-This starts Qdrant, the embedding server, and the mcp-md-wiki service. The kb-rag service waits for both dependencies to be healthy before starting.
+This starts Qdrant, the embedding server, and the mcp-md-wiki service. The mcp-md-wiki service waits for both dependencies to be healthy before starting.
 
-If `GIT_URL` is set and the data volume is empty, the server **automatically clones the repo and runs a full index** — no manual step needed. Check progress with `docker logs -f kb-rag`.
+If `GIT_URL` is set and the data volume is empty, the server **automatically clones the repo and runs a full index** — no manual step needed. Check progress with `docker logs -f mcp-md-wiki`.
 
 ### 5. Run the initial index (bind-mount only)
 
 If you're using the bind-mount approach without `GIT_URL`, run the initial index manually:
 
 ```bash
-docker compose exec kb-rag mcp-md-wiki index --full
+docker compose exec mcp-md-wiki mcp-md-wiki index --full
 ```
 
 Full index drops any existing Qdrant collection and re-processes every file. Also use this after changing `EMBEDDING_VECTOR_SIZE`.

@@ -51,7 +51,7 @@ ARG REVISION=unknown
 
 LABEL org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
-      org.opencontainers.image.source="https://github.com/St0nefish/md-kb-rag"
+      org.opencontainers.image.source="https://github.com/St0nefish/mcp-md-wiki"
 
 RUN apk add --no-cache ca-certificates git
 

@@ -24,7 +24,7 @@ stores buys you" below for what it saves you over a rebuild.
 2. Run a full reindex:
 
    ```bash
-   docker compose exec kb-rag mcp-md-wiki index --full
+   docker compose exec mcp-md-wiki mcp-md-wiki index --full
    ```
 
    This drops and recreates the Qdrant collection, clears `state.db`'s
@@ -133,9 +133,9 @@ The auto-clone on startup found a non-empty `DATA_PATH` without a `.git` directo
 **Fix:** Remove the volume and let the auto-clone start fresh:
 
 ```bash
-docker compose down kb-rag
+docker compose down mcp-md-wiki
 docker volume rm <project>_kb_data
-docker compose up -d kb-rag
+docker compose up -d mcp-md-wiki
 ```
 
 ### `/data/.git: Permission denied` on startup
@@ -146,15 +146,15 @@ Images from this fix forward create and chown `/data` in the image, so a fresh n
 
 ```bash
 docker run --rm -v <volume_name>:/data --user root --entrypoint chown \
-  ghcr.io/st0nefish/md-kb-rag:latest 65532:65532 /data
+  ghcr.io/st0nefish/mcp-md-wiki:latest 65532:65532 /data
 ```
 
 If you're running the container with a custom compose `user:` override instead of the image default, replace `65532:65532` with that uid:gid. This only needs to be done once per pre-existing volume.
 
-### `docker compose up` hangs; `kb-rag` never starts; `qdrant` shows `starting` then `unhealthy`
+### `docker compose up` hangs; `mcp-md-wiki` never starts; `qdrant` shows `starting` then `unhealthy`
 
 **Symptom.** `docker compose ps` shows `qdrant` stuck in `(health: starting)` and then
-`(unhealthy)` once its `retries` are exhausted. `kb-rag` never even shows as `Created`
+`(unhealthy)` once its `retries` are exhausted. `mcp-md-wiki` never even shows as `Created`
 starting a container — `depends_on: qdrant: condition: service_healthy` means compose
 won't start it until qdrant reports healthy, which here it never will. This hits a
 clean `docker compose up` on any host: a first-time deployment, a disaster-recovery
@@ -451,7 +451,7 @@ The webhook verified successfully but the in-container `git fetch` or `git merge
 - **SSH URL without keys** — SSH URLs bypass token injection, but the container needs SSH keys configured. For Docker deployments, HTTPS with a token is simpler.
 - **Diverged history** — the merge uses `--ff-only` and will fail if the local branch has diverged. This usually means someone modified files directly in the bind-mounted directory. Using a named volume (recommended) avoids this by keeping the repo inaccessible from the host.
 
-**Fix:** Check `docker logs kb-rag` for the specific error (tokens are redacted in log output). Verify the URL and token work from the host:
+**Fix:** Check `docker logs mcp-md-wiki` for the specific error (tokens are redacted in log output). Verify the URL and token work from the host:
 
 ```bash
 git ls-remote "https://<token>@your-forge.example.com/org/repo.git"
@@ -473,7 +473,7 @@ Passing a bearer token doesn't change the outcome. This was confirmed against th
 
 **Two ways out, neither requiring an interactive SSO session from a script:**
 
-1. **Reach the container directly, bypassing the proxy.** From inside the Docker network: `docker compose exec kb-rag curl http://localhost:8001/health`. From the host, if the port happens to be published: `curl http://localhost:8001/health` against the mapped port. Either way skips the proxy hop entirely, so nothing intercepts the request or has a chance to redirect it.
+1. **Reach the container directly, bypassing the proxy.** From inside the Docker network: `docker compose exec mcp-md-wiki curl http://localhost:8001/health`. From the host, if the port happens to be published: `curl http://localhost:8001/health` against the mapped port. Either way skips the proxy hop entirely, so nothing intercepts the request or has a chance to redirect it.
 2. **Use the bearer token against a route the proxy doesn't intercept.** `/status` is gated inside the binary itself (the same `bearer_auth` layer that protects `/mcp`), which is a different mechanism from the proxy's SSO layer that's producing the 302:
 
    ```bash
@@ -546,6 +546,6 @@ The llama.cpp Docker images don't support Apple Metal GPU acceleration. Docker o
 
 **Options:**
 
-1. **Run llama-server natively** — `brew install llama.cpp`, then run `llama-server` with your model and point `EMBEDDING_BASE_URL` at it (e.g. `http://host.docker.internal:8080/v1` if kb-rag is still in Docker).
+1. **Run llama-server natively** — `brew install llama.cpp`, then run `llama-server` with your model and point `EMBEDDING_BASE_URL` at it (e.g. `http://host.docker.internal:8080/v1` if mcp-md-wiki is still in Docker).
 2. **Use the CPU Docker image** — works but is slower than native Metal.
 3. **Use an external API** — point `EMBEDDING_BASE_URL` at OpenAI, Ollama, or any OpenAI-compatible endpoint and remove the `embeddings` service from compose.

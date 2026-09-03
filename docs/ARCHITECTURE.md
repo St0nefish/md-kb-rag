@@ -33,7 +33,7 @@ Three services, all defined in `docker-compose.yml` (or a hardware-specific temp
 
 ```text
 ┌─────────────────────────────────────────┐
-│                 kb-rag                  │
+│                 mcp-md-wiki                  │
 │  (MCP :8001, webhook /hooks/reindex)    │
 │                                         │
 │  ┌──────────────┐  ┌───────────────┐   │
@@ -60,11 +60,11 @@ Three services, all defined in `docker-compose.yml` (or a hardware-specific temp
 
 | Service | Image | Port(s) |
 |---|---|---|
-| `qdrant` | `qdrant/qdrant` | 6334 (gRPC, used by kb-rag), 6333 (REST, debugging) |
+| `qdrant` | `qdrant/qdrant` | 6334 (gRPC, used by mcp-md-wiki), 6333 (REST, debugging) |
 | `embeddings` | `ghcr.io/ggml-org/llama.cpp:server[-cuda12/-rocm/-vulkan]` | 8080 (internal only) |
-| `kb-rag` | `ghcr.io/st0nefish/md-kb-rag` | 8001 (MCP + webhook, exposed to host) |
+| `mcp-md-wiki` | `ghcr.io/st0nefish/mcp-md-wiki` | 8001 (MCP + webhook, exposed to host) |
 
-The kb-rag service waits for both `qdrant` and `embeddings` to pass their healthchecks before starting.
+The mcp-md-wiki service waits for both `qdrant` and `embeddings` to pass their healthchecks before starting.
 
 The MCP port (8001) is the only externally exposed port. This service is designed for intranet/tailnet deployment — it is not hardened for direct public internet exposure.
 

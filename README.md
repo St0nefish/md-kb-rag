@@ -15,8 +15,8 @@ Built as a single Rust binary for type safety, small Docker images, and simple d
 
 ```bash
 # Clone and configure
-git clone https://github.com/St0nefish/md-kb-rag.git
-cd md-kb-rag
+git clone https://github.com/St0nefish/mcp-md-wiki.git
+cd mcp-md-wiki
 cp deploy/.env.example .env
 # Edit .env: set MCP_BEARER_TOKEN and MODEL_PATH/MODEL_FILE
 # (GIT_PULL_TOKEN is optional — only needed to clone/fetch a private knowledge-base repo)
@@ -79,7 +79,7 @@ Three Docker services:
 |---|---|
 | `qdrant` | Vector database (gRPC + REST) |
 | `embeddings` | Local embedding server (llama.cpp, OpenAI-compatible API) |
-| `kb-rag` | Indexer, MCP server, and webhook handler (single Rust binary) |
+| `mcp-md-wiki` | Indexer, MCP server, and webhook handler (single Rust binary) |
 
 ## CLI Commands
 
@@ -255,7 +255,7 @@ Simpler driver setup than ROCm — works with standard Mesa Vulkan drivers. In `
 
 Metal GPU acceleration is **not available in Docker** (Docker on macOS runs a Linux VM). Options:
 
-1. **Run llama-server natively** — `brew install llama.cpp`, then start it with your model and point `EMBEDDING_BASE_URL` at it (`http://host.docker.internal:8080/v1` if kb-rag runs in Docker).
+1. **Run llama-server natively** — `brew install llama.cpp`, then start it with your model and point `EMBEDDING_BASE_URL` at it (`http://host.docker.internal:8080/v1` if mcp-md-wiki runs in Docker).
 2. **Use the CPU Docker image** — works but is slower than native Metal.
 
 ### External API
@@ -465,7 +465,7 @@ scrape_configs:
     authorization:
       credentials: ${MCP_BEARER_TOKEN}
     static_configs:
-      - targets: ["kb-rag:8001"]
+      - targets: ["mcp-md-wiki:8001"]
 ```
 
 Both report:
