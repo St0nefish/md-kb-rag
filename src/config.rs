@@ -230,7 +230,7 @@ pub struct ChunkingConfig {
     ///
     /// Like `prepend_description`, this changes the text every future chunk
     /// embeds — it is reindex-required (see `YAML_ONLY_SETTINGS`/`reload.rs`):
-    /// existing Qdrant chunks keep their old text until `md-kb-rag index --full`
+    /// existing Qdrant chunks keep their old text until `mcp-md-wiki index --full`
     /// re-chunks them.
     #[serde(default = "default_true")]
     pub prepend_heading_path: bool,
@@ -772,11 +772,11 @@ fn default_dedup_threshold() -> f32 {
 }
 
 fn default_commit_author_name() -> String {
-    "md-kb-rag".to_string()
+    "mcp-md-wiki".to_string()
 }
 
 fn default_commit_author_email() -> String {
-    "md-kb-rag@localhost".to_string()
+    "mcp-md-wiki@localhost".to_string()
 }
 
 impl Default for WriteConfig {
@@ -2471,8 +2471,8 @@ mcp:
         assert!(!cfg.validation.strict);
         assert_eq!(cfg.webhook.provider, WebhookProvider::Gitea);
         // Verify new write identity fields round-trip from the example config
-        assert_eq!(cfg.write.commit_author_name, "md-kb-rag");
-        assert_eq!(cfg.write.commit_author_email, "md-kb-rag@localhost");
+        assert_eq!(cfg.write.commit_author_name, "mcp-md-wiki");
+        assert_eq!(cfg.write.commit_author_email, "mcp-md-wiki@localhost");
         // Verify search section round-trips from the example config
         assert!(cfg.search.hybrid);
         assert_eq!(cfg.search.rrf_candidates, 50);
@@ -2609,8 +2609,8 @@ search:
     fn write_config_commit_author_defaults() {
         // Config without a write section should still produce the default bot identity.
         let cfg = Config::from_str_raw("{}").unwrap();
-        assert_eq!(cfg.write.commit_author_name, "md-kb-rag");
-        assert_eq!(cfg.write.commit_author_email, "md-kb-rag@localhost");
+        assert_eq!(cfg.write.commit_author_name, "mcp-md-wiki");
+        assert_eq!(cfg.write.commit_author_email, "mcp-md-wiki@localhost");
     }
 
     #[test]
@@ -2624,8 +2624,8 @@ write:
 "#;
         let cfg = Config::from_str_raw(yaml).unwrap();
         assert!(!cfg.write.dedup_enabled);
-        assert_eq!(cfg.write.commit_author_name, "md-kb-rag");
-        assert_eq!(cfg.write.commit_author_email, "md-kb-rag@localhost");
+        assert_eq!(cfg.write.commit_author_name, "mcp-md-wiki");
+        assert_eq!(cfg.write.commit_author_email, "mcp-md-wiki@localhost");
     }
 
     #[test]
@@ -2779,7 +2779,7 @@ chunking:
 
     #[test]
     fn unknown_field_gives_helpful_error() {
-        let dir = std::env::temp_dir().join("md-kb-rag-test-unknown-field");
+        let dir = std::env::temp_dir().join("mcp-md-wiki-test-unknown-field");
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.yaml");
         std::fs::write(&config_path, "chunking:\n  strategy: \"markdown\"\n").unwrap();
@@ -3255,7 +3255,7 @@ mcp:
         let _lock = ENV_MUTEX.lock().unwrap();
         set_required_env();
 
-        let dir = std::env::temp_dir().join("md-kb-rag-test-provenance-ui");
+        let dir = std::env::temp_dir().join("mcp-md-wiki-test-provenance-ui");
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.yaml");
         std::fs::write(&config_path, "ui:\n  semantic_edges:\n    enabled: true\n").unwrap();
@@ -3432,7 +3432,7 @@ reranking:
         let _lock = ENV_MUTEX.lock().unwrap();
         set_required_env();
 
-        let dir = std::env::temp_dir().join("md-kb-rag-test-provenance-yaml");
+        let dir = std::env::temp_dir().join("mcp-md-wiki-test-provenance-yaml");
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.yaml");
         std::fs::write(&config_path, "search:\n  hybrid: false\n").unwrap();

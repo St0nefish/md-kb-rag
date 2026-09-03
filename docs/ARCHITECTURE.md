@@ -1,10 +1,10 @@
 # Architecture
 
-Current-state reference for md-kb-rag. For setup instructions see [`deploy/USAGE.md`](../deploy/USAGE.md); for config options see [`deploy/config.example.yaml`](../deploy/config.example.yaml).
+Current-state reference for mcp-md-wiki. For setup instructions see [`deploy/USAGE.md`](../deploy/USAGE.md); for config options see [`deploy/config.example.yaml`](../deploy/config.example.yaml).
 
 ## Overview
 
-`md-kb-rag` is a single Rust binary that combines four concerns:
+`mcp-md-wiki` is a single Rust binary that combines four concerns:
 
 - **Indexing pipeline** — walks a markdown knowledge base, chunks and embeds files, and stores vectors + state
 - **MCP server** — exposes exactly six tools over Streamable HTTP (port 8001): `search`, `get_document`, `write_document`, `delete_document`, `get_schema`, and `update_schema`
@@ -191,7 +191,7 @@ Alongside `indexed_files`, `state.db` holds a document metadata index that backs
 
 Arrays produce one row per element. This table is projected by `document_fields.rs` from the `documents.frontmatter` JSON and is what `list_documents`'s `filters` and `order_by` query against — with one exception: `title` and `description` are deliberately excluded from this projection and filtered against their dedicated `documents.title`/`documents.description` columns instead (`PROMOTED_FIELDS` in `document_fields.rs`), so a `filters` entry for either field still works, it just doesn't go through `document_fields`. Because those columns each hold one scalar, `all_of` with more than one value on `title` or `description` is unsatisfiable — the query resolves to no matches rather than erroring.
 
-**Backfill:** existing deployments self-heal — on the next `index` run, files unchanged by content hash but missing metadata get their frontmatter parsed and stored into `documents`/`document_fields`, with no re-embedding and no Qdrant writes. No operator migration step is needed. After a field-projection rule change, `md-kb-rag reproject-fields` rebuilds `document_fields` from the stored frontmatter JSON alone (no markdown re-read, no re-embed).
+**Backfill:** existing deployments self-heal — on the next `index` run, files unchanged by content hash but missing metadata get their frontmatter parsed and stored into `documents`/`document_fields`, with no re-embedding and no Qdrant writes. No operator migration step is needed. After a field-projection rule change, `mcp-md-wiki reproject-fields` rebuilds `document_fields` from the stored frontmatter JSON alone (no markdown re-read, no re-embed).
 
 `reproject-fields` is safe to run against a live server: `StateDb::reproject_all_fields` re-reads each document's stored frontmatter *inside* the same transaction that rewrites its projection (rather than snapshotting paths and frontmatter up front), and retries on `SQLITE_BUSY`/`SQLITE_LOCKED` — so a concurrent index run or write-tool commit can never be reverted by a reprojection that raced it. A document whose stored frontmatter JSON is unparseable is skipped (logged as a warning) rather than aborting the whole run, and the command prints the count of documents successfully reprojected.
 
@@ -266,7 +266,7 @@ This same `kb_root_relative` reading of a leading `/` is shared by every path-ta
 
 **Schema fingerprint and incremental indexing.** `ResolvedSchema::fingerprint()` hashes a schema in a way that's stable regardless of map iteration order. `ingest.rs` compares both the file's content hash *and* this fingerprint against the stored `schema_hash` (see [State Model](#state-model)) before skipping a file as unchanged — matching content alone is not enough, since editing a schema doesn't touch any document's bytes. Rows written before this feature carry an empty `schema_hash`, which never matches a real fingerprint, so the first index run after upgrading revalidates every file once. Editing a root-level `.kb-schema.yaml` changes the root fingerprint and so revalidates the whole KB on the next run. That same forced revalidation is also when `with_derived_domain` (re)writes every document's `domain` from its folder — see the note on the Qdrant payload schema above — so an upgrade can change the effective `domain` of documents whose old frontmatter value disagreed with their folder.
 
-**Scope freezing.** A `.kb-schema.yaml` that fails to parse freezes its entire subtree (`SchemaCache::is_frozen`): nothing under it is indexed or re-indexed, and existing index entries are left exactly as they are — the cache never falls back to the parent schema, since that would silently apply the wrong rules across a whole subtree. `md-kb-rag validate` lists every broken scope in a `SCHEMA ERRORS` section (see `main.rs`) and treats it as a failure under `validation.strict`. A file over `MAX_SCHEMA_FILE_BYTES` (256 KB, `schema.rs`) is rejected on its `fs::metadata` size alone, before `read_to_string`/parsing ever runs, and freezes its subtree through the same `broken` map as any other unparseable schema.
+**Scope freezing.** A `.kb-schema.yaml` that fails to parse freezes its entire subtree (`SchemaCache::is_frozen`): nothing under it is indexed or re-indexed, and existing index entries are left exactly as they are — the cache never falls back to the parent schema, since that would silently apply the wrong rules across a whole subtree. `mcp-md-wiki validate` lists every broken scope in a `SCHEMA ERRORS` section (see `main.rs`) and treats it as a failure under `validation.strict`. A file over `MAX_SCHEMA_FILE_BYTES` (256 KB, `schema.rs`) is rejected on its `fs::metadata` size alone, before `read_to_string`/parsing ever runs, and freezes its subtree through the same `broken` map as any other unparseable schema.
 
 `index --full` refuses to run at all while `schemas.broken_scopes()` is non-empty, naming the offending directories in the error rather than proceeding: a full run drops and recreates the Qdrant collection, and a frozen scope is skipped during the rebuild, so its vectors would be lost outright instead of merely going stale. Incremental indexing is unaffected by scopes frozen elsewhere in the tree and is the way to make progress while a schema is broken.
 

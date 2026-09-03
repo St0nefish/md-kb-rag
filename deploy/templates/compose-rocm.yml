@@ -1,4 +1,4 @@
-# md-kb-rag — AMD ROCm embedding backend
+# mcp-md-wiki — AMD ROCm embedding backend
 # Requires ROCm userspace drivers on the host.
 # Usage: cp compose-rocm.yml docker-compose.yml && docker compose up -d
 #
@@ -78,7 +78,7 @@ services:
     ports:
       - "${MCP_PORT:-8001}:8001"
     healthcheck:
-      test: ["CMD", "md-kb-rag", "health"]
+      test: ["CMD", "mcp-md-wiki", "health"]
       interval: 10s
       timeout: 5s
       retries: 5

@@ -1,6 +1,6 @@
 # Contributing
 
-md-kb-rag is hosted on GitHub (this repo, its issues, and its PRs). The knowledge
+mcp-md-wiki is hosted on GitHub (this repo, its issues, and its PRs). The knowledge
 bases it indexes live on separate git hosts entirely — don't confuse the two when
 you're reading webhook or `deploy/` config; that side of the config always refers to
 the *indexed* knowledge base's git host, never this repo's.

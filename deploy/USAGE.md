@@ -1,6 +1,6 @@
 # Usage Guide
 
-This guide explains how to set up a markdown knowledge base for md-kb-rag, how documents are processed, and how to configure the system for your project.
+This guide explains how to set up a markdown knowledge base for mcp-md-wiki, how documents are processed, and how to configure the system for your project.
 
 ## Knowledge Base Structure
 
@@ -135,9 +135,9 @@ validation:
 
 With `validation.enabled: false`, frontmatter is still parsed — just not checked against `required`/`allowed`/lint rules — so Qdrant and the state DB's metadata index still reflect each file's actual frontmatter, rather than treating unvalidated files as fieldless.
 
-`frontmatter.allowed` is enforced by both `md-kb-rag validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
+`frontmatter.allowed` is enforced by both `mcp-md-wiki validate` and the MCP write tools. When a write tool rejects a document, it returns a structured error (`field_errors`) naming the offending field, the rule it broke (`required` / `allowed_value` / `lint` / `type_mismatch` / `closed_object`), and — for closed-set fields — the value it `got` versus the values it `expected`, so an agent can fix and retry without guessing.
 
-Run `md-kb-rag validate` to check all files without indexing — useful for CI or pre-commit hooks.
+Run `mcp-md-wiki validate` to check all files without indexing — useful for CI or pre-commit hooks.
 
 ## Directory Schemas (`.kb-schema.yaml`)
 
@@ -314,11 +314,11 @@ tags:
 
 ### Freezing
 
-A malformed `.kb-schema.yaml` **freezes its subtree**: nothing under it is indexed or re-indexed, and existing index entries are left untouched — it never silently falls back to the parent's rules. `md-kb-rag validate` reports broken schema files in a `SCHEMA ERRORS` section, and they count as a failure under `validation.strict: true`.
+A malformed `.kb-schema.yaml` **freezes its subtree**: nothing under it is indexed or re-indexed, and existing index entries are left untouched — it never silently falls back to the parent's rules. `mcp-md-wiki validate` reports broken schema files in a `SCHEMA ERRORS` section, and they count as a failure under `validation.strict: true`.
 
 A `.kb-schema.yaml` larger than 256 KB is rejected outright — it's never read or parsed, just refused on its file size — and freezes its subtree the same way any other invalid schema does.
 
-`md-kb-rag index --full` refuses to run at all while any scope is frozen, naming the offending directories: a full run drops and recreates the Qdrant collection, and a frozen scope's documents would be skipped during the rebuild — losing their vectors outright rather than merely leaving them stale. Fix the schema first, or keep making progress with an incremental `md-kb-rag index`, which is unaffected by scopes frozen elsewhere in the tree.
+`mcp-md-wiki index --full` refuses to run at all while any scope is frozen, naming the offending directories: a full run drops and recreates the Qdrant collection, and a frozen scope's documents would be skipped during the rebuild — losing their vectors outright rather than merely leaving them stale. Fix the schema first, or keep making progress with an incremental `mcp-md-wiki index`, which is unaffected by scopes frozen elsewhere in the tree.
 
 ### Root schema (`.kb-schema.yaml` at the KB root)
 
@@ -340,7 +340,7 @@ Under the hood, each indexed file now also tracks a `schema_hash` fingerprint (a
 - The **first index run after upgrading** to a version with schema support revalidates every file once, to backfill the fingerprint. This is also the run where every document's `domain` gets (re)computed from its folder and written to Qdrant and the state DB — see [Sample Document](#sample-document) above. If a document's old, hand-authored `domain:` disagreed with its folder, its effective `domain` value changes at that point, and any saved `search` filters built around the old value will need updating. Remove now-redundant `domain:` keys from your frontmatter — they're ignored either way.
 - Editing a **root-level** schema revalidates the entire knowledge base on the next run.
 
-If you only need to rebuild the document metadata projection backing `search`'s enumeration mode (e.g. after changing a field-projection rule) without a full reindex, `md-kb-rag reproject-fields` does that from the frontmatter JSON already stored in the state DB — no markdown re-read, no re-embedding. It's safe to run against a live server: each document's frontmatter is re-read inside the same transaction that rewrites it, so it retries past contention with a running index or write tool rather than reverting a concurrent update. A document whose stored frontmatter is unparseable is skipped with a warning instead of aborting the run, and the command reports how many documents were reprojected. Note also that a full reindex (`index --full`) clears the metadata index along with the vector collection, so a file deleted from disk since the last full run can't leave a phantom entry behind in that projection.
+If you only need to rebuild the document metadata projection backing `search`'s enumeration mode (e.g. after changing a field-projection rule) without a full reindex, `mcp-md-wiki reproject-fields` does that from the frontmatter JSON already stored in the state DB — no markdown re-read, no re-embedding. It's safe to run against a live server: each document's frontmatter is re-read inside the same transaction that rewrites it, so it retries past contention with a running index or write tool rather than reverting a concurrent update. A document whose stored frontmatter is unparseable is skipped with a warning instead of aborting the run, and the command reports how many documents were reprojected. Note also that a full reindex (`index --full`) clears the metadata index along with the vector collection, so a file deleted from disk since the last full run can't leave a phantom entry behind in that projection.
 
 Declared fields also get typed Qdrant payload indexes (Integer/Float/Bool for numeric and boolean fields, instead of a blanket Keyword index). Query-mode `search` filters run against Qdrant, so a range filter (`gte`/`lte`/`gt`/`lt`) on a field there needs this — an unindexed field is rejected by name rather than filtered slowly. Enumeration mode (no `query`) filters against the SQLite `document_fields` projection instead, which every frontmatter field lands in regardless of `indexed: true`, so its range filters need no Qdrant index at all. The same Qdrant indexing applies to the built-in `mtime` index used by `search`'s `modified_after`/`modified_before` filters in query mode. If a payload index fails to create — most often because a field's declared type changed and Qdrant is still holding an index of the old kind — it's logged as an error but never aborts startup or indexing; a query-mode filter on that field is still accepted (the schema still declares it indexed) and returns correct results, just more slowly via a full scan, until you delete the stale payload index in Qdrant and reindex.
 
@@ -355,7 +355,7 @@ Both tools run the same pipeline server-side:
 1. **Resolve and guard the path** — relative to the KB root, or a unique basename. A leading `/` is also accepted, and means the KB root, not a filesystem path: a caller has no way to know where the KB actually lives inside the container, so `/food/chili.md` and `food/chili.md` resolve to the same file. `..` components and symlinked ancestors that escape the data root are still rejected — `/../x` is refused exactly like `../x` — as are paths that don't match `indexing.include` (a file the indexer would never pick up).
 2. **Validate frontmatter** — required fields, `allowed` enums, and any `validation.lint_command`, against the *destination* directory's schema when the call also relocates the document. Failures come back as structured `field_errors` (see [Frontmatter Validation](#frontmatter-validation)) so the agent can self-correct.
 3. **Write to disk** — in the container-owned KB clone.
-4. **Commit with provenance** — the commit message gets `Tool: md-kb-rag` and `Operation: <tool>` trailers, authored under the `write.commit_author_*` identity. Tool-authored commits are trivially distinguishable from your own in `git log`.
+4. **Commit with provenance** — the commit message gets `Tool: mcp-md-wiki` and `Operation: <tool>` trailers, authored under the `write.commit_author_*` identity. Tool-authored commits are trivially distinguishable from your own in `git log`.
 5. **Push to the remote** — `add → commit → fetch → rebase → push`, so the KB's git host stays the source of truth.
 6. **Reindex** — incrementally, holding the same internal lock the webhook uses, so a write and a webhook-triggered pull can never race.
 
@@ -390,8 +390,8 @@ The `write` section of `config.yaml` (see [config.example.yaml](config.example.y
 write:
   dedup_enabled: true            # near-duplicate check on write_document's create path
   dedup_threshold: 0.80          # dense cosine similarity at/above which a create is refused
-  commit_author_name: "md-kb-rag"
-  commit_author_email: "md-kb-rag@localhost"
+  commit_author_name: "mcp-md-wiki"
+  commit_author_email: "mcp-md-wiki@localhost"
 ```
 
 For writes to push successfully, the container needs a writable, non-shallow clone of the KB and push credentials — i.e. `GIT_URL` set and `GIT_PULL_TOKEN` carrying a token with **write** access (read-only is enough for webhook pulls, but not for the write tools).
@@ -481,11 +481,11 @@ volumes:
 
 With this approach, you're responsible for keeping the directory up to date. If `GIT_URL` is also set, the webhook will still run `git fetch` + `git merge` inside the container, but having the directory accessible on the host risks accidental modifications that could cause merge conflicts.
 
-Without `GIT_URL`, you'll need an external process to update the bind-mounted directory and trigger a reindex (either via webhook or by running `docker compose exec kb-rag md-kb-rag index`).
+Without `GIT_URL`, you'll need an external process to update the bind-mounted directory and trigger a reindex (either via webhook or by running `docker compose exec kb-rag mcp-md-wiki index`).
 
 ## Deployment Posture: Network Exposure and Access Control
 
-md-kb-rag serves everything — the MCP endpoint, diagnostics, and the web UI — off one port (8001, by default), but not everything on that port carries the same protection. `server.rs`'s `assemble_router` wraps `/mcp`, `/status`, `/metrics`, and `POST /admin/reload` in a `bearer_auth` middleware layer; `/health` and every route `web.rs`'s `ui_router` registers (`/`, the static UI assets, and the whole `/api/*` family) are merged into the app with no such layer at all, by design. Which of those two groups a given route falls in is fixed in the binary — it doesn't change based on how you deploy it. What *does* change based on deployment is who can reach the unguarded group in the first place, and that's the actual decision this section covers: two supported ways to answer "who can reach `/health` and `/api/*`," each with a different trade-off.
+mcp-md-wiki serves everything — the MCP endpoint, diagnostics, and the web UI — off one port (8001, by default), but not everything on that port carries the same protection. `server.rs`'s `assemble_router` wraps `/mcp`, `/status`, `/metrics`, and `POST /admin/reload` in a `bearer_auth` middleware layer; `/health` and every route `web.rs`'s `ui_router` registers (`/`, the static UI assets, and the whole `/api/*` family) are merged into the app with no such layer at all, by design. Which of those two groups a given route falls in is fixed in the binary — it doesn't change based on how you deploy it. What *does* change based on deployment is who can reach the unguarded group in the first place, and that's the actual decision this section covers: two supported ways to answer "who can reach `/health` and `/api/*`," each with a different trade-off.
 
 ### Posture A: reverse proxy with SSO (the default)
 
@@ -493,7 +493,7 @@ This is the posture the project targets by default: the container's port is neve
 
 This is a sound default, and it's the only posture worth reaching for on any network that isn't fully trusted. It has two costs worth naming, both confirmed against the reference deployment rather than theoretical:
 
-- **Non-interactive clients can't reach the routes the proxy intercepts.** SSO assumes a browser completing a redirect. `/api/graph` serves the same knowledge base content `/mcp` already hands any bearer-token holder, but a monitoring probe, a script, or an agent hitting it directly gets bounced into the identity provider's login flow instead of a response — `curl`, with or without a bearer token, gets an identical 302 to the SSO login page, because the bearer token means nothing to a gate the proxy applies before the request ever reaches md-kb-rag.
+- **Non-interactive clients can't reach the routes the proxy intercepts.** SSO assumes a browser completing a redirect. `/api/graph` serves the same knowledge base content `/mcp` already hands any bearer-token holder, but a monitoring probe, a script, or an agent hitting it directly gets bounced into the identity provider's login flow instead of a response — `curl`, with or without a bearer token, gets an identical 302 to the SSO login page, because the bearer token means nothing to a gate the proxy applies before the request ever reaches mcp-md-wiki.
 - **There's no local diagnostic path when the proxy itself is the problem.** With the port unpublished, `curl` from the LAN can't reach `/health` or `/status` without completing an interactive SSO session first — backwards for the exact endpoints whose job is diagnosing a sick deployment, which may be sick *because* the proxy in front of it is misbehaving. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#curl-to-health-or-status-returns-a-302-redirect-to-an-sso-login-page) for the two ways around this without publishing the port.
 
 ### Posture B: LAN-only, no proxy
@@ -604,7 +604,7 @@ curl -X POST -H "Authorization: Bearer $MCP_BEARER_TOKEN" \
 The response reports exactly what happened: settings that took effect immediately,
 settings that need a restart (rate limiting, embedding batch tuning, and anything
 tied to authentication — these are baked into services built once at startup), and
-settings that need `md-kb-rag index --full` to be meaningful (`chunking.*` — a new
+settings that need `mcp-md-wiki index --full` to be meaningful (`chunking.*` — a new
 chunk size only applies to documents indexed after the change, so the corpus is
 inconsistent until a full reindex rewrites it). A malformed or invalid file is
 rejected with the parse/validation error and the running server is left completely
@@ -635,7 +635,7 @@ If you set `GIT_URL`, also set `GIT_PULL_TOKEN` to a personal access token. Read
 docker compose up -d
 ```
 
-This starts Qdrant, the embedding server, and the md-kb-rag service. The kb-rag service waits for both dependencies to be healthy before starting.
+This starts Qdrant, the embedding server, and the mcp-md-wiki service. The kb-rag service waits for both dependencies to be healthy before starting.
 
 If `GIT_URL` is set and the data volume is empty, the server **automatically clones the repo and runs a full index** — no manual step needed. Check progress with `docker logs -f kb-rag`.
 
@@ -644,7 +644,7 @@ If `GIT_URL` is set and the data volume is empty, the server **automatically clo
 If you're using the bind-mount approach without `GIT_URL`, run the initial index manually:
 
 ```bash
-docker compose exec kb-rag md-kb-rag index --full
+docker compose exec kb-rag mcp-md-wiki index --full
 ```
 
 Full index drops any existing Qdrant collection and re-processes every file. Also use this after changing `EMBEDDING_VECTOR_SIZE`.

@@ -10,7 +10,7 @@
  * licensed under the Apache License, Version 2.0. See LICENSE-okf.md in
  * this directory. The docs-first shell around it (router, home/browse
  * views, sidebar tree, graph toolbar, lazy graph construction, semantic
- * search results panel) is md-kb-rag's own.
+ * search results panel) is mcp-md-wiki's own.
  *
  * Architecture notes:
  *   - `api/graph` is fetched once at startup and is the single data

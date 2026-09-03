@@ -1,4 +1,4 @@
-# md-kb-rag — Apple Silicon (Metal) deployment
+# mcp-md-wiki — Apple Silicon (Metal) deployment
 #
 # Metal GPU acceleration is NOT available inside Docker (macOS Docker runs a
 # Linux VM). Run llama-server natively on the host for Metal performance:
@@ -65,7 +65,7 @@ services:
     ports:
       - "${MCP_PORT:-8001}:8001"
     healthcheck:
-      test: ["CMD", "md-kb-rag", "health"]
+      test: ["CMD", "mcp-md-wiki", "health"]
       interval: 10s
       timeout: 5s
       retries: 5

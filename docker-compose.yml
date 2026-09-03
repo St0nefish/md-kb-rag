@@ -132,7 +132,7 @@ services:
     ports:
       - "${MCP_PORT:-8001}:8001"
     healthcheck:
-      test: ["CMD", "md-kb-rag", "health"]
+      test: ["CMD", "mcp-md-wiki", "health"]
       interval: 10s
       timeout: 5s
       retries: 5

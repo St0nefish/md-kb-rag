@@ -635,7 +635,7 @@ pub fn is_git_repo(data_path: &str) -> bool {
 /// ```text
 /// <subject line>
 ///
-/// Tool: md-kb-rag
+/// Tool: mcp-md-wiki
 /// Operation: <operation>
 /// ```
 /// The FIRST matching line of each wins (a well-formed trailer block has
@@ -1843,9 +1843,9 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_provenance_trailers_both_present() {
-        let body = "add docs/foo.md\n\nTool: md-kb-rag\nOperation: write_document";
+        let body = "add docs/foo.md\n\nTool: mcp-md-wiki\nOperation: write_document";
         let (tool, operation) = parse_provenance_trailers(body);
-        assert_eq!(tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(tool.as_deref(), Some("mcp-md-wiki"));
         assert_eq!(operation.as_deref(), Some("write_document"));
     }
 
@@ -1859,17 +1859,17 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_provenance_trailers_tolerates_only_one_present() {
-        let body = "some commit\n\nTool: md-kb-rag";
+        let body = "some commit\n\nTool: mcp-md-wiki";
         let (tool, operation) = parse_provenance_trailers(body);
-        assert_eq!(tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(tool.as_deref(), Some("mcp-md-wiki"));
         assert_eq!(operation, None);
     }
 
     #[test]
     fn parse_provenance_trailers_first_occurrence_wins() {
-        let body = "msg\n\nTool: md-kb-rag\nOperation: write_document\nTool: something-else";
+        let body = "msg\n\nTool: mcp-md-wiki\nOperation: write_document\nTool: something-else";
         let (tool, _) = parse_provenance_trailers(body);
-        assert_eq!(tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(tool.as_deref(), Some("mcp-md-wiki"));
     }
 
     #[test]
@@ -1886,14 +1886,14 @@ pub(crate) mod tests {
         assert!(!base.is_tool_authored());
         assert!(
             !CommitInfo {
-                tool: Some("md-kb-rag".into()),
+                tool: Some("mcp-md-wiki".into()),
                 ..base.clone()
             }
             .is_tool_authored()
         );
         assert!(
             CommitInfo {
-                tool: Some("md-kb-rag".into()),
+                tool: Some("mcp-md-wiki".into()),
                 operation: Some("write_document".into()),
                 ..base
             }
@@ -1908,7 +1908,7 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_commit_log_parses_one_tool_authored_record() {
-        let raw = b"deadbeef\x1fTest Bot\x1fbot@localhost\x1f1700000000\x1fadd foo.md\n\nTool: md-kb-rag\nOperation: write_document\0";
+        let raw = b"deadbeef\x1fTest Bot\x1fbot@localhost\x1f1700000000\x1fadd foo.md\n\nTool: mcp-md-wiki\nOperation: write_document\0";
         let commits = parse_commit_log(raw);
         assert_eq!(commits.len(), 1);
         let c = &commits[0];
@@ -1917,7 +1917,7 @@ pub(crate) mod tests {
         assert_eq!(c.author_email, "bot@localhost");
         assert_eq!(c.timestamp, 1700000000);
         assert_eq!(c.subject, "add foo.md");
-        assert_eq!(c.tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(c.tool.as_deref(), Some("mcp-md-wiki"));
         assert_eq!(c.operation.as_deref(), Some("write_document"));
         assert!(c.is_tool_authored());
     }
@@ -1943,7 +1943,7 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_commit_log_preserves_a_multiline_body_as_one_field() {
-        let raw = b"sha\x1fA\x1fa@x\x1f100\x1fsubject line\n\nbody line one\nbody line two\n\nTool: md-kb-rag\nOperation: delete_document\0";
+        let raw = b"sha\x1fA\x1fa@x\x1f100\x1fsubject line\n\nbody line one\nbody line two\n\nTool: mcp-md-wiki\nOperation: delete_document\0";
         let commits = parse_commit_log(raw);
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].subject, "subject line");
@@ -1969,7 +1969,8 @@ pub(crate) mod tests {
     /// real, shipped trailer format rather than a hand-rolled approximation.
     fn commit_tool_authored(work_path: &str, rel_path: &str, content: &str, operation: &str) {
         std::fs::write(std::path::Path::new(work_path).join(rel_path), content).unwrap();
-        let message = format!("docs: update {rel_path}\n\nTool: md-kb-rag\nOperation: {operation}");
+        let message =
+            format!("docs: update {rel_path}\n\nTool: mcp-md-wiki\nOperation: {operation}");
         git_test_cmd(work_path)
             .args(["add", rel_path])
             .output()
@@ -2027,7 +2028,7 @@ pub(crate) mod tests {
         // Newest first: bar.md's hand-authored commit landed last.
         assert_eq!(commits[0].subject, "manual edit of bar");
         assert!(!commits[0].is_tool_authored());
-        assert_eq!(commits[1].tool.as_deref(), Some("md-kb-rag"));
+        assert_eq!(commits[1].tool.as_deref(), Some("mcp-md-wiki"));
         assert_eq!(commits[1].operation.as_deref(), Some("write_document"));
         assert!(commits[1].is_tool_authored());
     }
@@ -2171,7 +2172,7 @@ pub(crate) mod tests {
             work_path,
             None,
             &["notes.md"],
-            "add notes.md\n\nmd-kb-rag bot commit",
+            "add notes.md\n\nmcp-md-wiki bot commit",
             "test-bot",
             "test-bot@localhost",
         )

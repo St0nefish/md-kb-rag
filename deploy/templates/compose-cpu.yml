@@ -1,4 +1,4 @@
-# md-kb-rag — CPU embedding backend
+# mcp-md-wiki — CPU embedding backend
 # Works on any hardware, no GPU drivers needed.
 # Usage: cp compose-cpu.yml docker-compose.yml && docker compose up -d
 
@@ -69,7 +69,7 @@ services:
     ports:
       - "${MCP_PORT:-8001}:8001"
     healthcheck:
-      test: ["CMD", "md-kb-rag", "health"]
+      test: ["CMD", "mcp-md-wiki", "health"]
       interval: 10s
       timeout: 5s
       retries: 5

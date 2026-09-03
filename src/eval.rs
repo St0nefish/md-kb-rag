@@ -6,7 +6,7 @@
 //! `reranking.candidate_limit`, `chunking.max_chunk_size`, `search.hybrid`, and the
 //! embedding model itself all trade recall against precision against latency in ways
 //! that are only knowable empirically — every one of them was, until now, tuned
-//! blind. `md-kb-rag eval --queries eval.yaml` closes that loop: it runs a fixed set
+//! blind. `mcp-md-wiki eval --queries eval.yaml` closes that loop: it runs a fixed set
 //! of `{query, expected documents}` cases through the real `retrieval::search` core
 //! (the same function the server and the `search` CLI subcommand use — see #84's
 //! dependency injection, which is precisely what makes this cheap to build and run
@@ -335,7 +335,7 @@ impl EvalReport {
 
 /// Render a `SearchError` the same way the `search` CLI subcommand does, so a
 /// failure surfaced through `eval` reads consistently with one surfaced through
-/// `md-kb-rag search`.
+/// `mcp-md-wiki search`.
 fn describe_search_error(query: &str, e: SearchError) -> anyhow::Error {
     match e {
         SearchError::Embed(err) => anyhow::anyhow!("query '{query}': embedding failed: {err:#}"),

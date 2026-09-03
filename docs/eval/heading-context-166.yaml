@@ -8,7 +8,7 @@
 # real document in your own corpus before this file means anything. Run it
 # with:
 #
-#   md-kb-rag eval --queries docs/eval/heading-context-166.yaml
+#   mcp-md-wiki eval --queries docs/eval/heading-context-166.yaml
 #
 # What makes a case belong in this file specifically: pick a document with a
 # nested section whose heading (or an ancestor heading above it) names the
@@ -39,13 +39,13 @@
 #
 # How to actually measure the recall win this PR argues for but does not
 # claim to have measured (see the PR body for the full protocol):
-#   1. `md-kb-rag eval --queries docs/eval/heading-context-166.yaml` against
+#   1. `mcp-md-wiki eval --queries docs/eval/heading-context-166.yaml` against
 #      the CURRENTLY DEPLOYED index (pre-#166 chunk text) — record recall@k
 #      and MRR. Every case will likely show partial or zero recall, since the
 #      indexed chunks carry no heading-ancestry signal yet.
 #   2. Deploy this change. `chunking.prepend_heading_path` defaults to true,
 #      so no config edit is required.
-#   3. `md-kb-rag index --full` — REQUIRED. `chunking.*` settings are
+#   3. `mcp-md-wiki index --full` — REQUIRED. `chunking.*` settings are
 #      reindex-required (see `ChunkingConfig::prepend_heading_path`'s doc
 #      comment and, once added, `reload.rs`'s diff entry for it): existing
 #      Qdrant chunks keep their pre-#166 text, prefix and all, until a full

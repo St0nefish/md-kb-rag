@@ -168,7 +168,7 @@ fn validate_commit_message(message: Option<&str>) -> Result<(), WriteError> {
 /// ```text
 /// <subject line>
 ///
-/// Tool: md-kb-rag
+/// Tool: mcp-md-wiki
 /// Operation: <operation>
 /// ```
 ///
@@ -180,7 +180,7 @@ pub fn build_commit_message(
     operation: &str,
 ) -> String {
     let subject = user_subject.unwrap_or(default_subject);
-    format!("{}\n\nTool: md-kb-rag\nOperation: {}", subject, operation)
+    format!("{}\n\nTool: mcp-md-wiki\nOperation: {}", subject, operation)
 }
 
 /// Render a unified diff between `old` and `new` content, labelled with
@@ -4349,7 +4349,7 @@ mod tests {
     #[test]
     fn commit_message_has_trailers() {
         let msg = build_commit_message(None, "docs: add notes/guide.md", "create_document");
-        assert!(msg.contains("Tool: md-kb-rag"));
+        assert!(msg.contains("Tool: mcp-md-wiki"));
         assert!(msg.contains("Operation: create_document"));
         assert!(msg.starts_with("docs: add notes/guide.md"));
     }

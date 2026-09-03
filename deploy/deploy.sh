@@ -11,7 +11,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 source "$ENV_FILE"
 
-BINARY="md-kb-rag"
+BINARY="mcp-md-wiki"
 CONTEXT_FLAG=""
 [[ -n "${DOCKER_CONTEXT:-}" ]] && CONTEXT_FLAG="--context $DOCKER_CONTEXT"
 
@@ -28,7 +28,7 @@ if [[ "${1:-}" == "--reindex" ]]; then
   # stderr thrown away, and get swallowed by `|| true` — silently falling
   # through to a flat sleep regardless of whether the service was ready.
   # Even fixed, `compose wait` blocks until a container *stops*, which
-  # `md-kb-rag serve` never does on its own, so it's the wrong primitive for
+  # `mcp-md-wiki serve` never does on its own, so it's the wrong primitive for
   # a long-running service anyway. Poll the healthcheck docker-compose.yml
   # already defines for $SERVICE instead, bounded so a stuck container fails
   # the script instead of hanging it forever.

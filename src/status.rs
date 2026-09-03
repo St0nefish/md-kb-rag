@@ -71,7 +71,7 @@ impl RunMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
-    /// `md-kb-rag index` from the command line.
+    /// `mcp-md-wiki index` from the command line.
     Cli,
     /// The initial full index after a fresh git clone, run synchronously before the
     /// server starts serving — the one case with no worker to hand work to yet.

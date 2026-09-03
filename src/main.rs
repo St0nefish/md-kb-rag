@@ -47,7 +47,7 @@ fn print_component(name: &str, c: &server::ComponentHealth) {
 
 #[derive(Parser)]
 #[command(
-    name = "md-kb-rag",
+    name = "mcp-md-wiki",
     about = "Markdown knowledge base RAG server",
     version = env!("CARGO_PKG_VERSION")
 )]
@@ -406,7 +406,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 eprintln!(
                     "\nBROKEN LINKS: skipped — no index at {state_db_path}. \
-                     Run `md-kb-rag index` first."
+                     Run `mcp-md-wiki index` first."
                 );
             }
 
@@ -892,7 +892,7 @@ mod tests {
 
     #[test]
     fn get_line_bounds_are_optional() {
-        let args = parse_get(&["md-kb-rag", "get", "notes.md"]);
+        let args = parse_get(&["mcp-md-wiki", "get", "notes.md"]);
         assert_eq!(args.path, "notes.md");
         assert_eq!(args.start_line, None);
         assert_eq!(args.end_line, None);
@@ -901,7 +901,7 @@ mod tests {
     #[test]
     fn get_accepts_line_bounds_together_or_alone() {
         let both = parse_get(&[
-            "md-kb-rag",
+            "mcp-md-wiki",
             "get",
             "notes.md",
             "--start-line",
@@ -911,13 +911,13 @@ mod tests {
         ]);
         assert_eq!((both.start_line, both.end_line), (Some(10), Some(20)));
 
-        let start_only = parse_get(&["md-kb-rag", "get", "notes.md", "--start-line", "10"]);
+        let start_only = parse_get(&["mcp-md-wiki", "get", "notes.md", "--start-line", "10"]);
         assert_eq!(
             (start_only.start_line, start_only.end_line),
             (Some(10), None)
         );
 
-        let end_only = parse_get(&["md-kb-rag", "get", "notes.md", "--end-line", "20"]);
+        let end_only = parse_get(&["mcp-md-wiki", "get", "notes.md", "--end-line", "20"]);
         assert_eq!((end_only.start_line, end_only.end_line), (None, Some(20)));
     }
 
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn eval_defaults_k_to_five_and_flags_to_off() {
-        let args = parse_eval(&["md-kb-rag", "eval", "--queries", "eval.yaml"]);
+        let args = parse_eval(&["mcp-md-wiki", "eval", "--queries", "eval.yaml"]);
         assert_eq!(args.queries, PathBuf::from("eval.yaml"));
         assert_eq!(args.k, 5);
         assert!(!args.json);
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn eval_accepts_k_json_and_threshold() {
         let args = parse_eval(&[
-            "md-kb-rag",
+            "mcp-md-wiki",
             "eval",
             "--queries",
             "eval.yaml",
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn eval_requires_queries() {
         assert!(
-            Cli::try_parse_from(["md-kb-rag", "eval"]).is_err(),
+            Cli::try_parse_from(["mcp-md-wiki", "eval"]).is_err(),
             "--queries has no default and must be required"
         );
     }
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn get_rejects_a_negative_line_bound_at_parse_time() {
         assert!(
-            Cli::try_parse_from(["md-kb-rag", "get", "notes.md", "--start-line", "-3"]).is_err(),
+            Cli::try_parse_from(["mcp-md-wiki", "get", "notes.md", "--start-line", "-3"]).is_err(),
             "a negative line number should never reach the range validator"
         );
     }

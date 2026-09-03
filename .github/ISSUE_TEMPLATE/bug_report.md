@@ -20,7 +20,7 @@ description.
 
 ## Environment
 
-- md-kb-rag version / image tag (or commit sha if built from source):
+- mcp-md-wiki version / image tag (or commit sha if built from source):
 - Deployment: Docker Compose / bare binary / other:
 - Relevant config (redact secrets): chunking, embedding, search, or reranking
   settings if the bug is retrieval- or indexing-related.

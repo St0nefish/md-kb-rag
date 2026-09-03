@@ -30,7 +30,7 @@
  * original fixed graph+detail split with a sidebar document tree and
  * hash-routed views: the layout styles below (#app/#sidebar/#content,
  * .view, the tree, home/browse listings, the graph toolbar, the search
- * results panel) are all md-kb-rag's own; the doc-view typography
+ * results panel) are all mcp-md-wiki's own; the doc-view typography
  * (#detail-body etc.) and editor-overlay styles carry over unchanged.
  */
 :root {

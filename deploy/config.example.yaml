@@ -1,5 +1,5 @@
 # ============================================================================
-# md-kb-rag — full configuration reference
+# mcp-md-wiki — full configuration reference
 # ============================================================================
 #
 # Every field shown below is optional and displays its default value.
@@ -31,7 +31,7 @@
 # restart. Not every setting takes effect immediately: some are baked into
 # a value or service built once at startup (rate_limit, embedding batch/
 # timeout/concurrency tuning, anything auth-related) and stay restart-only;
-# chunking.* needs `md-kb-rag index --full` afterward to be meaningful (a
+# chunking.* needs `mcp-md-wiki index --full` afterward to be meaningful (a
 # new chunk size only applies to documents indexed after the change). The
 # reload response reports exactly which category each changed setting fell
 # into — see README.md's "Config reload" section for the full contract. A
@@ -163,7 +163,7 @@ frontmatter:
 #
 # REINDEX REQUIRED (whole section): POST /admin/reload picks these up for
 # the NEXT indexing run, but only for documents that run touches — existing
-# Qdrant chunks keep the old boundaries. Run `md-kb-rag index --full`
+# Qdrant chunks keep the old boundaries. Run `mcp-md-wiki index --full`
 # afterward for a consistent corpus.
 chunking:
 
@@ -451,8 +451,8 @@ write:
   # Git author identity used for commits made by the write tools (write_document,
   # delete_document). Setting these to a bot identity makes tool-authored commits
   # easy to distinguish from your own hand-made commits in `git log`.
-  commit_author_name: "md-kb-rag"
-  commit_author_email: "md-kb-rag@localhost"
+  commit_author_name: "mcp-md-wiki"
+  commit_author_email: "mcp-md-wiki@localhost"
 
 
 # ----------------------------------------------------------------------------

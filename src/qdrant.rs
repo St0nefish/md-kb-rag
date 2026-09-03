@@ -20,7 +20,7 @@ pub trait VectorStore: Send + Sync {
     async fn upsert_points(&self, collection: &str, points: Vec<QdrantPoint>) -> Result<()>;
     async fn delete_by_files(&self, collection: &str, file_paths: &[&str]) -> Result<()>;
     async fn delete_points_by_ids(&self, collection: &str, ids: Vec<String>) -> Result<()>;
-    /// Drop `collection` if it exists — `md-kb-rag index --full`'s destructive
+    /// Drop `collection` if it exists — `mcp-md-wiki index --full`'s destructive
     /// rebuild step. In the trait (rather than only an inherent `QdrantStore`
     /// method) so `ingest::index_paths_generic` can run this same call path against
     /// a fake in tests.
@@ -765,7 +765,7 @@ impl QdrantStore {
             // collection is being created fresh. If an operator changes
             // `embedding.vector_size` (or swaps to a differently-dimensioned embedding
             // model) in config.yaml and restarts `serve` with a plain restart — not
-            // `md-kb-rag index --full`, which always `drop_collection`s before calling
+            // `mcp-md-wiki index --full`, which always `drop_collection`s before calling
             // this (see `ingest::index_paths`) — the mismatch used to go uncaught here
             // and surface only much later, as a dimension-mismatch error out of
             // `upsert_pending`'s embed/upsert call. That error contains no
@@ -809,7 +809,7 @@ impl QdrantStore {
                      `embedding.vector_size` (or the embedding model itself) changed \
                      without a full reindex — a plain restart cannot fix this, since it \
                      never rebuilds the collection (only `index --full` does, by \
-                     dropping it first). Run `md-kb-rag index --full` to drop and \
+                     dropping it first). Run `mcp-md-wiki index --full` to drop and \
                      rebuild the collection at the new dimension, then restart `serve`."
                 );
             }
@@ -1648,7 +1648,7 @@ mod tests {
     /// random so a failure is reproducible: `cargo test <fn_name> --
     /// --ignored` always talks to the exact same collection a CI failure did.
     fn live_test_collection(test_name: &str) -> String {
-        format!("md-kb-rag-test-{test_name}")
+        format!("mcp-md-wiki-test-{test_name}")
     }
 
     /// Run a live-Qdrant test body, dropping its collection afterward

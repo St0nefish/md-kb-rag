@@ -1,4 +1,4 @@
-# md-kb-rag
+# mcp-md-wiki
 
 Rust binary with subcommands: `serve`, `index`, `validate`, `status`.
 
@@ -8,7 +8,7 @@ This project is hosted on **GitHub** (issues, PRs, CI). The knowledge bases it i
 
 ## Architecture
 
-Single binary (`md-kb-rag`) that combines MCP server, webhook handler, and CLI indexer. Docker Compose runs 3 services: qdrant, embeddings, md-kb-rag.
+Single binary (`mcp-md-wiki`) that combines MCP server, webhook handler, and CLI indexer. Docker Compose runs 3 services: qdrant, embeddings, mcp-md-wiki.
 
 In `serve` mode, indexing is asynchronous: MCP write tools and the webhook handler never call the indexer directly — they mark repo-relative paths (or a full reconcile) dirty on a `reindex::ReindexQueue` and return immediately. That queue is an injected dependency, not a global: `server::run_server` builds exactly one `Arc<ReindexQueue>` and clones it into every producer (`KbSearchServer`, `UiState`, `WebhookState`, `AdminState`) and into the worker, so every producer and the worker are provably talking to the same queue rather than relying on convention — `write::WriteDeps::queue` is how the write pipeline receives its handle. A single background worker (`reindex::run_worker`) drains that queue and is the only thing that calls `ingest::index_paths`, which is itself the only function that mutates Qdrant or the state DB. `ingest::scan_for_dirty` is the read-only detector behind a full reconcile — it walks the corpus and stat/hash-compares against `indexed_files`, producing a worklist for `index_paths` rather than indexing anything itself. The `index` CLI subcommand has no worker: it runs `ingest::scan_and_index` synchronously in-process.
 

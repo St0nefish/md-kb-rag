@@ -1,5 +1,5 @@
 [package]
-name = "md-kb-rag"
+name = "mcp-md-wiki"
 version = "0.1.0"
 edition = "2024"
 # Keep in lockstep with `channel` in rust-toolchain.toml and `RUST_VERSION`
